@@ -153,67 +153,6 @@ class UserLockManager:
 user_lock_manager = UserLockManager()
 
 
-class ActivityTimerManager:
-    """活动定时器管理器 - 防止内存泄漏"""
-
-    def __init__(self):
-        self._timers = {}
-        self._cleanup_interval = 300
-        self._last_cleanup = time.time()
-
-    async def start_timer(self, chat_id: int, uid: int, act: str, limit: int):
-        """启动活动定时器"""
-        key = f"{chat_id}-{uid}"
-        await self.cancel_timer(key)
-
-        timer_task = await task_manager.create_task(
-            self._activity_timer_wrapper(chat_id, uid, act, limit), name=f"timer_{key}"
-        )
-        self._timers[key] = timer_task
-        logger.debug(f"⏰ 启动定时器: {key} - {act}")
-
-    async def _activity_timer_wrapper(
-        self, chat_id: int, uid: int, act: str, limit: int
-    ):
-        """定时器包装器，确保异常处理"""
-        try:
-            await activity_timer(chat_id, uid, act, limit)
-        except Exception as e:
-            logger.error(f"定时器异常 {chat_id}-{uid}: {e}")
-
-    async def cancel_timer(self, key: str):
-        """取消定时器"""
-        if key in self._timers:
-            task = self._timers[key]
-            if not task.done():
-                task.cancel()
-                try:
-                    await task
-                except asyncio.CancelledError:
-                    pass
-            del self._timers[key]
-
-    async def cleanup_finished_timers(self):
-        """清理已完成定时器"""
-        if time.time() - self._last_cleanup < self._cleanup_interval:
-            return
-
-        finished_keys = [key for key, task in self._timers.items() if task.done()]
-        for key in finished_keys:
-            del self._timers[key]
-
-        if finished_keys:
-            logger.info(f"🧹 定时器清理: 移除了 {len(finished_keys)} 个已完成定时器")
-
-        self._last_cleanup = time.time()
-
-    def get_stats(self):
-        return {"active_timers": len(self._timers)}
-
-
-timer_manager = ActivityTimerManager()
-
-
 # ==================== 性能优化类 ====================
 class EnhancedPerformanceOptimizer:
     """增强版性能优化器"""
@@ -804,14 +743,37 @@ def get_admin_keyboard():
 
 
 # ==================== 活动定时提醒优化 ====================
+tasks = {}  # 定时任务：chat_id-uid → asyncio.Task
+
+
+async def safe_cancel_task(key: str):
+    """安全取消定时任务"""
+    if key in tasks:
+        task = tasks[key]
+        if not task.done():
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+            except Exception as e:
+                logger.error(f"取消任务异常: {e}")
+        del tasks[key]
+
+
 async def activity_timer(chat_id: int, uid: int, act: str, limit: int):
-    """活动定时提醒任务 - 纯业务逻辑版"""
+    """优化的活动定时提醒任务"""
     try:
-        # ✅ 直接执行内部逻辑，不管理任务创建
-        await _activity_timer_inner(chat_id, uid, act, limit)
+        key = f"{chat_id}-{uid}"
+        # 使用内存感知的任务管理器创建任务
+        timer_task = await task_manager.create_task(
+            _activity_timer_inner(chat_id, uid, act, limit), name=f"timer_{key}"
+        )
+        tasks[key] = timer_task
+        await timer_task  # 等待任务完成
 
     except asyncio.CancelledError:
-        logger.info(f"定时器 {chat_id}-{uid} 被取消")
+        logger.info(f"定时器 {key} 被取消")
     except Exception as e:
         logger.error(f"定时器错误: {e}")
 
@@ -996,7 +958,7 @@ async def _activity_timer_inner(chat_id: int, uid: int, act: str, limit: int):
                     except Exception as e:
                         logger.error(f"发送自动回座通知失败: {e}")
 
-                    await timer_manager.cancel_timer(f"{chat_id}-{uid}")
+                    await safe_cancel_task(f"{chat_id}-{uid}")
                     break
 
         await asyncio.sleep(30)
@@ -1057,10 +1019,13 @@ async def _start_activity_locked(
     await db.update_user_activity(chat_id, uid, act, str(now), name)
 
     key = f"{chat_id}-{uid}"
+    await safe_cancel_task(key)
 
     time_limit = await db.get_activity_time_limit(act)
-
-    await timer_manager.start_timer(chat_id, uid, act, time_limit)
+    timer_task = await task_manager.create_task(
+        activity_timer(chat_id, uid, act, time_limit), name=f"activity_timer_{key}"
+    )
+    tasks[key] = timer_task
 
     await message.answer(
         MessageFormatter.format_activity_message(
@@ -2513,7 +2478,7 @@ async def auto_end_current_activity(
 
         # 取消定时任务
         key = f"{chat_id}-{uid}"
-        await timer_manager.cancel_timer(key)
+        await safe_cancel_task(key)
 
         # 发送自动结束通知
         if message:
@@ -3503,7 +3468,7 @@ async def _process_back_locked(message: types.Message, chat_id: int, uid: int):
                 logger.info(f"🔍 [回座后] 用户{uid} 活动{act} 新计数: {after_count}")
 
             # 🔄 取消旧计时任务
-            await timer_manager.cancel_timer(f"{chat_id}-{uid}")
+            await safe_cancel_task(f"{chat_id}-{uid}")
 
             # ✅ 读取用户最新数据
             user_data = await asyncio.wait_for(
@@ -4192,9 +4157,15 @@ async def restore_activity_timers():
 
                 if remaining_time > 60:  # 剩余时间大于1分钟才恢复
                     # 还有剩余时间，恢复定时器
-                    await timer_manager.start_timer(
-                        chat_id, user_id, activity, time_limit
-                    )  # 🆕 直接调用
+                    key = f"{chat_id}-{user_id}"
+                    await safe_cancel_task(key)  # 清理可能存在的旧任务
+
+                    # 重新创建定时器
+                    timer_task = await task_manager.create_task(
+                        activity_timer(chat_id, user_id, activity, time_limit),
+                        name=f"activity_timer_{key}",
+                    )
+                    tasks[key] = timer_task
 
                     logger.info(
                         f"✅ 恢复定时器: 用户{user_id}({nickname}) 活动{activity} 剩余{remaining_time/60:.1f}分钟"
@@ -4417,8 +4388,6 @@ async def memory_cleanup_task():
 
             # 3️⃣ 数据库安全清理
             success = await db.safe_cleanup_old_data(30)
-            # 🆕 添加定时器清理
-            await timer_manager.cleanup_finished_timers()
             if not success:
                 logger.warning("⚠️ 数据库清理未执行，但不影响主要功能")
 
@@ -4439,9 +4408,8 @@ async def health_monitoring_task():
                 await performance_optimizer.memory_cleanup()
 
             # 检查任务数量
-            timer_stats = timer_manager.get_stats()
-            if timer_stats["active_timers"] > 1000:
-                logger.warning(f"⚠️ 活动任务数量过多: {timer_stats['active_timers']}")
+            if len(tasks) > 1000:
+                logger.warning(f"⚠️ 活动任务数量过多: {len(tasks)}")
                 await performance_optimizer.memory_cleanup()
 
             await asyncio.sleep(60)
@@ -4475,9 +4443,6 @@ async def enhanced_health_check(request):
 
         lock_stats = user_lock_manager.get_stats()
 
-        # 🆕 添加定时器状态
-        timer_stats = timer_manager.get_stats()
-
         # 获取基本状态
         status = "healthy" if memory_ok else "degraded"
 
@@ -4490,8 +4455,7 @@ async def enhanced_health_check(request):
                 "database": db_stats,
                 "heartbeat": heartbeat_status,
                 "user_locks": lock_stats,
-                "activity_timers": timer_stats,
-                "active_tasks": timer_manager.get_stats()["active_timers"],
+                "active_tasks": len(tasks),
                 "system": {
                     "python_version": sys.version,
                     "platform": sys.platform,
@@ -4581,8 +4545,7 @@ async def metrics_endpoint(request):
                 logger.warning(f"获取数据库连接数失败: {e}")
 
         # 获取其他性能指标
-        timer_stats = timer_manager.get_stats()
-        task_count = timer_stats["active_timers"]
+        task_count = len(tasks)
         cache_stats = global_cache.get_stats()
 
         # Prometheus格式指标
@@ -4625,7 +4588,7 @@ async def detailed_status_check(request):
             "status": "healthy",
             "timestamp": get_beijing_time().isoformat(),
             "bot": {
-                "active_tasks": timer_manager.get_stats()["active_timers"],
+                "active_tasks": len(tasks),
                 "user_locks_count": len(user_locks),
                 "memory_usage_ok": performance_optimizer.memory_usage_ok(),
             },
@@ -4657,14 +4620,16 @@ async def on_shutdown():
     """关闭时执行 - 优化版本"""
     logger.info("🛑 机器人正在关闭...")
 
-    async def cancel_all_timers(self):
-        """取消所有定时器"""
-        keys = list(self._timers.keys())
-        for key in keys:
-            await self.cancel_timer(key)
-        logger.info(f"✅ 已取消所有定时器: {len(keys)} 个")
-
-    await timer_manager.cancel_all_timers()
+    for key, task in list(tasks.items()):
+        if not task.done():
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+            except Exception as e:
+                logger.error(f"取消任务异常: {e}")
+        del tasks[key]
 
     logger.info("✅ 清理完成")
 
@@ -4808,8 +4773,20 @@ async def optimized_on_shutdown():
         ]
 
         # 取消所有活动任务
-        await timer_manager.cancel_all_timers()
+        for key, task in list(tasks.items()):
+            if not task.done():
+                task.cancel()
+
         await asyncio.gather(*cleanup_tasks, return_exceptions=True)
+
+        # 等待任务完成
+        for key, task in list(tasks.items()):
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+            except Exception as e:
+                logger.error(f"任务异常: {e}")
 
         logger.info("✅ 优化清理完成")
     except Exception as e:
