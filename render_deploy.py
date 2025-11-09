@@ -240,7 +240,8 @@ async def main():
 # ===========================
 if __name__ == "__main__":
     try:
-        # asyncio.run(main())
+        # asyncio.run(main())  # 🚫 已禁用 Render.py 启动，改由 main.py 负责
+        pass  # ✅ 防止 try 块为空导致语法错误
     except KeyboardInterrupt:
         logger.info("👋 收到键盘中断信号")
     except Exception as e:
