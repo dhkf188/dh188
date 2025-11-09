@@ -1,4 +1,4 @@
-# render_deploy.py - 修复版本（不启动轮询）
+# render_deploy.py - 修复版本
 import os
 import asyncio
 import logging
@@ -6,9 +6,10 @@ import time
 import signal
 from aiohttp import web
 
-# ✅ 导入所有需要的组件（移除 dp，因为不需要轮询）
+# ✅ 导入所有需要的组件
 from main import (
-    bot,  # 只保留 bot 用于 webhook 清理
+    dp,
+    bot,
     db,
     heartbeat_manager,
     memory_cleanup_task,
@@ -27,28 +28,48 @@ from config import Config
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("RenderBot")
 
+
 # ===========================
 # 全局状态管理
 # ===========================
 class AppState:
     def __init__(self):
         self.running = True
-        self.web_server_started = False  # 改为 web 服务器状态
+        self.polling_started = False
 
 
 app_state = AppState()
+
 
 # ===========================
 # 信号处理
 # ===========================
 def handle_sigterm(signum, frame):
-    """处理 SIGTERM 信号"""
-    logger.info(f"📡 收到信号 {signum}，准备优雅关闭...")
+    logger.info(f"📡 收到信号 {signum}，准备优雅关闭 polling...")
     app_state.running = False
+
+    try:
+        loop = asyncio.get_event_loop()
+        loop.create_task(stop_polling_safely())
+    except Exception as e:
+        logger.warning(f"⚠️ 停止 polling 时出错: {e}")
+
+
+async def stop_polling_safely():
+    try:
+        await dp.storage.close()
+        await dp.storage.wait_closed()
+        await dp.stop_polling()
+        await bot.session.close()
+        logger.info("✅ 已优雅停止 Telegram Polling")
+    except Exception as e:
+        logger.warning(f"⚠️ Polling 停止时出错: {e}")
+
 
 # 注册信号处理器
 signal.signal(signal.SIGTERM, handle_sigterm)
 signal.signal(signal.SIGINT, handle_sigterm)
+
 
 # ===========================
 # Render 保活健康检查接口
@@ -58,11 +79,12 @@ async def health_check(request):
     return web.json_response(
         {
             "status": "healthy" if app_state.running else "shutting_down",
-            "service": "telegram-bot-web",  # 修改服务名称
+            "service": "telegram-bot",
             "timestamp": time.time(),
-            "web_server_active": app_state.web_server_started,  # 改为 web 服务器状态
+            "polling_active": app_state.polling_started,
         }
     )
+
 
 # ===========================
 # Render 必需 Web 服务（动态端口）
@@ -83,9 +105,9 @@ async def start_web_server():
     site = web.TCPSite(runner, "0.0.0.0", port)
     await site.start()
 
-    app_state.web_server_started = True  # 设置状态
     logger.info(f"✅ Web server started on Render dynamic port: {port}")
     return runner, site
+
 
 # ===========================
 # 初始化所有关键服务（数据库 / 心跳 / 配置）
@@ -104,7 +126,7 @@ async def initialize_services():
     # ✅ 确保删除所有 webhook，避免冲突
     try:
         await bot.delete_webhook(drop_pending_updates=True)
-        logger.info("✅ Webhook deleted → Telegram polling will be handled by main.py")
+        logger.info("✅ Webhook deleted → switching to polling mode")
 
         # 额外等待确保 webhook 完全删除
         await asyncio.sleep(2)
@@ -114,6 +136,7 @@ async def initialize_services():
     # 🆕 执行启动流程
     await simple_on_startup()
     logger.info("✅ All services initialized with activity recovery")
+
 
 # ===========================
 # 启动后台任务（不会阻塞主线程）
@@ -131,8 +154,43 @@ async def start_background_tasks():
 
     logger.info("✅ All background tasks started")
 
+
 # ===========================
-# 主程序入口 - 只启动 Web 服务，不启动轮询
+# 安全启动轮询
+# ===========================
+async def safe_start_polling():
+    """安全启动轮询，处理冲突"""
+    max_retries = 3
+    retry_delay = 5
+
+    for attempt in range(max_retries):
+        try:
+            logger.info(
+                f"🤖 尝试启动 Telegram bot 轮询 (尝试 {attempt + 1}/{max_retries})..."
+            )
+
+            # 启动轮询
+            await dp.start_polling(bot, skip_updates=True)
+            app_state.polling_started = True
+            logger.info("✅ Telegram bot 轮询启动成功")
+            return True
+
+        except Exception as e:
+            logger.error(f"❌ 第 {attempt + 1} 次轮询启动失败: {e}")
+
+            if "Conflict" in str(e) and attempt < max_retries - 1:
+                logger.info(f"⏳ 检测到冲突，等待 {retry_delay} 秒后重试...")
+                await asyncio.sleep(retry_delay)
+                retry_delay *= 2  # 指数退避
+            else:
+                logger.error("💥 轮询启动彻底失败")
+                return False
+
+    return False
+
+
+# ===========================
+# 主程序入口
 # ===========================
 async def main():
     web_runner = None
@@ -148,20 +206,25 @@ async def main():
         # ✅ 启动后台任务（不阻塞）
         await start_background_tasks()
 
-        logger.info("🎉 Render Web 服务启动完成！")
-        logger.info("💡 Telegram 轮询将在主程序 (main.py) 中启动")
-        logger.info("🌐 Web 服务保持运行中...")
+        logger.info("🤖 Starting Telegram bot in POLLING mode...")
 
-        # ✅ 关键修改：只保持 Web 服务运行，不启动轮询
-        while app_state.running:
-            await asyncio.sleep(10)
+        # ✅ 安全启动轮询
+        polling_success = await safe_start_polling()
+
+        if not polling_success:
+            logger.error("❌ Telegram bot 启动失败，但 Web 服务仍在运行")
+
+            # 即使轮询失败，也保持 Web 服务运行
+            while app_state.running:
+                await asyncio.sleep(10)
+                logger.info("🌐 Web 服务保持运行中...")
 
     except Exception as e:
-        logger.error(f"💥 Web service failed to start: {e}")
+        logger.error(f"💥 Bot failed to start: {e}")
         raise
 
     finally:
-        logger.info("🛑 Web service shutdown complete")
+        logger.info("🛑 Bot shutdown complete")
 
         # 清理资源
         try:
@@ -171,12 +234,13 @@ async def main():
         except Exception as e:
             logger.warning(f"⚠️ 清理 web runner 时出错: {e}")
 
+
 # ===========================
 # 程序启动
 # ===========================
 if __name__ == "__main__":
     try:
-        asyncio.run(main())
+        # asyncio.run(main())
     except KeyboardInterrupt:
         logger.info("👋 收到键盘中断信号")
     except Exception as e:
