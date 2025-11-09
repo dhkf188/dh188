@@ -18,7 +18,6 @@ from main import (
     monthly_report_task,
     simple_on_startup,
     # ✅ 新增：导入清理函数
-    cleanup_resources,
     # ✅ 新增：导入必要的工具函数
     get_beijing_time,
     performance_optimizer,
