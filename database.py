@@ -1429,7 +1429,8 @@ class PostgreSQLDatabase:
         for attempt in range(2):  # ✅ 增加1次自动重试
             try:
                 async with self.pool.acquire() as conn:
-                    result = await conn.fetchval("SELECT 1;")
+                    # ✅ 使用更标准的PostgreSQL查询（移除分号）
+                    result = await conn.fetchval("SELECT 1")
                     if result == 1:
                         if attempt > 0:
                             logger.info("✅ [DB] 重试后连接恢复正常")
@@ -1441,10 +1442,9 @@ class PostgreSQLDatabase:
                         return False
 
             except (asyncio.TimeoutError, ConnectionError) as e:
-                logger.warning(
-                    f"⚠️ [DB] 健康检查网络异常 ({e.__class__.__name__})，正在重试... ({attempt+1}/2)"
-                )
-                await asyncio.sleep(1)
+                logger.warning(f"⚠️ [DB] 健康检查网络异常 ({e.__class__.__name__})，正在重试... ({attempt+1}/2)")
+                if attempt == 0:  # ✅ 只在第一次重试时等待
+                    await asyncio.sleep(1)
 
             except Exception as e:
                 logger.error(f"❌ [DB] 健康检查失败: {type(e).__name__}: {e}")
