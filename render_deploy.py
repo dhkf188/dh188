@@ -14,7 +14,6 @@ from main import (
     memory_cleanup_task,
     health_monitoring_task,
     daily_reset_task,
-    auto_daily_export_task,
     efficient_monthly_export_task,
     monthly_report_task,
     simple_on_startup,
