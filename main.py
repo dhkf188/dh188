@@ -154,20 +154,35 @@ user_lock_manager = UserLockManager()
 
 
 class ActivityTimerManager:
+    """活动定时器管理器 - 防止内存泄漏"""
+
     def __init__(self):
         self._timers = {}
         self._cleanup_interval = 300
+        self._last_cleanup = time.time()
 
     async def start_timer(self, chat_id: int, uid: int, act: str, limit: int):
+        """启动活动定时器"""
         key = f"{chat_id}-{uid}"
         await self.cancel_timer(key)
 
         timer_task = await task_manager.create_task(
-            activity_timer(chat_id, uid, act, limit), name=f"timer_{key}"
+            self._activity_timer_wrapper(chat_id, uid, act, limit), name=f"timer_{key}"
         )
         self._timers[key] = timer_task
+        logger.debug(f"⏰ 启动定时器: {key} - {act}")
+
+    async def _activity_timer_wrapper(
+        self, chat_id: int, uid: int, act: str, limit: int
+    ):
+        """定时器包装器，确保异常处理"""
+        try:
+            await activity_timer(chat_id, uid, act, limit)
+        except Exception as e:
+            logger.error(f"定时器异常 {chat_id}-{uid}: {e}")
 
     async def cancel_timer(self, key: str):
+        """取消定时器"""
         if key in self._timers:
             task = self._timers[key]
             if not task.done():
@@ -179,13 +194,18 @@ class ActivityTimerManager:
             del self._timers[key]
 
     async def cleanup_finished_timers(self):
-        """清理已完成但未删除的任务"""
+        """清理已完成定时器"""
+        if time.time() - self._last_cleanup < self._cleanup_interval:
+            return
+
         finished_keys = [key for key, task in self._timers.items() if task.done()]
         for key in finished_keys:
             del self._timers[key]
 
         if finished_keys:
-            logger.debug(f"🧹 清理了 {len(finished_keys)} 个已完成定时器")
+            logger.info(f"🧹 定时器清理: 移除了 {len(finished_keys)} 个已完成定时器")
+
+        self._last_cleanup = time.time()
 
     def get_stats(self):
         return {"active_timers": len(self._timers)}
@@ -783,10 +803,11 @@ def get_admin_keyboard():
     )
 
 
+# ==================== 活动定时提醒优化 ====================
 async def activity_timer(chat_id: int, uid: int, act: str, limit: int):
-    """活动定时提醒任务 - 优化版"""
+    """活动定时提醒任务 - 纯业务逻辑版"""
     try:
-        # 🆕 直接执行内部逻辑，不管理 tasks 字典
+        # ✅ 直接执行内部逻辑，不管理任务创建
         await _activity_timer_inner(chat_id, uid, act, limit)
 
     except asyncio.CancelledError:
@@ -2533,6 +2554,221 @@ async def auto_end_current_activity(
             )
 
 
+# ===== 上下班打卡功能 ======
+# async def process_work_checkin(message: types.Message, checkin_type: str):
+#     """处理上下班打卡 - 修复跨天问题版本"""
+#     chat_id = message.chat.id
+#     uid = message.from_user.id
+#     name = message.from_user.full_name
+#     now = get_beijing_time()
+#     current_time = now.strftime("%H:%M")
+
+#     user_lock = get_user_lock(chat_id, uid)
+#     async with user_lock:
+#         await db.init_group(chat_id)
+#         await db.init_user(chat_id, uid)
+
+#         user_data = await db.get_user_cached(chat_id, uid)
+#         today = str(now.date())
+
+#         # 检查是否有正在进行的活动（仅在下班打卡时检查）
+#         current_activity = user_data.get("current_activity")
+#         activity_auto_ended = False
+#         if checkin_type == "work_end" and current_activity:
+#             # 自动结束当前活动
+#             await auto_end_current_activity(chat_id, uid, user_data, now, message)
+#             activity_auto_ended = True
+
+#         today_records = await db.get_today_work_records(chat_id, uid)
+
+#         if checkin_type in today_records:
+#             action_text = "上班" if checkin_type == "work_start" else "下班"
+#             existing_time = today_records[checkin_type]["checkin_time"]
+#             existing_status = today_records[checkin_type]["status"]
+#             await message.answer(
+#                 f"❌ 您今天已经打过{action_text}卡了！\n"
+#                 f"⏰ 打卡时间：<code>{existing_time}</code>\n"
+#                 f"📊 状态：{existing_status}",
+#                 reply_markup=await get_main_keyboard(
+#                     chat_id=chat_id, show_admin=await is_admin(uid)
+#                 ),
+#                 parse_mode="HTML",
+#             )
+#             return
+
+#         if checkin_type == "work_end" and "work_start" not in today_records:
+#             await message.answer(
+#                 "❌ 您今天还没有打上班卡，无法打下班卡！\n"
+#                 "💡 请先使用'🟢 上班'按钮或 /workstart 命令打上班卡",
+#                 reply_markup=await get_main_keyboard(
+#                     chat_id=chat_id, show_admin=await is_admin(uid)
+#                 ),
+#                 parse_mode="HTML",
+#             )
+#             return
+
+#         work_hours = await db.get_group_work_time(chat_id)
+#         expected_time = work_hours[checkin_type]
+
+#         # 使用改进的跨天时间计算
+#         time_diff_minutes, expected_dt = calculate_cross_day_time_diff(
+#             now, expected_time, checkin_type
+#         )
+
+#         def format_time_diff(minutes):
+#             total_seconds = abs(int(minutes * 60))
+#             hours = total_seconds // 3600
+#             mins = (total_seconds % 3600) // 60
+#             secs = total_seconds % 60
+
+#             if hours > 0 and mins > 0 and secs > 0:
+#                 return f"{hours}小时{mins}分{secs}秒"
+#             elif hours > 0 and mins > 0:
+#                 return f"{hours}小时{mins}分"
+#             elif hours > 0:
+#                 return f"{hours}小时"
+#             elif mins > 0 and secs > 0:
+#                 return f"{mins}分{secs}秒"
+#             elif mins > 0:
+#                 return f"{mins}分"
+#             else:
+#                 return f"{secs}秒"
+
+#         time_diff_str = format_time_diff(time_diff_minutes)
+
+#         fine_amount = 0
+#         is_late_early = False
+
+#         if checkin_type == "work_start":
+#             # 上班打卡：时间差为正数表示迟到
+#             if time_diff_minutes > 0:
+#                 fine_amount = await calculate_work_fine("work_start", time_diff_minutes)
+#                 status = f"❌ 迟到 {time_diff_str}"
+#                 if fine_amount > 0:
+#                     status += f" \n💰罚款 {fine_amount}元"
+#                 emoji = "⏰"
+#                 is_late_early = True
+#             else:
+#                 status = "✅ 准时"
+#                 emoji = "👍"
+#             action_text = "上班"
+#         else:
+#             # 下班打卡：时间差为负数表示早退
+#             if time_diff_minutes < 0:
+#                 fine_amount = await calculate_work_fine(
+#                     "work_end", abs(time_diff_minutes)
+#                 )
+#                 status = f"❌ 早退 {time_diff_str}"
+#                 if fine_amount > 0:
+#                     status += f" \n💰罚款 {fine_amount}元"
+#                 emoji = "🏃"
+#                 is_late_early = True
+#             else:
+#                 status = "✅ 准时"
+#                 emoji = "👍"
+#             action_text = "下班"
+
+#         await db.add_work_record(
+#             chat_id,
+#             uid,
+#             today,
+#             checkin_type,
+#             current_time,
+#             status,
+#             time_diff_minutes,
+#             fine_amount,
+#         )
+
+#         # 显示实际选择的期望时间点
+#         expected_time_display = expected_dt.strftime("%m/%d %H:%M")
+
+#         result_msg = (
+#             f"{emoji} <b>{action_text}打卡完成</b>\n"
+#             f"👤 用户：{MessageFormatter.format_user_link(uid, name)}\n"
+#             f"⏰ 打卡时间：<code>{current_time}</code>\n"
+#             f"📅 期望时间：<code>{expected_time_display}</code>\n"
+#             f"📊 状态：{status}"
+#         )
+
+#         # 如果自动结束了活动，添加提示
+#         if checkin_type == "work_end" and activity_auto_ended and current_activity:
+#             result_msg += f"\n\n🔄 检测到您有未结束的活动 <code>{current_activity}</code>，已自动为您结束"
+
+#         await message.answer(
+#             result_msg,
+#             reply_markup=await get_main_keyboard(
+#                 chat_id=chat_id, show_admin=await is_admin(uid)
+#             ),
+#             parse_mode="HTML",
+#         )
+
+#         # 修复通知推送部分 - 确保迟到早退通知能正确发送
+#         if is_late_early:
+#             try:
+#                 # 确定通知类型
+#                 if checkin_type == "work_start":
+#                     status_type = "迟到"
+#                     time_detail = f"迟到 {time_diff_str}"
+#                 else:
+#                     status_type = "早退"
+#                     time_detail = f"早退 {time_diff_str}"
+
+#                 # 获取群组名称
+#                 chat_title = str(chat_id)
+#                 try:
+#                     chat_info = await bot.get_chat(chat_id)
+#                     chat_title = chat_info.title or chat_title
+#                 except Exception as e:
+#                     logger.warning(f"无法获取群组信息: {e}")
+
+#                 # 构建通知内容
+#                 notif_text = (
+#                     f"⚠️ <b>{action_text}{status_type}通知</b>\n"
+#                     f"🏢 群组：<code>{chat_title}</code>\n"
+#                     f"---------------------------------------\n"
+#                     f"👤 用户：{MessageFormatter.format_user_link(uid, name)}\n"
+#                     f"⏰ 打卡时间：<code>{current_time}</code>\n"
+#                     f"📅 期望时间：<code>{expected_time_display}</code>\n"
+#                     f"⏱️ {time_detail}"
+#                 )
+
+#                 if fine_amount > 0:
+#                     notif_text += f"\n💰 罚款金额：<code>{fine_amount}</code> 元"
+
+#                 # 发送通知并检查结果
+#                 sent = await NotificationService.send_notification(chat_id, notif_text)
+
+#                 if sent:
+#                     logger.info(
+#                         f"✅ 已发送{action_text}{status_type}通知：{time_detail}，罚款{fine_amount}元"
+#                     )
+#                 else:
+#                     logger.warning(
+#                         f"⚠️ {action_text}{status_type}通知发送失败，可能没有配置推送目标"
+#                     )
+
+#                     # 如果没有成功发送到任何目标，尝试发送给管理员作为兜底
+#                     try:
+#                         for admin_id in Config.ADMINS:
+#                             await bot.send_message(
+#                                 admin_id,
+#                                 f"🚨 重要：{action_text}{status_type}通知发送失败\n{notif_text}",
+#                                 parse_mode="HTML",
+#                             )
+#                         logger.info(f"✅ 已发送兜底通知给管理员")
+#                     except Exception as admin_e:
+#                         logger.error(f"❌ 发送兜底通知给管理员失败: {admin_e}")
+
+#             except Exception as e:
+#                 logger.error(f"❌ 发送上下班通知失败: {e}")
+
+#                 # 记录详细的错误信息以便调试
+#                 import traceback
+
+#                 error_details = traceback.format_exc()
+#                 logger.error(f"❌ 详细错误信息: {error_details}")
+
+
 async def process_work_checkin(message: types.Message, checkin_type: str):
     """
     智能化上下班打卡系统（跨天安全修复版）
@@ -3958,7 +4194,7 @@ async def restore_activity_timers():
                     # 还有剩余时间，恢复定时器
                     await timer_manager.start_timer(
                         chat_id, user_id, activity, time_limit
-                    )  # 清理可能存在的旧任务
+                    )  # 🆕 直接调用
 
                     logger.info(
                         f"✅ 恢复定时器: 用户{user_id}({nickname}) 活动{activity} 剩余{remaining_time/60:.1f}分钟"
@@ -4181,7 +4417,7 @@ async def memory_cleanup_task():
 
             # 3️⃣ 数据库安全清理
             success = await db.safe_cleanup_old_data(30)
-
+            # 🆕 添加定时器清理
             await timer_manager.cleanup_finished_timers()
             if not success:
                 logger.warning("⚠️ 数据库清理未执行，但不影响主要功能")
@@ -4239,10 +4475,11 @@ async def enhanced_health_check(request):
 
         lock_stats = user_lock_manager.get_stats()
 
+        # 🆕 添加定时器状态
+        timer_stats = timer_manager.get_stats()
+
         # 获取基本状态
         status = "healthy" if memory_ok else "degraded"
-
-        timer_stats = timer_manager.get_stats()
 
         return web.json_response(
             {
@@ -4570,6 +4807,7 @@ async def optimized_on_shutdown():
             heartbeat_manager.stop(),  # 停止心跳管理器
         ]
 
+        # 取消所有活动任务
         await timer_manager.cancel_all_timers()
         await asyncio.gather(*cleanup_tasks, return_exceptions=True)
 
