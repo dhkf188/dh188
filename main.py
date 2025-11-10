@@ -10,6 +10,7 @@ import weakref
 import aiofiles
 import logging
 import psutil
+import traceback
 from io import StringIO
 from datetime import datetime, timedelta
 from collections import defaultdict
@@ -33,6 +34,8 @@ from config import Config, beijing_tz
 from database import PostgreSQLDatabase as AsyncDatabase
 from heartbeat import heartbeat_manager
 from aiogram import types
+
+from contextlib import suppress
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 
 
@@ -1034,7 +1037,19 @@ async def _activity_timer_inner(chat_id: int, uid: int, act: str, limit: int):
                             f"💰 本次罚款：<code>{fine_amount}</code> 元\n"
                             f"🔔 类型：系统自动回座（超时2小时强制）"
                         )
-                        await NotificationService.send_notification(chat_id, notif_text)
+                        # 🆕 添加推送通知
+                        sent = await NotificationService.send_notification(
+                            chat_id, notif_text
+                        )
+                        if not sent:
+                            logger.warning(
+                                f"⚠️ 2小时自动回座通知发送失败，尝试管理员兜底。"
+                            )
+                            for admin_id in Config.ADMINS:
+                                with suppress(Exception):
+                                    await bot.send_message(
+                                        admin_id, notif_text, parse_mode="HTML"
+                                    )
 
                     except Exception as e:
                         logger.error(f"发送自动回座通知失败: {e}")
@@ -1769,36 +1784,45 @@ async def cmd_performance(message: types.Message):
 
         report_text = (
             "📊 <b>系统性能报告</b>\n\n"
-            f"⏰ 运行时间: <code>{perf_report['uptime']:.0f}</code> 秒\n"
-            f"💾 内存使用: <code>{perf_report['memory_usage_mb']:.1f}</code> MB\n"
-            f"🐌 慢操作数量: <code>{perf_report['slow_operations_count']}</code>\n\n"
+            f"⏰ 运行时间: <code>{perf_report.get('uptime', 0):.0f}</code> 秒\n"
+            f"💾 内存使用: <code>{perf_report.get('memory_usage_mb', 0):.1f}</code> MB\n"
+            f"🐌 慢操作数量: <code>{perf_report.get('slow_operations_count', 0)}</code>\n\n"
             f"<b>缓存统计:</b>\n"
-            f"• 命中率: <code>{cache_stats['hit_rate']:.1%}</code>\n"
-            f"• 命中次数: <code>{cache_stats['hits']}</code>\n"
-            f"• 未命中: <code>{cache_stats['misses']}</code>\n"
-            f"• 缓存大小: <code>{cache_stats['size']}</code>\n\n"
-            f"<b>操作性能:</b>\n"
+            f"• 命中率: <code>{cache_stats.get('hit_rate', 0):.1%}</code>\n"
+            f"• 命中次数: <code>{cache_stats.get('hits', 0)}</code>\n"
+            f"• 未命中: <code>{cache_stats.get('misses', 0)}</code>\n"
+            f"• 缓存大小: <code>{cache_stats.get('size', 0)}</code>\n\n"
         )
 
-        # 添加关键操作性能
-        for op_name, metrics in perf_report["metrics_summary"].items():
-            if metrics["count"] > 0:
-                report_text += (
-                    f"• {op_name}: 平均<code>{metrics['avg']:.3f}</code>s, "
-                    f"最大<code>{metrics['max']:.3f}</code>s, "
-                    f"次数<code>{metrics['count']}</code>\n"
-                )
+        # 添加关键操作性能 - 修复空值问题
+        metrics_summary = perf_report.get("metrics_summary", {})
+        if metrics_summary:
+            report_text += "<b>操作性能:</b>\n"
+            for op_name, metrics in metrics_summary.items():
+                if metrics.get("count", 0) > 0:
+                    report_text += (
+                        f"• {op_name}: 平均<code>{metrics.get('avg', 0):.3f}</code>s, "
+                        f"最大<code>{metrics.get('max', 0):.3f}</code>s, "
+                        f"次数<code>{metrics.get('count', 0)}</code>\n"
+                    )
+        else:
+            report_text += "<b>操作性能:</b>\n• 暂无性能数据\n\n"
 
         # 🆕 添加用户锁统计
         lock_stats = user_lock_manager.get_stats()
         report_text += f"\n🔒 <b>用户锁统计:</b>\n"
-        report_text += f"• 活跃锁数量: <code>{lock_stats['active_locks']}</code>\n"
-        report_text += f"• 跟踪用户数: <code>{lock_stats['tracked_users']}</code>\n"
-        report_text += f"• 上次清理: <code>{time.strftime('%H:%M:%S', time.localtime(lock_stats['last_cleanup']))}</code>\n"
+        report_text += (
+            f"• 活跃锁数量: <code>{lock_stats.get('active_locks', 0)}</code>\n"
+        )
+        report_text += (
+            f"• 跟踪用户数: <code>{lock_stats.get('tracked_users', 0)}</code>\n"
+        )
+        report_text += f"• 上次清理: <code>{time.strftime('%H:%M:%S', time.localtime(lock_stats.get('last_cleanup', time.time())))}</code>\n"
 
         await message.answer(report_text, parse_mode="HTML")
 
     except Exception as e:
+        logger.error(f"❌ 获取性能报告失败: {e}")
         await message.answer(f"❌ 获取性能报告失败: {e}")
 
 
@@ -2692,8 +2716,6 @@ async def process_work_checkin(message: types.Message, checkin_type: str):
     智能化上下班打卡系统（跨天安全修复版）
     保留全部原有功能 + 增强智能判断、错误容错、日志追踪。
     """
-    import traceback
-    from contextlib import suppress
 
     chat_id = message.chat.id
     uid = message.from_user.id
@@ -3202,17 +3224,22 @@ async def handle_admin_panel_button(message: types.Message):
         "• /setgroup <群组ID> - 绑定通知群组\n"
         "• /unbindchannel - 解除绑定频道\n"
         "• /unbindgroup - 解除绑定通知群组\n"
+        "• /setpush <channel|group|admin> <on|off> - 设置推送开关\n"
+        "• /showpush - 显示推送设置状态\n"
         "• \n"
         "• /addactivity <活动名> <次数> <分钟> - 添加或修改活动\n"
-        "• /set <用户ID> <活动> <分钟> - 设置用户时间\n"
         "• /delactivity <活动名> - 删除活动\n"
         "• \n"
         "• /setworktime 9:00 18:00 - 设置上下班时间\n"
         "• /delwork - 基本移除，保留历史记录\n"
         "• /delwork clear - 移除并清除所有记录\n"
         "• /workstatus - 查看当前上下班功能状态\n"
+        "• /worktime  - 查看当前群组工作时间设置\n"
         "• /reset_work 用户ID - 可以重置用户记录\n"
+        "• /showworktime - 显示当前上下班时间设置\n"
+        "• /resetworktime - 重置为默认上下班时间\n"
         "• \n"
+        "• /set <用户ID> <活动> <分钟> - 设置用户时间\n"
         "• /reset <用户ID> - 重置用户数据\n"
         "• \n"
         "• /setresettime <小时> <分钟> - 设置每日重置时间\n"
@@ -3222,11 +3249,18 @@ async def handle_admin_panel_button(message: types.Message):
         "• /setfines_all <t1> <f1> [<t2> <f2> ...] - 为所有活动统一设置分段罚款\n"
         "• \n"
         "• /showsettings - 查看当前群设置\n"
-        "• //reset_status - 查看重置状态\n"
+        "• /reset_status - 查看重置状态\n"
+        "• /reset_status - 查看重置状态\n"
         "• \n"
         "• /exportmonthly - 导出月度数据\n"
         "• /exportmonthly 2024 1 - 导出指定年月数据\n"
+        "• /monthlyreport - 生成最近一个月报告\n"
+        "• /monthlyreport <年> <月> - 生成指定年月报告\n"
         "• /export - 导出数据\n\n"
+        "• \n"
+        "• /refresh_keyboard - 强制刷新键盘显示新活动\n"
+        "• /debug_work - 调试上下班功能状态\n"
+        "• \n"
     )
     await message.answer(admin_text, reply_markup=get_admin_keyboard())
 
@@ -3481,6 +3515,7 @@ async def show_rank(message: types.Message):
 
 
 # ==================== 回座功能优化 ====================
+
 
 async def _process_back_locked(message: types.Message, chat_id: int, uid: int):
     """线程安全的回座逻辑（防重入 + 超时 + 日志优化）"""
