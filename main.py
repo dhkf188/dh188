@@ -392,7 +392,7 @@ class MessageFormatter:
     @staticmethod
     def create_dashed_line():
         """创建短虚线分割线"""
-        return "-------------------------------------"
+        return "----------------------------------"
 
     @staticmethod
     def format_copyable_text(text: str):
@@ -420,7 +420,7 @@ class MessageFormatter:
         )
 
         if count >= max_times:
-            message += f"\n⚠️ 警告：本次结束后，您今日的{MessageFormatter.format_copyable_text(activity)}次数将达到上限，请留意！"
+            message += f"\n🚨 警告：本次结束后，您今日的{MessageFormatter.format_copyable_text(activity)}次数将达到上限，请留意！"
 
         message += f"\n💡提示：活动完成后请及时输入'回座'或点击'✅ 回座'按钮"
 
@@ -448,14 +448,14 @@ class MessageFormatter:
             f"{first_line}\n"
             f"✅ {MessageFormatter.format_copyable_text(time_str)} 回座打卡成功\n"
             f"📝 活动：{MessageFormatter.format_copyable_text(activity)}\n"
-            f"⏳ 本次活动耗时：{MessageFormatter.format_copyable_text(elapsed_time)}\n"
+            f"⏰ 本次活动耗时：{MessageFormatter.format_copyable_text(elapsed_time)}\n"
             f"📈 今日累计{MessageFormatter.format_copyable_text(activity)}时间：{MessageFormatter.format_copyable_text(total_activity_time)}\n"
             f"📊 今日总计时：{MessageFormatter.format_copyable_text(total_time)}\n"
         )
 
         if is_overtime:
             overtime_time = MessageFormatter.format_time(int(overtime_seconds))
-            message += f"⚠️ 警告：您本次的活动已超时！\n 🚨 超时时间：{MessageFormatter.format_copyable_text(overtime_time)}\n"
+            message += f"⚠️ 警告：您本次的活动已超时！\n🚨 超时时间：{MessageFormatter.format_copyable_text(overtime_time)}\n"
             if fine_amount > 0:
                 message += f"💸 罚款：{MessageFormatter.format_copyable_text(str(fine_amount))} 元\n"
 
@@ -887,7 +887,7 @@ async def _activity_timer_inner(chat_id: int, uid: int, act: str, limit: int):
             warning_msg = (
                 f"⏳ <b>即将超时警告</b>\n"
                 f"👤 用户：{MessageFormatter.format_user_link(uid, nickname)}\n"
-                f"❌ 您本次 {MessageFormatter.format_copyable_text(act)} 还有 <code>1</code> 分钟即将超时！\n"
+                f"🕓 您本次 {MessageFormatter.format_copyable_text(act)} 还有 <code>1</code> 分钟即将超时！\n"
                 f"💡 请及时回座，避免超时罚款"
             )
             # 创建回座按钮
@@ -915,7 +915,7 @@ async def _activity_timer_inner(chat_id: int, uid: int, act: str, limit: int):
                     f"⚠️ <b>超时警告</b>\n"
                     f"👤 用户：{MessageFormatter.format_user_link(uid, nickname)}\n"
                     f"❌ 您的 {MessageFormatter.format_copyable_text(act)} 已经<code>超时</code>！\n"
-                    f"💢 请立即回座，避免产生更多罚款！"
+                    f"🏃‍♂️ 请立即回座，避免产生更多罚款！"
                 )
                 # 创建回座按钮
                 back_keyboard = InlineKeyboardMarkup(
@@ -940,7 +940,7 @@ async def _activity_timer_inner(chat_id: int, uid: int, act: str, limit: int):
                     f"🔔 <b>超时警告</b>\n"
                     f"👤 用户：{MessageFormatter.format_user_link(uid, nickname)}\n"
                     f"❌ 您的 {MessageFormatter.format_copyable_text(act)} 已经超时 <code>5</code> 分钟！\n"
-                    f"💢 请立即回座，避免罚款增加！"
+                    f"😤 请立即回座，避免罚款增加！"
                 )
                 # 创建回座按钮
                 back_keyboard = InlineKeyboardMarkup(
@@ -1029,7 +1029,7 @@ async def _activity_timer_inner(chat_id: int, uid: int, act: str, limit: int):
                         notif_text = (
                             f"🚨 <b>自动回座超时通知</b>\n"
                             f"🏢 群组：<code>{chat_title}</code>\n"
-                            f"----------------------------------------\n"
+                            f"-------------------------------------\n"
                             f"👤 用户：{MessageFormatter.format_user_link(uid, nickname)}\n"
                             f"📝 活动：<code>{act}</code>\n"
                             f"⏰ 回座时间：<code>{get_beijing_time().strftime('%m/%d %H:%M:%S')}</code>\n"
@@ -2752,7 +2752,7 @@ async def process_work_checkin(message: types.Message, checkin_type: str):
             today_records = await db.get_today_work_records(chat_id, uid)
             existing_record = today_records.get(checkin_type)
             action_text = "上班" if checkin_type == "work_start" else "下班"
-            status_msg = f"❌ 您今天已经打过{action_text}卡了！"
+            status_msg = f"🚫 您今天已经打过{action_text}卡了！"
 
             if existing_record:
                 existing_time = existing_record["checkin_time"]
@@ -2781,7 +2781,7 @@ async def process_work_checkin(message: types.Message, checkin_type: str):
                 end_time = end_record["checkin_time"] if end_record else "未知时间"
 
                 await message.answer(
-                    f"❌ 您今天已经在 <code>{end_time}</code> 打过下班卡，无法再打上班卡！\n"
+                    f"🚫 您今天已经在 <code>{end_time}</code> 打过下班卡，无法再打上班卡！\n"
                     f"💡 如需重新打卡，请联系管理员或等待次日自动重置",
                     reply_markup=await get_main_keyboard(chat_id, await is_admin(uid)),
                     parse_mode="HTML",
@@ -2868,10 +2868,10 @@ async def process_work_checkin(message: types.Message, checkin_type: str):
         if checkin_type == "work_start":
             if time_diff_minutes > 0:
                 fine_amount = await calculate_work_fine("work_start", time_diff_minutes)
-                status = f"❌ 迟到 {time_diff_str}"
+                status = f"🚨 迟到 {time_diff_str}"
                 if fine_amount:
                     status += f"（💰罚款 {fine_amount}元）"
-                emoji = "⏰"
+                emoji = "😅"
                 is_late_early = True
             else:
                 status = "✅ 准时"
@@ -2882,7 +2882,7 @@ async def process_work_checkin(message: types.Message, checkin_type: str):
                 fine_amount = await calculate_work_fine(
                     "work_end", abs(time_diff_minutes)
                 )
-                status = f"❌ 早退 {time_diff_str}"
+                status = f"🚨 早退 {time_diff_str}"
                 if fine_amount:
                     status += f"（💰罚款 {fine_amount}元）"
                 emoji = "🏃"
@@ -2947,7 +2947,7 @@ async def process_work_checkin(message: types.Message, checkin_type: str):
                 notif_text = (
                     f"⚠️ <b>{action_text}{status_type}通知</b>\n"
                     f"🏢 群组：<code>{chat_title}</code>\n"
-                    f"---------------------------------------\n"
+                    f"------------------------------------\n"
                     f"👤 用户：{MessageFormatter.format_user_link(uid, name)}\n"
                     f"⏰ 打卡时间：<code>{current_time}</code>\n"
                     f"📅 期望时间：<code>{expected_time_display}</code>\n"
@@ -3685,7 +3685,7 @@ async def _process_back_locked(message: types.Message, chat_id: int, uid: int):
                     notif_text = (
                         f"🚨 <b>超时回座通知</b>\n"
                         f"🏢 群组：<code>{chat_title}</code>\n"
-                        f"---------------------------------------\n"
+                        f"------------------------------------\n"
                         f"👤 用户：{MessageFormatter.format_user_link(uid, user_data.get('nickname', '未知用户'))}\n"
                         f"📝 活动：<code>{act}</code>\n"
                         f"⏰ 回座时间：<code>{now.strftime('%m/%d %H:%M:%S')}</code>\n"
@@ -4012,7 +4012,7 @@ async def export_and_push_csv(
             f"📊 群组数据导出\n"
             f"🏢 群组：<code>{chat_title}</code>\n"
             f"📅 导出时间：<code>{get_beijing_time().strftime('%Y-%m-%d %H:%M:%S')}</code>\n"
-            f"-------------------------------------\n"
+            f"----------------------------------\n"
             f"💾 包含每个用户的所有活动统计和总计信息"
         )
 
@@ -4081,7 +4081,7 @@ async def export_monthly_csv(
             f"🏢 群组：<code>{chat_title}</code>\n"
             f"📅 统计月份：<code>{year}年{month}月</code>\n"
             f"⏰ 导出时间：<code>{get_beijing_time().strftime('%Y-%m-%d %H:%M:%S')}</code>\n"
-            f"-------------------------------------\n"
+            f"----------------------------------\n"
             f"💾 包含每个用户的月度活动统计"
         )
 
