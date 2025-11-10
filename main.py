@@ -721,22 +721,53 @@ async def can_perform_activities(chat_id: int, uid: int) -> tuple[bool, str]:
 
 
 async def calculate_fine(activity: str, overtime_minutes: float) -> int:
-    """计算罚款金额 - 分段罚款"""
+    """计算罚款金额 - 分段罚款（修复字符串键问题）"""
     fine_rates = await db.get_fine_rates_for_activity(activity)
     if not fine_rates:
         return 0
 
-    segments = sorted([int(time) for time in fine_rates.keys()])
+    # 修复：正确处理字符串键（如 '30min'）
+    segments = []
+    for time_key in fine_rates.keys():
+        try:
+            # 处理 '30min' 格式的键
+            if isinstance(time_key, str) and "min" in time_key.lower():
+                # 提取数字部分
+                time_value = int(time_key.lower().replace("min", "").strip())
+            else:
+                time_value = int(time_key)
+            segments.append(time_value)
+        except (ValueError, TypeError) as e:
+            logger.warning(f"⚠️ 无法解析罚款时间段键 '{time_key}': {e}")
+            continue
+
+    if not segments:
+        return 0
+
+    segments.sort()
 
     applicable_fine = 0
     for segment in segments:
         if overtime_minutes <= segment:
-            applicable_fine = fine_rates[str(segment)]
+            # 使用原始键获取罚款金额
+            original_key = str(segment)
+            if original_key not in fine_rates:
+                # 尝试 '30min' 格式
+                original_key = f"{segment}min"
+            applicable_fine = fine_rates.get(original_key, 0)
             break
 
     if applicable_fine == 0 and segments:
-        applicable_fine = fine_rates[str(segments[-1])]
+        # 使用最大的时间段
+        max_segment = segments[-1]
+        original_key = str(max_segment)
+        if original_key not in fine_rates:
+            original_key = f"{max_segment}min"
+        applicable_fine = fine_rates.get(original_key, 0)
 
+    logger.debug(
+        f"💰 罚款计算: 活动={activity}, 超时={overtime_minutes:.1f}分钟, 罚款={applicable_fine}元"
+    )
     return applicable_fine
 
 
@@ -3111,6 +3142,7 @@ async def handle_back_command(message: types.Message):
     """处理回座命令 - 优化版本"""
     await process_back(message)
 
+
 @dp.message(lambda message: message.text and message.text.strip() in ["🔙 返回主菜单"])
 @rate_limit(rate=5, per=60)
 async def handle_back_to_main_menu(message: types.Message):
@@ -3250,9 +3282,6 @@ async def handle_dynamic_activity_buttons(message: types.Message):
         ),
         parse_mode="HTML",
     )
-
-
-
 
 
 @dp.message(lambda message: message.text and message.text.strip() in ["📤 导出数据"])
@@ -3453,7 +3482,6 @@ async def show_rank(message: types.Message):
 
 # ==================== 回座功能优化 ====================
 
-
 async def _process_back_locked(message: types.Message, chat_id: int, uid: int):
     """线程安全的回座逻辑（防重入 + 超时 + 日志优化）"""
     start_time = time.time()
@@ -3510,6 +3538,9 @@ async def _process_back_locked(message: types.Message, chat_id: int, uid: int):
                         )
                     except asyncio.TimeoutError:
                         logger.warning(f"💸 计算罚款超时: act={act}")
+                    except Exception as e:
+                        logger.error(f"❌ 计算罚款失败: {e}")
+                        fine_amount = 0  # 计算失败时不罚款
 
                 # 记录活动计数前后变化
                 try:
@@ -3532,46 +3563,82 @@ async def _process_back_locked(message: types.Message, chat_id: int, uid: int):
                 after_count = await db.get_user_activity_count(chat_id, uid, act)
                 logger.info(f"🔍 [回座后] 用户{uid} 活动{act} 新计数: {after_count}")
 
-            # 🔄 取消旧计时任务
-            await timer_manager.cancel_timer(f"{chat_id}-{uid}")
+            # 🔄 取消旧计时任务 - 确保这里没有遗漏
+            try:
+                await timer_manager.cancel_timer(f"{chat_id}-{uid}")
+                logger.info(f"✅ 已取消定时器: {chat_id}-{uid}")
+            except Exception as e:
+                logger.warning(f"⚠️ 取消定时器失败: {e}")
 
-            # ✅ 读取用户最新数据
-            user_data = await asyncio.wait_for(
-                db.get_user_cached(chat_id, uid), timeout=10
-            )
-            user_activities = await asyncio.wait_for(
-                db.get_user_all_activities(chat_id, uid), timeout=10
-            )
+            # ✅ 读取用户最新数据 - 添加更多错误处理
+            try:
+                user_data = await asyncio.wait_for(
+                    db.get_user_cached(chat_id, uid), timeout=10
+                )
+                if not user_data:
+                    logger.error(f"❌ 无法获取用户数据: {chat_id}:{uid}")
+                    await message.answer("❌ 获取用户数据失败，请稍后重试。")
+                    return
+            except asyncio.TimeoutError:
+                logger.error(f"⏰ 获取用户数据超时: {chat_id}:{uid}")
+                await message.answer("❌ 数据获取超时，请稍后重试。")
+                return
+            except Exception as e:
+                logger.error(f"❌ 获取用户数据失败: {e}")
+                await message.answer("❌ 数据获取失败，请稍后重试。")
+                return
+
+            try:
+                user_activities = await asyncio.wait_for(
+                    db.get_user_all_activities(chat_id, uid), timeout=10
+                )
+            except Exception as e:
+                logger.warning(f"⚠️ 获取用户活动数据失败: {e}")
+                user_activities = {}
+
             activity_counts = {a: i.get("count", 0) for a, i in user_activities.items()}
 
-            # 生成回座信息
-            await message.answer(
-                MessageFormatter.format_back_message(
-                    user_id=uid,
-                    user_name=user_data["nickname"],
-                    activity=act,
-                    time_str=now.strftime("%m/%d %H:%M:%S"),
-                    elapsed_time=MessageFormatter.format_time(int(elapsed)),
-                    total_activity_time=MessageFormatter.format_time(
-                        int(user_activities.get(act, {}).get("time", 0))
+            # 生成回座信息 - 添加更多空值保护
+            try:
+                await message.answer(
+                    MessageFormatter.format_back_message(
+                        user_id=uid,
+                        user_name=user_data.get("nickname", "未知用户"),
+                        activity=act,
+                        time_str=now.strftime("%m/%d %H:%M:%S"),
+                        elapsed_time=MessageFormatter.format_time(int(elapsed)),
+                        total_activity_time=MessageFormatter.format_time(
+                            int(user_activities.get(act, {}).get("time", 0))
+                        ),
+                        total_time=MessageFormatter.format_time(
+                            int(user_data.get("total_accumulated_time", 0))
+                        ),
+                        activity_counts=activity_counts,
+                        total_count=user_data.get("total_activity_count", 0),
+                        is_overtime=is_overtime,
+                        overtime_seconds=overtime_seconds,
+                        fine_amount=fine_amount,
                     ),
-                    total_time=MessageFormatter.format_time(
-                        int(user_data["total_accumulated_time"])
+                    reply_markup=await get_main_keyboard(
+                        chat_id=chat_id, show_admin=await is_admin(uid)
                     ),
-                    activity_counts=activity_counts,
-                    total_count=user_data["total_activity_count"],
-                    is_overtime=is_overtime,
-                    overtime_seconds=overtime_seconds,
-                    fine_amount=fine_amount,
-                ),
-                reply_markup=await get_main_keyboard(
-                    chat_id=chat_id, show_admin=await is_admin(uid)
-                ),
-                parse_mode="HTML",
-            )
+                    parse_mode="HTML",
+                )
+            except Exception as e:
+                logger.error(f"❌ 发送回座消息失败: {e}")
+                # 发送简化版消息
+                await message.answer(
+                    f"✅ 回座成功！\n"
+                    f"活动: {act}\n"
+                    f"时长: {MessageFormatter.format_time(int(elapsed))}\n"
+                    f"{'⚠️ 已超时' if is_overtime else '✅ 按时完成'}",
+                    reply_markup=await get_main_keyboard(
+                        chat_id=chat_id, show_admin=await is_admin(uid)
+                    ),
+                )
 
             # ✅ 超时通知推送（容错）
-            if is_overtime:
+            if is_overtime and fine_amount > 0:
                 try:
                     chat_title = str(chat_id)
                     try:
@@ -3584,7 +3651,7 @@ async def _process_back_locked(message: types.Message, chat_id: int, uid: int):
                         f"🚨 <b>超时回座通知</b>\n"
                         f"🏢 群组：<code>{chat_title}</code>\n"
                         f"---------------------------------------\n"
-                        f"👤 用户：{MessageFormatter.format_user_link(uid, user_data['nickname'])}\n"
+                        f"👤 用户：{MessageFormatter.format_user_link(uid, user_data.get('nickname', '未知用户'))}\n"
                         f"📝 活动：<code>{act}</code>\n"
                         f"⏰ 回座时间：<code>{now.strftime('%m/%d %H:%M:%S')}</code>\n"
                         f"⏱️ 超时：<code>{MessageFormatter.format_time(int(overtime_seconds))}</code>\n"
@@ -3612,7 +3679,7 @@ async def _process_back_locked(message: types.Message, chat_id: int, uid: int):
             pass
 
     finally:
-        # ✅ 释放防重入锁
+        # ✅ 释放防重入锁 - 确保这里没有遗漏
         active_back_processing.pop(key, None)
         duration = round(time.time() - start_time, 2)
         logger.info(f"✅ 回座结束 chat_id={chat_id}, uid={uid}，耗时 {duration}s")
