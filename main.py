@@ -15,6 +15,7 @@ from io import StringIO
 from datetime import datetime, timedelta
 from collections import defaultdict
 from functools import wraps
+from aiogram.filters import Text
 from typing import Dict, Any, Optional, List, Tuple
 
 from aiogram import Bot, Dispatcher, types
@@ -3408,10 +3409,12 @@ async def handle_dynamic_activity_buttons(message: types.Message):
     )
 
 
-@dp.message(lambda message: message.text and message.text.strip() in ["📤 导出数据"])
-@rate_limit(rate=5, per=60)
+# 在现有的消息处理器后面添加这个
+@dp.message(Text("📤 导出数据"))
+@admin_required
+@rate_limit(rate=2, per=60)
 async def handle_export_data_button(message: types.Message):
-    """处理导出数据按钮点击 - 修复版"""
+    """处理导出数据按钮点击 - 修复版本"""
     if not await is_admin(message.from_user.id):
         await message.answer(
             Config.MESSAGES["no_permission"],
@@ -3420,15 +3423,21 @@ async def handle_export_data_button(message: types.Message):
             ),
         )
         return
-
+    
     chat_id = message.chat.id
-    await message.answer("⏳ 正在导出数据，请稍候.")
+    await message.answer("⏳ 正在准备导出数据，请稍候...")
     try:
         await export_and_push_csv(chat_id)
-        await message.answer("✅ 数据已导出并推送到绑定的群组或频道！")
+        await message.answer(
+            "✅ 数据已成功导出并推送到绑定的群组或频道！",
+            reply_markup=await get_main_keyboard(chat_id=chat_id, show_admin=True)
+        )
     except Exception as e:
-        await message.answer(f"❌ 导出失败：{e}")
-
+        logger.error(f"❌ 导出数据失败: {e}")
+        await message.answer(
+            f"❌ 导出失败：{e}",
+            reply_markup=await get_main_keyboard(chat_id=chat_id, show_admin=True)
+        )
 
 
 @dp.message(
