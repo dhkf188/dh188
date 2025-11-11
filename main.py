@@ -3390,7 +3390,7 @@ async def handle_dynamic_activity_buttons(message: types.Message):
 @dp.message(lambda message: message.text and message.text.strip() in ["📤 导出数据"])
 @rate_limit(rate=5, per=60)
 async def handle_export_data_button(message: types.Message):
-    """处理导出数据按钮点击 - 优化版本"""
+    """处理导出数据按钮点击 - 修复版"""
     if not await is_admin(message.from_user.id):
         await message.answer(
             Config.MESSAGES["no_permission"],
@@ -3399,7 +3399,14 @@ async def handle_export_data_button(message: types.Message):
             ),
         )
         return
-    await export_data(message)
+
+    chat_id = message.chat.id
+    await message.answer("⏳ 正在导出数据，请稍候.")
+    try:
+        await export_and_push_csv(chat_id)
+        await message.answer("✅ 数据已导出并推送到绑定的群组或频道！")
+    except Exception as e:
+        await message.answer(f"❌ 导出失败：{e}")
 
 
 @dp.message(
