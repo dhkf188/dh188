@@ -902,7 +902,6 @@ def get_admin_keyboard():
     return ReplyKeyboardMarkup(
         keyboard=[
             [KeyboardButton(text="👑 管理员面板"), KeyboardButton(text="📤 导出数据")],
-            [KeyboardButton(text="🔔 通知设置"), KeyboardButton(text="🕒 上下班设置")],
             [KeyboardButton(text="🔙 返回主菜单")],
         ],
         resize_keyboard=True,
@@ -1994,25 +1993,6 @@ async def cmd_worktime(message: types.Message):
     )
 
 
-@dp.message(Command("showworktime"))
-@admin_required
-@rate_limit(rate=5, per=60)
-async def cmd_showworktime(message: types.Message):
-    """显示当前上下班时间设置 - 优化版本"""
-    chat_id = message.chat.id
-    await db.init_group(chat_id)
-    work_hours = await db.get_group_work_time(chat_id)
-
-    await message.answer(
-        f"🕒 当前上下班时间设置：\n\n"
-        f"🟢 上班时间：<code>{work_hours['work_start']}</code>\n"
-        f"🔴 下班时间：<code>{work_hours['work_end']}</code>\n\n"
-        f"💡 修改命令：/setworktime <上班时间> <下班时间>",
-        reply_markup=await get_main_keyboard(chat_id=message.chat.id, show_admin=True),
-        parse_mode="HTML",
-    )
-
-
 @dp.message(Command("resetworktime"))
 @admin_required
 @rate_limit(rate=3, per=30)
@@ -2040,13 +2020,60 @@ async def cmd_resetworktime(message: types.Message):
 @admin_required
 @rate_limit(rate=3, per=30)
 async def cmd_delwork(message: types.Message):
-    """移除上下班功能 - 修复版本"""
-    args = message.text.split()
-    clear_records = False
+    """移除上下班功能（保留历史记录）- 新版本"""
+    chat_id = message.chat.id
 
-    if len(args) > 1 and args[1].lower() in ["clear", "清除", "删除记录"]:
-        clear_records = True
+    # 修复：使用修复后的 has_work_hours_enabled 函数
+    if not await has_work_hours_enabled(chat_id):
+        await message.answer(
+            "❌ 当前群组没有设置上下班功能",
+            reply_markup=await get_main_keyboard(chat_id=chat_id, show_admin=True),
+        )
+        return
 
+    work_hours = await db.get_group_work_time(chat_id)
+    old_start = work_hours.get("work_start")
+    old_end = work_hours.get("work_end")
+
+    # 重置为默认时间（相当于禁用功能）
+    await db.update_group_work_time(
+        chat_id,
+        Config.DEFAULT_WORK_HOURS["work_start"],
+        Config.DEFAULT_WORK_HOURS["work_end"],
+    )
+
+    # 🆕 清理用户缓存，确保立即生效
+    group_members = await db.get_group_members(chat_id)
+    for user_data in group_members:
+        user_id = user_data["user_id"]
+        db._cache.pop(f"user:{chat_id}:{user_id}", None)
+
+    success_msg = (
+        f"✅ 已移除上下班功能\n"
+        f"🗑️ 已删除设置：<code>{old_start}</code> - <code>{old_end}</code>\n"
+        f"💡 上下班记录仍然保留\n"
+        f"🔧 如需清除记录请使用：<code>/delwork_clear</code>\n\n"
+        f"🔧 上下班按钮已隐藏\n"
+        f"🎯 现在用户可以正常进行其他活动打卡\n"
+        f"🔄 键盘已自动刷新"
+    )
+
+    await message.answer(
+        success_msg,
+        reply_markup=await get_main_keyboard(chat_id=chat_id, show_admin=True),
+        parse_mode="HTML",
+    )
+
+    logger.info(
+        f"👤 管理员 {message.from_user.id} 移除了群组 {chat_id} 的上下班功能（保留记录）"
+    )
+
+
+@dp.message(Command("delwork_clear"))
+@admin_required
+@rate_limit(rate=3, per=30)
+async def cmd_delwork_clear(message: types.Message):
+    """移除上下班功能并清除所有记录 - 新命令"""
     chat_id = message.chat.id
 
     # 修复：使用修复后的 has_work_hours_enabled 函数
@@ -2069,34 +2096,29 @@ async def cmd_delwork(message: types.Message):
     )
 
     records_cleared = 0
-    if clear_records:
-        # ✅ 修复1：不再使用 tuple 形式传参（删除 (chat_id,)）
-        # ✅ 修复2：asyncpg.execute() 返回字符串，如 'DELETE 10'，用 split 解析
-        conn = await db.get_connection()
-        try:
-            result = await conn.execute(
-                "DELETE FROM work_records WHERE chat_id = $1", chat_id
-            )
-            # result 形如 "DELETE 5"
-            records_cleared = (
-                int(result.split()[-1]) if result and result.startswith("DELETE") else 0
-            )
-        finally:
-            await db.release_connection(conn)
+    # ✅ 清除所有上下班记录
+    conn = await db.get_connection()
+    try:
+        result = await conn.execute(
+            "DELETE FROM work_records WHERE chat_id = $1", chat_id
+        )
+        # result 形如 "DELETE 5"
+        records_cleared = (
+            int(result.split()[-1]) if result and result.startswith("DELETE") else 0
+        )
+    finally:
+        await db.release_connection(conn)
+
+    # 🆕 补充：清理用户缓存，确保立即生效
+    group_members = await db.get_group_members(chat_id)
+    for user_data in group_members:
+        user_id = user_data["user_id"]
+        db._cache.pop(f"user:{chat_id}:{user_id}", None)
 
     success_msg = (
-        f"✅ 已移除上下班功能\n"
+        f"✅ 已移除上下班功能并清除所有记录\n"
         f"🗑️ 已删除设置：<code>{old_start}</code> - <code>{old_end}</code>\n"
-    )
-
-    if clear_records:
-        success_msg += f"📊 同时清除了 <code>{records_cleared}</code> 条上下班记录\n"
-    else:
-        success_msg += (
-            "💡 上下班记录仍然保留，如需清除请使用：<code>/delwork clear</code>\n"
-        )
-
-    success_msg += (
+        f"📊 同时清除了 <code>{records_cleared}</code> 条上下班记录\n"
         f"\n🔧 上下班按钮已隐藏\n"
         f"🎯 现在用户可以正常进行其他活动打卡\n"
         f"🔄 键盘已自动刷新"
@@ -2108,7 +2130,9 @@ async def cmd_delwork(message: types.Message):
         parse_mode="HTML",
     )
 
-    logger.info(f"👤 管理员 {message.from_user.id} 移除了群组 {chat_id} 的上下班功能")
+    logger.info(
+        f"👤 管理员 {message.from_user.id} 移除了群组 {chat_id} 的上下班功能并清除 {records_cleared} 条记录"
+    )
 
 
 @dp.message(Command("workstatus"))
@@ -3301,11 +3325,10 @@ async def handle_admin_panel_button(message: types.Message):
         "• \n"
         "• /setworktime 9:00 18:00 - 设置上下班时间\n"
         "• /delwork - 基本移除，保留历史记录\n"
-        "• /delwork clear - 移除并清除所有记录\n"
+        "• /delwork_clear - 移除并清除所有记录\n"
         "• /workstatus - 查看当前上下班功能状态\n"
         "• /worktime  - 查看当前群组工作时间设置\n"
         "• /reset_work 用户ID - 可以重置用户记录\n"
-        "• /showworktime - 显示当前上下班时间设置\n"
         "• /resetworktime - 重置为默认上下班时间\n"
         "• \n"
         "• /set <用户ID> <活动> <分钟> - 设置用户时间\n"
@@ -3351,8 +3374,6 @@ async def handle_dynamic_activity_buttons(message: types.Message):
         "👑 管理员面板",
         "🔙 返回主菜单",
         "📤 导出数据",
-        "🔔 通知设置",
-        "🕒 上下班设置",
         "📊 我的记录",
         "🏆 排行榜",
         "✅ 回座",
@@ -3407,6 +3428,7 @@ async def handle_export_data_button(message: types.Message):
         await message.answer("✅ 数据已导出并推送到绑定的群组或频道！")
     except Exception as e:
         await message.answer(f"❌ 导出失败：{e}")
+
 
 
 @dp.message(
@@ -3807,10 +3829,10 @@ async def process_back(message: types.Message):
 
 
 # ==================== 管理员按钮处理优化 ====================
-@dp.message(lambda message: message.text == "🔔 通知设置")
-@rate_limit(rate=5, per=60)
-async def handle_notification_settings(message: types.Message, state: FSMContext):
-    """处理通知设置按钮 - 优化版本"""
+
+
+async def export_data(message: types.Message):
+    """导出数据 - 优化版本"""
     if not await is_admin(message.from_user.id):
         await message.answer(
             Config.MESSAGES["no_permission"],
@@ -3819,106 +3841,14 @@ async def handle_notification_settings(message: types.Message, state: FSMContext
             ),
         )
         return
-    await notification_settings_menu(message, state)
 
-
-async def notification_settings_menu(message: types.Message, state: FSMContext):
-    """通知设置菜单 - 优化版本"""
     chat_id = message.chat.id
-    await db.init_group(chat_id)
-    group_data = await db.get_group_cached(chat_id)
-
-    current_settings = (
-        f"🔔 当前通知设置：\n"
-        f"频道ID: <code>{group_data.get('channel_id', '未设置')}</code>\n"
-        f"通知群组ID: <code>{group_data.get('notification_group_id', '未设置')}</code>\n\n"
-        f"请选择操作："
-    )
-
-    keyboard = ReplyKeyboardMarkup(
-        keyboard=[
-            [KeyboardButton(text="设置频道"), KeyboardButton(text="设置通知群组")],
-            [KeyboardButton(text="清除频道"), KeyboardButton(text="清除通知群组")],
-            [KeyboardButton(text="🔙 返回管理员面板")],
-        ],
-        resize_keyboard=True,
-    )
-
-    await message.answer(current_settings, reply_markup=keyboard, parse_mode="HTML")
-
-
-@dp.message(
-    lambda message: message.text
-    in ["设置频道", "设置通知群组", "清除频道", "清除通知群组", "🔙 返回管理员面板"]
-)
-@rate_limit(rate=5, per=60)
-async def handle_notification_actions(message: types.Message, state: FSMContext):
-    """处理通知设置操作 - 优化版本"""
-    text = message.text
-    chat_id = message.chat.id
-
-    if text == "🔙 返回管理员面板":
-        await state.clear()
-        await message.answer("已返回管理员面板", reply_markup=get_admin_keyboard())
-        return
-    elif text == "设置频道":
-        await message.answer(
-            "请输入频道ID（格式如 -1001234567890）：",
-            reply_markup=ReplyKeyboardRemove(),
-        )
-        await state.set_state(AdminStates.waiting_for_channel_id)
-    elif text == "设置通知群组":
-        await message.answer(
-            "请输入通知群组ID（格式如 -1001234567890）：",
-            reply_markup=ReplyKeyboardRemove(),
-        )
-        await state.set_state(AdminStates.waiting_for_group_id)
-    elif text == "清除频道":
-        await db.init_group(chat_id)
-        await db.update_group_channel(chat_id, None)
-        await message.answer("✅ 已清除频道设置", reply_markup=get_admin_keyboard())
-    elif text == "清除通知群组":
-        await db.init_group(chat_id)
-        await db.update_group_notification(chat_id, None)
-        await message.answer("✅ 已清除通知群组设置", reply_markup=get_admin_keyboard())
-
-
-@dp.message(AdminStates.waiting_for_channel_id)
-@rate_limit(rate=5, per=60)
-async def set_channel_id(message: types.Message, state: FSMContext):
-    """设置频道ID - 优化版本"""
+    await message.answer("⏳ 正在导出数据...")
     try:
-        channel_id = int(message.text)
-        chat_id = message.chat.id
-        await db.init_group(chat_id)
-        await db.update_group_channel(chat_id, channel_id)
-        await message.answer(
-            f"✅ 已绑定提醒频道：<code>{channel_id}</code>",
-            reply_markup=get_admin_keyboard(),
-            parse_mode="HTML",
-        )
-        await state.clear()
-    except ValueError:
-        await message.answer("❌ 请输入有效的频道ID！")
-
-
-@dp.message(AdminStates.waiting_for_group_id)
-@rate_limit(rate=5, per=60)
-async def set_group_id(message: types.Message, state: FSMContext):
-    """设置通知群组ID - 优化版本"""
-    try:
-        group_id = int(message.text)
-        chat_id = message.chat.id
-        await db.init_group(chat_id)
-        await db.update_group_notification(chat_id, group_id)
-        await message.answer(
-            f"✅ 已绑定通知群组：<code>{group_id}</code>",
-            reply_markup=get_admin_keyboard(),
-            parse_mode="HTML",
-        )
-        await state.clear()
-    except ValueError:
-        await message.answer("❌ 请输入有效的群组ID！")
+        await export_and_push_csv(chat_id)
+        await message.answer("✅ 数据导出完成！")
+    except Exception as e:
+        await message.answer(f"❌ 导出失败：{e}")
 
 
 # ==================== CSV导出推送功能优化 ====================
