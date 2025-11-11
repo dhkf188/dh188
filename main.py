@@ -638,44 +638,104 @@ async def calculate_work_fine(checkin_type: str, late_minutes: float) -> int:
 
 async def reset_daily_data_if_needed(chat_id: int, uid: int):
     """
-    改进版每日数据重置：
-    按群组设定的 reset_hour/minute 作为“统计日”边界。
-    例如重置时间为 9:00，则计算周期为：
-    今天 9:00 ~ 明天 9:00。
+    🎯 精确版每日数据重置 - 基于管理员设定的重置时间点
+    逻辑：如果用户最后更新时间在上个重置周期之前，就重置数据
     """
-    now = get_beijing_time()
-
-    # 获取群组自定义重置时间
-    group_info = await db.get_group(chat_id)
-    reset_hour = group_info.get("reset_hour", Config.DAILY_RESET_HOUR)
-    reset_minute = group_info.get("reset_minute", Config.DAILY_RESET_MINUTE)
-
-    reset_time_today = now.replace(
-        hour=reset_hour, minute=reset_minute, second=0, microsecond=0
-    )
-    if now < reset_time_today:
-        # 当前时间还没到今天的重置点 → 统计周期起点应是昨天的重置时间
-        period_start = reset_time_today - timedelta(days=1)
-    else:
-        # 已经过了今天的重置点 → 当前周期起点为今天的重置时间
-        period_start = reset_time_today
-
-    user_data = await db.get_user_cached(chat_id, uid)
-    if not user_data:
-        return
-
-    last_updated_str = user_data.get("last_updated")
-    if not last_updated_str:
-        return
+    from datetime import date, datetime, timedelta
 
     try:
-        last_updated_date = datetime.fromisoformat(str(last_updated_str))
-    except Exception:
-        last_updated_date = datetime.strptime(str(last_updated_str), "%Y-%m-%d")
+        now = get_beijing_time()
 
-    # 判断是否跨过重置周期
-    if last_updated_date.date() < period_start.date():
-        await db.reset_user_daily_data(chat_id, uid)
+        # 获取群组自定义重置时间
+        group_info = await db.get_group_cached(chat_id)
+        if not group_info:
+            # 如果群组不存在，先初始化
+            await db.init_group(chat_id)
+            group_info = await db.get_group_cached(chat_id)
+
+        reset_hour = group_info.get("reset_hour", Config.DAILY_RESET_HOUR)
+        reset_minute = group_info.get("reset_minute", Config.DAILY_RESET_MINUTE)
+
+        # 计算当前重置周期开始时间
+        reset_time_today = now.replace(
+            hour=reset_hour, minute=reset_minute, second=0, microsecond=0
+        )
+
+        if now < reset_time_today:
+            # 当前时间还没到今天的重置点 → 当前周期起点是昨天的重置时间
+            current_period_start = reset_time_today - timedelta(days=1)
+        else:
+            # 已经过了今天的重置点 → 当前周期起点为今天的重置时间
+            current_period_start = reset_time_today
+
+        # 获取用户数据
+        user_data = await db.get_user_cached(chat_id, uid)
+        if not user_data:
+            # 用户不存在，初始化用户
+            await db.init_user(chat_id, uid, "用户")
+            return
+
+        last_updated_str = user_data.get("last_updated")
+        if not last_updated_str:
+            # 如果没有最后更新时间，重置数据
+            logger.info(f"🔄 初始化用户数据: {chat_id}-{uid} (无最后更新时间)")
+            await db.reset_user_daily_data(chat_id, uid, now.date())
+            await db.update_user_last_updated(chat_id, uid, now.date())
+            return
+
+        # 解析最后更新时间
+        last_updated = None
+        if isinstance(last_updated_str, str):
+            try:
+                # 尝试ISO格式解析
+                last_updated = datetime.fromisoformat(
+                    str(last_updated_str).replace("Z", "+00:00")
+                )
+            except ValueError:
+                try:
+                    # 尝试日期格式解析
+                    last_updated = datetime.strptime(str(last_updated_str), "%Y-%m-%d")
+                except ValueError:
+                    # 其他格式，直接使用今天日期
+                    last_updated = now
+        elif isinstance(last_updated_str, datetime):
+            last_updated = last_updated_str
+        elif isinstance(last_updated_str, date):
+            last_updated = datetime.combine(last_updated_str, datetime.min.time())
+        else:
+            # 未知类型，使用今天日期
+            last_updated = now
+
+        # 🎯 关键逻辑：比较最后更新时间是否在当前重置周期之前
+        if last_updated.date() < current_period_start.date():
+            logger.info(
+                f"🔄 重置用户数据: {chat_id}-{uid}\n"
+                f"   最后活动时间: {last_updated.date()}\n"
+                f"   当前周期开始: {current_period_start.date()}\n"
+                f"   重置时间设置: {reset_hour:02d}:{reset_minute:02d}\n"
+                f"   当前北京时问: {now.strftime('%Y-%m-%d %H:%M:%S')}"
+            )
+
+            # 执行重置
+            await db.reset_user_daily_data(chat_id, uid, current_period_start.date())
+            # 更新最后更新时间到当前周期
+            await db.update_user_last_updated(chat_id, uid, now.date())
+
+        else:
+            logger.debug(
+                f"✅ 无需重置: {chat_id}-{uid}\n"
+                f"   最后活动: {last_updated.date()}\n"
+                f"   周期开始: {current_period_start.date()}"
+            )
+
+    except Exception as e:
+        logger.error(f"❌ 重置检查失败 {chat_id}-{uid}: {e}")
+        # 出错时安全初始化用户
+        try:
+            await db.init_user(chat_id, uid, "用户")
+            await db.update_user_last_updated(chat_id, uid, datetime.now().date())
+        except Exception as init_error:
+            logger.error(f"❌ 用户初始化也失败: {init_error}")
 
 
 async def check_activity_limit(chat_id: int, uid: int, act: str):
@@ -2816,23 +2876,35 @@ async def process_work_checkin(message: types.Message, checkin_type: str):
                 return
 
         # 🆕 添加时间范围检查（放在获取工作时间设置之前）
-        if not await is_valid_checkin_time(chat_id, checkin_type, now):
-            work_hours = await db.get_group_work_time(chat_id)
-            if checkin_type == "work_start":
-                expected_time = work_hours["work_start"]
-                time_range = "打卡前2小时至打卡后4小时"
-            else:
-                expected_time = work_hours["work_end"]
-                time_range = "打卡前4小时至打卡后2小时"
+        try:
+            valid_time, expected_dt = await is_valid_checkin_time(
+                chat_id, checkin_type, now
+            )
+        except Exception as e:
+            logger.error(f"[{trace_id}] ❌ is_valid_checkin_time 调用失败: {e}")
+            valid_time, expected_dt = True, now  # 避免误伤，默认允许
 
+        if not valid_time:
+            # 计算可打卡窗口的起止时间（基于选中的 expected_dt）
+            allowed_start = (expected_dt - timedelta(hours=7)).strftime(
+                "%Y-%m-%d %H:%M"
+            )
+            allowed_end = (expected_dt + timedelta(hours=7)).strftime("%Y-%m-%d %H:%M")
+
+            # 显示更友好的本地化提示（包含日期，避免跨天误解）
             await message.answer(
-                f"⏰ 当前不在合理的打卡时间范围内！\n"
-                f"📅 期望时间: <code>{expected_time}</code>\n"
-                f"🕒 允许范围: {time_range}",
+                f"⏰ 当前时间不在允许的打卡范围内（前后7小时规则）！\n\n"
+                f"📅 期望打卡时间（参考）：<code>{expected_dt.strftime('%H:%M')}</code>\n"
+                f"🕒 允许范围（含日期）：\n"
+                f"   • 开始：<code>{allowed_start}</code>\n"
+                f"   • 结束：<code>{allowed_end}</code>\n\n"
+                f"💡 如果你确认时间有特殊情况，请联系管理员处理。",
                 reply_markup=await get_main_keyboard(chat_id, await is_admin(uid)),
                 parse_mode="HTML",
             )
-            logger.info(f"[{trace_id}] ⏰ 打卡时间范围检查失败，终止处理")
+            logger.info(
+                f"[{trace_id}] ⏰ 打卡时间范围检查失败（不在 ±7 小时内），终止处理"
+            )
             return
 
         # ✅ 获取工作时间设置
@@ -2978,99 +3050,96 @@ def calculate_cross_day_time_diff(
     current_dt: datetime, expected_time: str, checkin_type: str
 ):
     """
-    计算跨天时间差 - 专门处理夜班场景
-    返回: (时间差（分钟）, 选择的期望时间点)
+    🕒 智能化的时间差计算（支持跨天和最近匹配）
+    自动选择与当前时间最近的“期望时间点”，解决夜班/跨天迟到显示异常问题。
+    返回:
+        time_diff_minutes: 当前时间 - 最近期望时间（分钟）
+        expected_dt: 实际匹配到的期望时间点（datetime）
     """
-    # 解析期望时间
-    expected_hour, expected_minute = map(int, expected_time.split(":"))
+    try:
+        expected_hour, expected_minute = map(int, expected_time.split(":"))
 
-    # 创建五个可能的时间点：前2天、前1天、当天、后1天、后2天
-    possible_times = []
-
-    for day_offset in [-2, -1, 0, 1, 2]:
-        target_day = current_dt + timedelta(days=day_offset)
-        possible_times.append(
-            target_day.replace(
+        # 生成前一天、当天、后一天三个候选时间点
+        candidates = []
+        for d in (-1, 0, 1):
+            candidate = current_dt.replace(
                 hour=expected_hour, minute=expected_minute, second=0, microsecond=0
-            )
+            ) + timedelta(days=d)
+            candidates.append(candidate)
+
+        # 找到与当前时间最接近的 expected_dt
+        expected_dt = min(
+            candidates, key=lambda t: abs((t - current_dt).total_seconds())
         )
 
-    # 根据打卡类型选择最合适的时间点
-    if checkin_type == "work_start":
-        # 上班打卡：选择最接近但不超过当前时间的时间点
-        valid_times = [t for t in possible_times if t <= current_dt]
-        if valid_times:
-            expected_dt = max(valid_times)  # 选择最接近的一个
-        else:
-            # 如果没有合适的时间，选择最早的时间
-            expected_dt = min(possible_times)
-    else:  # work_end
-        # 下班打卡：选择最接近但超过当前时间的时间点
-        valid_times = [t for t in possible_times if t >= current_dt]
-        if valid_times:
-            expected_dt = min(valid_times)  # 选择最接近的一个
-        else:
-            # 如果没有合适的时间，选择最晚的时间
-            expected_dt = max(possible_times)
+        # 计算时间差（单位：分钟）
+        time_diff_minutes = (current_dt - expected_dt).total_seconds() / 60
 
-    time_diff_minutes = (current_dt - expected_dt).total_seconds() / 60
+        logger.info(f"🔍 时间差计算:")
+        logger.info(f"  当前时间: {current_dt.strftime('%Y-%m-%d %H:%M')}")
+        logger.info(f"  匹配期望: {expected_dt.strftime('%Y-%m-%d %H:%M')}")
+        logger.info(f"  打卡类型: {checkin_type}")
+        logger.info(f"  时间差: {time_diff_minutes:.2f} 分钟")
 
-    # 调试日志
-    logger.info(f"🔍 跨天计算调试:")
-    logger.info(f"  当前时间: {current_dt.strftime('%Y-%m-%d %H:%M')}")
-    logger.info(f"  期望时间: {expected_time}")
-    logger.info(f"  打卡类型: {checkin_type}")
-    logger.info(f"  选择的时间点: {expected_dt.strftime('%Y-%m-%d %H:%M')}")
-    logger.info(f"  时间差: {time_diff_minutes:.2f} 分钟")
+        return time_diff_minutes, expected_dt
 
-    return time_diff_minutes, expected_dt
+    except Exception as e:
+        logger.error(f"❌ 时间差计算出错: {e}")
+        return 0, current_dt
 
 
 # 🆕 直接添加时间范围检查函数
 async def is_valid_checkin_time(
     chat_id: int, checkin_type: str, current_time: datetime
-) -> bool:
+) -> tuple[bool, datetime]:
     """
-    检查是否在合理的打卡时间范围内
-    返回: True-有效, False-无效
+    检查是否在允许的打卡时间窗口内（前后 7 小时）。
+    返回 (is_valid, expected_dt)：
+      - is_valid: True/False
+      - expected_dt: 选中的“期望打卡时间点”（datetime），用于在提示中显示实际允许范围
+    逻辑：在相邻的 -1/0/+1 天中挑选最接近 current_time 的 expected_dt，适用于夜班/跨天场景。
     """
     try:
         work_hours = await db.get_group_work_time(chat_id)
-
         if checkin_type == "work_start":
-            # 上班打卡允许前后范围：前2小时至后4小时
-            expected_hour, expected_minute = map(
-                int, work_hours["work_start"].split(":")
-            )
-            expected_time = current_time.replace(
-                hour=expected_hour, minute=expected_minute, second=0, microsecond=0
-            )
-            earliest = expected_time - timedelta(hours=4)
-            latest = expected_time + timedelta(hours=4)
+            expected_time_str = work_hours["work_start"]
         else:
-            # 下班打卡允许前后范围：前4小时至后2小时
-            expected_hour, expected_minute = map(int, work_hours["work_end"].split(":"))
-            expected_time = current_time.replace(
-                hour=expected_hour, minute=expected_minute, second=0, microsecond=0
-            )
-            earliest = expected_time - timedelta(hours=4)
-            latest = expected_time + timedelta(hours=4)
+            expected_time_str = work_hours["work_end"]
+
+        exp_h, exp_m = map(int, expected_time_str.split(":"))
+
+        # 在 -1/0/+1 天范围内生成候选 expected_dt，选择与 current_time 差值最小的那个
+        candidates = []
+        for d in (-1, 0, 1):
+            candidate = current_time.replace(
+                hour=exp_h, minute=exp_m, second=0, microsecond=0
+            ) + timedelta(days=d)
+            candidates.append(candidate)
+
+        # 选择与 current_time 时间差绝对值最小的 candidate
+        expected_dt = min(
+            candidates, key=lambda t: abs((t - current_time).total_seconds())
+        )
+
+        # 允许前后窗口：7小时
+        earliest = expected_dt - timedelta(hours=7)
+        latest = expected_dt + timedelta(hours=7)
 
         is_valid = earliest <= current_time <= latest
 
         if not is_valid:
             logger.warning(
-                f"⚠️ 打卡时间范围检查失败: {checkin_type}, "
-                f"当前: {current_time.strftime('%H:%M')}, "
-                f"允许: {earliest.strftime('%H:%M')} ~ {latest.strftime('%H:%M')}"
+                f"⚠️ 打卡时间超出允许窗口: {checkin_type}, 当前: {current_time.strftime('%Y-%m-%d %H:%M')}, "
+                f"允许: {earliest.strftime('%Y-%m-%d %H:%M')} ~ {latest.strftime('%Y-%m-%d %H:%M')}"
             )
 
-        return is_valid
+        return is_valid, expected_dt
 
     except Exception as e:
-        logger.error(f"❌ 检查打卡时间范围失败: {e}")
-        # 如果检查失败，默认允许打卡（避免影响正常使用）
-        return True
+        logger.error(f"❌ 检查打卡时间范围失败（is_valid_checkin_time）: {e}")
+        # 出现异常时为兼容性考虑，返回允许 + 今天的期望时间
+        fallback = current_time.replace(hour=9, minute=0, second=0, microsecond=0)
+        return True, fallback
 
 
 # ============ 文本命令处理优化 =================
@@ -3257,7 +3326,7 @@ async def handle_admin_panel_button(message: types.Message):
         "• /monthlyreport - 生成最近一个月报告\n"
         "• /monthlyreport <年> <月> - 生成指定年月报告\n"
         "• /export - 导出数据\n\n"
-        "• \n"
+        "• /performance 查看性能\n"
         "• /refresh_keyboard - 强制刷新键盘显示新活动\n"
         "• /debug_work - 调试上下班功能状态\n"
         "• \n"
@@ -3931,14 +4000,26 @@ async def optimized_monthly_export(chat_id: int, year: int, month: int):
         return None
 
 
+# main.py - 替换 export_and_push_csv 为下面版本
 async def export_and_push_csv(
-    chat_id: int, to_admin_if_no_group: bool = True, file_name: str = None
+    chat_id: int,
+    to_admin_if_no_group: bool = True,
+    file_name: str = None,
+    target_date=None,  # datetime.date 或 datetime.datetime 或 None
 ):
-    """导出群组数据为 CSV 并推送 - 优化版本"""
+    """导出群组数据为 CSV 并推送 - 支持按 target_date 导出（默认：当天）"""
     await db.init_group(chat_id)
 
+    # 规范 target_date（如果传了 datetime，取 .date()）
+    if target_date is not None and hasattr(target_date, "date"):
+        target_date = target_date.date()
+
     if not file_name:
-        date_str = get_beijing_time().strftime("%Y%m%d_%H%M%S")
+        date_str = (
+            target_date.strftime("%Y%m%d")
+            if target_date is not None
+            else get_beijing_time().strftime("%Y%m%d_%H%M%S")
+        )
         file_name = f"group_{chat_id}_statistics_{date_str}.csv"
 
     csv_buffer = StringIO()
@@ -3954,28 +4035,29 @@ async def export_and_push_csv(
     writer.writerow(headers)
 
     has_data = False
-    group_stats = await db.get_group_statistics(chat_id)
+
+    # 关键：把 target_date 传给 db.get_group_statistics
+    group_stats = await db.get_group_statistics(chat_id, target_date)
 
     for user_data in group_stats:
         total_count = user_data.get("total_activity_count", 0)
-        if total_count > 0:
+        total_time = user_data.get("total_accumulated_time", 0)
+        if total_count > 0 or (total_time and total_time > 0):
             has_data = True
 
         row = [user_data["user_id"], user_data.get("nickname", "未知用户")]
         for act in activity_limits.keys():
-            activity_info = user_data["activities"].get(act, {})
+            activity_info = user_data.get("activities", {}).get(act, {})
             count = activity_info.get("count", 0)
             total_seconds = int(activity_info.get("time", 0))
-
             time_str = MessageFormatter.format_time_for_csv(total_seconds)
-
             row.append(count)
             row.append(time_str)
 
-        total_seconds_all = int(user_data.get("total_accumulated_time", 0))
+        total_seconds_all = int(user_data.get("total_accumulated_time", 0) or 0)
         total_time_str = MessageFormatter.format_time_for_csv(total_seconds_all)
 
-        overtime_seconds = int(user_data.get("total_overtime_time", 0))
+        overtime_seconds = int(user_data.get("total_overtime_time", 0) or 0)
         overtime_str = MessageFormatter.format_time_for_csv(overtime_seconds)
 
         row.extend(
@@ -4009,23 +4091,23 @@ async def export_and_push_csv(
             pass
 
         caption = (
-            f"📊 群组数据导出\n"
-            f"🏢 群组：<code>{chat_title}</code>\n"
-            f"📅 导出时间：<code>{get_beijing_time().strftime('%Y-%m-%d %H:%M:%S')}</code>\n"
-            f"----------------------------------\n"
-            f"💾 包含每个用户的所有活动统计和总计信息"
+            f"📊 群组：<b>{chat_title}</b>\n"
+            f"📅 统计日期：<code>{(target_date.strftime('%Y-%m-%d') if target_date else get_beijing_time().strftime('%Y-%m-%d'))}</code>\n"
+            f"⏰ 导出时间：<code>{get_beijing_time().strftime('%Y-%m-%d %H:%M:%S')}</code>"
         )
 
+        # 先把文件发回到当前 chat（可选）
         try:
             csv_input_file = FSInputFile(temp_file, filename=file_name)
             await bot.send_document(
                 chat_id, csv_input_file, caption=caption, parse_mode="HTML"
             )
         except Exception as e:
-            logger.error(f"❌ 发送到当前聊天失败: {e}")
+            logger.warning(f"发送到当前聊天失败: {e}")
 
+        # 使用统一的 NotificationService 推送到绑定的频道/群组/管理员
         await NotificationService.send_document(
-            chat_id, FSInputFile(temp_file, filename=file_name), caption
+            chat_id, FSInputFile(temp_file, filename=file_name), caption=caption
         )
 
         logger.info(f"✅ 数据导出并推送完成: {file_name}")
@@ -4204,8 +4286,12 @@ async def export_data_before_reset(chat_id: int):
 
         date_str = get_beijing_time().strftime("%Y%m%d")
         file_name = f"group_{chat_id}_statistics_{date_str}.csv"
+        today_date = get_beijing_time().date()
         await export_and_push_csv(
-            chat_id, to_admin_if_no_group=True, file_name=file_name
+            chat_id,
+            to_admin_if_no_group=True,
+            file_name=file_name,
+            target_date=today_date,
         )
         logger.info(f"✅ 群组 {chat_id} 的每日数据已自动导出并推送")
     except Exception as e:
@@ -4285,7 +4371,7 @@ async def auto_daily_export_task():
 
 async def daily_reset_task():
     """
-    每日自动重置任务（重置 + 延迟导出昨日数据）
+    每日自动重置任务（重置 + 延迟导出昨日数据）- 修复版
     """
     while True:
         now = get_beijing_time()
@@ -4313,13 +4399,19 @@ async def daily_reset_task():
                 if now.hour == reset_hour and now.minute == reset_minute:
                     logger.info(f"⏰ 到达重置时间，正在重置群组 {chat_id} 的数据...")
 
+                    # 🆕 关键修复：计算昨天的日期
+                    yesterday = now - timedelta(days=1)
+
                     # 执行每日数据重置（带用户锁防并发）
                     group_members = await db.get_group_members(chat_id)
                     for user_data in group_members:
                         user_lock = get_user_lock(chat_id, user_data["user_id"])
                         async with user_lock:
+                            # 🆕 关键修复：传递昨天的日期
                             await db.reset_user_daily_data(
-                                chat_id, user_data["user_id"]
+                                chat_id,
+                                user_data["user_id"],
+                                yesterday.date(),  # 🆕 传递昨天的日期
                             )
 
                     logger.info(f"✅ 群组 {chat_id} 数据重置完成")
@@ -4342,20 +4434,30 @@ async def delayed_export(chat_id: int, delay_minutes: int = 30):
     """
     try:
         logger.info(f"⏳ 群组 {chat_id} 将在 {delay_minutes} 分钟后导出昨日数据...")
+        # 延迟执行
         await asyncio.sleep(delay_minutes * 60)
 
-        yesterday = get_beijing_time() - timedelta(days=1)
-        file_name = f"group_{chat_id}_statistics_{yesterday.strftime('%Y%m%d')}.csv"
+        # 获取昨天的北京时间与日期
+        yesterday_dt = get_beijing_time() - timedelta(days=1)
+        yesterday_date = yesterday_dt.date()
 
+        # 生成文件名（用昨日日期）
+        file_name = f"group_{chat_id}_statistics_{yesterday_dt.strftime('%Y%m%d')}.csv"
+
+        # ✅ 关键修改：传入 target_date=yesterday_date
         await export_and_push_csv(
-            chat_id, to_admin_if_no_group=True, file_name=file_name
+            chat_id,
+            to_admin_if_no_group=True,
+            file_name=file_name,
+            target_date=yesterday_date,
         )
-        logger.info(f"✅ 群组 {chat_id} 昨日数据导出并推送完成")
+
+        logger.info(f"✅ 群组 {chat_id} 昨日({yesterday_date}) 数据导出并推送完成")
 
     except asyncio.TimeoutError:
         logger.warning(f"⏰ 群组 {chat_id} 延迟导出超时")
     except Exception as e:
-        logger.error(f"❌ 群组 {chat_id} 延迟导出昨日数据失败: {e}")
+        logger.error(f"❌ 群组 {chat_id} 延迟导出昨日数据失败: {e}", exc_info=True)
 
 
 # ==================== 活动状态恢复功能 ====================
