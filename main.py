@@ -3914,26 +3914,6 @@ async def set_group_id(message: types.Message, state: FSMContext):
         await message.answer("❌ 请输入有效的群组ID！")
 
 
-async def export_data(message: types.Message):
-    """导出数据 - 优化版本"""
-    if not await is_admin(message.from_user.id):
-        await message.answer(
-            Config.MESSAGES["no_permission"],
-            reply_markup=await get_main_keyboard(
-                chat_id=message.chat.id, show_admin=False
-            ),
-        )
-        return
-
-    chat_id = message.chat.id
-    await message.answer("⏳ 正在导出数据...")
-    try:
-        await export_and_push_csv(chat_id)
-        await message.answer("✅ 数据导出完成！")
-    except Exception as e:
-        await message.answer(f"❌ 导出失败：{e}")
-
-
 # ==================== CSV导出推送功能优化 ====================
 async def optimized_monthly_export(chat_id: int, year: int, month: int):
     """优化版月度数据导出，每个用户一行，活动横向排列"""
