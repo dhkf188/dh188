@@ -1234,11 +1234,10 @@ class PostgreSQLDatabase:
             return result
 
     # ========== 月度统计 ==========
-
     async def get_monthly_statistics(
         self, chat_id: int, year: int = None, month: int = None
     ) -> List[Dict]:
-        """获取月度统计信息 - 修复日期格式问题"""
+        """获取月度统计信息 - 修复重置后数据丢失问题"""
         if year is None or month is None:
             today = datetime.now()
             year = today.year
@@ -1251,21 +1250,30 @@ class PostgreSQLDatabase:
             end_date = date(year, month + 1, 1)
 
         async with self.pool.acquire() as conn:
+            # 🆕 关键修复：直接从 user_activities 和 work_records 计算所有统计
             monthly_stats = await conn.fetch(
                 """
                 SELECT 
                     u.user_id,
                     u.nickname,
+                    -- 从 user_activities 计算活动统计
                     SUM(COALESCE(ua.accumulated_time, 0)) as total_time,
                     SUM(COALESCE(ua.activity_count, 0)) as total_count,
-                    SUM(COALESCE(u.total_fines, 0)) as total_fines,
-                    SUM(COALESCE(u.overtime_count, 0)) as total_overtime_count,
-                    SUM(COALESCE(u.total_overtime_time, 0)) as total_overtime_time
+                    -- 🆕 从 work_records 计算罚款（不依赖 users.total_fines）
+                    COALESCE((
+                        SELECT SUM(fine_amount) 
+                        FROM work_records wr 
+                        WHERE wr.chat_id = u.chat_id AND wr.user_id = u.user_id 
+                        AND wr.record_date >= $1::date AND wr.record_date < $2::date
+                    ), 0) as total_fines,
+                    -- 🆕 超时统计需要重新设计计算逻辑（暂时设为0，或从其他方式计算）
+                    0 as total_overtime_count,
+                    0 as total_overtime_time
                 FROM users u
                 LEFT JOIN user_activities ua ON u.chat_id = ua.chat_id AND u.user_id = ua.user_id
-                    AND ua.activity_date >= $1::date AND ua.activity_date < $2::date  -- 🆕 添加 ::date 转换
+                    AND ua.activity_date >= $1::date AND ua.activity_date < $2::date
                 WHERE u.chat_id = $3
-                GROUP BY u.user_id, u.nickname
+                GROUP BY u.user_id, u.nickname, u.chat_id
                 ORDER BY total_time DESC
                 """,
                 start_date,
@@ -1277,12 +1285,11 @@ class PostgreSQLDatabase:
             for stat in monthly_stats:
                 user_data = dict(stat)
                 user_data["total_time"] = user_data["total_time"] or 0
-                user_data["total_overtime_time"] = user_data["total_overtime_time"] or 0
                 user_data["total_time_formatted"] = self.format_seconds_to_hms(
                     user_data["total_time"]
                 )
                 user_data["total_overtime_time_formatted"] = self.format_seconds_to_hms(
-                    user_data["total_overtime_time"]
+                    user_data["total_overtime_time"] or 0
                 )
 
                 # 获取用户每项活动的详细统计
@@ -1293,7 +1300,7 @@ class PostgreSQLDatabase:
                         SUM(activity_count) as activity_count,
                         SUM(accumulated_time) as accumulated_time
                     FROM user_activities
-                    WHERE chat_id = $1 AND user_id = $2 AND activity_date >= $3::date AND activity_date < $4::date  -- 🆕 添加 ::date 转换
+                    WHERE chat_id = $1 AND user_id = $2 AND activity_date >= $3::date AND activity_date < $4::date
                     GROUP BY activity_name
                     """,
                     chat_id,
@@ -1307,7 +1314,7 @@ class PostgreSQLDatabase:
                     activity_time = row["accumulated_time"] or 0
                     user_data["activities"][row["activity_name"]] = {
                         "count": row["activity_count"] or 0,
-                        "time": activity_time,  # 🆕 保持原始秒数，用于计算
+                        "time": activity_time,
                         "time_formatted": self.format_seconds_to_hms(activity_time),
                     }
 
@@ -1424,10 +1431,11 @@ class PostgreSQLDatabase:
 
             return result
 
+    # ========== 月度工作统计 ==========
     async def get_monthly_activity_ranking(
         self, chat_id: int, year: int = None, month: int = None
     ) -> Dict[str, List]:
-        """获取月度活动排行榜 - 修复日期格式"""
+        """获取月度活动排行榜 - 修复重置后数据丢失问题"""
         if year is None or month is None:
             today = datetime.now()
             year = today.year
@@ -1444,17 +1452,19 @@ class PostgreSQLDatabase:
             rankings = {}
 
             for activity in activity_limits.keys():
+                # 🆕 关键修复：直接从 user_activities 计算，不依赖 users 表
                 rows = await conn.fetch(
                     """
                     SELECT 
-                        u.user_id,
+                        ua.user_id,
                         u.nickname,
                         SUM(COALESCE(ua.accumulated_time, 0)) as total_time,
                         SUM(COALESCE(ua.activity_count, 0)) as total_count
                     FROM user_activities ua
                     JOIN users u ON ua.chat_id = u.chat_id AND ua.user_id = u.user_id
-                    WHERE ua.chat_id = $1 AND ua.activity_name = $2 AND ua.activity_date >= $3::date AND ua.activity_date < $4::date  -- 🆕 添加 ::date 转换
-                    GROUP BY u.user_id, u.nickname
+                    WHERE ua.chat_id = $1 AND ua.activity_name = $2 
+                        AND ua.activity_date >= $3::date AND ua.activity_date < $4::date
+                    GROUP BY ua.user_id, u.nickname
                     ORDER BY total_time DESC
                     LIMIT 10
                     """,
