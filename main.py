@@ -4015,11 +4015,10 @@ async def export_and_push_csv(
         target_date = target_date.date()
 
     if not file_name:
-        date_str = (
-            target_date.strftime("%Y%m%d")
-            if target_date is not None
-            else get_beijing_time().strftime("%Y%m%d_%H%M%S")
-        )
+        if target_date is not None:
+            date_str = target_date.strftime("%Y%m%d")
+        else:
+            date_str = get_beijing_time().strftime("%Y%m%d_%H%M%S")
         file_name = f"group_{chat_id}_statistics_{date_str}.csv"
 
     csv_buffer = StringIO()
@@ -4430,14 +4429,14 @@ async def daily_reset_task():
 
 async def delayed_export(chat_id: int, delay_minutes: int = 30):
     """
-    在每日重置后延迟导出昨日数据
+    在每日重置后延迟导出昨日数据 - 修复版
     """
     try:
         logger.info(f"⏳ 群组 {chat_id} 将在 {delay_minutes} 分钟后导出昨日数据...")
         # 延迟执行
         await asyncio.sleep(delay_minutes * 60)
 
-        # 获取昨天的北京时间与日期
+        # 🆕 关键修复：明确获取昨天的日期
         yesterday_dt = get_beijing_time() - timedelta(days=1)
         yesterday_date = yesterday_dt.date()
 
@@ -4449,7 +4448,7 @@ async def delayed_export(chat_id: int, delay_minutes: int = 30):
             chat_id,
             to_admin_if_no_group=True,
             file_name=file_name,
-            target_date=yesterday_date,
+            target_date=yesterday_date,  # 明确传递昨天日期
         )
 
         logger.info(f"✅ 群组 {chat_id} 昨日({yesterday_date}) 数据导出并推送完成")
