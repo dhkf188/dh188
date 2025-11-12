@@ -8,7 +8,6 @@ from config import Config
 import asyncpg
 from asyncpg.pool import Pool
 from datetime import date, datetime
-from config import Config, beijing_tz
 
 logger = logging.getLogger("GroupCheckInBot")
 
@@ -600,12 +599,7 @@ class PostgreSQLDatabase:
 
             async with self.pool.acquire() as conn:
                 async with conn.transaction():
-                    # 🆕 关键修改：不再删除历史记录！
-                    # ❌ 删除这2个DELETE操作：
-                    # - 不要删除 user_activities 记录（保留导出所需的历史数据）
-                    # - 不要删除 work_records 记录（保留上下班打卡历史）
 
-                    # 3. 只重置用户统计数据和状态
                     await conn.execute(
                         """
                         UPDATE users SET
@@ -616,7 +610,7 @@ class PostgreSQLDatabase:
                             total_fines = 0,
                             current_activity = NULL,
                             activity_start_time = NULL,
-                            last_updated = $3, 
+                            last_updated = $3,  # 🆕 更新为新的日期
                             updated_at = CURRENT_TIMESTAMP
                         WHERE chat_id = $1 AND user_id = $2
                         """,
@@ -697,24 +691,6 @@ class PostgreSQLDatabase:
             logger.debug(f"📊 获取活动计数: 用户{user_id} 活动{activity} 计数{count}")
             return count
 
-    async def get_user_activity_count_for_date(
-        self, chat_id: int, user_id: int, activity: str, query_date: date
-    ) -> int:
-        """按指定日期获取用户活动次数"""
-        async with self.pool.acquire() as conn:
-            row = await conn.fetchrow(
-                "SELECT activity_count FROM user_activities WHERE chat_id = $1 AND user_id = $2 AND activity_date = $3 AND activity_name = $4",
-                chat_id,
-                user_id,
-                query_date,
-                activity,
-            )
-            count = row["activity_count"] if row else 0
-            logger.debug(
-                f"📊 获取活动计数: 用户{user_id} 活动{activity} 日期{query_date} 计数{count}"
-            )
-            return count
-
     async def get_user_activity_time(
         self, chat_id: int, user_id: int, activity: str
     ) -> int:
@@ -753,61 +729,6 @@ class PostgreSQLDatabase:
                     ),
                 }
             return activities
-
-    # ========== 重置数据逻辑 =========
-    async def get_user_all_activities_with_reset(self, chat_id: int, user_id: int):
-        """考虑重置时间的用户活动数据查询 - 修复时间统一版本"""
-        try:
-            # 获取群组重置时间
-            group_data = await self.get_group(chat_id)
-            reset_hour = group_data.get("reset_hour", Config.DAILY_RESET_HOUR)
-            reset_minute = group_data.get("reset_minute", Config.DAILY_RESET_MINUTE)
-
-            # 🎯 关键修复：使用与 main.py 相同的时间获取方式
-            from main import get_beijing_time  # 导入相同的时间函数
-
-            now = get_beijing_time()  # 使用统一的时间函数
-
-            reset_time_today = now.replace(
-                hour=reset_hour, minute=reset_minute, second=0, microsecond=0
-            )
-
-            if now < reset_time_today:
-                # 重置时间还没到，查询昨天的数据
-                query_date = (now - timedelta(days=1)).date()
-            else:
-                # 重置时间已过，查询今天的数据
-                query_date = now.date()
-
-            logger.info(
-                f"🕒 智能查询: 群组{chat_id} 用户{user_id} 查询日期{query_date} 重置时间{reset_hour}:{reset_minute}"
-            )
-
-            async with self.pool.acquire() as conn:
-                rows = await conn.fetch(
-                    "SELECT activity_name, activity_count, accumulated_time FROM user_activities WHERE chat_id = $1 AND user_id = $2 AND activity_date = $3",
-                    chat_id,
-                    user_id,
-                    query_date,
-                )
-
-            activities = {}
-            for row in rows:
-                activities[row["activity_name"]] = {
-                    "count": row["activity_count"],
-                    "time": row["accumulated_time"],
-                    "time_formatted": self.format_seconds_to_hms(
-                        row["accumulated_time"]
-                    ),
-                }
-
-            logger.info(f"📊 查询结果: 找到{len(activities)}个活动记录")
-            return activities
-
-        except Exception as e:
-            logger.error(f"❌ 获取用户活动数据失败 {chat_id}-{user_id}: {e}")
-            # 出错时返回空数据，避免阻塞其他功能
-            return {}
 
     # ========== 上下班记录操作 ==========
     async def add_work_record(
@@ -1177,6 +1098,7 @@ class PostgreSQLDatabase:
             self._cache.pop("push_settings", None)
 
     # ========== 统计和导出相关 ==========
+
     async def get_group_statistics(
         self, chat_id: int, target_date: Optional[date] = None
     ) -> List[Dict]:
