@@ -3354,7 +3354,6 @@ async def handle_admin_panel_button(message: types.Message):
         "• /monthlyreport - 生成最近一个月报告\n"
         "• /monthlyreport <年> <月> - 生成指定年月报告\n"
         "• /export - 导出数据\n\n"
-        "• \n"
         "• /performance 查看性能\n"
         "• /refresh_keyboard - 强制刷新键盘显示新活动\n"
         "• /debug_work - 调试上下班功能状态\n"
@@ -3881,9 +3880,8 @@ async def export_data(message: types.Message):
 
 
 # ==================== CSV导出推送功能优化 ====================
-# main.py - 优化月度导出方法
 async def optimized_monthly_export(chat_id: int, year: int, month: int):
-    """优化版月度数据导出 - 稳定版本"""
+    """优化版月度数据导出 - 修复空数据处理"""
     try:
         # 获取所有活动配置
         activity_limits = await db.get_activity_limits_cached()
