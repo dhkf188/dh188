@@ -577,8 +577,8 @@ class PostgreSQLDatabase:
         self, chat_id: int, user_id: int, target_date: date | None = None
     ):
         """
-        ✅ 修复版：重置用户每日数据但保留历史记录
-        只重置累计统计和当前状态，不删除历史记录
+        ✅ 完整重置版：重置用户每日数据，包括 user_activities 表的当日记录
+        保留历史记录（非当日记录），确保"我的记录"和"排行榜"正确重置
         """
         try:
             # 验证和设置目标日期
@@ -600,6 +600,29 @@ class PostgreSQLDatabase:
 
             async with self.pool.acquire() as conn:
                 async with conn.transaction():
+                    # 🆕 关键修改：删除 user_activities 表的当日记录
+                    await conn.execute(
+                        """
+                        DELETE FROM user_activities 
+                        WHERE chat_id = $1 AND user_id = $2 AND activity_date = $3
+                        """,
+                        chat_id,
+                        user_id,
+                        new_date,
+                    )
+
+                    # 🆕 关键修改：删除 work_records 表的当日记录（如果需要）
+                    await conn.execute(
+                        """
+                        DELETE FROM work_records 
+                        WHERE chat_id = $1 AND user_id = $2 AND record_date = $3
+                        """,
+                        chat_id,
+                        user_id,
+                        new_date,
+                    )
+
+                    # 3. 重置用户统计数据和状态
                     await conn.execute(
                         """
                         UPDATE users SET
@@ -610,13 +633,13 @@ class PostgreSQLDatabase:
                             total_fines = 0,
                             current_activity = NULL,
                             activity_start_time = NULL,
-                            last_updated = $3,  
+                            last_updated = $3,
                             updated_at = CURRENT_TIMESTAMP
                         WHERE chat_id = $1 AND user_id = $2
                         """,
                         chat_id,
                         user_id,
-                        new_date,  # 🆕 使用新的日期
+                        new_date,
                     )
 
             # 4. 清理相关缓存
@@ -631,9 +654,10 @@ class PostgreSQLDatabase:
 
             # 记录详细的重置日志
             logger.info(
-                f"✅ 数据重置完成（保留历史记录）: 用户 {user_id} (群组 {chat_id})\n"
+                f"✅ 完整数据重置完成: 用户 {user_id} (群组 {chat_id})\n"
                 f"   📅 重置日期: {target_date} → {new_date}\n"
-                f"   💾 历史记录: 已保留（支持后续导出）\n"
+                f"   💾 历史记录: 已保留（除当日记录外）\n"
+                f"   🗑️  清理内容: user_activities和work_records的当日记录\n"
                 f"   📊 重置前状态:\n"
                 f"       - 活动次数: {user_before.get('total_activity_count', 0) if user_before else 0}\n"
                 f"       - 累计时长: {user_before.get('total_accumulated_time', 0) if user_before else 0}秒\n"
