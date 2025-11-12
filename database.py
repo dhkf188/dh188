@@ -1273,9 +1273,8 @@ class PostgreSQLDatabase:
             end_date = date(year, month + 1, 1)
 
         async with self.pool.acquire() as conn:
-            # 基于 user_activities 表统计
-            monthly_stats = await conn.fetch(
-                """
+            # 🆕 修复：使用不同的参数占位符避免冲突
+            monthly_stats = await conn.fetch("""
                 SELECT 
                     ua.user_id,
                     COALESCE(u.nickname, '用户' || ua.user_id::TEXT) as nickname,
@@ -1295,11 +1294,7 @@ class PostgreSQLDatabase:
                 HAVING SUM(COALESCE(ua.accumulated_time, 0)) > 0 
                     OR SUM(COALESCE(ua.activity_count, 0)) > 0
                 ORDER BY total_time DESC
-            """,
-                start_date,
-                end_date,
-                chat_id,
-            )
+            """, start_date, end_date, chat_id)
 
             result = []
             for stat in monthly_stats:
@@ -1311,7 +1306,7 @@ class PostgreSQLDatabase:
                 user_data["total_overtime_time_formatted"] = "0秒"
                 user_data["total_overtime_count"] = 0
 
-                # 获取用户当月活动详情
+                # 🆕 修复：移除 HAVING 条件，确保所有活动都返回
                 activity_details = await conn.fetch(
                     """
                     SELECT 
@@ -1322,8 +1317,8 @@ class PostgreSQLDatabase:
                     WHERE chat_id = $1 AND user_id = $2 
                         AND activity_date >= $3 AND activity_date < $4
                     GROUP BY activity_name
-                    HAVING SUM(activity_count) > 0
-                """,
+                    -- 🆕 移除：HAVING SUM(activity_count) > 0
+                    """,
                     chat_id,
                     user_data["user_id"],
                     start_date,
