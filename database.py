@@ -1529,7 +1529,7 @@ class PostgreSQLDatabase:
         )
 
         async with self.pool.acquire() as conn:
-            # ✅ 修复：从users表获取该月有活动的所有用户
+            # ✅ 修复：移除活动数量的限制条件，查询所有在该月有记录的用户
             base_users = await conn.fetch(
                 """
                 SELECT DISTINCT 
@@ -1538,7 +1538,7 @@ class PostgreSQLDatabase:
                 FROM users u
                 WHERE u.chat_id = $1
                 AND u.last_updated >= $2 AND u.last_updated < $3
-                AND (u.total_activity_count > 0 OR u.total_fines > 0)
+                -- 🚨 重要：移除了这个条件 → AND (u.total_activity_count > 0 OR u.total_fines > 0)
                 ORDER BY u.nickname
                 """,
                 chat_id,
@@ -1546,7 +1546,7 @@ class PostgreSQLDatabase:
                 end_date,
             )
 
-            logger.info(f"📊 找到 {len(base_users)} 个活跃用户")
+            logger.info(f"📊 找到 {len(base_users)} 个在该月有记录的用户")
 
             result = []
 
@@ -1605,7 +1605,7 @@ class PostgreSQLDatabase:
                     monthly_totals["total_overtime_time"] or 0
                 )
 
-                # 3️⃣ ✅ 修复：从user_activities获取活动详情（如果存在）
+                # 3️⃣ ✅ 修复：从user_activities获取活动详情（移除HAVING条件）
                 activity_details = await conn.fetch(
                     """
                     SELECT 
@@ -1616,7 +1616,7 @@ class PostgreSQLDatabase:
                     WHERE chat_id = $1 AND user_id = $2
                     AND activity_date >= $3 AND activity_date < $4
                     GROUP BY activity_name
-                    HAVING SUM(activity_count) > 0  -- 只返回有数据的活动
+                    -- 🚨 重要：移除了这个条件 → HAVING SUM(activity_count) > 0
                     ORDER BY activity_name
                     """,
                     chat_id,
@@ -1635,19 +1635,37 @@ class PostgreSQLDatabase:
                         "time_formatted": self.format_seconds_to_hms(activity_time),
                     }
 
-                # 4️⃣ ✅ 补充：如果user_activities没有数据，从活动配置生成空结构
-                if not user_data["activities"]:
-                    activity_limits = await self.get_activity_limits()
-                    for activity_name in activity_limits.keys():
+                # 4️⃣ ✅ 修复：为所有配置的活动生成结构（包括计数为0的）
+                activity_limits = await self.get_activity_limits()
+                for activity_name in activity_limits.keys():
+                    if activity_name not in user_data["activities"]:
                         user_data["activities"][activity_name] = {
                             "count": 0,
                             "time": 0,
                             "time_formatted": "0秒",
                         }
 
-                result.append(user_data)
+                # ✅ 只在有数据时才添加到最终结果中（避免导出全是0的用户）
+                has_data = (
+                    user_data["total_time"] > 0
+                    or user_data["total_count"] > 0
+                    or user_data["total_fines"] > 0
+                    or user_data["work_days"] > 0
+                    or any(
+                        act_data["count"] > 0
+                        for act_data in user_data["activities"].values()
+                    )
+                )
 
-            logger.info(f"✅ 月度统计完成: 处理了 {len(result)} 个用户的数据")
+                if has_data:
+                    result.append(user_data)
+                    logger.debug(
+                        f"✅ 包含用户数据: {user_id} - 活动次数: {user_data['total_count']}, 上班天数: {user_data['work_days']}"
+                    )
+                else:
+                    logger.debug(f"⏭️ 跳过无数据用户: {user_id}")
+
+            logger.info(f"✅ 月度统计完成: 处理了 {len(result)} 个有数据的用户")
             return result
 
     # ========== 数据清理 ==========
