@@ -28,9 +28,10 @@ EXPOSE 10000
 
 
 # ✅ 修改：使用 render_deploy.py 作为启动文件
-# 清除缓存
+# 清除
 
 CMD ["python", "render_deploy.py"]
+
 
 
 
