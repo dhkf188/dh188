@@ -497,7 +497,7 @@ class PostgreSQLDatabase:
         fine_amount: int = 0,
         is_overtime: bool = False,
     ):
-        """完成用户活动 - 修复计数问题版本"""
+        """完成用户活动 - 修复重置后数据更新问题"""
         today = datetime.now().date()
 
         logger.info(
@@ -533,7 +533,7 @@ class PostgreSQLDatabase:
                     """,
                     chat_id,
                     user_id,
-                    today,
+                    today,  # 🆕 确保使用今天日期
                     activity,
                     elapsed_time,
                 )
@@ -610,7 +610,7 @@ class PostgreSQLDatabase:
                             total_fines = 0,
                             current_activity = NULL,
                             activity_start_time = NULL,
-                            last_updated = $3,  
+                            last_updated = $3,  # 🆕 更新为新的日期
                             updated_at = CURRENT_TIMESTAMP
                         WHERE chat_id = $1 AND user_id = $2
                         """,
@@ -675,20 +675,24 @@ class PostgreSQLDatabase:
             logger.error(f"❌ 更新最后更新时间失败 {chat_id}-{user_id}: {e}")
 
     async def get_user_activity_count(
-        self, chat_id: int, user_id: int, activity: str
+        self, chat_id: int, user_id: int, activity: str, target_date: date = None
     ) -> int:
-        """获取用户今日活动次数"""
-        today = datetime.now().date()
+        """获取用户指定日期的活动次数"""
+        if target_date is None:
+            target_date = datetime.now().date()
+
         async with self.pool.acquire() as conn:
             row = await conn.fetchrow(
                 "SELECT activity_count FROM user_activities WHERE chat_id = $1 AND user_id = $2 AND activity_date = $3 AND activity_name = $4",
                 chat_id,
                 user_id,
-                today,
+                target_date,
                 activity,
             )
             count = row["activity_count"] if row else 0
-            logger.debug(f"📊 获取活动计数: 用户{user_id} 活动{activity} 计数{count}")
+            logger.debug(
+                f"📊 获取活动计数: 用户{user_id} 活动{activity} 日期{target_date} 计数{count}"
+            )
             return count
 
     async def get_user_activity_time(
@@ -706,17 +710,20 @@ class PostgreSQLDatabase:
             )
             return row["accumulated_time"] if row else 0
 
+    # database.py - 修改 get_user_all_activities 方法
     async def get_user_all_activities(
-        self, chat_id: int, user_id: int
+        self, chat_id: int, user_id: int, target_date: date = None
     ) -> Dict[str, Dict]:
-        """获取用户所有活动数据"""
-        today = datetime.now().date()
+        """获取用户所有活动数据 - 修复重置后显示问题"""
+        if target_date is None:
+            target_date = datetime.now().date()
+
         async with self.pool.acquire() as conn:
             rows = await conn.fetch(
                 "SELECT activity_name, activity_count, accumulated_time FROM user_activities WHERE chat_id = $1 AND user_id = $2 AND activity_date = $3",
                 chat_id,
                 user_id,
-                today,
+                target_date,
             )
 
             activities = {}
@@ -1765,4 +1772,3 @@ class PostgreSQLDatabase:
 
 # 全局数据库实例
 db = PostgreSQLDatabase()
-
