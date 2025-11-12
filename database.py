@@ -1518,14 +1518,13 @@ class PostgreSQLDatabase:
         self, chat_id: int, year: int, month: int
     ):
         """获取月度统计数据 - 横向格式专用（安全修复版）"""
+        from datetime import date
+
         start_date = date(year, month, 1)
-        if month == 12:
-            end_date = date(year + 1, 1, 1)
-        else:
-            end_date = date(year, month + 1, 1)
+        end_date = date(year + (month // 12), (month % 12) + 1, 1)
 
         async with self.pool.acquire() as conn:
-            # 🆕 安全修复：简化查询，移除复杂子查询
+            # ✅ 修复 join 条件 + 使用正确字段
             user_stats = await conn.fetch(
                 """
                 SELECT 
@@ -1536,18 +1535,21 @@ class PostgreSQLDatabase:
                     COALESCE((
                         SELECT SUM(fine_amount) 
                         FROM work_records wr 
-                        WHERE wr.chat_id = u.chat_id AND wr.user_id = u.user_id 
-                        AND wr.record_date >= $1 AND wr.record_date < $2
+                        WHERE wr.chat_id = u.chat_id 
+                        AND wr.user_id = u.user_id 
+                        AND wr.record_date >= $1 
+                        AND wr.record_date < $2
                     ), 0) as total_fines,
-                    -- 🆕 简化超时统计
-                    COALESCE(u.total_overtime_count, 0) as total_overtime_count,
+                    COALESCE(u.overtime_count, 0) as total_overtime_count,
                     COALESCE(u.total_overtime_time, 0) as total_overtime_time
                 FROM users u
-                LEFT JOIN user_activities ua ON u.chat_id = ua.chat_id AND u.user_id = u.user_id
-                    AND ua.activity_date >= $1 AND ua.activity_date < $2
+                LEFT JOIN user_activities ua 
+                ON u.chat_id = ua.chat_id 
+                AND u.user_id = ua.user_id
+                AND ua.activity_date >= $1 
+                AND ua.activity_date < $2
                 WHERE u.chat_id = $3
-                GROUP BY u.user_id, u.nickname, u.total_overtime_count, u.total_overtime_time
-                -- 🆕 移除 HAVING 子句
+                GROUP BY u.user_id, u.nickname, u.overtime_count, u.total_overtime_time
                 """,
                 start_date,
                 end_date,
@@ -1558,7 +1560,7 @@ class PostgreSQLDatabase:
             for stat in user_stats:
                 user_data = dict(stat)
 
-                # 🆕 安全修复：获取用户当月活动详情
+                # ✅ 同步活动详情
                 activity_details = await conn.fetch(
                     """
                     SELECT 
@@ -1566,9 +1568,10 @@ class PostgreSQLDatabase:
                         SUM(activity_count) as activity_count,
                         SUM(accumulated_time) as accumulated_time
                     FROM user_activities
-                    WHERE chat_id = $1 AND user_id = $2 AND activity_date >= $3 AND activity_date < $4
+                    WHERE chat_id = $1 AND user_id = $2 
+                    AND activity_date >= $3 
+                    AND activity_date < $4
                     GROUP BY activity_name
-                    -- 🆕 移除 HAVING
                     """,
                     chat_id,
                     user_data["user_id"],
