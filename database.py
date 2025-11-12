@@ -1260,7 +1260,7 @@ class PostgreSQLDatabase:
     async def get_monthly_statistics(
         self, chat_id: int, year: int = None, month: int = None
     ) -> List[Dict]:
-        """获取月度统计信息 - 安全修复版"""
+        """修复版月度统计信息 - 基于原始数据表"""
         if year is None or month is None:
             today = datetime.now()
             year = today.year
@@ -1273,31 +1273,29 @@ class PostgreSQLDatabase:
             end_date = date(year, month + 1, 1)
 
         async with self.pool.acquire() as conn:
-            # 🆕 安全修复：移除有问题的 HAVING 子句
+            # 基于 user_activities 表统计
             monthly_stats = await conn.fetch(
                 """
                 SELECT 
-                    u.user_id,
-                    u.nickname,
-                    COALESCE(SUM(ua.accumulated_time), 0) as total_time,
-                    COALESCE(SUM(ua.activity_count), 0) as total_count,
+                    ua.user_id,
+                    COALESCE(u.nickname, '用户' || ua.user_id::TEXT) as nickname,
+                    SUM(COALESCE(ua.accumulated_time, 0)) as total_time,
+                    SUM(COALESCE(ua.activity_count, 0)) as total_count,
                     COALESCE((
                         SELECT SUM(fine_amount) 
                         FROM work_records wr 
-                        WHERE wr.chat_id = u.chat_id AND wr.user_id = u.user_id 
+                        WHERE wr.chat_id = ua.chat_id AND wr.user_id = ua.user_id 
                         AND wr.record_date >= $1 AND wr.record_date < $2
-                    ), 0) as total_fines,
-                    -- 🆕 简化超时统计，避免复杂子查询
-                    0 as total_overtime_count,
-                    0 as total_overtime_time
-                FROM users u
-                LEFT JOIN user_activities ua ON u.chat_id = ua.chat_id AND u.user_id = u.user_id
+                    ), 0) as total_fines
+                FROM user_activities ua
+                LEFT JOIN users u ON ua.chat_id = u.chat_id AND ua.user_id = u.user_id
+                WHERE ua.chat_id = $3
                     AND ua.activity_date >= $1 AND ua.activity_date < $2
-                WHERE u.chat_id = $3
-                GROUP BY u.user_id, u.nickname, u.chat_id
-                -- 🆕 移除 HAVING 子句，确保所有用户都返回
+                GROUP BY ua.user_id, u.nickname, ua.chat_id
+                HAVING SUM(COALESCE(ua.accumulated_time, 0)) > 0 
+                    OR SUM(COALESCE(ua.activity_count, 0)) > 0
                 ORDER BY total_time DESC
-                """,
+            """,
                 start_date,
                 end_date,
                 chat_id,
@@ -1306,15 +1304,14 @@ class PostgreSQLDatabase:
             result = []
             for stat in monthly_stats:
                 user_data = dict(stat)
-                user_data["total_time"] = user_data["total_time"] or 0
                 user_data["total_time_formatted"] = self.format_seconds_to_hms(
                     user_data["total_time"]
                 )
-                user_data["total_overtime_time_formatted"] = self.format_seconds_to_hms(
-                    user_data["total_overtime_time"] or 0
-                )
+                user_data["total_overtime_time"] = 0  # 简化处理
+                user_data["total_overtime_time_formatted"] = "0秒"
+                user_data["total_overtime_count"] = 0
 
-                # 🆕 安全修复：获取用户当月活动详情
+                # 获取用户当月活动详情
                 activity_details = await conn.fetch(
                     """
                     SELECT 
@@ -1322,10 +1319,11 @@ class PostgreSQLDatabase:
                         SUM(activity_count) as activity_count,
                         SUM(accumulated_time) as accumulated_time
                     FROM user_activities
-                    WHERE chat_id = $1 AND user_id = $2 AND activity_date >= $3 AND activity_date < $4
+                    WHERE chat_id = $1 AND user_id = $2 
+                        AND activity_date >= $3 AND activity_date < $4
                     GROUP BY activity_name
-                    -- 🆕 移除 HAVING，确保所有活动都返回
-                    """,
+                    HAVING SUM(activity_count) > 0
+                """,
                     chat_id,
                     user_data["user_id"],
                     start_date,
@@ -1459,7 +1457,7 @@ class PostgreSQLDatabase:
     async def get_monthly_activity_ranking(
         self, chat_id: int, year: int = None, month: int = None
     ) -> Dict[str, List]:
-        """获取月度活动排行榜 - 安全修复版"""
+        """修复版月度活动排行榜 - 基于 user_activities 表"""
         if year is None or month is None:
             today = datetime.now()
             year = today.year
@@ -1476,23 +1474,22 @@ class PostgreSQLDatabase:
             rankings = {}
 
             for activity in activity_limits.keys():
-                # 🆕 安全修复：移除 HAVING 子句
                 rows = await conn.fetch(
                     """
                     SELECT 
                         ua.user_id,
-                        u.nickname,
+                        COALESCE(u.nickname, '用户' || ua.user_id::TEXT) as nickname,
                         SUM(COALESCE(ua.accumulated_time, 0)) as total_time,
                         SUM(COALESCE(ua.activity_count, 0)) as total_count
                     FROM user_activities ua
-                    JOIN users u ON ua.chat_id = u.chat_id AND ua.user_id = u.user_id
+                    LEFT JOIN users u ON ua.chat_id = u.chat_id AND ua.user_id = u.user_id
                     WHERE ua.chat_id = $1 AND ua.activity_name = $2 
                         AND ua.activity_date >= $3 AND ua.activity_date < $4
                     GROUP BY ua.user_id, u.nickname
-                    -- 🆕 移除 HAVING 子句
+                    HAVING SUM(COALESCE(ua.accumulated_time, 0)) > 0
                     ORDER BY total_time DESC
                     LIMIT 10
-                    """,
+                """,
                     chat_id,
                     activity,
                     start_date,
@@ -1502,8 +1499,6 @@ class PostgreSQLDatabase:
                 formatted_rows = []
                 for row in rows:
                     user_data = dict(row)
-                    user_data["total_time"] = user_data["total_time"] or 0
-                    user_data["total_count"] = user_data["total_count"] or 0
                     user_data["total_time_formatted"] = self.format_seconds_to_hms(
                         user_data["total_time"]
                     )
@@ -1517,7 +1512,7 @@ class PostgreSQLDatabase:
     async def get_monthly_statistics_horizontal(
         self, chat_id: int, year: int, month: int
     ):
-        """获取月度统计数据 - 修复版本：从users表历史数据统计"""
+        """修复版月度统计 - 完全基于 user_activities 和 work_records 表，不依赖 users 表统计字段"""
         start_date = date(year, month, 1)
         if month == 12:
             end_date = date(year + 1, 1, 1)
@@ -1525,50 +1520,63 @@ class PostgreSQLDatabase:
             end_date = date(year, month + 1, 1)
 
         logger.info(
-            f"📊 开始月度统计: 群组{chat_id}, {year}年{month}月, 范围{start_date}到{end_date}"
+            f"📊 [修复版]月度统计: 群组{chat_id}, {year}年{month}月, 范围{start_date}到{end_date}"
         )
 
         async with self.pool.acquire() as conn:
-            # ✅ 修复：移除活动数量的限制条件，查询所有在该月有记录的用户
-            base_users = await conn.fetch(
+            # 1. 获取该月有活动的所有用户
+            active_users = await conn.fetch(
                 """
                 SELECT DISTINCT 
-                    u.user_id,
-                    u.nickname
-                FROM users u
-                WHERE u.chat_id = $1
-                AND u.last_updated >= $2 AND u.last_updated < $3
-                -- 🚨 重要：移除了这个条件 → AND (u.total_activity_count > 0 OR u.total_fines > 0)
-                ORDER BY u.nickname
-                """,
+                    ua.user_id,
+                    COALESCE(u.nickname, '用户' || ua.user_id::TEXT) as nickname
+                FROM user_activities ua
+                LEFT JOIN users u ON ua.chat_id = u.chat_id AND ua.user_id = u.user_id
+                WHERE ua.chat_id = $1 
+                    AND ua.activity_date >= $2 AND ua.activity_date < $3
+                UNION
+                SELECT DISTINCT 
+                    wr.user_id,
+                    COALESCE(u.nickname, '用户' || wr.user_id::TEXT) as nickname
+                FROM work_records wr
+                LEFT JOIN users u ON wr.chat_id = u.chat_id AND wr.user_id = u.user_id
+                WHERE wr.chat_id = $1 
+                    AND wr.record_date >= $2 AND wr.record_date < $3
+            """,
                 chat_id,
                 start_date,
                 end_date,
             )
 
-            logger.info(f"📊 找到 {len(base_users)} 个在该月有记录的用户")
+            logger.info(f"📊 找到 {len(active_users)} 个在该月有记录的用户")
 
             result = []
 
-            for user in base_users:
+            for user in active_users:
                 user_id = user["user_id"]
                 nickname = user["nickname"]
 
                 user_data = {
                     "user_id": user_id,
-                    "nickname": nickname or f"用户{user_id}",
-                    "activities": {},  # 初始化空的活动字典
+                    "nickname": nickname,
+                    "activities": {},
+                    "work_days": 0,
+                    "total_time": 0,
+                    "total_count": 0,
+                    "total_fines": 0,
+                    "total_overtime_count": 0,
+                    "total_overtime_time": 0,
                 }
 
-                # 1️⃣ 上班天数（保持不变）
+                # 2. 获取上班天数（从 work_records）
                 work_days = await conn.fetchval(
                     """
                     SELECT COUNT(DISTINCT record_date)
                     FROM work_records
                     WHERE chat_id = $1 AND user_id = $2
-                    AND record_date >= $3 AND record_date < $4
-                    AND checkin_type = 'work_start'
-                    """,
+                        AND record_date >= $3 AND record_date < $4
+                        AND checkin_type = 'work_start'
+                """,
                     chat_id,
                     user_id,
                     start_date,
@@ -1576,49 +1584,81 @@ class PostgreSQLDatabase:
                 )
                 user_data["work_days"] = work_days or 0
 
-                # 2️⃣ ✅ 修复：从users表获取月度累计数据
-                monthly_totals = await conn.fetchrow(
+                # 3. 获取活动统计（从 user_activities）
+                activity_totals = await conn.fetchrow(
                     """
                     SELECT 
-                        COALESCE(SUM(total_accumulated_time), 0) as total_time,
-                        COALESCE(SUM(total_activity_count), 0) as total_count,
-                        COALESCE(SUM(total_fines), 0) as total_fines,
-                        COALESCE(SUM(overtime_count), 0) as total_overtime_count,
-                        COALESCE(SUM(total_overtime_time), 0) as total_overtime_time
-                    FROM users
+                        SUM(activity_count) as total_count,
+                        SUM(accumulated_time) as total_time
+                    FROM user_activities
                     WHERE chat_id = $1 AND user_id = $2
-                    AND last_updated >= $3 AND last_updated < $4
-                    """,
+                        AND activity_date >= $3 AND activity_date < $4
+                """,
                     chat_id,
                     user_id,
                     start_date,
                     end_date,
                 )
 
-                user_data["total_time"] = monthly_totals["total_time"] or 0
-                user_data["total_count"] = monthly_totals["total_count"] or 0
-                user_data["total_fines"] = monthly_totals["total_fines"] or 0
-                user_data["total_overtime_count"] = (
-                    monthly_totals["total_overtime_count"] or 0
+                if activity_totals:
+                    user_data["total_count"] = activity_totals["total_count"] or 0
+                    user_data["total_time"] = activity_totals["total_time"] or 0
+
+                # 4. 获取罚款总额（从 work_records）
+                total_fines = await conn.fetchval(
+                    """
+                    SELECT SUM(fine_amount)
+                    FROM work_records
+                    WHERE chat_id = $1 AND user_id = $2
+                        AND record_date >= $3 AND record_date < $4
+                """,
+                    chat_id,
+                    user_id,
+                    start_date,
+                    end_date,
                 )
-                user_data["total_overtime_time"] = (
-                    monthly_totals["total_overtime_time"] or 0
+                user_data["total_fines"] = total_fines or 0
+
+                # 5. 获取超时统计（从 user_activities 关联计算）
+                # 注意：这里需要根据活动时间限制计算超时，简化处理
+                overtime_stats = await conn.fetchrow(
+                    """
+                    SELECT 
+                        COUNT(*) as overtime_count,
+                        SUM(GREATEST(ua.accumulated_time - (ac.time_limit * 60), 0)) as overtime_time
+                    FROM user_activities ua
+                    JOIN activity_configs ac ON ua.activity_name = ac.activity_name
+                    WHERE ua.chat_id = $1 AND ua.user_id = $2
+                        AND ua.activity_date >= $3 AND ua.activity_date < $4
+                        AND ua.accumulated_time > (ac.time_limit * 60)
+                """,
+                    chat_id,
+                    user_id,
+                    start_date,
+                    end_date,
                 )
 
-                # 3️⃣ ✅ 修复：从user_activities获取活动详情（移除HAVING条件）
+                if overtime_stats:
+                    user_data["total_overtime_count"] = (
+                        overtime_stats["overtime_count"] or 0
+                    )
+                    user_data["total_overtime_time"] = (
+                        overtime_stats["overtime_time"] or 0
+                    )
+
+                # 6. 获取详细活动数据
                 activity_details = await conn.fetch(
                     """
                     SELECT 
-                        activity_name,
-                        SUM(activity_count) AS activity_count,
-                        SUM(accumulated_time) AS accumulated_time
-                    FROM user_activities
-                    WHERE chat_id = $1 AND user_id = $2
-                    AND activity_date >= $3 AND activity_date < $4
-                    GROUP BY activity_name
-                    -- 🚨 重要：移除了这个条件 → HAVING SUM(activity_count) > 0
-                    ORDER BY activity_name
-                    """,
+                        ua.activity_name,
+                        SUM(ua.activity_count) as activity_count,
+                        SUM(ua.accumulated_time) as accumulated_time
+                    FROM user_activities ua
+                    WHERE ua.chat_id = $1 AND ua.user_id = $2
+                        AND ua.activity_date >= $3 AND ua.activity_date < $4
+                    GROUP BY ua.activity_name
+                    ORDER BY ua.activity_name
+                """,
                     chat_id,
                     user_id,
                     start_date,
@@ -1635,7 +1675,7 @@ class PostgreSQLDatabase:
                         "time_formatted": self.format_seconds_to_hms(activity_time),
                     }
 
-                # 4️⃣ ✅ 修复：为所有配置的活动生成结构（包括计数为0的）
+                # 7. 为所有配置的活动生成结构（包括计数为0的）
                 activity_limits = await self.get_activity_limits()
                 for activity_name in activity_limits.keys():
                     if activity_name not in user_data["activities"]:
@@ -1645,7 +1685,7 @@ class PostgreSQLDatabase:
                             "time_formatted": "0秒",
                         }
 
-                # ✅ 只在有数据时才添加到最终结果中（避免导出全是0的用户）
+                # 8. 只在有数据时才添加到最终结果中
                 has_data = (
                     user_data["total_time"] > 0
                     or user_data["total_count"] > 0
@@ -1658,6 +1698,14 @@ class PostgreSQLDatabase:
                 )
 
                 if has_data:
+                    # 添加格式化字段
+                    user_data["total_time_formatted"] = self.format_seconds_to_hms(
+                        user_data["total_time"]
+                    )
+                    user_data["total_overtime_time_formatted"] = (
+                        self.format_seconds_to_hms(user_data["total_overtime_time"])
+                    )
+
                     result.append(user_data)
                     logger.debug(
                         f"✅ 包含用户数据: {user_id} - 活动次数: {user_data['total_count']}, 上班天数: {user_data['work_days']}"
@@ -1665,7 +1713,7 @@ class PostgreSQLDatabase:
                 else:
                     logger.debug(f"⏭️ 跳过无数据用户: {user_id}")
 
-            logger.info(f"✅ 月度统计完成: 处理了 {len(result)} 个有数据的用户")
+            logger.info(f"✅ [修复版]月度统计完成: 处理了 {len(result)} 个有数据的用户")
             return result
 
     # ========== 数据清理 ==========
