@@ -3479,7 +3479,6 @@ async def handle_other_text_messages(message: types.Message):
 
 
 # ==================== 用户功能优化 ====================
-# main.py - 修复 show_history 方法
 async def show_history(message: types.Message):
     """显示用户历史记录 - 修复重置后数据问题"""
     chat_id = message.chat.id
