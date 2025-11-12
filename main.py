@@ -739,26 +739,15 @@ async def reset_daily_data_if_needed(chat_id: int, uid: int):
 
 
 async def check_activity_limit(chat_id: int, uid: int, act: str):
-    """检查活动次数是否达到上限 - 修复重置时间版本"""
+    """检查活动次数是否达到上限 - 使用业务日 query_date"""
     await db.init_group(chat_id)
     await db.init_user(chat_id, uid)
 
-    # 🎯 获取当前周期信息
-    group_data = await db.get_group_cached(chat_id)
-    reset_hour = group_data.get("reset_hour", Config.DAILY_RESET_HOUR)
-    reset_minute = group_data.get("reset_minute", Config.DAILY_RESET_MINUTE)
-
+    # 计算业务日
     now = get_beijing_time()
-    reset_time_today = now.replace(
-        hour=reset_hour, minute=reset_minute, second=0, microsecond=0
-    )
+    query_date = await compute_business_date(chat_id, now)
 
-    if now < reset_time_today:
-        query_date = (now - timedelta(days=1)).date()
-    else:
-        query_date = now.date()
-
-    # 🎯 使用正确的日期查询活动次数
+    # 使用 db 的按日期查询次数
     current_count = await db.get_user_activity_count_for_date(
         chat_id, uid, act, query_date
     )
@@ -850,6 +839,49 @@ async def calculate_fine(activity: str, overtime_minutes: float) -> int:
         f"💰 罚款计算: 活动={activity}, 超时={overtime_minutes:.1f}分钟, 罚款={applicable_fine}元"
     )
     return applicable_fine
+
+
+def compute_business_date_from_group_data(
+    now: datetime, reset_hour: int, reset_minute: int
+):
+    """
+    给定当前时刻 now (datetime)，和 reset_hour/reset_minute (int)，
+    返回对应的业务日期（date）。
+    规则：如果 now < reset_time_today -> business_date = yesterday; else business_date = today
+    包含边界： reset_time_today 属于新周期（>= 属于今天）
+    """
+    reset_time_today = now.replace(
+        hour=reset_hour, minute=reset_minute, second=0, microsecond=0
+    )
+    if now < reset_time_today:
+        return (reset_time_today - timedelta(days=1)).date()
+    return reset_time_today.date()
+
+
+async def compute_business_date(chat_id: int, now: datetime = None):
+    """
+    异步工具：使用缓存的群组配置计算 business_date。
+    使用 db.get_group_cached(chat_id) 来获取 reset_hour/reset_minute（避免多次 DB 访问）。
+    """
+    if now is None:
+        now = get_beijing_time()
+    group = await db.get_group_cached(chat_id)
+    # 安全转换
+    try:
+        reset_hour = int(
+            group.get("reset_hour", Config.DAILY_RESET_HOUR) or Config.DAILY_RESET_HOUR
+        )
+    except Exception:
+        reset_hour = Config.DAILY_RESET_HOUR
+    try:
+        reset_minute = int(
+            group.get("reset_minute", Config.DAILY_RESET_MINUTE)
+            or Config.DAILY_RESET_MINUTE
+        )
+    except Exception:
+        reset_minute = Config.DAILY_RESET_MINUTE
+
+    return compute_business_date_from_group_data(now, reset_hour, reset_minute)
 
 
 # ==================== 回复键盘 ====================
@@ -3493,36 +3525,48 @@ async def handle_other_text_messages(message: types.Message):
 
 
 # ==================== 用户功能优化 ====================
+# 替换/新增 show_history handler
 async def show_history(message: types.Message):
-    """显示用户历史记录 - 修复重置时间版本"""
     chat_id = message.chat.id
     uid = message.from_user.id
 
     user_lock = get_user_lock(chat_id, uid)
     async with user_lock:
-        # 🎯 获取当前周期信息
-        group_data = await db.get_group_cached(chat_id)
-        reset_hour = group_data.get("reset_hour", Config.DAILY_RESET_HOUR)
-        reset_minute = group_data.get("reset_minute", Config.DAILY_RESET_MINUTE)
-
+        # 计算业务日（使用缓存的群组配置）
         now = get_beijing_time()
+        query_date = await compute_business_date(chat_id, now)
+
+        # 从 DB 获取该用户在 query_date 的活动数据（使用新的 DB 方法）
+        user_activities = await db.get_user_all_activities_for_date(
+            chat_id, uid, query_date
+        )
+
+        # 获取当前周期标签（今日/昨日）
+        # 这里复用 compute_business_date_from_group_data 以获得 period 字符串
+        group_data = await db.get_group_cached(chat_id)
+        try:
+            reset_hour = int(
+                group_data.get("reset_hour", Config.DAILY_RESET_HOUR)
+                or Config.DAILY_RESET_HOUR
+            )
+        except Exception:
+            reset_hour = Config.DAILY_RESET_HOUR
+        try:
+            reset_minute = int(
+                group_data.get("reset_minute", Config.DAILY_RESET_MINUTE)
+                or Config.DAILY_RESET_MINUTE
+            )
+        except Exception:
+            reset_minute = Config.DAILY_RESET_MINUTE
+
         reset_time_today = now.replace(
             hour=reset_hour, minute=reset_minute, second=0, microsecond=0
         )
-
-        if now < reset_time_today:
-            period_label = "昨日"
-        else:
-            period_label = "今日"
-
-        # 🎯 使用新的考虑重置时间的查询方法
-        user_activities = await db.get_user_all_activities_with_reset(chat_id, uid)
+        period_label = "昨日" if now < reset_time_today else "今日"
 
         async with OptimizedUserContext(chat_id, uid) as user:
-            first_line = (
-                f"👤 用户：{MessageFormatter.format_user_link(uid, user['nickname'])}"
-            )
-            text = f"{first_line}\n📊 {period_label}记录：\n\n"
+            first_line = f"👤 用户：{MessageFormatter.format_user_link(uid, user.get('nickname'))}"
+            text = f"{first_line}\n📊 {period_label}记录（{query_date}）：\n\n"
 
             has_records = False
             activity_limits = await db.get_activity_limits_cached()
@@ -3532,21 +3576,24 @@ async def show_history(message: types.Message):
                 total_time = activity_info.get("time", 0)
                 count = activity_info.get("count", 0)
                 max_times = activity_limits[act]["max_times"]
+
                 if total_time > 0 or count > 0:
                     status = "✅" if count < max_times else "❌"
                     time_str = MessageFormatter.format_time(int(total_time))
                     text += f"• <code>{act}</code>：<code>{time_str}</code>，次数：<code>{count}</code>/<code>{max_times}</code> {status}\n"
                     has_records = True
 
+            # 使用 users 表的缓存值（作为参考），但注意可能与实时聚合不同步
             total_time_all = user.get("total_accumulated_time", 0)
             total_count_all = user.get("total_activity_count", 0)
             total_fine = user.get("total_fines", 0)
             overtime_count = user.get("overtime_count", 0)
             total_overtime = user.get("total_overtime_time", 0)
 
-            text += f"\n📈 {period_label}总统计：\n"
+            text += f"\n📈 {period_label}总统计（缓存）:\n"
             text += f"• 总累计时间：<code>{MessageFormatter.format_time(int(total_time_all))}</code>\n"
             text += f"• 总活动次数：<code>{total_count_all}</code> 次\n"
+
             if overtime_count > 0:
                 text += f"• 超时次数：<code>{overtime_count}</code> 次\n"
                 text += f"• 总超时时间：<code>{MessageFormatter.format_time(int(total_overtime))}</code>\n"
@@ -3565,15 +3612,15 @@ async def show_history(message: types.Message):
             )
 
 
+# ============ 排行榜 ============
 async def show_rank(message: types.Message):
-    """显示排行榜（修复重置时间版）——直接从 user_activities 聚合数据，支持重置时间"""
     chat_id = message.chat.id
     uid = message.from_user.id
 
     # 确保群组初始化
     await db.init_group(chat_id)
 
-    # 读取活动列表（带缓存）
+    # 读取活动列表
     activity_limits = await db.get_activity_limits_cached()
     if not activity_limits:
         await message.answer(
@@ -3584,28 +3631,31 @@ async def show_rank(message: types.Message):
         )
         return
 
-    # 🎯 获取当前周期信息
-    group_data = await db.get_group_cached(chat_id)
-    reset_hour = group_data.get("reset_hour", Config.DAILY_RESET_HOUR)
-    reset_minute = group_data.get("reset_minute", Config.DAILY_RESET_MINUTE)
-
+    # 计算业务日
     now = get_beijing_time()
-    reset_time_today = now.replace(
-        hour=reset_hour, minute=reset_minute, second=0, microsecond=0
-    )
+    query_date = await compute_business_date(chat_id, now)
+    # label
+    # 若 query_date == today -> 今日，否则 昨日（注意：compute_business_date 已考虑边界）
+    group_data = await db.get_group_cached(chat_id)
+    try:
+        rh = int(
+            group_data.get("reset_hour", Config.DAILY_RESET_HOUR)
+            or Config.DAILY_RESET_HOUR
+        )
+    except Exception:
+        rh = Config.DAILY_RESET_HOUR
+    try:
+        rm = int(
+            group_data.get("reset_minute", Config.DAILY_RESET_MINUTE)
+            or Config.DAILY_RESET_MINUTE
+        )
+    except Exception:
+        rm = Config.DAILY_RESET_MINUTE
+    reset_time_today = now.replace(hour=rh, minute=rm, second=0, microsecond=0)
+    period_label = "昨日" if now < reset_time_today else "今日"
 
-    if now < reset_time_today:
-        query_date = (now - timedelta(days=1)).date()
-        period_label = "昨日"
-    else:
-        query_date = now.date()
-        period_label = "今日"
+    rank_text = f"🏆 {period_label}活动排行榜（{query_date}）\n\n"
 
-    # 准备文本头
-    rank_text = f"🏆 {period_label}活动排行榜\n\n"
-
-    # 为避免大量单次连接开销，我们直接用连接一次性查询每个活动的 TopN
-    top_n = 3
     async with db.pool.acquire() as conn:
         any_result = False
         for act in activity_limits.keys():
@@ -3623,12 +3673,11 @@ async def show_rank(message: types.Message):
                 """,
                 chat_id,
                 act,
-                query_date,  # 🎯 使用计算后的日期，而不是固定的 today
-                top_n,
+                query_date,
+                3,
             )
 
             if not rows:
-                # 跳过没有数据的活动（也可以显示"暂无记录"）
                 continue
 
             any_result = True
@@ -3637,25 +3686,13 @@ async def show_rank(message: types.Message):
                 user_id = row["user_id"]
                 name = row["nickname"] or str(user_id)
                 time_sec = row["total_time"] or 0
-                # 你的 MessageFormatter.format_time / format_seconds_to_hms 根据项目定义来用
-                # 这里尽量使用项目里已有的工具：
-                try:
-                    time_str = MessageFormatter.format_time(int(time_sec))
-                except Exception:
-                    # 兜底格式化为秒->时分秒
-                    time_str = (
-                        db.format_seconds_to_hms(int(time_sec))
-                        if hasattr(db, "format_seconds_to_hms")
-                        else f"{int(time_sec)}s"
-                    )
+                time_str = MessageFormatter.format_time(int(time_sec))
 
                 rank_text += f"  <code>{i}.</code> {MessageFormatter.format_user_link(user_id, name)} - <code>{time_str}</code>\n"
             rank_text += "\n"
 
     if not any_result:
-        rank_text = (
-            f"🏆 {period_label}活动排行榜\n\n暂时没有任何活动记录，大家快去打卡吧！"
-        )
+        rank_text = f"🏆 {period_label}活动排行榜（{query_date}）\n\n暂时没有任何活动记录，大家快去打卡吧！"
 
     await message.answer(
         rank_text,
