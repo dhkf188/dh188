@@ -422,7 +422,7 @@ class MessageFormatter:
         if count >= max_times:
             message += f"\n🚨 警告：本次结束后，您今日的{MessageFormatter.format_copyable_text(activity)}次数将达到上限，请留意！"
 
-        message += f"\n💡提示：活动完成后请及时输入'回座'或点击'✅ 回座'按钮"
+        message += f"\n💡提示：活动完成后请及点击'✅ 回座'按钮"
 
         return message
 
@@ -3328,6 +3328,7 @@ async def handle_admin_panel_button(message: types.Message):
         "• /showpush - 显示推送设置状态\n"
         "• \n"
         "• /addactivity <活动名> <次数> <分钟> - 添加或修改活动\n"
+        "• /set <用户ID> <活动> <分钟> - 设置用户时间\n"
         "• /delactivity <活动名> - 删除活动\n"
         "• \n"
         "• /setworktime 9:00 18:00 - 设置上下班时间\n"
@@ -3338,28 +3339,25 @@ async def handle_admin_panel_button(message: types.Message):
         "• /reset_work 用户ID - 可以重置用户记录\n"
         "• /resetworktime - 重置为默认上下班时间\n"
         "• \n"
-        "• /set <用户ID> <活动> <分钟> - 设置用户时间\n"
-        "• /reset <用户ID> - 重置用户数据\n"
-        "• \n"
         "• /setresettime <小时> <分钟> - 设置每日重置时间\n"
-        "• /setworkfine <work_start|work_end> <时间段> <金额> - 设置上下班罚款\n"
+        "• /reset_status - 查看重置状态\n"
+        "• /reset <用户ID> - 重置用户数据\n"
         "• \n"
         "• /setfine <活动名> <时间段> <金额> - 设置活动罚款费率\n"
         "• /setfines_all <t1> <f1> [<t2> <f2> ...] - 为所有活动统一设置分段罚款\n"
+        "• /setworkfine <work_start|work_end> <时间段> <金额> - 设置上下班罚款\n"
         "• \n"
         "• /showsettings - 查看当前群设置\n"
-        "• /reset_status - 查看重置状态\n"
-        "• /reset_status - 查看重置状态\n"
         "• \n"
         "• /exportmonthly - 导出月度数据\n"
         "• /exportmonthly 2024 1 - 导出指定年月数据\n"
         "• /monthlyreport - 生成最近一个月报告\n"
         "• /monthlyreport <年> <月> - 生成指定年月报告\n"
         "• /export - 导出数据\n\n"
+        "• \n"
         "• /performance 查看性能\n"
         "• /refresh_keyboard - 强制刷新键盘显示新活动\n"
         "• /debug_work - 调试上下班功能状态\n"
-        "• \n"
     )
     await message.answer(admin_text, reply_markup=get_admin_keyboard())
 
@@ -4042,6 +4040,8 @@ async def export_and_push_csv(
             f"📊 群组：<b>{chat_title}</b>\n"
             f"📅 统计日期：<code>{(target_date.strftime('%Y-%m-%d') if target_date else get_beijing_time().strftime('%Y-%m-%d'))}</code>\n"
             f"⏰ 导出时间：<code>{get_beijing_time().strftime('%Y-%m-%d %H:%M:%S')}</code>"
+            f"{MessageFormatter.create_dashed_line()}\n"
+            f"💾 包含每个用户的所有活动统计和总计信息"
         )
 
         # 先把文件发回到当前 chat（可选）
