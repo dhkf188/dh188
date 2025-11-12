@@ -3881,19 +3881,30 @@ async def export_data(message: types.Message):
 
 
 # ==================== CSV导出推送功能优化 ====================
-# main.py - 安全修复 optimized_monthly_export
+# main.py - 优化月度导出方法
 async def optimized_monthly_export(chat_id: int, year: int, month: int):
-    """优化版月度数据导出 - 安全修复版"""
+    """优化版月度数据导出 - 稳定版本"""
     try:
-        # 获取活动配置
+        # 获取所有活动配置
         activity_limits = await db.get_activity_limits_cached()
+
+        # 🆕 定义所有需要的活动（确保顺序一致）
+        required_activities = ["吃饭", "小厕", "大厕", "抽烟", "休息"]
+
+        # 合并配置中的活动和必需活动
         activity_names = list(activity_limits.keys())
+        for act in required_activities:
+            if act not in activity_names:
+                activity_names.append(act)
+
+        # 按固定顺序排序
+        activity_names = sorted(activity_names)
 
         csv_buffer = StringIO()
         writer = csv.writer(csv_buffer)
 
-        # 构建表头
-        headers = ["用户ID", "用户昵称"]
+        # 🆕 完整表头
+        headers = ["用户ID", "用户昵称", "上班天数"]
 
         # 为每个活动添加次数和时长的列
         for act in activity_names:
@@ -3915,9 +3926,13 @@ async def optimized_monthly_export(chat_id: int, year: int, month: int):
 
         # 处理每个用户的数据
         for user_stat in monthly_stats:
-            row = [user_stat["user_id"], user_stat.get("nickname", "未知用户")]
+            row = [
+                user_stat["user_id"],
+                user_stat.get("nickname", "未知用户"),
+                user_stat.get("work_days", 0),  # 上班天数
+            ]
 
-            # 🆕 安全修复：添加空值保护
+            # 🆕 为每个活动添加次数和时长
             for act in activity_names:
                 activity_info = user_stat.get("activities", {}).get(act, {})
                 count = activity_info.get("count", 0)
@@ -3927,23 +3942,33 @@ async def optimized_monthly_export(chat_id: int, year: int, month: int):
                 row.append(count)
                 row.append(time_formatted)
 
-            # 🆕 安全修复：添加空值保护
+            # 🆕 添加总计信息
             row.extend(
                 [
-                    user_stat.get("total_count", 0),
-                    db.format_time_for_csv(user_stat.get("total_time", 0)),
-                    user_stat.get("total_fines", 0),
-                    user_stat.get("total_overtime_count", 0),
-                    db.format_time_for_csv(user_stat.get("total_overtime_time", 0)),
+                    user_stat.get("total_count", 0),  # 活动次数总计
+                    db.format_time_for_csv(
+                        user_stat.get("total_time", 0)
+                    ),  # 活动用时总计
+                    user_stat.get("total_fines", 0),  # 罚款总金额
+                    user_stat.get("total_overtime_count", 0),  # 超时次数
+                    db.format_time_for_csv(
+                        user_stat.get("total_overtime_time", 0)
+                    ),  # 总超时时间
                 ]
             )
 
             writer.writerow(row)
 
+        logger.info(
+            f"✅ 月度数据导出完成: {len(monthly_stats)} 个用户，{len(activity_names)} 个活动"
+        )
         return csv_buffer.getvalue()
 
     except Exception as e:
-        logger.error(f"❌ 月度导出优化版失败: {e}")
+        logger.error(f"❌ 月度导出失败: {e}")
+        import traceback
+
+        logger.error(f"❌ 详细错误: {traceback.format_exc()}")
         return None
 
 
