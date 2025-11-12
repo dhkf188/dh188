@@ -3282,6 +3282,8 @@ async def handle_my_record(message: types.Message):
     chat_id = message.chat.id
     uid = message.from_user.id
 
+    await reset_daily_data_if_needed(chat_id, uid)
+
     user_lock = get_user_lock(chat_id, uid)
     async with user_lock:
         await show_history(message)
@@ -3294,6 +3296,8 @@ async def handle_rank(message: types.Message):
     """处理排行榜按钮 - 优化版本"""
     chat_id = message.chat.id
     uid = message.from_user.id
+
+    await reset_daily_data_if_needed(chat_id, uid)
 
     user_lock = get_user_lock(chat_id, uid)
     async with user_lock:
@@ -3484,29 +3488,26 @@ async def show_history(message: types.Message):
     chat_id = message.chat.id
     uid = message.from_user.id
 
+    # 🆕 先检查并执行重置
+    await reset_daily_data_if_needed(chat_id, uid)
+
     async with OptimizedUserContext(chat_id, uid) as user:
         first_line = (
             f"👤 用户：{MessageFormatter.format_user_link(uid, user['nickname'])}"
         )
         text = f"{first_line}\n📊 今日记录：\n\n"
 
-        # 🆕 关键修复：检查用户最后更新时间，判断是否需要重置
-        await reset_daily_data_if_needed(chat_id, uid)
-
-        # 🆕 重新获取用户数据（重置后）
-        user = await db.get_user_cached(chat_id, uid)
-
         has_records = False
         activity_limits = await db.get_activity_limits_cached()
 
-        # 🆕 直接从 users 表获取今日统计，而不是从 user_activities
+        # 🆕 直接从 users 表获取统计，确保与重置同步
         total_time_all = user.get("total_accumulated_time", 0)
         total_count_all = user.get("total_activity_count", 0)
         total_fine = user.get("total_fines", 0)
         overtime_count = user.get("overtime_count", 0)
         total_overtime = user.get("total_overtime_time", 0)
 
-        # 🆕 显示每个活动的统计（从 users 表获取）
+        # 🆕 显示每个活动的统计
         for act in activity_limits.keys():
             # 获取用户今日该活动的次数
             current_count = await db.get_user_activity_count(chat_id, uid, act)
@@ -3543,12 +3544,15 @@ async def show_history(message: types.Message):
 
 # main.py - 修复 show_rank 方法
 async def show_rank(message: types.Message):
-    """显示排行榜（修复重置后问题）——使用 users 表当日统计"""
+    """显示排行榜（修复重置后问题）——确保显示重置后的数据"""
     chat_id = message.chat.id
     uid = message.from_user.id
 
     # 确保群组初始化
     await db.init_group(chat_id)
+
+    # 🆕 为当前用户检查重置
+    await reset_daily_data_if_needed(chat_id, uid)
 
     # 读取活动列表
     activity_limits = await db.get_activity_limits_cached()
@@ -3565,27 +3569,26 @@ async def show_rank(message: types.Message):
     rank_text = "🏆 今日活动排行榜\n\n"
     today = datetime.now().date()
 
-    # 🆕 关键修复：使用 users 表的当日统计，而不是 user_activities 历史记录
     async with db.pool.acquire() as conn:
         any_result = False
 
-        # 获取今日有活动的用户
-        active_users = await conn.fetch(
+        # 🆕 获取今日总时长排行（从users表）
+        total_rank = await conn.fetch(
             """
             SELECT user_id, nickname, total_accumulated_time, total_activity_count
             FROM users 
             WHERE chat_id = $1 AND last_updated = $2 AND total_activity_count > 0
             ORDER BY total_accumulated_time DESC
-            LIMIT 10
+            LIMIT 5
             """,
             chat_id,
             today,
         )
 
-        if active_users:
+        if total_rank:
             any_result = True
             rank_text += "📊 <b>今日总时长排行：</b>\n"
-            for i, user in enumerate(active_users, start=1):
+            for i, user in enumerate(total_rank, start=1):
                 user_id = user["user_id"]
                 name = user["nickname"] or str(user_id)
                 time_sec = user["total_accumulated_time"] or 0
@@ -3595,7 +3598,7 @@ async def show_rank(message: types.Message):
                 rank_text += f"  <code>{i}.</code> {MessageFormatter.format_user_link(user_id, name)} - <code>{time_str}</code> (<code>{count}</code>次)\n"
             rank_text += "\n"
 
-        # 按活动分类排行（可选显示）
+        # 🆕 按活动分类排行（从user_activities表查询当日数据）
         for act in activity_limits.keys():
             rows = await conn.fetch(
                 """
@@ -4313,6 +4316,7 @@ async def auto_daily_export_task():
         await asyncio.sleep(sleep_time)
 
 
+# main.py - 修复 daily_reset_task 方法
 async def daily_reset_task():
     """
     每日自动重置任务（重置 + 延迟导出昨日数据）- 修复版
@@ -4327,6 +4331,8 @@ async def daily_reset_task():
             logger.error(f"❌ 获取群组列表失败: {e}")
             await asyncio.sleep(60)
             continue
+
+        reset_executed = False
 
         for chat_id in all_groups:
             try:
@@ -4348,17 +4354,24 @@ async def daily_reset_task():
 
                     # 执行每日数据重置（带用户锁防并发）
                     group_members = await db.get_group_members(chat_id)
+                    reset_count = 0
+
                     for user_data in group_members:
                         user_lock = get_user_lock(chat_id, user_data["user_id"])
                         async with user_lock:
-                            # 🆕 关键修复：传递昨天的日期
-                            await db.reset_user_daily_data(
+                            # 🆕 关键修复：传递昨天的日期，执行完整重置
+                            success = await db.reset_user_daily_data(
                                 chat_id,
                                 user_data["user_id"],
                                 yesterday.date(),  # 🆕 传递昨天的日期
                             )
+                            if success:
+                                reset_count += 1
 
-                    logger.info(f"✅ 群组 {chat_id} 数据重置完成")
+                    logger.info(
+                        f"✅ 群组 {chat_id} 数据重置完成，重置了 {reset_count} 个用户"
+                    )
+                    reset_executed = True
 
                     # 启动延迟导出任务（默认30分钟）
                     asyncio.create_task(delayed_export(chat_id, 30))
@@ -4368,8 +4381,9 @@ async def daily_reset_task():
             except Exception as e:
                 logger.error(f"❌ 群组 {chat_id} 重置失败: {e}")
 
-        # 每分钟检查一次
-        await asyncio.sleep(60)
+        # 如果执行了重置，等待时间长一些避免重复执行
+        sleep_time = 120 if reset_executed else 60
+        await asyncio.sleep(sleep_time)
 
 
 async def delayed_export(chat_id: int, delay_minutes: int = 30):
