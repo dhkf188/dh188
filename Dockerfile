@@ -27,10 +27,10 @@ COPY . .
 EXPOSE 10000  
 
 
-# ✅ 修改：使用 render_deploy.py 作为启动文件
 # 清空缓存
-
+# ✅ 修改：使用 render_deploy.py 作为启动文件
 
 CMD ["python", "render_deploy.py"]
+
 
 
