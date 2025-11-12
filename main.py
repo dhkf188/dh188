@@ -3883,8 +3883,9 @@ async def export_data(message: types.Message):
 
 
 # ==================== CSV导出推送功能优化 ====================
+# main.py - 安全修复 optimized_monthly_export
 async def optimized_monthly_export(chat_id: int, year: int, month: int):
-    """优化版月度数据导出，每个用户一行，活动横向排列"""
+    """优化版月度数据导出 - 安全修复版"""
     try:
         # 获取活动配置
         activity_limits = await db.get_activity_limits_cached()
@@ -3907,28 +3908,28 @@ async def optimized_monthly_export(chat_id: int, year: int, month: int):
 
         writer.writerow(headers)
 
-        # 使用现有的月度统计方法
-        monthly_stats = await db.get_monthly_statistics(chat_id, year, month)
+        # 使用修复后的月度统计方法
+        monthly_stats = await db.get_monthly_statistics_horizontal(chat_id, year, month)
 
         if not monthly_stats:
+            logger.info(f"⚠️ 群组 {chat_id} {year}年{month}月没有数据需要导出")
             return None
 
         # 处理每个用户的数据
         for user_stat in monthly_stats:
             row = [user_stat["user_id"], user_stat.get("nickname", "未知用户")]
 
-            # 添加每个活动的次数和时长
+            # 🆕 安全修复：添加空值保护
             for act in activity_names:
-                activity_info = user_stat["activities"].get(act, {})
+                activity_info = user_stat.get("activities", {}).get(act, {})
                 count = activity_info.get("count", 0)
                 time_seconds = activity_info.get("time", 0)
-                # 使用数据库的格式化方法
                 time_formatted = db.format_time_for_csv(time_seconds)
 
                 row.append(count)
                 row.append(time_formatted)
 
-            # 添加总计信息 - 使用正确的字段名
+            # 🆕 安全修复：添加空值保护
             row.extend(
                 [
                     user_stat.get("total_count", 0),
@@ -4246,11 +4247,10 @@ async def export_data_before_reset(chat_id: int):
 
 
 # ==================== 自动导出与每日重置任务（最终整合版） ====================
-
-
+# main.py - 修复 auto_daily_export_task
 async def auto_daily_export_task():
     """
-    每日重置前自动导出群组数据（重置前 1 分钟导出）
+    每日重置前自动导出群组数据（重置前 1 分钟导出）- 修复版
     """
     while True:
         now = get_beijing_time()
@@ -4285,25 +4285,50 @@ async def auto_daily_export_task():
                 reset_hour = group_data.get("reset_hour", Config.DAILY_RESET_HOUR)
                 reset_minute = group_data.get("reset_minute", Config.DAILY_RESET_MINUTE)
 
-                # 计算目标时间（重置前1分钟）
-                target_time = (reset_hour * 60 + reset_minute - 1) % (24 * 60)
-                now_minutes = now.hour * 60 + now.minute
+                # 🆕 修复：正确计算重置前1分钟的时间
+                reset_time_today = now.replace(
+                    hour=reset_hour, minute=reset_minute, second=0, microsecond=0
+                )
 
-                if now_minutes == target_time:
-                    logger.info(f"📤 到达重置前导出时间，导出群组 {chat_id} 数据中...")
+                # 计算重置前1分钟的时间点
+                pre_reset_time = reset_time_today - timedelta(minutes=1)
 
-                    file_name = (
-                        f"group_{chat_id}_pre_reset_{now.strftime('%Y%m%d')}.csv"
+                # 🆕 修复：检查当前时间是否在重置前1分钟的时间窗口内（前后30秒）
+                time_diff = abs((now - pre_reset_time).total_seconds())
+
+                if time_diff <= 30:  # 30秒时间窗口
+                    logger.info(
+                        f"📤 到达重置前导出时间，导出群组 {chat_id} 昨日数据中..."
                     )
-                    await asyncio.wait_for(
-                        export_and_push_csv(
-                            chat_id, to_admin_if_no_group=True, file_name=file_name
-                        ),
-                        timeout=30,
-                    )
 
-                    logger.info(f"✅ 群组 {chat_id} 导出成功（重置前）")
-                    export_executed = True
+                    # 🆕 修复：计算正确的昨日日期
+                    if now < reset_time_today:
+                        # 当前时间在重置时间之前，昨日就是今天的前一天
+                        target_date = (now - timedelta(days=1)).date()
+                    else:
+                        # 当前时间在重置时间之后，昨日就是今天
+                        target_date = now.date()
+
+                    file_name = f"group_{chat_id}_pre_reset_{target_date.strftime('%Y%m%d')}.csv"
+
+                    try:
+                        await asyncio.wait_for(
+                            export_and_push_csv(
+                                chat_id,
+                                to_admin_if_no_group=True,
+                                file_name=file_name,
+                                target_date=target_date,  # 🆕 传递正确的目标日期
+                            ),
+                            timeout=60,  # 增加超时时间
+                        )
+                        logger.info(
+                            f"✅ 群组 {chat_id} 重置前导出成功，日期: {target_date}"
+                        )
+                        export_executed = True
+                    except asyncio.TimeoutError:
+                        logger.warning(f"⏰ 群组 {chat_id} 重置前导出超时")
+                    except Exception as e:
+                        logger.error(f"❌ 群组 {chat_id} 重置前导出失败: {e}")
 
             except asyncio.TimeoutError:
                 logger.warning(f"⏰ 群组 {chat_id} 导出或查询超时，跳过此群。")
@@ -4386,36 +4411,51 @@ async def daily_reset_task():
         await asyncio.sleep(sleep_time)
 
 
+# main.py - 修复 delayed_export
 async def delayed_export(chat_id: int, delay_minutes: int = 30):
     """
     在每日重置后延迟导出昨日数据 - 修复版
     """
     try:
-        logger.info(f"⏳ 群组 {chat_id} 将在 {delay_minutes} 分钟后导出昨日数据...")
+        logger.info(f"⏳ 群组 {chat_id} 将在 {delay_minutes} 分钟后导出重置前的数据...")
+
         # 延迟执行
         await asyncio.sleep(delay_minutes * 60)
 
-        # 🆕 关键修复：明确获取昨天的日期
-        yesterday_dt = get_beijing_time() - timedelta(days=1)
-        yesterday_date = yesterday_dt.date()
+        now = get_beijing_time()
 
-        # 生成文件名（用昨日日期）
-        file_name = f"group_{chat_id}_statistics_{yesterday_dt.strftime('%Y%m%d')}.csv"
+        # 🆕 修复：获取群组的重置时间配置
+        group_data = await db.get_group_cached(chat_id)
+        reset_hour = group_data.get("reset_hour", Config.DAILY_RESET_HOUR)
+        reset_minute = group_data.get("reset_minute", Config.DAILY_RESET_MINUTE)
 
-        # ✅ 关键修改：传入 target_date=yesterday_date
+        # 🆕 修复：计算重置时的"昨日"日期
+        reset_time_today = now.replace(hour=reset_hour, minute=reset_minute, second=0)
+
+        if now.hour >= reset_hour and now.minute >= reset_minute:
+            # 当前时间在重置时间之后，重置的是今天的数据
+            target_date = now.date()
+        else:
+            # 当前时间在重置时间之前，重置的是昨天的数据
+            target_date = (now - timedelta(days=1)).date()
+
+        # 生成文件名（用重置前的日期）
+        file_name = f"group_{chat_id}_post_reset_{target_date.strftime('%Y%m%d')}.csv"
+
+        # 🆕 修复：导出重置前的数据
         await export_and_push_csv(
             chat_id,
             to_admin_if_no_group=True,
             file_name=file_name,
-            target_date=yesterday_date,  # 明确传递昨天日期
+            target_date=target_date,  # 传递重置前的日期
         )
 
-        logger.info(f"✅ 群组 {chat_id} 昨日({yesterday_date}) 数据导出并推送完成")
+        logger.info(f"✅ 群组 {chat_id} 重置后数据导出完成，日期: {target_date}")
 
     except asyncio.TimeoutError:
         logger.warning(f"⏰ 群组 {chat_id} 延迟导出超时")
     except Exception as e:
-        logger.error(f"❌ 群组 {chat_id} 延迟导出昨日数据失败: {e}", exc_info=True)
+        logger.error(f"❌ 群组 {chat_id} 延迟导出重置前数据失败: {e}", exc_info=True)
 
 
 # ==================== 活动状态恢复功能 ====================
