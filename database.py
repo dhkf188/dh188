@@ -677,7 +677,7 @@ class PostgreSQLDatabase:
     async def get_user_activity_count(
         self, chat_id: int, user_id: int, activity: str
     ) -> int:
-        """获取用户今日活动次数"""
+        """获取用户今日活动次数 - 修复版本"""
         today = datetime.now().date()
         async with self.pool.acquire() as conn:
             row = await conn.fetchrow(
@@ -694,7 +694,7 @@ class PostgreSQLDatabase:
     async def get_user_activity_time(
         self, chat_id: int, user_id: int, activity: str
     ) -> int:
-        """获取用户今日活动累计时间"""
+        """获取用户今日活动累计时间 - 修复版本"""
         today = datetime.now().date()
         async with self.pool.acquire() as conn:
             row = await conn.fetchrow(
@@ -704,7 +704,11 @@ class PostgreSQLDatabase:
                 today,
                 activity,
             )
-            return row["accumulated_time"] if row else 0
+            time_seconds = row["accumulated_time"] if row else 0
+            logger.debug(
+                f"📊 获取活动时间: 用户{user_id} 活动{activity} 时间{time_seconds}秒"
+            )
+            return time_seconds
 
     async def get_user_all_activities(
         self, chat_id: int, user_id: int
