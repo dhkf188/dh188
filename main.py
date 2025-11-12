@@ -3475,8 +3475,9 @@ async def handle_other_text_messages(message: types.Message):
 
 
 # ==================== 用户功能优化 ====================
+# main.py - 修复 show_history 方法
 async def show_history(message: types.Message):
-    """显示用户历史记录 - 优化版本"""
+    """显示用户历史记录 - 修复重置后数据问题"""
     chat_id = message.chat.id
     uid = message.from_user.id
 
@@ -3488,6 +3489,8 @@ async def show_history(message: types.Message):
 
         has_records = False
         activity_limits = await db.get_activity_limits_cached()
+
+        # 🆕 直接从 user_activities 获取今日数据，不依赖 users 表的统计字段
         user_activities = await db.get_user_all_activities(chat_id, uid)
 
         for act in activity_limits.keys():
@@ -3501,8 +3504,15 @@ async def show_history(message: types.Message):
                 text += f"• <code>{act}</code>：<code>{time_str}</code>，次数：<code>{count}</code>/<code>{max_times}</code> {status}\n"
                 has_records = True
 
-        total_time_all = user.get("total_accumulated_time", 0)
-        total_count_all = user.get("total_activity_count", 0)
+        # 🆕 从 user_activities 重新计算今日总统计
+        total_time_all = sum(
+            activity.get("time", 0) for activity in user_activities.values()
+        )
+        total_count_all = sum(
+            activity.get("count", 0) for activity in user_activities.values()
+        )
+
+        # 其他统计从 users 表获取（这些字段在重置时会被清零）
         total_fine = user.get("total_fines", 0)
         overtime_count = user.get("overtime_count", 0)
         total_overtime = user.get("total_overtime_time", 0)
@@ -3528,6 +3538,7 @@ async def show_history(message: types.Message):
         )
 
 
+# main.py - 修复 show_rank 方法
 async def show_rank(message: types.Message):
     """显示排行榜（修复版）——直接从 user_activities 聚合当天数据，避免依赖 last_updated"""
     chat_id = message.chat.id
@@ -3575,7 +3586,7 @@ async def show_rank(message: types.Message):
             )
 
             if not rows:
-                # 跳过没有数据的活动（也可以显示“暂无记录”）
+                # 跳过没有数据的活动（也可以显示"暂无记录"）
                 continue
 
             any_result = True
