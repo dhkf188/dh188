@@ -497,16 +497,14 @@ class PostgreSQLDatabase:
         fine_amount: int = 0,
         is_overtime: bool = False,
     ):
-        """完成用户活动 - 修复计数问题版本"""
+        """完成用户活动 - 确保同时更新 users 表和 user_activities 表"""
         today = datetime.now().date()
 
-        logger.info(
-            f"🔍 [数据库操作开始] 用户{user_id} 活动{activity} 时长{elapsed_time}s"
-        )
+        logger.info(f"🔍 [完成活动] 用户{user_id} 活动{activity} 时长{elapsed_time}s")
 
         async with self.pool.acquire() as conn:
             async with conn.transaction():
-                # 确保用户记录存在并更新日期
+                # 1. ✅ 确保用户记录存在
                 await conn.execute(
                     """
                     INSERT INTO users (chat_id, user_id, last_updated) 
@@ -519,7 +517,7 @@ class PostgreSQLDatabase:
                     today,
                 )
 
-                # 使用 ON CONFLICT 原子更新活动计数
+                # 2. ✅ 写入 user_activities 表（永久记录，用于月度统计）
                 await conn.execute(
                     """
                     INSERT INTO user_activities 
@@ -538,7 +536,7 @@ class PostgreSQLDatabase:
                     elapsed_time,
                 )
 
-                # 更新用户总体统计
+                # 3. ✅ 更新 users 表的累计数据（用于实时查询）
                 update_fields = [
                     "total_accumulated_time = total_accumulated_time + $1",
                     "total_activity_count = total_activity_count + 1",
@@ -570,15 +568,15 @@ class PostgreSQLDatabase:
 
             self._cache.pop(f"user:{chat_id}:{user_id}", None)
 
-        logger.info(f"🔍 [数据库操作完成] 用户{user_id} 活动{activity} 完成更新")
+        logger.info(f"✅ [完成活动] 用户{user_id} 活动{activity} 已更新两个表")
 
     # database.py - 修改 reset_user_daily_data 方法
     async def reset_user_daily_data(
         self, chat_id: int, user_id: int, target_date: date | None = None
     ):
         """
-        ✅ 完整重置版：重置用户每日数据，包括 user_activities 表的当日记录
-        保留历史记录（非当日记录），确保"我的记录"和"排行榜"正确重置
+        ✅ 彻底修复版：只重置 users 表的统计字段，完全保留 user_activities 表
+        确保月度统计和历史数据完整无缺
         """
         try:
             # 验证和设置目标日期
@@ -592,37 +590,19 @@ class PostgreSQLDatabase:
             # 获取重置前的用户状态（用于日志）
             user_before = await self.get_user(chat_id, user_id)
 
-            # 🆕 计算新的日期（重置后的日期）
-            new_date = target_date
-            # 如果是重置昨天的数据，那么新的日期应该是今天
-            if target_date < datetime.now().date():
-                new_date = datetime.now().date()
+            # 🆕 检查 user_activities 表中今日是否有数据（用于验证）
+            today_activities_count = 0
+            async with self.pool.acquire() as conn:
+                today_activities_count = await conn.fetchval(
+                    "SELECT COUNT(*) FROM user_activities WHERE chat_id = $1 AND user_id = $2 AND activity_date = $3",
+                    chat_id,
+                    user_id,
+                    target_date,
+                )
 
             async with self.pool.acquire() as conn:
                 async with conn.transaction():
-                    # 🆕 关键修改：删除 user_activities 表的当日记录
-                    await conn.execute(
-                        """
-                        DELETE FROM user_activities 
-                        WHERE chat_id = $1 AND user_id = $2 AND activity_date = $3
-                        """,
-                        chat_id,
-                        user_id,
-                        new_date,
-                    )
-
-                    # 🆕 关键修改：删除 work_records 表的当日记录（如果需要）
-                    await conn.execute(
-                        """
-                        DELETE FROM work_records 
-                        WHERE chat_id = $1 AND user_id = $2 AND record_date = $3
-                        """,
-                        chat_id,
-                        user_id,
-                        new_date,
-                    )
-
-                    # 3. 重置用户统计数据和状态
+                    # 🆕 关键修复：只重置 users 表的统计字段，不删除任何记录
                     await conn.execute(
                         """
                         UPDATE users SET
@@ -639,14 +619,20 @@ class PostgreSQLDatabase:
                         """,
                         chat_id,
                         user_id,
-                        new_date,
+                        target_date,
                     )
 
-            # 4. 清理相关缓存
+                    # 🆕 可选：重置当日的上下班记录（根据业务需求决定）
+                    # 如果不需要保留当日的上下班记录，可以取消注释
+                    # work_records_deleted = await conn.execute(
+                    #     "DELETE FROM work_records WHERE chat_id = $1 AND user_id = $2 AND record_date = $3",
+                    #     chat_id, user_id, target_date
+                    # )
+
+            # 清理相关缓存
             cache_keys = [
                 f"user:{chat_id}:{user_id}",
                 f"group:{chat_id}",
-                "activity_limits",
             ]
             for key in cache_keys:
                 self._cache.pop(key, None)
@@ -654,10 +640,11 @@ class PostgreSQLDatabase:
 
             # 记录详细的重置日志
             logger.info(
-                f"✅ 完整数据重置完成: 用户 {user_id} (群组 {chat_id})\n"
-                f"   📅 重置日期: {target_date} → {new_date}\n"
-                f"   💾 历史记录: 已保留（除当日记录外）\n"
-                f"   🗑️  清理内容: user_activities和work_records的当日记录\n"
+                f"✅ 安全数据重置完成: 用户 {user_id} (群组 {chat_id})\n"
+                f"   📅 重置日期: {target_date}\n"
+                f"   💾 历史记录: 完整保留(user_activities表有{today_activities_count}条记录)\n"
+                f"   🔄 重置内容: users表统计字段归零\n"
+                f"   🗑️  清理内容: 无记录被删除\n"
                 f"   📊 重置前状态:\n"
                 f"       - 活动次数: {user_before.get('total_activity_count', 0) if user_before else 0}\n"
                 f"       - 累计时长: {user_before.get('total_accumulated_time', 0) if user_before else 0}秒\n"
@@ -701,17 +688,22 @@ class PostgreSQLDatabase:
     async def get_user_activity_count(
         self, chat_id: int, user_id: int, activity: str
     ) -> int:
-        """获取用户今日活动次数 - 必须基于user_activities表"""
+        """获取用户今日特定活动次数 - 从user_activities表读取"""
         today = datetime.now().date()
         async with self.pool.acquire() as conn:
             row = await conn.fetchrow(
-                "SELECT activity_count FROM user_activities WHERE chat_id = $1 AND user_id = $2 AND activity_date = $3 AND activity_name = $4",
+                """
+                SELECT activity_count 
+                FROM user_activities 
+                WHERE chat_id = $1 AND user_id = $2 AND activity_date = $3 AND activity_name = $4
+                """,
                 chat_id,
                 user_id,
                 today,
                 activity,
             )
             count = row["activity_count"] if row else 0
+            logger.debug(f"🔍 活动次数查询: {chat_id}-{user_id}-{activity} = {count}")
             return count
 
     async def get_user_activity_time(
@@ -1292,11 +1284,11 @@ class PostgreSQLDatabase:
                     OR SUM(COALESCE(ua.activity_count, 0)) > 0
                 ORDER BY total_time DESC
             """,
-                chat_id,      # $1
-                start_date,   # $2
-                end_date,     # $3
-                start_date,   # $4 (子查询用)
-                end_date,     # $5 (子查询用)
+                chat_id,  # $1
+                start_date,  # $2
+                end_date,  # $3
+                start_date,  # $4 (子查询用)
+                end_date,  # $5 (子查询用)
             )
 
             result = []
