@@ -701,7 +701,7 @@ class PostgreSQLDatabase:
     async def get_user_activity_count(
         self, chat_id: int, user_id: int, activity: str
     ) -> int:
-        """获取用户今日活动次数 - 修复版本"""
+        """获取用户今日活动次数 - 必须基于user_activities表"""
         today = datetime.now().date()
         async with self.pool.acquire() as conn:
             row = await conn.fetchrow(
@@ -712,13 +712,12 @@ class PostgreSQLDatabase:
                 activity,
             )
             count = row["activity_count"] if row else 0
-            logger.debug(f"📊 获取活动计数: 用户{user_id} 活动{activity} 计数{count}")
             return count
 
     async def get_user_activity_time(
         self, chat_id: int, user_id: int, activity: str
     ) -> int:
-        """获取用户今日活动累计时间 - 修复版本"""
+        """获取用户今日活动累计时间 - 必须基于user_activities表"""
         today = datetime.now().date()
         async with self.pool.acquire() as conn:
             row = await conn.fetchrow(
@@ -729,9 +728,6 @@ class PostgreSQLDatabase:
                 activity,
             )
             time_seconds = row["accumulated_time"] if row else 0
-            logger.debug(
-                f"📊 获取活动时间: 用户{user_id} 活动{activity} 时间{time_seconds}秒"
-            )
             return time_seconds
 
     async def get_user_all_activities(
@@ -1273,8 +1269,9 @@ class PostgreSQLDatabase:
             end_date = date(year, month + 1, 1)
 
         async with self.pool.acquire() as conn:
-            # 🆕 修复：使用不同的参数占位符避免冲突
-            monthly_stats = await conn.fetch("""
+            # 🆕 修复：使用不同的参数占位符，避免子查询冲突
+            monthly_stats = await conn.fetch(
+                """
                 SELECT 
                     ua.user_id,
                     COALESCE(u.nickname, '用户' || ua.user_id::TEXT) as nickname,
@@ -1284,17 +1281,23 @@ class PostgreSQLDatabase:
                         SELECT SUM(fine_amount) 
                         FROM work_records wr 
                         WHERE wr.chat_id = ua.chat_id AND wr.user_id = ua.user_id 
-                        AND wr.record_date >= $1 AND wr.record_date < $2
+                        AND wr.record_date >= $4 AND wr.record_date < $5  
                     ), 0) as total_fines
                 FROM user_activities ua
                 LEFT JOIN users u ON ua.chat_id = u.chat_id AND ua.user_id = u.user_id
-                WHERE ua.chat_id = $3
-                    AND ua.activity_date >= $1 AND ua.activity_date < $2
+                WHERE ua.chat_id = $1
+                    AND ua.activity_date >= $2 AND ua.activity_date < $3  
                 GROUP BY ua.user_id, u.nickname, ua.chat_id
                 HAVING SUM(COALESCE(ua.accumulated_time, 0)) > 0 
                     OR SUM(COALESCE(ua.activity_count, 0)) > 0
                 ORDER BY total_time DESC
-            """, start_date, end_date, chat_id)
+            """,
+                chat_id,      # $1
+                start_date,   # $2
+                end_date,     # $3
+                start_date,   # $4 (子查询用)
+                end_date,     # $5 (子查询用)
+            )
 
             result = []
             for stat in monthly_stats:
@@ -1317,7 +1320,6 @@ class PostgreSQLDatabase:
                     WHERE chat_id = $1 AND user_id = $2 
                         AND activity_date >= $3 AND activity_date < $4
                     GROUP BY activity_name
-                    -- 🆕 移除：HAVING SUM(activity_count) > 0
                     """,
                     chat_id,
                     user_data["user_id"],
