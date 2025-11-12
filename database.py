@@ -1517,31 +1517,35 @@ class PostgreSQLDatabase:
     async def get_monthly_statistics_horizontal(
         self, chat_id: int, year: int, month: int
     ):
-        """获取月度统计数据 - 横向格式专用（安全修复版）"""
+        """获取月度统计数据 - 横向格式专用（最终安全修复版）"""
         from datetime import date
 
+        # ✅ 安全计算下个月日期（跨年自动处理）
+        if month == 12:
+            end_date = date(year + 1, 1, 1)
+        else:
+            end_date = date(year, month + 1, 1)
         start_date = date(year, month, 1)
-        end_date = date(year + (month // 12), (month % 12) + 1, 1)
 
         async with self.pool.acquire() as conn:
-            # ✅ 修复 join 条件 + 使用正确字段
+            # ✅ 修复 join 条件 + GROUP BY 错误 + 字段命名统一
             user_stats = await conn.fetch(
                 """
                 SELECT 
                     u.user_id,
                     u.nickname,
-                    COALESCE(SUM(ua.accumulated_time), 0) as total_time,
-                    COALESCE(SUM(ua.activity_count), 0) as total_count,
+                    COALESCE(SUM(ua.accumulated_time), 0) AS total_time,
+                    COALESCE(SUM(ua.activity_count), 0) AS total_count,
                     COALESCE((
-                        SELECT SUM(fine_amount) 
-                        FROM work_records wr 
-                        WHERE wr.chat_id = u.chat_id 
-                        AND wr.user_id = u.user_id 
-                        AND wr.record_date >= $1 
+                        SELECT SUM(fine_amount)
+                        FROM work_records wr
+                        WHERE wr.chat_id = u.chat_id
+                        AND wr.user_id = u.user_id
+                        AND wr.record_date >= $1
                         AND wr.record_date < $2
-                    ), 0) as total_fines,
-                    COALESCE(u.overtime_count, 0) as total_overtime_count,
-                    COALESCE(u.total_overtime_time, 0) as total_overtime_time
+                    ), 0) AS total_fines,
+                    COALESCE(u.overtime_count, 0) AS total_overtime_count,
+                    COALESCE(u.total_overtime_time, 0) AS total_overtime_time
                 FROM users u
                 LEFT JOIN user_activities ua 
                 ON u.chat_id = ua.chat_id 
@@ -1549,7 +1553,13 @@ class PostgreSQLDatabase:
                 AND ua.activity_date >= $1 
                 AND ua.activity_date < $2
                 WHERE u.chat_id = $3
-                GROUP BY u.user_id, u.nickname, u.overtime_count, u.total_overtime_time
+                GROUP BY 
+                    u.chat_id, 
+                    u.user_id, 
+                    u.nickname, 
+                    u.overtime_count, 
+                    u.total_overtime_time
+                ORDER BY total_time DESC
                 """,
                 start_date,
                 end_date,
@@ -1560,18 +1570,20 @@ class PostgreSQLDatabase:
             for stat in user_stats:
                 user_data = dict(stat)
 
-                # ✅ 同步活动详情
+                # ✅ 获取用户当月各活动详情
                 activity_details = await conn.fetch(
                     """
                     SELECT 
                         activity_name,
-                        SUM(activity_count) as activity_count,
-                        SUM(accumulated_time) as accumulated_time
+                        SUM(activity_count) AS activity_count,
+                        SUM(accumulated_time) AS accumulated_time
                     FROM user_activities
-                    WHERE chat_id = $1 AND user_id = $2 
+                    WHERE chat_id = $1 
+                    AND user_id = $2 
                     AND activity_date >= $3 
                     AND activity_date < $4
                     GROUP BY activity_name
+                    ORDER BY activity_name
                     """,
                     chat_id,
                     user_data["user_id"],
@@ -1579,6 +1591,7 @@ class PostgreSQLDatabase:
                     end_date,
                 )
 
+                # ✅ 组织活动数据
                 user_data["activities"] = {}
                 for row in activity_details:
                     activity_time = row["accumulated_time"] or 0
