@@ -636,6 +636,7 @@ async def calculate_work_fine(checkin_type: str, late_minutes: float) -> int:
     return applicable_fine
 
 
+# main.py - 确保 reset_daily_data_if_needed 正确执行
 async def reset_daily_data_if_needed(chat_id: int, uid: int):
     """
     🎯 精确版每日数据重置 - 基于管理员设定的重置时间点
@@ -1200,6 +1201,8 @@ async def start_activity(message: types.Message, act: str):
     """优化的开始活动"""
     chat_id = message.chat.id
     uid = message.from_user.id
+
+    await reset_daily_data_if_needed(chat_id, uid)
 
     user_lock = get_user_lock(chat_id, uid)
     async with user_lock:
@@ -3487,35 +3490,35 @@ async def show_history(message: types.Message):
         )
         text = f"{first_line}\n📊 今日记录：\n\n"
 
+        # 🆕 关键修复：检查用户最后更新时间，判断是否需要重置
+        await reset_daily_data_if_needed(chat_id, uid)
+
+        # 🆕 重新获取用户数据（重置后）
+        user = await db.get_user_cached(chat_id, uid)
+
         has_records = False
         activity_limits = await db.get_activity_limits_cached()
 
-        # 🆕 直接从 user_activities 获取今日数据，不依赖 users 表的统计字段
-        user_activities = await db.get_user_all_activities(chat_id, uid)
-
-        for act in activity_limits.keys():
-            activity_info = user_activities.get(act, {})
-            total_time = activity_info.get("time", 0)
-            count = activity_info.get("count", 0)
-            max_times = activity_limits[act]["max_times"]
-            if total_time > 0 or count > 0:
-                status = "✅" if count < max_times else "❌"
-                time_str = MessageFormatter.format_time(int(total_time))
-                text += f"• <code>{act}</code>：<code>{time_str}</code>，次数：<code>{count}</code>/<code>{max_times}</code> {status}\n"
-                has_records = True
-
-        # 🆕 从 user_activities 重新计算今日总统计
-        total_time_all = sum(
-            activity.get("time", 0) for activity in user_activities.values()
-        )
-        total_count_all = sum(
-            activity.get("count", 0) for activity in user_activities.values()
-        )
-
-        # 其他统计从 users 表获取（这些字段在重置时会被清零）
+        # 🆕 直接从 users 表获取今日统计，而不是从 user_activities
+        total_time_all = user.get("total_accumulated_time", 0)
+        total_count_all = user.get("total_activity_count", 0)
         total_fine = user.get("total_fines", 0)
         overtime_count = user.get("overtime_count", 0)
         total_overtime = user.get("total_overtime_time", 0)
+
+        # 🆕 显示每个活动的统计（从 users 表获取）
+        for act in activity_limits.keys():
+            # 获取用户今日该活动的次数
+            current_count = await db.get_user_activity_count(chat_id, uid, act)
+            # 获取用户今日该活动的累计时间
+            activity_time = await db.get_user_activity_time(chat_id, uid, act)
+            max_times = activity_limits[act]["max_times"]
+
+            if activity_time > 0 or current_count > 0:
+                status = "✅" if current_count < max_times else "❌"
+                time_str = MessageFormatter.format_time(int(activity_time))
+                text += f"• <code>{act}</code>：<code>{time_str}</code>，次数：<code>{current_count}</code>/<code>{max_times}</code> {status}\n"
+                has_records = True
 
         text += f"\n📈 今日总统计：\n"
         text += f"• 总累计时间：<code>{MessageFormatter.format_time(int(total_time_all))}</code>\n"
@@ -3527,7 +3530,7 @@ async def show_history(message: types.Message):
             text += f"• 累计罚款：<code>{total_fine}</code> 元"
 
         if not has_records and total_count_all == 0:
-            text += "暂无记录，请先进行打卡活动"
+            text += "\n\n📝 暂无今日活动记录，快去打卡吧！"
 
         await message.answer(
             text,
@@ -3540,14 +3543,14 @@ async def show_history(message: types.Message):
 
 # main.py - 修复 show_rank 方法
 async def show_rank(message: types.Message):
-    """显示排行榜（修复版）——直接从 user_activities 聚合当天数据，避免依赖 last_updated"""
+    """显示排行榜（修复重置后问题）——使用 users 表当日统计"""
     chat_id = message.chat.id
     uid = message.from_user.id
 
-    # 确保群组初始化（如果你 init_group 有副作用）
+    # 确保群组初始化
     await db.init_group(chat_id)
 
-    # 读取活动列表（带缓存）
+    # 读取活动列表
     activity_limits = await db.get_activity_limits_cached()
     if not activity_limits:
         await message.answer(
@@ -3562,56 +3565,71 @@ async def show_rank(message: types.Message):
     rank_text = "🏆 今日活动排行榜\n\n"
     today = datetime.now().date()
 
-    # 为避免大量单次连接开销，我们直接用连接一次性查询每个活动的 TopN
-    top_n = 3
+    # 🆕 关键修复：使用 users 表的当日统计，而不是 user_activities 历史记录
     async with db.pool.acquire() as conn:
         any_result = False
+
+        # 获取今日有活动的用户
+        active_users = await conn.fetch(
+            """
+            SELECT user_id, nickname, total_accumulated_time, total_activity_count
+            FROM users 
+            WHERE chat_id = $1 AND last_updated = $2 AND total_activity_count > 0
+            ORDER BY total_accumulated_time DESC
+            LIMIT 10
+            """,
+            chat_id,
+            today,
+        )
+
+        if active_users:
+            any_result = True
+            rank_text += "📊 <b>今日总时长排行：</b>\n"
+            for i, user in enumerate(active_users, start=1):
+                user_id = user["user_id"]
+                name = user["nickname"] or str(user_id)
+                time_sec = user["total_accumulated_time"] or 0
+                count = user["total_activity_count"] or 0
+
+                time_str = MessageFormatter.format_time(int(time_sec))
+                rank_text += f"  <code>{i}.</code> {MessageFormatter.format_user_link(user_id, name)} - <code>{time_str}</code> (<code>{count}</code>次)\n"
+            rank_text += "\n"
+
+        # 按活动分类排行（可选显示）
         for act in activity_limits.keys():
             rows = await conn.fetch(
                 """
-                SELECT
+                SELECT 
                     u.user_id,
                     u.nickname,
-                    ua.accumulated_time as total_time
+                    ua.accumulated_time as total_time,
+                    ua.activity_count as activity_count
                 FROM user_activities ua
                 JOIN users u ON ua.chat_id = u.chat_id AND ua.user_id = u.user_id
                 WHERE ua.chat_id = $1 AND ua.activity_name = $2 AND ua.activity_date = $3
                 ORDER BY ua.accumulated_time DESC
-                LIMIT $4
+                LIMIT 3
                 """,
                 chat_id,
                 act,
                 today,
-                top_n,
             )
 
-            if not rows:
-                # 跳过没有数据的活动（也可以显示"暂无记录"）
-                continue
+            if rows:
+                any_result = True
+                rank_text += f"📈 <code>{act}</code>：\n"
+                for i, row in enumerate(rows, start=1):
+                    user_id = row["user_id"]
+                    name = row["nickname"] or str(user_id)
+                    time_sec = row["total_time"] or 0
+                    count = row["activity_count"] or 0
 
-            any_result = True
-            rank_text += f"📈 <code>{act}</code>：\n"
-            for i, row in enumerate(rows, start=1):
-                user_id = row["user_id"]
-                name = row["nickname"] or str(user_id)
-                time_sec = row["total_time"] or 0
-                # 你的 MessageFormatter.format_time / format_seconds_to_hms 根据项目定义来用
-                # 这里尽量使用项目里已有的工具：
-                try:
                     time_str = MessageFormatter.format_time(int(time_sec))
-                except Exception:
-                    # 兜底格式化为秒->时分秒
-                    time_str = (
-                        db.format_seconds_to_hms(int(time_sec))
-                        if hasattr(db, "format_seconds_to_hms")
-                        else f"{int(time_sec)}s"
-                    )
-
-                rank_text += f"  <code>{i}.</code> {MessageFormatter.format_user_link(user_id, name)} - <code>{time_str}</code>\n"
-            rank_text += "\n"
+                    rank_text += f"  <code>{i}.</code> {MessageFormatter.format_user_link(user_id, name)} - <code>{time_str}</code> (<code>{count}</code>次)\n"
+                rank_text += "\n"
 
     if not any_result:
-        rank_text = "🏆 今日活动排行榜\n\n暂时没有任何活动记录，大家快去打卡吧！"
+        rank_text = "🏆 今日活动排行榜\n\n📝 暂时没有任何活动记录，大家快去打卡吧！"
 
     await message.answer(
         rank_text,
