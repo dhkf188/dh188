@@ -1517,60 +1517,146 @@ class PostgreSQLDatabase:
     async def get_monthly_statistics_horizontal(
         self, chat_id: int, year: int, month: int
     ):
-        """获取月度统计数据 - 横向格式专用（最终安全修复版）"""
-        from datetime import date
+        """获取月度统计数据 - 修复分组问题 & 稳定版本"""
 
-        # ✅ 安全计算下个月日期（跨年自动处理）
-        if month == 12:
-            end_date = date(year + 1, 1, 1)
-        else:
-            end_date = date(year, month + 1, 1)
         start_date = date(year, month, 1)
+        end_date = date(year + (month // 12), (month % 12) + 1, 1)
 
         async with self.pool.acquire() as conn:
-            # ✅ 修复 join 条件 + GROUP BY 错误 + 字段命名统一
-            user_stats = await conn.fetch(
+            # ✅ 获取本月有活动或打卡记录的所有用户
+            base_users = await conn.fetch(
                 """
-                SELECT 
+                SELECT DISTINCT 
                     u.user_id,
-                    u.nickname,
-                    COALESCE(SUM(ua.accumulated_time), 0) AS total_time,
-                    COALESCE(SUM(ua.activity_count), 0) AS total_count,
-                    COALESCE((
-                        SELECT SUM(fine_amount)
-                        FROM work_records wr
-                        WHERE wr.chat_id = u.chat_id
-                        AND wr.user_id = u.user_id
-                        AND wr.record_date >= $1
-                        AND wr.record_date < $2
-                    ), 0) AS total_fines,
-                    COALESCE(u.overtime_count, 0) AS total_overtime_count,
-                    COALESCE(u.total_overtime_time, 0) AS total_overtime_time
+                    u.nickname
                 FROM users u
-                LEFT JOIN user_activities ua 
-                ON u.chat_id = ua.chat_id 
-                AND u.user_id = ua.user_id
-                AND ua.activity_date >= $1 
-                AND ua.activity_date < $2
-                WHERE u.chat_id = $3
-                GROUP BY 
-                    u.chat_id, 
-                    u.user_id, 
-                    u.nickname, 
-                    u.overtime_count, 
-                    u.total_overtime_time
-                ORDER BY total_time DESC
+                WHERE u.chat_id = $1
+                AND (
+                    EXISTS (
+                        SELECT 1 FROM user_activities ua 
+                        WHERE ua.chat_id = u.chat_id 
+                        AND ua.user_id = u.user_id 
+                        AND ua.activity_date >= $2 
+                        AND ua.activity_date < $3
+                    )
+                    OR EXISTS (
+                        SELECT 1 FROM work_records wr 
+                        WHERE wr.chat_id = u.chat_id 
+                        AND wr.user_id = u.user_id 
+                        AND wr.record_date >= $2 
+                        AND wr.record_date < $3
+                    )
+                )
+                ORDER BY u.nickname
                 """,
+                chat_id,
                 start_date,
                 end_date,
-                chat_id,
             )
 
             result = []
-            for stat in user_stats:
-                user_data = dict(stat)
 
-                # ✅ 获取用户当月各活动详情
+            for user in base_users:
+                user_id = user["user_id"]
+                nickname = user["nickname"]
+
+                user_data = {
+                    "user_id": user_id,
+                    "nickname": nickname,
+                }
+
+                # 1️⃣ 上班天数
+                work_days = await conn.fetchval(
+                    """
+                    SELECT COUNT(DISTINCT record_date)
+                    FROM work_records
+                    WHERE chat_id = $1 AND user_id = $2
+                    AND record_date >= $3 AND record_date < $4
+                    AND checkin_type = 'work_start'
+                    """,
+                    chat_id,
+                    user_id,
+                    start_date,
+                    end_date,
+                )
+                user_data["work_days"] = work_days or 0
+
+                # 2️⃣ 活动总计
+                activity_total = await conn.fetchrow(
+                    """
+                    SELECT 
+                        SUM(accumulated_time) AS total_time,
+                        SUM(activity_count) AS total_count
+                    FROM user_activities
+                    WHERE chat_id = $1 AND user_id = $2
+                    AND activity_date >= $3 AND activity_date < $4
+                    """,
+                    chat_id,
+                    user_id,
+                    start_date,
+                    end_date,
+                )
+                user_data["total_time"] = (
+                    activity_total["total_time"]
+                    if activity_total and activity_total["total_time"]
+                    else 0
+                )
+                user_data["total_count"] = (
+                    activity_total["total_count"]
+                    if activity_total and activity_total["total_count"]
+                    else 0
+                )
+
+                # 3️⃣ 罚款总额
+                total_fines = await conn.fetchval(
+                    """
+                    SELECT SUM(fine_amount)
+                    FROM work_records
+                    WHERE chat_id = $1 AND user_id = $2
+                    AND record_date >= $3 AND record_date < $4
+                    """,
+                    chat_id,
+                    user_id,
+                    start_date,
+                    end_date,
+                )
+                user_data["total_fines"] = total_fines or 0
+
+                # 4️⃣ 超时统计
+                overtime_stats = await conn.fetchrow(
+                    """
+                    SELECT 
+                        COUNT(*) AS overtime_count,
+                        SUM(
+                            CASE 
+                                WHEN ua.accumulated_time > (COALESCE(ac.time_limit, 30) * 60)
+                                THEN ua.accumulated_time - (COALESCE(ac.time_limit, 30) * 60)
+                                ELSE 0
+                            END
+                        ) AS overtime_time
+                    FROM user_activities ua
+                    LEFT JOIN activity_configs ac ON ac.activity_name = ua.activity_name
+                    WHERE ua.chat_id = $1 AND ua.user_id = $2
+                    AND ua.activity_date >= $3 AND ua.activity_date < $4
+                    AND ua.accumulated_time > (COALESCE(ac.time_limit, 30) * 60)
+                    """,
+                    chat_id,
+                    user_id,
+                    start_date,
+                    end_date,
+                )
+                user_data["total_overtime_count"] = (
+                    overtime_stats["overtime_count"]
+                    if overtime_stats and overtime_stats["overtime_count"]
+                    else 0
+                )
+                user_data["total_overtime_time"] = (
+                    overtime_stats["overtime_time"]
+                    if overtime_stats and overtime_stats["overtime_time"]
+                    else 0
+                )
+
+                # 5️⃣ 各活动详情
                 activity_details = await conn.fetch(
                     """
                     SELECT 
@@ -1578,20 +1664,17 @@ class PostgreSQLDatabase:
                         SUM(activity_count) AS activity_count,
                         SUM(accumulated_time) AS accumulated_time
                     FROM user_activities
-                    WHERE chat_id = $1 
-                    AND user_id = $2 
-                    AND activity_date >= $3 
-                    AND activity_date < $4
+                    WHERE chat_id = $1 AND user_id = $2
+                    AND activity_date >= $3 AND activity_date < $4
                     GROUP BY activity_name
                     ORDER BY activity_name
                     """,
                     chat_id,
-                    user_data["user_id"],
+                    user_id,
                     start_date,
                     end_date,
                 )
 
-                # ✅ 组织活动数据
                 user_data["activities"] = {}
                 for row in activity_details:
                     activity_time = row["accumulated_time"] or 0
