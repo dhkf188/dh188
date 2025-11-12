@@ -572,6 +572,7 @@ class PostgreSQLDatabase:
 
         logger.info(f"🔍 [数据库操作完成] 用户{user_id} 活动{activity} 完成更新")
 
+    # database.py - 修改 reset_user_daily_data 方法
     async def reset_user_daily_data(
         self, chat_id: int, user_id: int, target_date: date | None = None
     ):
@@ -599,12 +600,6 @@ class PostgreSQLDatabase:
 
             async with self.pool.acquire() as conn:
                 async with conn.transaction():
-                    # 🆕 关键修改：不再删除历史记录！
-                    # ❌ 删除这2个DELETE操作：
-                    # - 不要删除 user_activities 记录（保留导出所需的历史数据）
-                    # - 不要删除 work_records 记录（保留上下班打卡历史）
-
-                    # 3. 只重置用户统计数据和状态
                     await conn.execute(
                         """
                         UPDATE users SET
@@ -1270,7 +1265,7 @@ class PostgreSQLDatabase:
                     0 as total_overtime_count,
                     0 as total_overtime_time
                 FROM users u
-                LEFT JOIN user_activities ua ON u.chat_id = ua.chat_id AND u.user_id = ua.user_id
+                LEFT JOIN user_activities ua ON u.chat_id = ua.chat_id AND u.user_id = u.user_id
                     AND ua.activity_date >= $1::date AND ua.activity_date < $2::date
                 WHERE u.chat_id = $3
                 GROUP BY u.user_id, u.nickname, u.chat_id
