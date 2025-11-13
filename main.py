@@ -12,7 +12,7 @@ import logging
 import psutil
 import traceback
 from io import StringIO
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, date
 from collections import defaultdict
 from functools import wraps
 from typing import Dict, Any, Optional, List, Tuple
@@ -49,6 +49,15 @@ from performance import (
     with_retry,
     message_deduplicate,
 )
+
+# 设置为北京时间
+os.environ["TZ"] = "Asia/Shanghai"
+try:
+    time.tzset()
+except AttributeError:
+    print("⚠️ 时区设置可能不生效（非Unix系统）")
+
+print(f"✅ 时区设置为: {time.tzname} | UTC偏移: {time.timezone}")
 
 # 日志配置优化
 logging.basicConfig(
@@ -422,7 +431,7 @@ class MessageFormatter:
         if count >= max_times:
             message += f"\n🚨 警告：本次结束后，您今日的{MessageFormatter.format_copyable_text(activity)}次数将达到上限，请留意！"
 
-        message += f"\n💡提示：活动完成后请及点击'✅ 回座'按钮"
+        message += f"\n💡提示：活动完成后请及时输入'回座'或点击'✅ 回座'按钮"
 
         return message
 
@@ -636,26 +645,42 @@ async def calculate_work_fine(checkin_type: str, late_minutes: float) -> int:
     return applicable_fine
 
 
-# main.py - 确保 reset_daily_data_if_needed 正确执行
+# ==================== 重置时间管理函数 ====================
+async def get_group_reset_time(chat_id: int) -> tuple[int, int]:
+    """获取群组的重置时间（小时, 分钟）- 优先管理员设定，否则使用config默认"""
+    try:
+        group_data = await db.get_group_cached(chat_id)
+        if group_data:
+            reset_hour = group_data.get("reset_hour")
+            reset_minute = group_data.get("reset_minute")
+
+            # 如果管理员设置了有效的时间，使用管理员设置
+            if reset_hour is not None and reset_minute is not None:
+                logger.debug(
+                    f"🎯 使用管理员设定重置时间: {chat_id} - {reset_hour:02d}:{reset_minute:02d}"
+                )
+                return reset_hour, reset_minute
+
+        # 否则使用config默认时间
+        logger.debug(
+            f"⚙️ 使用系统默认重置时间: {chat_id} - {Config.DAILY_RESET_HOUR:02d}:{Config.DAILY_RESET_MINUTE:02d}"
+        )
+        return Config.DAILY_RESET_HOUR, Config.DAILY_RESET_MINUTE
+    except Exception as e:
+        logger.error(f"❌ 获取群组 {chat_id} 重置时间失败: {e}")
+        return Config.DAILY_RESET_HOUR, Config.DAILY_RESET_MINUTE
+
+
 async def reset_daily_data_if_needed(chat_id: int, uid: int):
     """
-    🎯 精确版每日数据重置 - 基于管理员设定的重置时间点
-    逻辑：如果用户最后更新时间在上个重置周期之前，就重置数据
+    🎯 修正版每日数据重置 - 基于管理员设定的重置时间点
     """
-    from datetime import date, datetime, timedelta
-
     try:
         now = get_beijing_time()
+        today = now.date()
 
-        # 获取群组自定义重置时间
-        group_info = await db.get_group_cached(chat_id)
-        if not group_info:
-            # 如果群组不存在，先初始化
-            await db.init_group(chat_id)
-            group_info = await db.get_group_cached(chat_id)
-
-        reset_hour = group_info.get("reset_hour", Config.DAILY_RESET_HOUR)
-        reset_minute = group_info.get("reset_minute", Config.DAILY_RESET_MINUTE)
+        # 🎯 使用统一的函数获取重置时间
+        reset_hour, reset_minute = await get_group_reset_time(chat_id)
 
         # 计算当前重置周期开始时间
         reset_time_today = now.replace(
@@ -672,85 +697,76 @@ async def reset_daily_data_if_needed(chat_id: int, uid: int):
         # 获取用户数据
         user_data = await db.get_user_cached(chat_id, uid)
         if not user_data:
-            # 用户不存在，初始化用户
             await db.init_user(chat_id, uid, "用户")
             return
 
-        last_updated_str = user_data.get("last_updated")
-        if not last_updated_str:
+        last_updated = user_data.get("last_updated")
+        if not last_updated:
             # 如果没有最后更新时间，重置数据
-            logger.info(f"🔄 初始化用户数据: {chat_id}-{uid} (无最后更新时间)")
-            await db.reset_user_daily_data(chat_id, uid, now.date())
-            await db.update_user_last_updated(chat_id, uid, now.date())
+            logger.info(f"🔄 初始化用户数据: {chat_id}-{uid}")
+            await db.reset_user_daily_data(chat_id, uid, today)
+            await db.update_user_last_updated(chat_id, uid, today)
             return
 
-        # 解析最后更新时间
-        last_updated = None
-        if isinstance(last_updated_str, str):
+        # 简化日期处理逻辑
+        last_updated_date = None
+        if isinstance(last_updated, (datetime, date)):
+            last_updated_date = (
+                last_updated.date()
+                if isinstance(last_updated, datetime)
+                else last_updated
+            )
+        elif isinstance(last_updated, str):
             try:
-                # 尝试ISO格式解析
-                last_updated = datetime.fromisoformat(
-                    str(last_updated_str).replace("Z", "+00:00")
-                )
+                # 尝试解析日期字符串
+                if " " in last_updated or "T" in last_updated:
+                    last_updated_date = datetime.fromisoformat(
+                        last_updated.replace("Z", "+00:00")
+                    ).date()
+                else:
+                    last_updated_date = datetime.strptime(
+                        last_updated, "%Y-%m-%d"
+                    ).date()
             except ValueError:
-                try:
-                    # 尝试日期格式解析
-                    last_updated = datetime.strptime(str(last_updated_str), "%Y-%m-%d")
-                except ValueError:
-                    # 其他格式，直接使用今天日期
-                    last_updated = now
-        elif isinstance(last_updated_str, datetime):
-            last_updated = last_updated_str
-        elif isinstance(last_updated_str, date):
-            last_updated = datetime.combine(last_updated_str, datetime.min.time())
+                last_updated_date = today
         else:
-            # 未知类型，使用今天日期
-            last_updated = now
+            last_updated_date = today
 
         # 🎯 关键逻辑：比较最后更新时间是否在当前重置周期之前
-        if last_updated.date() < current_period_start.date():
+        if last_updated_date < current_period_start.date():
             logger.info(
-                f"🔄 重置用户数据: {chat_id}-{uid}\n"
-                f"   最后活动时间: {last_updated.date()}\n"
-                f"   当前周期开始: {current_period_start.date()}\n"
-                f"   重置时间设置: {reset_hour:02d}:{reset_minute:02d}\n"
-                f"   当前北京时问: {now.strftime('%Y-%m-%d %H:%M:%S')}"
+                f"🔄 用户数据过期，执行重置: {chat_id}-{uid}\n"
+                f"   最后活动: {last_updated_date}\n"
+                f"   周期开始: {current_period_start.date()}\n"
+                f"   重置时间: {reset_hour:02d}:{reset_minute:02d}\n"
+                f"   时间来源: {'管理员设定' if reset_hour != Config.DAILY_RESET_HOUR or reset_minute != Config.DAILY_RESET_MINUTE else '系统默认'}"
             )
 
-            # 执行重置
-            await db.reset_user_daily_data(chat_id, uid, current_period_start.date())
-            # 更新最后更新时间到当前周期
-            await db.update_user_last_updated(chat_id, uid, now.date())
+            # 🎯 关键修复：使用今天日期进行重置
+            await db.reset_user_daily_data(chat_id, uid, today)
+            await db.update_user_last_updated(chat_id, uid, today)
 
         else:
             logger.debug(
-                f"✅ 无需重置: {chat_id}-{uid}\n"
-                f"   最后活动: {last_updated.date()}\n"
-                f"   周期开始: {current_period_start.date()}"
+                f"✅ 数据正常: {chat_id}-{uid} (最后更新: {last_updated_date})"
             )
 
     except Exception as e:
         logger.error(f"❌ 重置检查失败 {chat_id}-{uid}: {e}")
-        # 出错时安全初始化用户
         try:
             await db.init_user(chat_id, uid, "用户")
             await db.update_user_last_updated(chat_id, uid, datetime.now().date())
         except Exception as init_error:
-            logger.error(f"❌ 用户初始化也失败: {init_error}")
+            logger.error(f"❌ 用户初始化失败: {init_error}")
 
 
 async def check_activity_limit(chat_id: int, uid: int, act: str):
-    """检查活动次数是否达到上限 - 修复版"""
+    """检查活动次数是否达到上限"""
     await db.init_group(chat_id)
     await db.init_user(chat_id, uid)
 
-    # 🆕 使用修复后的方法获取活动次数
     current_count = await db.get_user_activity_count(chat_id, uid, act)
     max_times = await db.get_activity_max_times(act)
-
-    logger.debug(
-        f"🔍 活动限制检查: 用户{uid} 活动{act} 当前{current_count}/{max_times}"
-    )
 
     return current_count < max_times, current_count, max_times
 
@@ -1206,8 +1222,6 @@ async def start_activity(message: types.Message, act: str):
     """优化的开始活动"""
     chat_id = message.chat.id
     uid = message.from_user.id
-
-    await reset_daily_data_if_needed(chat_id, uid)
 
     user_lock = get_user_lock(chat_id, uid)
     async with user_lock:
@@ -2340,9 +2354,8 @@ async def cmd_reset_status(message: types.Message):
     chat_id = message.chat.id
 
     try:
-        group_data = await db.get_group_cached(chat_id)
-        reset_hour = group_data.get("reset_hour", Config.DAILY_RESET_HOUR)
-        reset_minute = group_data.get("reset_minute", Config.DAILY_RESET_MINUTE)
+        # 🎯 使用统一的函数获取重置时间
+        reset_hour, reset_minute = await get_group_reset_time(chat_id)
 
         now = get_beijing_time()
         reset_time_today = now.replace(hour=reset_hour, minute=reset_minute, second=0)
@@ -2351,15 +2364,22 @@ async def cmd_reset_status(message: types.Message):
             f"🔄 重置状态检查\n\n"
             f"📅 当前时间: {now.strftime('%Y-%m-%d %H:%M:%S')}\n"
             f"⏰ 重置时间: {reset_hour:02d}:{reset_minute:02d}\n"
+            f"🔧 时间来源: {'👑 管理员设定' if reset_hour != Config.DAILY_RESET_HOUR or reset_minute != Config.DAILY_RESET_MINUTE else '⚙️ 系统默认'}\n"
             f"📊 下次重置: {reset_time_today.strftime('%Y-%m-%d %H:%M')}\n\n"
-            f"🔧 重置内容:\n"
-            f"• 每日活动次数和时间 ✅\n"
-            f"• 上下班打卡记录 ✅\n"
-            f"• 当前进行中的活动 ✅\n\n"
-            f"📤 导出设置:\n"
-            f"• 重置前1分钟自动导出 ✅\n"
-            f"• 重置后30分钟导出昨日数据 ✅\n"
-            f"• 推送到绑定频道/群组 ✅"
+        )
+
+        # 获取群组信息显示具体设置
+        group_data = await db.get_group_cached(chat_id)
+        if group_data:
+            actual_hour = group_data.get("reset_hour")
+            actual_minute = group_data.get("reset_minute")
+            if actual_hour is not None and actual_minute is not None:
+                status_info += f"👑 管理员设定: {actual_hour:02d}:{actual_minute:02d}\n"
+            else:
+                status_info += f"👑 管理员设定: 未设置（使用系统默认）\n"
+
+        status_info += (
+            f"⚙️ 系统默认: {Config.DAILY_RESET_HOUR:02d}:{Config.DAILY_RESET_MINUTE:02d}"
         )
 
         await message.answer(status_info)
@@ -3287,8 +3307,6 @@ async def handle_my_record(message: types.Message):
     chat_id = message.chat.id
     uid = message.from_user.id
 
-    await reset_daily_data_if_needed(chat_id, uid)
-
     user_lock = get_user_lock(chat_id, uid)
     async with user_lock:
         await show_history(message)
@@ -3301,8 +3319,6 @@ async def handle_rank(message: types.Message):
     """处理排行榜按钮 - 优化版本"""
     chat_id = message.chat.id
     uid = message.from_user.id
-
-    await reset_daily_data_if_needed(chat_id, uid)
 
     user_lock = get_user_lock(chat_id, uid)
     async with user_lock:
@@ -3333,7 +3349,6 @@ async def handle_admin_panel_button(message: types.Message):
         "• /showpush - 显示推送设置状态\n"
         "• \n"
         "• /addactivity <活动名> <次数> <分钟> - 添加或修改活动\n"
-        "• /set <用户ID> <活动> <分钟> - 设置用户时间\n"
         "• /delactivity <活动名> - 删除活动\n"
         "• \n"
         "• /setworktime 9:00 18:00 - 设置上下班时间\n"
@@ -3344,15 +3359,18 @@ async def handle_admin_panel_button(message: types.Message):
         "• /reset_work 用户ID - 可以重置用户记录\n"
         "• /resetworktime - 重置为默认上下班时间\n"
         "• \n"
-        "• /setresettime <小时> <分钟> - 设置每日重置时间\n"
-        "• /reset_status - 查看重置状态\n"
+        "• /set <用户ID> <活动> <分钟> - 设置用户时间\n"
         "• /reset <用户ID> - 重置用户数据\n"
+        "• \n"
+        "• /setresettime <小时> <分钟> - 设置每日重置时间\n"
+        "• /setworkfine <work_start|work_end> <时间段> <金额> - 设置上下班罚款\n"
         "• \n"
         "• /setfine <活动名> <时间段> <金额> - 设置活动罚款费率\n"
         "• /setfines_all <t1> <f1> [<t2> <f2> ...] - 为所有活动统一设置分段罚款\n"
-        "• /setworkfine <work_start|work_end> <时间段> <金额> - 设置上下班罚款\n"
         "• \n"
         "• /showsettings - 查看当前群设置\n"
+        "• /reset_status - 查看重置状态\n"
+        "• /reset_status - 查看重置状态\n"
         "• \n"
         "• /exportmonthly - 导出月度数据\n"
         "• /exportmonthly 2024 1 - 导出指定年月数据\n"
@@ -3362,6 +3380,7 @@ async def handle_admin_panel_button(message: types.Message):
         "• /performance 查看性能\n"
         "• /refresh_keyboard - 强制刷新键盘显示新活动\n"
         "• /debug_work - 调试上下班功能状态\n"
+        "• \n"
     )
     await message.answer(admin_text, reply_markup=get_admin_keyboard())
 
@@ -3485,88 +3504,67 @@ async def handle_other_text_messages(message: types.Message):
 
 # ==================== 用户功能优化 ====================
 async def show_history(message: types.Message):
-    """显示用户历史记录 - 修复版：基于users表（今日数据）"""
+    """显示用户历史记录 - 优化版本"""
     chat_id = message.chat.id
     uid = message.from_user.id
 
-    # 🆕 先检查并执行重置
-    await reset_daily_data_if_needed(chat_id, uid)
+    async with OptimizedUserContext(chat_id, uid) as user:
+        first_line = (
+            f"👤 用户：{MessageFormatter.format_user_link(uid, user['nickname'])}"
+        )
+        text = f"{first_line}\n📊 今日记录：\n\n"
 
-    # 确保群组和用户初始化
-    await db.init_group(chat_id)
-    await db.init_user(chat_id, uid)
+        has_records = False
+        activity_limits = await db.get_activity_limits_cached()
+        user_activities = await db.get_user_all_activities(chat_id, uid)
 
-    # 获取用户信息（从users表）
-    user_data = await db.get_user_cached(chat_id, uid)
-    if not user_data:
-        await message.answer("❌ 用户数据获取失败")
-        return
+        for act in activity_limits.keys():
+            activity_info = user_activities.get(act, {})
+            total_time = activity_info.get("time", 0)
+            count = activity_info.get("count", 0)
+            max_times = activity_limits[act]["max_times"]
+            if total_time > 0 or count > 0:
+                status = "✅" if count < max_times else "❌"
+                time_str = MessageFormatter.format_time(int(total_time))
+                text += f"• <code>{act}</code>：<code>{time_str}</code>，次数：<code>{count}</code>/<code>{max_times}</code> {status}\n"
+                has_records = True
 
-    nickname = user_data.get("nickname", "用户")
-    first_line = f"👤 用户：{MessageFormatter.format_user_link(uid, nickname)}"
-    text = f"{first_line}\n📊 今日记录：\n\n"
+        total_time_all = user.get("total_accumulated_time", 0)
+        total_count_all = user.get("total_activity_count", 0)
+        total_fine = user.get("total_fines", 0)
+        overtime_count = user.get("overtime_count", 0)
+        total_overtime = user.get("total_overtime_time", 0)
 
-    # 🆕 直接从users表获取今日总统计
-    total_count_all = user_data.get("total_activity_count", 0)
-    total_time_all = user_data.get("total_accumulated_time", 0)
-    total_fine = user_data.get("total_fines", 0)
-    overtime_count = user_data.get("overtime_count", 0)
-    total_overtime = user_data.get("total_overtime_time", 0)
+        text += f"\n📈 今日总统计：\n"
+        text += f"• 总累计时间：<code>{MessageFormatter.format_time(int(total_time_all))}</code>\n"
+        text += f"• 总活动次数：<code>{total_count_all}</code> 次\n"
+        if overtime_count > 0:
+            text += f"• 超时次数：<code>{overtime_count}</code> 次\n"
+            text += f"• 总超时时间：<code>{MessageFormatter.format_time(int(total_overtime))}</code>\n"
+        if total_fine > 0:
+            text += f"• 累计罚款：<code>{total_fine}</code> 元"
 
-    has_records = False
-    activity_limits = await db.get_activity_limits_cached()
+        if not has_records and total_count_all == 0:
+            text += "暂无记录，请先进行打卡活动"
 
-    # 🆕 从user_activities表获取每个活动的详细统计（用于显示）
-    user_activities = await db.get_user_all_activities(chat_id, uid)
-
-    for act in activity_limits.keys():
-        activity_info = user_activities.get(act, {})
-        current_count = activity_info.get("count", 0)
-        activity_time = activity_info.get("time", 0)
-        max_times = activity_limits[act]["max_times"]
-
-        if activity_time > 0 or current_count > 0:
-            status = "✅" if current_count < max_times else "❌"
-            time_str = MessageFormatter.format_time(int(activity_time))
-            text += f"• <code>{act}</code>：<code>{time_str}</code>，次数：<code>{current_count}</code>/<code>{max_times}</code> {status}\n"
-            has_records = True
-
-    text += f"\n📈 今日总统计：\n"
-    text += f"• 总累计时间：<code>{MessageFormatter.format_time(int(total_time_all))}</code>\n"
-    text += f"• 总活动次数：<code>{total_count_all}</code> 次\n"
-
-    if overtime_count > 0:
-        text += f"• 超时次数：<code>{overtime_count}</code> 次\n"
-        text += f"• 总超时时间：<code>{MessageFormatter.format_time(int(total_overtime))}</code>\n"
-
-    if total_fine > 0:
-        text += f"• 累计罚款：<code>{total_fine}</code> 元"
-
-    if not has_records and total_count_all == 0:
-        text += "\n\n📝 暂无今日活动记录，快去打卡吧！"
-
-    await message.answer(
-        text,
-        reply_markup=await get_main_keyboard(
-            chat_id=chat_id, show_admin=await is_admin(uid)
-        ),
-        parse_mode="HTML",
-    )
+        await message.answer(
+            text,
+            reply_markup=await get_main_keyboard(
+                chat_id=chat_id, show_admin=await is_admin(uid)
+            ),
+            parse_mode="HTML",
+        )
 
 
-# main.py - 修复 show_rank 方法
 async def show_rank(message: types.Message):
-    """显示排行榜（修复重置后问题）——确保显示重置后的数据"""
+    """显示排行榜（修复版）——直接从 user_activities 聚合当天数据，避免依赖 last_updated"""
     chat_id = message.chat.id
     uid = message.from_user.id
 
-    # 确保群组初始化
+    # 确保群组初始化（如果你 init_group 有副作用）
     await db.init_group(chat_id)
 
-    # 🆕 为当前用户检查重置
-    await reset_daily_data_if_needed(chat_id, uid)
-
-    # 读取活动列表
+    # 读取活动列表（带缓存）
     activity_limits = await db.get_activity_limits_cached()
     if not activity_limits:
         await message.answer(
@@ -3581,70 +3579,56 @@ async def show_rank(message: types.Message):
     rank_text = "🏆 今日活动排行榜\n\n"
     today = datetime.now().date()
 
+    # 为避免大量单次连接开销，我们直接用连接一次性查询每个活动的 TopN
+    top_n = 3
     async with db.pool.acquire() as conn:
         any_result = False
-
-        # 🆕 获取今日总时长排行（从users表）
-        total_rank = await conn.fetch(
-            """
-            SELECT user_id, nickname, total_accumulated_time, total_activity_count
-            FROM users 
-            WHERE chat_id = $1 AND last_updated = $2 AND total_activity_count > 0
-            ORDER BY total_accumulated_time DESC
-            LIMIT 5
-            """,
-            chat_id,
-            today,
-        )
-
-        if total_rank:
-            any_result = True
-            rank_text += "📊 <b>今日总时长排行：</b>\n"
-            for i, user in enumerate(total_rank, start=1):
-                user_id = user["user_id"]
-                name = user["nickname"] or str(user_id)
-                time_sec = user["total_accumulated_time"] or 0
-                count = user["total_activity_count"] or 0
-
-                time_str = MessageFormatter.format_time(int(time_sec))
-                rank_text += f"  <code>{i}.</code> {MessageFormatter.format_user_link(user_id, name)} - <code>{time_str}</code> (<code>{count}</code>次)\n"
-            rank_text += "\n"
-
-        # 🆕 按活动分类排行（从user_activities表查询当日数据）
         for act in activity_limits.keys():
             rows = await conn.fetch(
                 """
-                SELECT 
+                SELECT
                     u.user_id,
                     u.nickname,
-                    ua.accumulated_time as total_time,
-                    ua.activity_count as activity_count
+                    ua.accumulated_time as total_time
                 FROM user_activities ua
                 JOIN users u ON ua.chat_id = u.chat_id AND ua.user_id = u.user_id
                 WHERE ua.chat_id = $1 AND ua.activity_name = $2 AND ua.activity_date = $3
                 ORDER BY ua.accumulated_time DESC
-                LIMIT 3
+                LIMIT $4
                 """,
                 chat_id,
                 act,
                 today,
+                top_n,
             )
 
-            if rows:
-                any_result = True
-                rank_text += f"📈 <code>{act}</code>：\n"
-                for i, row in enumerate(rows, start=1):
-                    user_id = row["user_id"]
-                    name = row["nickname"] or str(user_id)
-                    time_sec = row["total_time"] or 0
-                    count = row["activity_count"] or 0
+            if not rows:
+                # 跳过没有数据的活动（也可以显示“暂无记录”）
+                continue
 
+            any_result = True
+            rank_text += f"📈 <code>{act}</code>：\n"
+            for i, row in enumerate(rows, start=1):
+                user_id = row["user_id"]
+                name = row["nickname"] or str(user_id)
+                time_sec = row["total_time"] or 0
+                # 你的 MessageFormatter.format_time / format_seconds_to_hms 根据项目定义来用
+                # 这里尽量使用项目里已有的工具：
+                try:
                     time_str = MessageFormatter.format_time(int(time_sec))
-                    rank_text += f"  <code>{i}.</code> {MessageFormatter.format_user_link(user_id, name)} - <code>{time_str}</code> (<code>{count}</code>次)\n"
-                rank_text += "\n"
+                except Exception:
+                    # 兜底格式化为秒->时分秒
+                    time_str = (
+                        db.format_seconds_to_hms(int(time_sec))
+                        if hasattr(db, "format_seconds_to_hms")
+                        else f"{int(time_sec)}s"
+                    )
+
+                rank_text += f"  <code>{i}.</code> {MessageFormatter.format_user_link(user_id, name)} - <code>{time_str}</code>\n"
+            rank_text += "\n"
 
     if not any_result:
-        rank_text = "🏆 今日活动排行榜\n\n📝 暂时没有任何活动记录，大家快去打卡吧！"
+        rank_text = "🏆 今日活动排行榜\n\n暂时没有任何活动记录，大家快去打卡吧！"
 
     await message.answer(
         rank_text,
@@ -3896,28 +3880,17 @@ async def export_data(message: types.Message):
 
 # ==================== CSV导出推送功能优化 ====================
 async def optimized_monthly_export(chat_id: int, year: int, month: int):
-    """优化版月度数据导出 - 修复空数据处理"""
+    """优化版月度数据导出，每个用户一行，活动横向排列"""
     try:
-        # 获取所有活动配置
+        # 获取活动配置
         activity_limits = await db.get_activity_limits_cached()
-
-        # 🆕 定义所有需要的活动（确保顺序一致）
-        required_activities = ["吃饭", "小厕", "大厕", "抽烟", "休息"]
-
-        # 合并配置中的活动和必需活动
         activity_names = list(activity_limits.keys())
-        for act in required_activities:
-            if act not in activity_names:
-                activity_names.append(act)
-
-        # 按固定顺序排序
-        activity_names = sorted(activity_names)
 
         csv_buffer = StringIO()
         writer = csv.writer(csv_buffer)
 
-        # 🆕 完整表头
-        headers = ["用户ID", "用户昵称", "上班天数"]
+        # 构建表头
+        headers = ["用户ID", "用户昵称"]
 
         # 为每个活动添加次数和时长的列
         for act in activity_names:
@@ -3930,58 +3903,44 @@ async def optimized_monthly_export(chat_id: int, year: int, month: int):
 
         writer.writerow(headers)
 
-        # 使用修复后的月度统计方法
-        monthly_stats = await db.get_monthly_statistics_horizontal(chat_id, year, month)
+        # 使用现有的月度统计方法
+        monthly_stats = await db.get_monthly_statistics(chat_id, year, month)
 
         if not monthly_stats:
-            logger.info(f"⚠️ 群组 {chat_id} {year}年{month}月没有数据需要导出")
             return None
 
         # 处理每个用户的数据
         for user_stat in monthly_stats:
-            row = [
-                user_stat["user_id"],
-                user_stat.get("nickname", "未知用户"),
-                user_stat.get("work_days", 0),  # 上班天数
-            ]
+            row = [user_stat["user_id"], user_stat.get("nickname", "未知用户")]
 
-            # 🆕 为每个活动添加次数和时长
+            # 添加每个活动的次数和时长
             for act in activity_names:
-                activity_info = user_stat.get("activities", {}).get(act, {})
+                activity_info = user_stat["activities"].get(act, {})
                 count = activity_info.get("count", 0)
                 time_seconds = activity_info.get("time", 0)
+                # 使用数据库的格式化方法
                 time_formatted = db.format_time_for_csv(time_seconds)
 
                 row.append(count)
                 row.append(time_formatted)
 
-            # 🆕 添加总计信息
+            # 添加总计信息 - 使用正确的字段名
             row.extend(
                 [
-                    user_stat.get("total_count", 0),  # 活动次数总计
-                    db.format_time_for_csv(
-                        user_stat.get("total_time", 0)
-                    ),  # 活动用时总计
-                    user_stat.get("total_fines", 0),  # 罚款总金额
-                    user_stat.get("total_overtime_count", 0),  # 超时次数
-                    db.format_time_for_csv(
-                        user_stat.get("total_overtime_time", 0)
-                    ),  # 总超时时间
+                    user_stat.get("total_count", 0),
+                    db.format_time_for_csv(user_stat.get("total_time", 0)),
+                    user_stat.get("total_fines", 0),
+                    user_stat.get("total_overtime_count", 0),
+                    db.format_time_for_csv(user_stat.get("total_overtime_time", 0)),
                 ]
             )
 
             writer.writerow(row)
 
-        logger.info(
-            f"✅ 月度数据导出完成: {len(monthly_stats)} 个用户，{len(activity_names)} 个活动"
-        )
         return csv_buffer.getvalue()
 
     except Exception as e:
-        logger.error(f"❌ 月度导出失败: {e}")
-        import traceback
-
-        logger.error(f"❌ 详细错误: {traceback.format_exc()}")
+        logger.error(f"❌ 月度导出优化版失败: {e}")
         return None
 
 
@@ -4078,8 +4037,6 @@ async def export_and_push_csv(
             f"📊 群组：<b>{chat_title}</b>\n"
             f"📅 统计日期：<code>{(target_date.strftime('%Y-%m-%d') if target_date else get_beijing_time().strftime('%Y-%m-%d'))}</code>\n"
             f"⏰ 导出时间：<code>{get_beijing_time().strftime('%Y-%m-%d %H:%M:%S')}</code>"
-            f"{MessageFormatter.create_dashed_line()}\n"
-            f"💾 包含每个用户的所有活动统计和总计信息"
         )
 
         # 先把文件发回到当前 chat（可选）
@@ -4285,10 +4242,11 @@ async def export_data_before_reset(chat_id: int):
 
 
 # ==================== 自动导出与每日重置任务（最终整合版） ====================
-# main.py - 修复 auto_daily_export_task
+
+
 async def auto_daily_export_task():
     """
-    每日重置前自动导出群组数据（重置前 1 分钟导出）- 修复版
+    每日重置前自动导出群组数据（重置前 1 分钟导出）
     """
     while True:
         now = get_beijing_time()
@@ -4323,50 +4281,25 @@ async def auto_daily_export_task():
                 reset_hour = group_data.get("reset_hour", Config.DAILY_RESET_HOUR)
                 reset_minute = group_data.get("reset_minute", Config.DAILY_RESET_MINUTE)
 
-                # 🆕 修复：正确计算重置前1分钟的时间
-                reset_time_today = now.replace(
-                    hour=reset_hour, minute=reset_minute, second=0, microsecond=0
-                )
+                # 计算目标时间（重置前1分钟）
+                target_time = (reset_hour * 60 + reset_minute - 1) % (24 * 60)
+                now_minutes = now.hour * 60 + now.minute
 
-                # 计算重置前1分钟的时间点
-                pre_reset_time = reset_time_today - timedelta(minutes=1)
+                if now_minutes == target_time:
+                    logger.info(f"📤 到达重置前导出时间，导出群组 {chat_id} 数据中...")
 
-                # 🆕 修复：检查当前时间是否在重置前1分钟的时间窗口内（前后30秒）
-                time_diff = abs((now - pre_reset_time).total_seconds())
-
-                if time_diff <= 30:  # 30秒时间窗口
-                    logger.info(
-                        f"📤 到达重置前导出时间，导出群组 {chat_id} 昨日数据中..."
+                    file_name = (
+                        f"group_{chat_id}_pre_reset_{now.strftime('%Y%m%d')}.csv"
+                    )
+                    await asyncio.wait_for(
+                        export_and_push_csv(
+                            chat_id, to_admin_if_no_group=True, file_name=file_name
+                        ),
+                        timeout=30,
                     )
 
-                    # 🆕 修复：计算正确的昨日日期
-                    if now < reset_time_today:
-                        # 当前时间在重置时间之前，昨日就是今天的前一天
-                        target_date = (now - timedelta(days=1)).date()
-                    else:
-                        # 当前时间在重置时间之后，昨日就是今天
-                        target_date = now.date()
-
-                    file_name = f"group_{chat_id}_pre_reset_{target_date.strftime('%Y%m%d')}.csv"
-
-                    try:
-                        await asyncio.wait_for(
-                            export_and_push_csv(
-                                chat_id,
-                                to_admin_if_no_group=True,
-                                file_name=file_name,
-                                target_date=target_date,  # 🆕 传递正确的目标日期
-                            ),
-                            timeout=60,  # 增加超时时间
-                        )
-                        logger.info(
-                            f"✅ 群组 {chat_id} 重置前导出成功，日期: {target_date}"
-                        )
-                        export_executed = True
-                    except asyncio.TimeoutError:
-                        logger.warning(f"⏰ 群组 {chat_id} 重置前导出超时")
-                    except Exception as e:
-                        logger.error(f"❌ 群组 {chat_id} 重置前导出失败: {e}")
+                    logger.info(f"✅ 群组 {chat_id} 导出成功（重置前）")
+                    export_executed = True
 
             except asyncio.TimeoutError:
                 logger.warning(f"⏰ 群组 {chat_id} 导出或查询超时，跳过此群。")
@@ -4379,121 +4312,112 @@ async def auto_daily_export_task():
         await asyncio.sleep(sleep_time)
 
 
-# main.py - 修复 daily_reset_task 方法
 async def daily_reset_task():
     """
-    每日自动重置任务（重置 + 延迟导出昨日数据）- 修复版
+    🎯 修正版每日重置任务 - 按照管理员设定时间或config默认时间重置
     """
+    # 记录上次重置的日期，避免重复重置
+    last_reset_dates = {}  # {chat_id: date}
+
     while True:
-        now = get_beijing_time()
-        logger.info(f"🔄 重置任务检查，当前时间: {now}")
-
         try:
-            all_groups = await asyncio.wait_for(db.get_all_groups(), timeout=15)
-        except Exception as e:
-            logger.error(f"❌ 获取群组列表失败: {e}")
-            await asyncio.sleep(60)
-            continue
+            now = get_beijing_time()
+            today = now.date()
 
-        reset_executed = False
+            logger.debug(
+                f"🔄 重置任务检查，当前时间: {now.strftime('%Y-%m-%d %H:%M:%S')}"
+            )
 
-        for chat_id in all_groups:
-            try:
-                group_data = await asyncio.wait_for(
-                    db.get_group_cached(chat_id), timeout=10
-                )
-                if not group_data:
+            # 获取所有群组
+            all_groups = await db.get_all_groups()
+            if not all_groups:
+                logger.debug("⚠️ 未找到任何群组")
+                await asyncio.sleep(60)
+                continue
+
+            for chat_id in all_groups:
+                try:
+                    # 🎯 使用统一的函数获取重置时间
+                    reset_hour, reset_minute = await get_group_reset_time(chat_id)
+
+                    # 检查这个群组今天是否已经重置过
+                    if last_reset_dates.get(chat_id) == today:
+                        continue
+
+                    # 检查是否到达重置时间
+                    if now.hour == reset_hour and now.minute == reset_minute:
+                        logger.info(
+                            f"🎯 触发定时重置: 群组 {chat_id}\n"
+                            f"   重置时间: {reset_hour:02d}:{reset_minute:02d}\n"
+                            f"   时间来源: {'管理员设定' if reset_hour != Config.DAILY_RESET_HOUR or reset_minute != Config.DAILY_RESET_MINUTE else '系统默认'}"
+                        )
+
+                        # 执行重置
+                        reset_count = 0
+                        group_members = await db.get_group_members(chat_id)
+
+                        for user_data in group_members:
+                            user_id = user_data["user_id"]
+                            user_lock = get_user_lock(chat_id, user_id)
+
+                            async with user_lock:
+                                success = await db.reset_user_daily_data(
+                                    chat_id, user_id, today
+                                )
+                                if success:
+                                    reset_count += 1
+
+                        # 记录这个群组今天已经重置
+                        last_reset_dates[chat_id] = today
+
+                        logger.info(
+                            f"✅ 群组 {chat_id} 定时重置完成，重置了 {reset_count} 个用户"
+                        )
+
+                        # 启动延迟导出任务
+                        asyncio.create_task(delayed_export(chat_id, 30))
+
+                except Exception as e:
+                    logger.error(f"❌ 处理群组 {chat_id} 重置失败: {e}")
                     continue
 
-                reset_hour = group_data.get("reset_hour", Config.DAILY_RESET_HOUR)
-                reset_minute = group_data.get("reset_minute", Config.DAILY_RESET_MINUTE)
+            await asyncio.sleep(60)  # 每分钟检查一次
 
-                # 到达重置时间
-                if now.hour == reset_hour and now.minute == reset_minute:
-                    logger.info(f"⏰ 到达重置时间，正在重置群组 {chat_id} 的数据...")
-
-                    # 🆕 关键修复：计算昨天的日期
-                    yesterday = now - timedelta(days=1)
-
-                    # 执行每日数据重置（带用户锁防并发）
-                    group_members = await db.get_group_members(chat_id)
-                    reset_count = 0
-
-                    for user_data in group_members:
-                        user_lock = get_user_lock(chat_id, user_data["user_id"])
-                        async with user_lock:
-                            # 🆕 关键修复：传递昨天的日期，执行完整重置
-                            success = await db.reset_user_daily_data(
-                                chat_id,
-                                user_data["user_id"],
-                                yesterday.date(),  # 🆕 传递昨天的日期
-                            )
-                            if success:
-                                reset_count += 1
-
-                    logger.info(
-                        f"✅ 群组 {chat_id} 数据重置完成，重置了 {reset_count} 个用户"
-                    )
-                    reset_executed = True
-
-                    # 启动延迟导出任务（默认30分钟）
-                    asyncio.create_task(delayed_export(chat_id, 30))
-
-            except asyncio.TimeoutError:
-                logger.warning(f"⏰ 群组 {chat_id} 重置或查询超时，跳过。")
-            except Exception as e:
-                logger.error(f"❌ 群组 {chat_id} 重置失败: {e}")
-
-        # 如果执行了重置，等待时间长一些避免重复执行
-        sleep_time = 120 if reset_executed else 60
-        await asyncio.sleep(sleep_time)
+        except Exception as e:
+            logger.error(f"💥 重置任务主循环异常: {e}")
+            await asyncio.sleep(60)
 
 
-# main.py - 修复 delayed_export
 async def delayed_export(chat_id: int, delay_minutes: int = 30):
     """
     在每日重置后延迟导出昨日数据 - 修复版
     """
     try:
-        logger.info(f"⏳ 群组 {chat_id} 将在 {delay_minutes} 分钟后导出重置前的数据...")
-
+        logger.info(f"⏳ 群组 {chat_id} 将在 {delay_minutes} 分钟后导出昨日数据...")
         # 延迟执行
         await asyncio.sleep(delay_minutes * 60)
 
-        now = get_beijing_time()
+        # 🆕 关键修复：明确获取昨天的日期
+        yesterday_dt = get_beijing_time() - timedelta(days=1)
+        yesterday_date = yesterday_dt.date()
 
-        # 🆕 修复：获取群组的重置时间配置
-        group_data = await db.get_group_cached(chat_id)
-        reset_hour = group_data.get("reset_hour", Config.DAILY_RESET_HOUR)
-        reset_minute = group_data.get("reset_minute", Config.DAILY_RESET_MINUTE)
+        # 生成文件名（用昨日日期）
+        file_name = f"group_{chat_id}_statistics_{yesterday_dt.strftime('%Y%m%d')}.csv"
 
-        # 🆕 修复：计算重置时的"昨日"日期
-        reset_time_today = now.replace(hour=reset_hour, minute=reset_minute, second=0)
-
-        if now.hour >= reset_hour and now.minute >= reset_minute:
-            # 当前时间在重置时间之后，重置的是今天的数据
-            target_date = now.date()
-        else:
-            # 当前时间在重置时间之前，重置的是昨天的数据
-            target_date = (now - timedelta(days=1)).date()
-
-        # 生成文件名（用重置前的日期）
-        file_name = f"group_{chat_id}_post_reset_{target_date.strftime('%Y%m%d')}.csv"
-
-        # 🆕 修复：导出重置前的数据
+        # ✅ 关键修改：传入 target_date=yesterday_date
         await export_and_push_csv(
             chat_id,
             to_admin_if_no_group=True,
             file_name=file_name,
-            target_date=target_date,  # 传递重置前的日期
+            target_date=yesterday_date,  # 明确传递昨天日期
         )
 
-        logger.info(f"✅ 群组 {chat_id} 重置后数据导出完成，日期: {target_date}")
+        logger.info(f"✅ 群组 {chat_id} 昨日({yesterday_date}) 数据导出并推送完成")
 
     except asyncio.TimeoutError:
         logger.warning(f"⏰ 群组 {chat_id} 延迟导出超时")
     except Exception as e:
-        logger.error(f"❌ 群组 {chat_id} 延迟导出重置前数据失败: {e}", exc_info=True)
+        logger.error(f"❌ 群组 {chat_id} 延迟导出昨日数据失败: {e}", exc_info=True)
 
 
 # ==================== 活动状态恢复功能 ====================
