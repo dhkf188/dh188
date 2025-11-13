@@ -629,22 +629,30 @@ async def get_reset_period(chat_id: int):
     reset_hour = group_info.get("reset_hour", Config.DAILY_RESET_HOUR)
     reset_minute = group_info.get("reset_minute", Config.DAILY_RESET_MINUTE)
 
-    # 计算今天的重置时间点（与reset_daily_data_if_needed保持一致）
-    reset_time = now.replace(
+    # 计算今天的重置时间点
+    reset_time_today = now.replace(
         hour=reset_hour, minute=reset_minute, second=0, microsecond=0
     )
 
-    # 判断当前处于哪个重置周期
-    if now < reset_time:
+    # 🎯 关键逻辑：判断当前处于哪个重置周期
+    if now < reset_time_today:
         # 当前时间在今天的重置点之前 → 周期是：昨天重置时间 ~ 今天重置时间
-        period_start = reset_time - timedelta(days=1)
-        period_end = reset_time
+        period_start = reset_time_today - timedelta(days=1)
+        period_end = reset_time_today
     else:
         # 当前时间在今天的重置点之后 → 周期是：今天重置时间 ~ 明天重置时间
-        period_start = reset_time
-        period_end = reset_time + timedelta(days=1)
+        period_start = reset_time_today
+        period_end = reset_time_today + timedelta(days=1)
 
-    return period_start, period_end, reset_time
+    # 🎯 添加调试日志
+    logger.info(
+        f"🔍 重置周期计算: 当前时间={now.strftime('%m/%d %H:%M')}, 重置点={reset_time_today.strftime('%m/%d %H:%M')}"
+    )
+    logger.info(
+        f"🔍 周期范围: {period_start.strftime('%m/%d %H:%M')} - {period_end.strftime('%m/%d %H:%M')}"
+    )
+
+    return period_start, period_end, reset_time_today
 
 
 async def calculate_work_fine(checkin_type: str, late_minutes: float) -> int:
@@ -776,18 +784,22 @@ async def check_activity_limit(chat_id: int, uid: int, act: str):
 
     # 🎯 获取重置周期
     period_start, period_end, reset_time = await get_reset_period(chat_id)
-    
+
     # 🎯 使用重置周期查询当前次数
-    current_count = await db.get_user_activity_count(chat_id, uid, act, period_start.date(), period_end.date())
+    current_count = await db.get_user_activity_count(
+        chat_id, uid, act, period_start.date(), period_end.date()
+    )
     max_times = await db.get_activity_max_times(act)
-    
+
     # ✅ 添加空值保护
     if current_count is None:
         current_count = 0
     if max_times is None:
         max_times = 0
 
-    logger.info(f"🔍 活动次数检查(周期): 用户{uid} 活动{act} 当前{current_count}次 上限{max_times}次")
+    logger.info(
+        f"🔍 活动次数检查(周期): 用户{uid} 活动{act} 当前{current_count}次 上限{max_times}次"
+    )
 
     return current_count < max_times, current_count, max_times
 
@@ -1390,6 +1402,35 @@ async def cmd_setchannel(message: types.Message):
                 chat_id=message.chat.id, show_admin=True
             ),
         )
+
+@dp.message(Command("reset_status"))
+async def cmd_reset_status(message: types.Message):
+    """检查重置状态"""
+    chat_id = message.chat.id
+    uid = message.from_user.id
+    
+    # 获取重置周期
+    period_start, period_end, reset_time = await get_reset_period(chat_id)
+    
+    # 获取当前时间
+    now = get_beijing_time()
+    
+    # 检查当前处于哪个周期
+    if now < reset_time:
+        current_period = "昨天重置时间 ~ 今天重置时间"
+    else:
+        current_period = "今天重置时间 ~ 明天重置时间"
+    
+    status_info = (
+        f"🔄 重置状态检查\n\n"
+        f"⏰ 当前时间: {now.strftime('%Y-%m-%d %H:%M:%S')}\n"
+        f"🎯 重置时间: {reset_time.strftime('%H:%M')}\n"
+        f"📅 当前周期: {current_period}\n"
+        f"🕒 周期范围: {period_start.strftime('%m/%d %H:%M')} - {period_end.strftime('%m/%d %H:%M')}\n"
+        f"👤 你的数据: 显示以上周期内的打卡记录"
+    )
+    
+    await message.answer(status_info)
 
 
 @dp.message(Command("setgroup"))
@@ -3519,7 +3560,7 @@ async def handle_other_text_messages(message: types.Message):
 
 # ==================== 用户功能优化 ====================
 async def show_history(message: types.Message):
-    """显示用户历史记录 - 使用重置周期版本"""
+    """显示用户历史记录 - 明确显示重置周期"""
     chat_id = message.chat.id
     uid = message.from_user.id
 
@@ -3535,7 +3576,10 @@ async def show_history(message: types.Message):
         first_line = (
             f"👤 用户：{MessageFormatter.format_user_link(uid, user['nickname'])}"
         )
-        text = f"{first_line}\n📊 本重置周期记录：\n\n"
+
+        # 🎯 明确显示重置周期
+        period_text = f"{period_start.strftime('%m/%d %H:%M')} - {period_end.strftime('%m/%d %H:%M')}"
+        text = f"{first_line}\n📊 重置周期记录：<code>{period_text}</code>\n\n"
 
         has_records = False
         activity_limits = await db.get_activity_limits_cached()
@@ -3552,12 +3596,8 @@ async def show_history(message: types.Message):
                 text += f"• <code>{act}</code>：<code>{time_str}</code>，次数：<code>{count}</code>/<code>{max_times}</code> {status}\n"
                 has_records = True
 
-        # 🎯 显示重置周期信息
-        period_text = f"{period_start.strftime('%m/%d %H:%M')} - {period_end.strftime('%m/%d %H:%M')}"
-        text += f"\n🔄 重置周期：<code>{period_text}</code>\n"
-
         if not has_records:
-            text += "暂无记录，请先进行打卡活动"
+            text += "本重置周期暂无记录，请先进行打卡活动"
 
         await message.answer(
             text,
