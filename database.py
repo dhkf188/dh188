@@ -576,8 +576,8 @@ class PostgreSQLDatabase:
         self, chat_id: int, user_id: int, target_date: date | None = None
     ):
         """
-        ✅ 修复版：重置用户每日数据但保留历史记录
-        只重置累计统计和当前状态，不删除历史记录
+        ✅ 修复版：只更新用户最后更新时间，不删除任何数据
+        通过周期查询自动实现数据重置效果
         """
         try:
             # 验证和设置目标日期
@@ -588,69 +588,34 @@ class PostgreSQLDatabase:
                     f"target_date必须是date类型，得到: {type(target_date)}"
                 )
 
-            # 获取重置前的用户状态（用于日志）
-            user_before = await self.get_user(chat_id, user_id)
-
-            # 🆕 计算新的日期（重置后的日期）
-            new_date = target_date
-            # 如果是重置昨天的数据，那么新的日期应该是今天
-            if target_date < datetime.now().date():
-                new_date = datetime.now().date()
-
             async with self.pool.acquire() as conn:
                 async with conn.transaction():
-                    # 🆕 关键修改：不再删除历史记录！
-                    # ❌ 删除这2个DELETE操作：
-                    # - 不要删除 user_activities 记录（保留导出所需的历史数据）
-                    # - 不要删除 work_records 记录（保留上下班打卡历史）
-
-                    # 3. 只重置用户统计数据和状态
+                    # 🆕 关键修改：只更新最后更新时间，不删除任何数据
                     await conn.execute(
                         """
                         UPDATE users SET
-                            total_activity_count = 0,
-                            total_accumulated_time = 0,
-                            total_overtime_time = 0,
-                            overtime_count = 0,
-                            total_fines = 0,
-                            current_activity = NULL,
-                            activity_start_time = NULL,
                             last_updated = $3,  
                             updated_at = CURRENT_TIMESTAMP
                         WHERE chat_id = $1 AND user_id = $2
                         """,
                         chat_id,
                         user_id,
-                        new_date,  # 🆕 使用新的日期
+                        target_date,
                     )
 
-            # 4. 清理相关缓存
-            cache_keys = [
-                f"user:{chat_id}:{user_id}",
-                f"group:{chat_id}",
-                "activity_limits",
-            ]
-            for key in cache_keys:
-                self._cache.pop(key, None)
-                self._cache_ttl.pop(key, None)
+            # 清理用户缓存
+            self._cache.pop(f"user:{chat_id}:{user_id}", None)
 
-            # 记录详细的重置日志
             logger.info(
-                f"✅ 数据重置完成（保留历史记录）: 用户 {user_id} (群组 {chat_id})\n"
-                f"   📅 重置日期: {target_date} → {new_date}\n"
-                f"   💾 历史记录: 已保留（支持后续导出）\n"
-                f"   📊 重置前状态:\n"
-                f"       - 活动次数: {user_before.get('total_activity_count', 0) if user_before else 0}\n"
-                f"       - 累计时长: {user_before.get('total_accumulated_time', 0) if user_before else 0}秒\n"
-                f"       - 罚款金额: {user_before.get('total_fines', 0) if user_before else 0}元\n"
-                f"       - 超时次数: {user_before.get('overtime_count', 0) if user_before else 0}\n"
-                f"       - 当前活动: {user_before.get('current_activity', '无') if user_before else '无'}"
+                f"✅ 用户日期更新完成: 用户 {user_id} (群组 {chat_id})\n"
+                f"   📅 更新日期: {target_date}\n"
+                f"   💾 数据保留: 所有历史记录完整保留"
             )
 
             return True
 
         except Exception as e:
-            logger.error(f"❌ 重置用户数据失败 {chat_id}-{user_id}: {e}")
+            logger.error(f"❌ 更新用户日期失败 {chat_id}-{user_id}: {e}")
             return False
 
     async def update_user_last_updated(
@@ -759,6 +724,7 @@ class PostgreSQLDatabase:
     ) -> int:
         """获取用户活动次数 - 使用周期参数"""
         if period_start is None or period_end is None:
+            # 如果没有传入周期，使用当天（保持兼容）
             today = datetime.now().date()
             period_start = today
             period_end = today
@@ -786,6 +752,62 @@ class PostgreSQLDatabase:
             )
             logger.info(f"🔍 次数查询结果: {count}")
             return count
+
+    async def get_user_all_activities(
+        self,
+        chat_id: int,
+        user_id: int,
+        period_start: date = None,
+        period_end: date = None,
+    ) -> Dict[str, Dict]:
+        """获取用户所有活动数据 - 使用周期参数"""
+
+        # 清理缓存确保获取最新数据
+        cache_keys_to_clear = [
+            f"user:{chat_id}:{user_id}",
+            "activity_limits",
+            "push_settings",
+        ]
+        for key in cache_keys_to_clear:
+            self._cache.pop(key, None)
+            self._cache_ttl.pop(key, None)
+
+        # 🎯 如果没有传入周期，使用当天（保持兼容）
+        if period_start is None or period_end is None:
+            today = datetime.now().date()
+            period_start = today
+            period_end = today
+
+        logger.info(f"🔍 数据库查询: 周期范围 {period_start} - {period_end}")
+
+        async with self.pool.acquire() as conn:
+            rows = await conn.fetch(
+                """
+                SELECT activity_name, SUM(activity_count) as activity_count, 
+                    SUM(accumulated_time) as accumulated_time 
+                FROM user_activities 
+                WHERE chat_id = $1 AND user_id = $2 
+                AND activity_date >= $3 AND activity_date <= $4
+                GROUP BY activity_name
+                """,
+                chat_id,
+                user_id,
+                period_start,
+                period_end,
+            )
+
+            activities = {}
+            for row in rows:
+                activities[row["activity_name"]] = {
+                    "count": row["activity_count"] or 0,
+                    "time": row["accumulated_time"] or 0,
+                    "time_formatted": self.format_seconds_to_hms(
+                        row["accumulated_time"] or 0
+                    ),
+                }
+
+            logger.info(f"🔍 数据库查询结果: {activities}")
+            return activities
 
     # ========== 上下班记录操作 ==========
     async def add_work_record(
