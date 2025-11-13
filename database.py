@@ -576,23 +576,35 @@ class PostgreSQLDatabase:
         self, chat_id: int, user_id: int, target_date: date | None = None
     ):
         """
-        ✅ 紧急修复版：确保重置后状态正确
+        ✅ 修复版：重置用户每日数据但保留历史记录
+        只重置累计统计和当前状态，不删除历史记录
         """
         try:
+            # 验证和设置目标日期
             if target_date is None:
                 target_date = datetime.now().date()
+            elif not isinstance(target_date, date):
+                raise ValueError(
+                    f"target_date必须是date类型，得到: {type(target_date)}"
+                )
 
+            # 获取重置前的用户状态（用于日志）
+            user_before = await self.get_user(chat_id, user_id)
+
+            # 🆕 计算新的日期（重置后的日期）
             new_date = target_date
+            # 如果是重置昨天的数据，那么新的日期应该是今天
             if target_date < datetime.now().date():
                 new_date = datetime.now().date()
 
-            logger.info(
-                f"🔄 [重置开始] 用户{user_id} 目标日期{target_date} 新日期{new_date}"
-            )
-
             async with self.pool.acquire() as conn:
                 async with conn.transaction():
-                    # 🆕 关键修复：确保 last_updated 正确设置为新日期
+                    # 🆕 关键修改：不再删除历史记录！
+                    # ❌ 删除这2个DELETE操作：
+                    # - 不要删除 user_activities 记录（保留导出所需的历史数据）
+                    # - 不要删除 work_records 记录（保留上下班打卡历史）
+
+                    # 3. 只重置用户统计数据和状态
                     await conn.execute(
                         """
                         UPDATE users SET
@@ -603,37 +615,42 @@ class PostgreSQLDatabase:
                             total_fines = 0,
                             current_activity = NULL,
                             activity_start_time = NULL,
-                            last_updated = $3,  -- 🆕 确保设置为新日期
+                            last_updated = $3,  
                             updated_at = CURRENT_TIMESTAMP
                         WHERE chat_id = $1 AND user_id = $2
                         """,
                         chat_id,
                         user_id,
-                        new_date,  # 🆕 使用新日期
+                        new_date,  # 🆕 使用新的日期
                     )
 
-                    # 🆕 验证更新是否成功
-                    updated_user = await conn.fetchrow(
-                        "SELECT last_updated FROM users WHERE chat_id = $1 AND user_id = $2",
-                        chat_id,
-                        user_id,
-                    )
+            # 4. 清理相关缓存
+            cache_keys = [
+                f"user:{chat_id}:{user_id}",
+                f"group:{chat_id}",
+                "activity_limits",
+            ]
+            for key in cache_keys:
+                self._cache.pop(key, None)
+                self._cache_ttl.pop(key, None)
 
-            # 清理缓存
-            self._cache.pop(f"user:{chat_id}:{user_id}", None)
-
+            # 记录详细的重置日志
             logger.info(
-                f"✅ [重置完成] 用户{user_id}\n"
-                f"   目标日期: {target_date}\n"
-                f"   新日期: {new_date}\n"
-                f"   最后更新: {updated_user['last_updated'] if updated_user else '未知'}\n"
-                f"   状态: {'成功' if updated_user and updated_user['last_updated'] == new_date else '可能失败'}"
+                f"✅ 数据重置完成（保留历史记录）: 用户 {user_id} (群组 {chat_id})\n"
+                f"   📅 重置日期: {target_date} → {new_date}\n"
+                f"   💾 历史记录: 已保留（支持后续导出）\n"
+                f"   📊 重置前状态:\n"
+                f"       - 活动次数: {user_before.get('total_activity_count', 0) if user_before else 0}\n"
+                f"       - 累计时长: {user_before.get('total_accumulated_time', 0) if user_before else 0}秒\n"
+                f"       - 罚款金额: {user_before.get('total_fines', 0) if user_before else 0}元\n"
+                f"       - 超时次数: {user_before.get('overtime_count', 0) if user_before else 0}\n"
+                f"       - 当前活动: {user_before.get('current_activity', '无') if user_before else '无'}"
             )
 
             return True
 
         except Exception as e:
-            logger.error(f"❌ [重置失败] 用户{user_id}: {e}")
+            logger.error(f"❌ 重置用户数据失败 {chat_id}-{user_id}: {e}")
             return False
 
     async def update_user_last_updated(
@@ -665,74 +682,28 @@ class PostgreSQLDatabase:
     async def get_user_activity_count(
         self, chat_id: int, user_id: int, activity: str
     ) -> int:
-        """获取用户今日活动次数 - 紧急修复版本"""
+        """获取用户今日活动次数"""
         today = datetime.now().date()
-
-        logger.debug(f"🔍 [计数查询开始] 用户{user_id} 活动{activity} 日期{today}")
-
-        # 🆕 详细检查用户状态
-        user_data = await self.get_user(chat_id, user_id)
-        if not user_data:
-            logger.debug(f"🔍 [计数查询] 用户{user_id} 无数据，返回0")
-            return 0
-
-        user_last_updated = user_data.get("last_updated")
-        logger.debug(
-            f"🔍 [计数查询] 用户{user_id} 最后更新: {user_last_updated}, 今日: {today}"
-        )
-
-        if user_last_updated != today:
-            logger.debug(
-                f"🔍 [计数查询] 用户{user_id} 不在今日状态({user_last_updated} != {today})，返回0"
-            )
-            return 0
-
         async with self.pool.acquire() as conn:
-            # 🆕 使用更严格的查询，确保只返回今日数据
             row = await conn.fetchrow(
-                """
-                SELECT ua.activity_count 
-                FROM user_activities ua
-                INNER JOIN users u ON ua.chat_id = u.chat_id AND ua.user_id = u.user_id
-                WHERE ua.chat_id = $1 
-                    AND ua.user_id = $2 
-                    AND ua.activity_date = $3 
-                    AND ua.activity_name = $4
-                    AND u.last_updated = $3  -- 🆕 关键过滤条件
-                """,
+                "SELECT activity_count FROM user_activities WHERE chat_id = $1 AND user_id = $2 AND activity_date = $3 AND activity_name = $4",
                 chat_id,
                 user_id,
                 today,
                 activity,
             )
-
             count = row["activity_count"] if row else 0
-            logger.debug(f"🔍 [计数查询结果] 用户{user_id} 活动{activity} 计数{count}")
+            logger.debug(f"📊 获取活动计数: 用户{user_id} 活动{activity} 计数{count}")
             return count
 
     async def get_user_activity_time(
         self, chat_id: int, user_id: int, activity: str
     ) -> int:
-        """获取用户今日活动累计时间 - 修复版本"""
+        """获取用户今日活动累计时间"""
         today = datetime.now().date()
-
-        # 🆕 检查用户状态
-        user_data = await self.get_user(chat_id, user_id)
-        if not user_data or user_data.get("last_updated") != today:
-            return 0
-
         async with self.pool.acquire() as conn:
             row = await conn.fetchrow(
-                """
-                SELECT ua.accumulated_time 
-                FROM user_activities ua
-                JOIN users u ON ua.chat_id = u.chat_id AND ua.user_id = u.user_id
-                WHERE ua.chat_id = $1 
-                    AND ua.user_id = $2 
-                    AND ua.activity_date = $3 
-                    AND ua.activity_name = $4
-                    AND u.last_updated = $3  -- 🆕 关键过滤
-                """,
+                "SELECT accumulated_time FROM user_activities WHERE chat_id = $1 AND user_id = $2 AND activity_date = $3 AND activity_name = $4",
                 chat_id,
                 user_id,
                 today,
@@ -743,25 +714,11 @@ class PostgreSQLDatabase:
     async def get_user_all_activities(
         self, chat_id: int, user_id: int
     ) -> Dict[str, Dict]:
-        """获取用户所有活动数据 - 修复版本"""
+        """获取用户所有活动数据"""
         today = datetime.now().date()
-
-        # 🆕 检查用户状态
-        user_data = await self.get_user(chat_id, user_id)
-        if not user_data or user_data.get("last_updated") != today:
-            return {}  # 不在今日状态，返回空数据
-
         async with self.pool.acquire() as conn:
             rows = await conn.fetch(
-                """
-                SELECT ua.activity_name, ua.activity_count, ua.accumulated_time 
-                FROM user_activities ua
-                JOIN users u ON ua.chat_id = u.chat_id AND ua.user_id = u.user_id
-                WHERE ua.chat_id = $1 
-                    AND ua.user_id = $2 
-                    AND ua.activity_date = $3
-                    AND u.last_updated = $3  -- 🆕 关键过滤
-                """,
+                "SELECT activity_name, activity_count, accumulated_time FROM user_activities WHERE chat_id = $1 AND user_id = $2 AND activity_date = $3",
                 chat_id,
                 user_id,
                 today,
@@ -1253,586 +1210,64 @@ class PostgreSQLDatabase:
                 logger.error(f"💥 未知错误（get_all_groups）：{e}")
                 return []
 
-    # database.py — 替换原 get_group_members
-    async def get_group_members(
-        self,
-        chat_id: int,
-        target_date: Optional[date] = None,
-        include_all: bool = False,
-    ) -> List[Dict]:
-        """
-        获取群组成员
-        - 默认行为（target_date is None and include_all is False）：返回 last_updated == 今天 的成员（与之前兼容）
-        - target_date 提供时：返回 last_updated == target_date 的成员（用于导出/按历史日期查询）
-        - include_all=True 时：返回群组中所有用户（不按 last_updated 过滤），用于后台批量操作/重置
-        """
-        async with self.pool.acquire() as conn:
-            if include_all:
-                rows = await conn.fetch(
-                    "SELECT user_id, nickname, current_activity, activity_start_time, total_accumulated_time, total_activity_count, total_fines, overtime_count, total_overtime_time FROM users WHERE chat_id = $1",
-                    chat_id,
-                )
+
+async def get_group_members(
+    self, chat_id: int, target_date: None = None, include_all: bool = False
+):
+    """Compatibility wrapper for fetching group members.
+    - Default behavior (target_date is None and include_all is False): preserves legacy behavior (filters by last_updated == today).
+    - target_date provided: filters last_updated == target_date.
+    - include_all=True: returns all users in the group (no last_updated filter) — useful for scheduled full-group resets.
+    """
+    from datetime import datetime
+
+    async with self.pool.acquire() as conn:
+        if include_all:
+            rows = await conn.fetch(
+                """
+                SELECT user_id, nickname, current_activity, activity_start_time,
+                       total_accumulated_time, total_activity_count, total_fines,
+                       overtime_count, total_overtime_time, last_updated
+                FROM users
+                WHERE chat_id = $1
+                """,
+                chat_id,
+            )
+        else:
+            if target_date is None:
+                # Use a neutral local date if caller didn't provide one.
+                # Prefer caller to pass in a timezone-aware date (e.g., from get_beijing_time()).
+                today = datetime.now().date()
             else:
-                # 使用明确的日期（如果未给 target_date，使用北京时区的今天）
-                if target_date is None:
-                    # 不要用 datetime.now()，请从调用方传入或使用统一时间函数
-                    today = datetime.now().date()
-                else:
-                    today = target_date
-                rows = await conn.fetch(
-                    "SELECT user_id, nickname, current_activity, activity_start_time, total_accumulated_time, total_activity_count, total_fines, overtime_count, total_overtime_time FROM users WHERE chat_id = $1 AND last_updated = $2",
-                    chat_id,
-                    today,
-                )
-
-            result = []
-            for row in rows:
-                user_data = dict(row)
-                user_data["total_accumulated_time_formatted"] = (
-                    self.format_seconds_to_hms(
-                        user_data.get("total_accumulated_time", 0)
-                    )
-                )
-                user_data["total_overtime_time_formatted"] = self.format_seconds_to_hms(
-                    user_data.get("total_overtime_time", 0)
-                )
-                result.append(user_data)
-
-            return result
-
-    # ========== 月度统计 ==========
-    async def get_monthly_statistics(
-        self, chat_id: int, year: int = None, month: int = None
-    ) -> List[Dict]:
-        """获取月度统计信息 - 修复重置后数据丢失问题"""
-        if year is None or month is None:
-            today = datetime.now()
-            year = today.year
-            month = today.month
-
-        start_date = date(year, month, 1)
-        if month == 12:
-            end_date = date(year + 1, 1, 1)
-        else:
-            end_date = date(year, month + 1, 1)
-
-        async with self.pool.acquire() as conn:
-            # 🆕 关键修复：直接从 user_activities 和 work_records 计算所有统计
-            monthly_stats = await conn.fetch(
-                """
-                SELECT 
-                    u.user_id,
-                    u.nickname,
-                    -- 从 user_activities 计算活动统计
-                    SUM(COALESCE(ua.accumulated_time, 0)) as total_time,
-                    SUM(COALESCE(ua.activity_count, 0)) as total_count,
-                    -- 🆕 从 work_records 计算罚款（不依赖 users.total_fines）
-                    COALESCE((
-                        SELECT SUM(fine_amount) 
-                        FROM work_records wr 
-                        WHERE wr.chat_id = u.chat_id AND wr.user_id = u.user_id 
-                        AND wr.record_date >= $1::date AND wr.record_date < $2::date
-                    ), 0) as total_fines,
-                    -- 🆕 超时统计需要重新设计计算逻辑（暂时设为0，或从其他方式计算）
-                    0 as total_overtime_count,
-                    0 as total_overtime_time
-                FROM users u
-                LEFT JOIN user_activities ua ON u.chat_id = ua.chat_id AND u.user_id = ua.user_id
-                    AND ua.activity_date >= $1::date AND ua.activity_date < $2::date
-                WHERE u.chat_id = $3
-                GROUP BY u.user_id, u.nickname, u.chat_id
-                ORDER BY total_time DESC
-                """,
-                start_date,
-                end_date,
-                chat_id,
-            )
-
-            result = []
-            for stat in monthly_stats:
-                user_data = dict(stat)
-                user_data["total_time"] = user_data["total_time"] or 0
-                user_data["total_time_formatted"] = self.format_seconds_to_hms(
-                    user_data["total_time"]
-                )
-                user_data["total_overtime_time_formatted"] = self.format_seconds_to_hms(
-                    user_data["total_overtime_time"] or 0
-                )
-
-                # 获取用户每项活动的详细统计
-                activity_details = await conn.fetch(
-                    """
-                    SELECT 
-                        activity_name,
-                        SUM(activity_count) as activity_count,
-                        SUM(accumulated_time) as accumulated_time
-                    FROM user_activities
-                    WHERE chat_id = $1 AND user_id = $2 AND activity_date >= $3::date AND activity_date < $4::date
-                    GROUP BY activity_name
-                    """,
-                    chat_id,
-                    user_data["user_id"],
-                    start_date,
-                    end_date,
-                )
-
-                user_data["activities"] = {}
-                for row in activity_details:
-                    activity_time = row["accumulated_time"] or 0
-                    user_data["activities"][row["activity_name"]] = {
-                        "count": row["activity_count"] or 0,
-                        "time": activity_time,
-                        "time_formatted": self.format_seconds_to_hms(activity_time),
-                    }
-
-                result.append(user_data)
-
-            return result
-
-    async def get_monthly_statistics_batch(
-        self, chat_id: int, year: int, month: int, limit: int, offset: int
-    ) -> List[Dict]:
-        """分批获取月度统计信息 - 修复日期格式"""
-        start_date = date(year, month, 1)
-        if month == 12:
-            end_date = date(year + 1, 1, 1)
-        else:
-            end_date = date(year, month + 1, 1)
-
-        async with self.pool.acquire() as conn:
+                today = target_date
             rows = await conn.fetch(
                 """
-                SELECT 
-                    u.user_id,
-                    u.nickname,
-                    ua.activity_name,
-                    SUM(ua.activity_count) as total_count,
-                    SUM(ua.accumulated_time) as total_time
-                FROM users u
-                JOIN user_activities ua ON u.chat_id = ua.chat_id AND u.user_id = ua.user_id
-                WHERE u.chat_id = $1 
-                    AND ua.activity_date >= $2::date  -- 🆕 添加 ::date 转换
-                    AND ua.activity_date < $3::date   -- 🆕 添加 ::date 转换
-                GROUP BY u.user_id, u.nickname, ua.activity_name
-                ORDER BY u.user_id, ua.activity_name
-                LIMIT $4 OFFSET $5
+                SELECT user_id, nickname, current_activity, activity_start_time,
+                       total_accumulated_time, total_activity_count, total_fines,
+                       overtime_count, total_overtime_time, last_updated
+                FROM users
+                WHERE chat_id = $1 AND last_updated = $2
                 """,
                 chat_id,
-                start_date,
-                end_date,
-                limit,
-                offset,
+                today,
             )
 
-            # 按用户分组数据
-            user_stats = {}
-            for row in rows:
-                user_id = row["user_id"]
-                if user_id not in user_stats:
-                    user_stats[user_id] = {
-                        "user_id": user_id,
-                        "nickname": row["nickname"],
-                        "activities": {},
-                    }
-
-                user_stats[user_id]["activities"][row["activity_name"]] = {
-                    "count": row["total_count"] or 0,
-                    "time": row["total_time"] or 0,
-                    "time_formatted": self.format_seconds_to_hms(
-                        row["total_time"] or 0
-                    ),
-                }
-
-            return list(user_stats.values())
-
-    async def get_monthly_work_statistics(
-        self, chat_id: int, year: int = None, month: int = None
-    ) -> List[Dict]:
-        """获取月度上下班统计"""
-        if year is None or month is None:
-            today = datetime.now()
-            year = today.year
-            month = today.month
-
-        start_date = date(year, month, 1)
-        if month == 12:
-            end_date = date(year + 1, 1, 1)
-        else:
-            end_date = date(year, month + 1, 1)
-
-        async with self.pool.acquire() as conn:
-            rows = await conn.fetch(
-                """
-                SELECT 
-                    wr.user_id,
-                    u.nickname,
-                    COUNT(CASE WHEN wr.checkin_type = 'work_start' THEN 1 END) as work_start_count,
-                    COUNT(CASE WHEN wr.checkin_type = 'work_end' THEN 1 END) as work_end_count,
-                    SUM(CASE WHEN wr.checkin_type = 'work_start' THEN wr.fine_amount ELSE 0 END) as work_start_fines,
-                    SUM(CASE WHEN wr.checkin_type = 'work_end' THEN wr.fine_amount ELSE 0 END) as work_end_fines,
-                    AVG(CASE WHEN wr.checkin_type = 'work_start' THEN wr.time_diff_minutes ELSE NULL END) as avg_work_start_late,
-                    AVG(CASE WHEN wr.checkin_type = 'work_end' THEN wr.time_diff_minutes ELSE NULL END) as avg_work_end_early
-                FROM work_records wr
-                JOIN users u ON wr.chat_id = u.chat_id AND wr.user_id = u.user_id
-                WHERE wr.chat_id = $1 AND wr.record_date >= $2 AND wr.record_date < $3
-                GROUP BY wr.user_id, u.nickname
-                ORDER BY work_start_count DESC, work_end_count DESC
-            """,
-                chat_id,
-                start_date,
-                end_date,
-            )
-
-            result = []
-            for row in rows:
-                user_data = dict(row)
-                user_data["avg_work_start_late"] = user_data["avg_work_start_late"] or 0
-                user_data["avg_work_end_early"] = user_data["avg_work_end_early"] or 0
-                user_data["avg_work_start_late_formatted"] = self.format_minutes_to_hm(
-                    user_data["avg_work_start_late"]
-                )
-                user_data["avg_work_end_early_formatted"] = self.format_minutes_to_hm(
-                    user_data["avg_work_end_early"]
-                )
-                result.append(user_data)
-
-            return result
-
-    # ========== 月度工作统计 ==========
-    async def get_monthly_activity_ranking(
-        self, chat_id: int, year: int = None, month: int = None
-    ) -> Dict[str, List]:
-        """获取月度活动排行榜 - 修复重置后数据丢失问题"""
-        if year is None or month is None:
-            today = datetime.now()
-            year = today.year
-            month = today.month
-
-        start_date = date(year, month, 1)
-        if month == 12:
-            end_date = date(year + 1, 1, 1)
-        else:
-            end_date = date(year, month + 1, 1)
-
-        async with self.pool.acquire() as conn:
-            activity_limits = await self.get_activity_limits()
-            rankings = {}
-
-            for activity in activity_limits.keys():
-                # 🆕 关键修复：直接从 user_activities 计算，不依赖 users 表
-                rows = await conn.fetch(
-                    """
-                    SELECT 
-                        ua.user_id,
-                        u.nickname,
-                        SUM(COALESCE(ua.accumulated_time, 0)) as total_time,
-                        SUM(COALESCE(ua.activity_count, 0)) as total_count
-                    FROM user_activities ua
-                    JOIN users u ON ua.chat_id = u.chat_id AND ua.user_id = u.user_id
-                    WHERE ua.chat_id = $1 AND ua.activity_name = $2 
-                        AND ua.activity_date >= $3::date AND ua.activity_date < $4::date
-                    GROUP BY ua.user_id, u.nickname
-                    ORDER BY total_time DESC
-                    LIMIT 10
-                    """,
-                    chat_id,
-                    activity,
-                    start_date,
-                    end_date,
-                )
-
-                formatted_rows = []
-                for row in rows:
-                    user_data = dict(row)
-                    user_data["total_time"] = user_data["total_time"] or 0
-                    user_data["total_time_formatted"] = self.format_seconds_to_hms(
-                        user_data["total_time"]
+        result = []
+        for r in rows:
+            row = dict(r)
+            # Ensure numeric fields are not None
+            row["total_accumulated_time"] = row.get("total_accumulated_time") or 0
+            row["total_overtime_time"] = row.get("total_overtime_time") or 0
+            # Optional formatting helper compatibility
+            if hasattr(self, "format_seconds_to_hms"):
+                try:
+                    row["total_accumulated_time_formatted"] = (
+                        self.format_seconds_to_hms(row["total_accumulated_time"])
                     )
-                    formatted_rows.append(user_data)
-
-                rankings[activity] = formatted_rows
-
-            return rankings
-
-    # === 获取月度统计数据 - 横向格式专用 ===
-
-    async def get_monthly_statistics_horizontal(
-        self, chat_id: int, year: int, month: int
-    ):
-        """获取月度统计数据 - 横向格式专用"""
-        from datetime import date
-
-        start_date = date(year, month, 1)
-        if month == 12:
-            end_date = date(year + 1, 1, 1)
-        else:
-            end_date = date(year, month + 1, 1)
-
-        async with self.pool.acquire() as conn:
-            # 获取用户基本统计
-            user_stats = await conn.fetch(
-                """
-                SELECT 
-                    u.user_id,
-                    u.nickname,
-                    SUM(COALESCE(ua.accumulated_time, 0)) as total_time,
-                    SUM(COALESCE(ua.activity_count, 0)) as total_count,
-                    SUM(COALESCE(u.total_fines, 0)) as total_fines,
-                    SUM(COALESCE(u.overtime_count, 0)) as total_overtime_count,
-                    SUM(COALESCE(u.total_overtime_time, 0)) as total_overtime_time
-                FROM users u
-                LEFT JOIN user_activities ua ON u.chat_id = ua.chat_id AND u.user_id = ua.user_id
-                    AND ua.activity_date >= $1 AND ua.activity_date < $2
-                WHERE u.chat_id = $3
-                GROUP BY u.user_id, u.nickname
-                """,
-                start_date,
-                end_date,
-                chat_id,
-            )
-
-            result = []
-            for stat in user_stats:
-                user_data = dict(stat)
-
-                # 获取用户每项活动的详细统计
-                activity_details = await conn.fetch(
-                    """
-                    SELECT 
-                        activity_name,
-                        SUM(activity_count) as activity_count,
-                        SUM(accumulated_time) as accumulated_time
-                    FROM user_activities
-                    WHERE chat_id = $1 AND user_id = $2 AND activity_date >= $3 AND activity_date < $4
-                    GROUP BY activity_name
-                    """,
-                    chat_id,
-                    user_data["user_id"],
-                    start_date,
-                    end_date,
-                )
-
-                user_data["activities"] = {}
-                for row in activity_details:
-                    activity_time = row["accumulated_time"] or 0
-                    user_data["activities"][row["activity_name"]] = {
-                        "count": row["activity_count"] or 0,
-                        "time": activity_time,
-                        "time_formatted": self.format_seconds_to_hms(activity_time),
-                    }
-
-                result.append(user_data)
-
-            return result
-
-    # ========== 数据清理 ==========
-
-    async def cleanup_old_data(self, days: int = 30):
-        """清理旧数据 - 修复版（防止 str 传入 asyncpg）"""
-        try:
-            cutoff_date = (datetime.now() - timedelta(days=days)).date()
-            logger.info(
-                f"🔄 开始清理 {days} 天前的数据，截止日期: {cutoff_date.isoformat()}"
-            )
-
-            async with self.pool.acquire() as conn:
-                async with conn.transaction():
-                    # ✅ 关键修复：传入 cutoff_date（date对象），不再用字符串
-                    await conn.execute(
-                        "DELETE FROM user_activities WHERE activity_date < $1::date",
-                        cutoff_date,
+                    row["total_overtime_time_formatted"] = self.format_seconds_to_hms(
+                        row["total_overtime_time"]
                     )
-                    await conn.execute(
-                        "DELETE FROM work_records WHERE record_date < $1::date",
-                        cutoff_date,
-                    )
-                    await conn.execute(
-                        "DELETE FROM users WHERE last_updated < $1::date", cutoff_date
-                    )
-
-            logger.info(f"✅ 成功清理超过 {days} 天的数据")
-        except Exception as e:
-            logger.error(f"❌ 清理旧数据失败: {e}")
-            raise
-
-    async def safe_cleanup_old_data(self, days: int = 30) -> bool:
-        """安全清理旧数据 - 不会抛出异常，适合在定时任务中使用"""
-        try:
-            await self.cleanup_old_data(days)
-            logger.info(f"✅ 安全清理完成: 清理了超过 {days} 天的数据")
-            return True
-        except Exception as e:
-            logger.warning(f"⚠️ 安全清理数据失败（不影响主要功能）: {e}")
-            return False
-
-    async def manage_monthly_data(self):
-        """月度数据管理"""
-        try:
-            await self.cleanup_old_data(Config.DATA_RETENTION_DAYS)
-            logger.info(
-                f"✅ 月度数据管理完成，保留 {Config.DATA_RETENTION_DAYS} 天数据"
-            )
-        except Exception as e:
-            logger.error(f"❌ 月度数据管理失败: {e}")
-
-    async def should_create_monthly_archive(self) -> bool:
-        """检查是否应该创建月度归档"""
-        today = datetime.now()
-        return today.day == 1
-
-    # ========== 数据库统计 ==========
-    async def get_database_stats(self) -> Dict[str, Any]:
-        """获取数据库统计信息"""
-        return {
-            "type": "postgresql",
-            "initialized": self._initialized,
-            "cache_size": len(self._cache),
-        }
-
-    async def get_database_size(self) -> int:
-        """获取数据库大小"""
-        async with self.pool.acquire() as conn:
-            # 提取数据库名
-            db_name = self.database_url.split("/")[-1]
-            row = await conn.fetchrow("SELECT pg_database_size($1)", db_name)
-            return row[0] if row else 0
-
-    # ========== 工具方法 ==========
-    @staticmethod
-    def format_seconds_to_hms(seconds: int) -> str:
-        """将秒数格式化为小时:分钟:秒的字符串"""
-        if not seconds:
-            return "0秒"
-
-        hours = seconds // 3600
-        minutes = (seconds % 3600) // 60
-        secs = seconds % 60
-
-        if hours > 0:
-            return f"{hours}小时{minutes}分{secs}秒"
-        elif minutes > 0:
-            return f"{minutes}分{secs}秒"
-        else:
-            return f"{secs}秒"
-
-    # ========== 健康检查与监控 ==========
-    async def connection_health_check(self) -> bool:
-        """
-        ✅ 数据库连接健康检查（优化版）
-        - 自动重试1次（防止瞬时断连）
-        - 更高效的轻量查询
-        - 统一日志风格
-        - 精确异常区分
-        """
-        if not self.pool:
-            logger.warning("⚠️ [DB] 健康检查失败：连接池未初始化")
-            return False
-
-        for attempt in range(2):  # ✅ 增加1次自动重试
-            try:
-                async with self.pool.acquire() as conn:
-                    # ✅ 使用更标准的PostgreSQL查询（移除分号）
-                    result = await conn.fetchval("SELECT 1")
-                    if result == 1:
-                        if attempt > 0:
-                            logger.info("✅ [DB] 重试后连接恢复正常")
-                        else:
-                            logger.debug("✅ [DB] 连接正常")
-                        return True
-                    else:
-                        logger.error(f"❌ [DB] 健康检查返回异常值: {result}")
-                        return False
-
-            except (asyncio.TimeoutError, ConnectionError) as e:
-                logger.warning(
-                    f"⚠️ [DB] 健康检查网络异常 ({e.__class__.__name__})，正在重试... ({attempt+1}/2)"
-                )
-                if attempt == 0:  # ✅ 只在第一次重试时等待
-                    await asyncio.sleep(1)
-
-            except Exception as e:
-                logger.error(f"❌ [DB] 健康检查失败: {type(e).__name__}: {e}")
-                return False
-
-        logger.error("❌ [DB] 健康检查多次失败，数据库可能断开连接")
-        return False
-
-    async def reconnect(self, max_retries: int = 3) -> bool:
-        """
-        重新连接数据库
-        返回: True-成功, False-失败
-        """
-        logger.warning("🔄 尝试重新连接数据库...")
-
-        for attempt in range(1, max_retries + 1):
-            try:
-                # 关闭现有连接池
-                if self.pool:
-                    await self.pool.close()
-                    logger.debug("✅ 旧连接池已关闭")
-
-                # 重置状态
-                self.pool = None
-                self._initialized = False
-                self._cache.clear()
-                self._cache_ttl.clear()
-
-                # 重新初始化
-                await self.initialize()
-
-                # 验证重新连接是否成功
-                if await self.connection_health_check():
-                    logger.info(f"✅ 数据库重连成功 (第{attempt}次尝试)")
-                    return True
-                else:
-                    logger.warning(f"⚠️ 重连后健康检查失败 (第{attempt}次尝试)")
-
-            except Exception as e:
-                logger.error(f"❌ 数据库重连第{attempt}次尝试失败: {e}")
-
-                if attempt < max_retries:
-                    retry_delay = 2**attempt  # 指数退避
-                    logger.info(f"⏳ {retry_delay}秒后重试...")
-                    await asyncio.sleep(retry_delay)
-                else:
-                    logger.error(f"💥 数据库重连{max_retries}次后彻底失败")
-                    return False
-
-        return False
-
-    @staticmethod
-    def format_minutes_to_hm(minutes: float) -> str:
-        """将分钟数格式化为小时:分钟的字符串"""
-        if not minutes:
-            return "0小时0分钟"
-
-        total_seconds = int(minutes * 60)
-        hours = total_seconds // 3600
-        mins = (total_seconds % 3600) // 60
-        secs = total_seconds % 60
-
-        if hours > 0:
-            return f"{hours}小时{mins}分{secs}秒"
-        elif mins > 0:
-            return f"{mins}分{secs}秒"
-        else:
-            return f"{secs}秒"
-
-    @staticmethod
-    def format_time_for_csv(seconds: int) -> str:
-        """为 CSV 导出格式化时间显示"""
-        if not seconds:
-            return "0分0秒"
-
-        hours = seconds // 3600
-        minutes = (seconds % 3600) // 60
-        secs = seconds % 60
-
-        if hours > 0:
-            return f"{hours}时{minutes}分{secs}秒"
-        else:
-            return f"{minutes}分{secs}秒"
-
-
-# 全局数据库实例
-db = PostgreSQLDatabase()
+                except Exception:
+                    pass
+            result.append(row)
+        return result
