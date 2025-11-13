@@ -591,38 +591,81 @@ class PostgreSQLDatabase:
             # 🆕 关键修复：总是使用当前日期作为新的日期
             new_date = datetime.now().date()
 
+            logger.info(
+                f"🔄 开始重置用户数据: {chat_id}-{user_id}, 目标日期: {new_date}"
+            )
+
             async with self.pool.acquire() as conn:
                 async with conn.transaction():
-
-                    # 3. 只重置用户统计数据和状态
-                    await conn.execute(
+                    # 🆕 关键修复：确保重置所有相关字段
+                    result = await conn.execute(
                         """
-                        UPDATE users SET
-                            total_activity_count = 0,
-                            total_accumulated_time = 0,
-                            total_overtime_time = 0,
-                            overtime_count = 0,
-                            total_fines = 0,
-                            current_activity = NULL,
-                            activity_start_time = NULL,
-                            last_updated = $3,  
-                            updated_at = CURRENT_TIMESTAMP
-                        WHERE chat_id = $1 AND user_id = $2
-                        """,
+                            UPDATE users SET
+                                total_activity_count = 0,
+                                total_accumulated_time = 0,
+                                total_overtime_time = 0,
+                                overtime_count = 0,
+                                total_fines = 0,
+                                current_activity = NULL,
+                                activity_start_time = NULL,
+                                last_updated = $3,
+                                updated_at = CURRENT_TIMESTAMP
+                            WHERE chat_id = $1 AND user_id = $2
+                            RETURNING user_id
+                            """,
                         chat_id,
                         user_id,
                         new_date,
                     )
 
-            # 4. 清理相关缓存
-            cache_keys = [
-                f"user:{chat_id}:{user_id}",
-                f"group:{chat_id}",
-                "activity_limits",
-            ]
-            for key in cache_keys:
+                    # 检查是否真的更新了记录
+                    if "UPDATE 0" in str(result):
+                        logger.warning(f"⚠️ 没有更新任何记录: {chat_id}-{user_id}")
+                        # 尝试初始化用户
+                        await self.init_user(chat_id, user_id, "用户")
+                        # 再次尝试重置
+                        await conn.execute(
+                            """
+                                UPDATE users SET
+                                    total_activity_count = 0,
+                                    total_accumulated_time = 0,
+                                    total_overtime_time = 0,
+                                    overtime_count = 0,
+                                    total_fines = 0,
+                                    current_activity = NULL,
+                                    activity_start_time = NULL,
+                                    last_updated = $3,
+                                    updated_at = CURRENT_TIMESTAMP
+                                WHERE chat_id = $1 AND user_id = $2
+                                """,
+                            chat_id,
+                            user_id,
+                            new_date,
+                        )
+
+            # 🆕 强制清理缓存 - 更彻底
+            cache_keys_to_remove = []
+
+            # 清理用户相关缓存
+            cache_keys_to_remove.extend(
+                [
+                    f"user:{chat_id}:{user_id}",
+                    f"group:{chat_id}",
+                ]
+            )
+
+            # 清理所有可能包含用户数据的缓存
+            for key in list(self._cache.keys()):
+                if f"user:{chat_id}" in key or f"group:{chat_id}" in key:
+                    cache_keys_to_remove.append(key)
+
+            # 执行清理
+            for key in set(cache_keys_to_remove):
                 self._cache.pop(key, None)
                 self._cache_ttl.pop(key, None)
+
+            # 🆕 强制重新加载用户数据验证重置结果
+            user_after = await self.get_user(chat_id, user_id)
 
             # 记录详细的重置日志
             logger.info(
@@ -634,7 +677,11 @@ class PostgreSQLDatabase:
                 f"       - 累计时长: {user_before.get('total_accumulated_time', 0) if user_before else 0}秒\n"
                 f"       - 罚款金额: {user_before.get('total_fines', 0) if user_before else 0}元\n"
                 f"       - 超时次数: {user_before.get('overtime_count', 0) if user_before else 0}\n"
-                f"       - 当前活动: {user_before.get('current_activity', '无') if user_before else '无'}"
+                f"       - 当前活动: {user_before.get('current_activity', '无') if user_before else '无'}\n"
+                f"   📊 重置后状态:\n"
+                f"       - 活动次数: {user_after.get('total_activity_count', 0) if user_after else 0}\n"
+                f"       - 累计时长: {user_after.get('total_accumulated_time', 0) if user_after else 0}秒\n"
+                f"       - 罚款金额: {user_after.get('total_fines', 0) if user_after else 0}元"
             )
 
             return True
