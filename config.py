@@ -1,19 +1,25 @@
 # config.py - 完整优化版本
 import os
-from datetime import timedelta, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Dict, Any, List
 
 # 时区配置
 beijing_tz = timezone(timedelta(hours=8))
 
 
+# 🆕 添加 get_beijing_time 函数
+def get_beijing_time():
+    """获取北京时间"""
+    return datetime.now(beijing_tz)
+
+
 class Config:
     # Bot 配置
-    TOKEN = os.getenv("BOT_TOKEN", "")
+    TOKEN = os.getenv("BOT_TOKEN", "8301902909:AAG9FVqGgvntWNYNgbIrYROXrfFMlM0PRkA")
 
     # 数据库配置
     DATABASE_URL = os.getenv(
-        "DATABASE_URL", ""
+        "DATABASE_URL", "postgresql://postgres:hc456456@localhost:5432/mydata"
     )
 
     # 性能优化配置
@@ -386,4 +392,3 @@ else:
 
     if "gunicorn" not in sys.modules and "uwsgi" not in sys.modules:
         print_startup_config()
-
