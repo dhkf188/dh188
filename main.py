@@ -1360,6 +1360,49 @@ async def cmd_setchannel(message: types.Message):
             ),
         )
 
+@dp.message(Command("time_check"))
+async def cmd_time_check(message: types.Message):
+    """检查所有相关时间"""
+    from datetime import datetime
+    
+    # 获取各种时间
+    server_time = datetime.now()
+    beijing_time = get_beijing_time()
+    today_date = datetime.now().date()
+    beijing_date = beijing_time.date()
+    
+    # 获取用户时间
+    chat_id = message.chat.id
+    uid = message.from_user.id
+    user_data = await db.get_user_cached(chat_id, uid)
+    user_last_updated = user_data.get('last_updated') if user_data else None
+    
+    time_report = (
+        f"🕒 时间诊断报告\n\n"
+        f"⏰ 服务器时间:\n"
+        f"  - 完整: {server_time}\n"
+        f"  - 日期: {today_date}\n"
+        f"  - 时区: {server_time.tzinfo}\n\n"
+        f"🇨🇳 北京时间:\n"
+        f"  - 完整: {beijing_time}\n"
+        f"  - 日期: {beijing_date}\n"
+        f"  - 时区: {beijing_time.tzinfo}\n\n"
+        f"👤 用户状态:\n"
+        f"  - 最后更新: {user_last_updated}\n"
+        f"  - 匹配服务器: {user_last_updated == today_date}\n"
+        f"  - 匹配北京: {user_last_updated == beijing_date}\n\n"
+        f"🔍 问题诊断:\n"
+    )
+    
+    if user_last_updated == beijing_date:
+        time_report += "  ✅ 用户时间与北京时间匹配\n"
+    elif user_last_updated == today_date:
+        time_report += "  ⚠️ 用户时间与服务器时间匹配（但可能不是北京时间）\n"
+    else:
+        time_report += "  ❌ 用户时间与任何时间都不匹配\n"
+    
+    await message.answer(time_report)
+
 
 @dp.message(Command("setgroup"))
 @admin_required
@@ -4329,10 +4372,13 @@ async def daily_reset_task():
                     logger.info(f"⏰ 到达重置时间，正在重置群组 {chat_id} 的数据...")
 
                     # 🆕 关键修复：计算昨天的日期
-                    yesterday = now - timedelta(days=1)
+                    yesterday_dt = now - timedelta(days=1)
+                    yesterday_date = yesterday_dt.date()
 
                     # 执行每日数据重置（带用户锁防并发）
-                    group_members = await db.get_group_members(chat_id)
+                    group_members = await db.get_group_members(
+                        chat_id, include_all=True
+                    )
                     for user_data in group_members:
                         user_lock = get_user_lock(chat_id, user_data["user_id"])
                         async with user_lock:
@@ -4340,7 +4386,7 @@ async def daily_reset_task():
                             await db.reset_user_daily_data(
                                 chat_id,
                                 user_data["user_id"],
-                                yesterday.date(),  # 🆕 传递昨天的日期
+                                yesterday_date.date(),  # 🆕 传递昨天的日期
                             )
 
                     logger.info(f"✅ 群组 {chat_id} 数据重置完成")
