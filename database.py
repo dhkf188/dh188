@@ -679,23 +679,6 @@ class PostgreSQLDatabase:
         except Exception as e:
             logger.error(f"❌ 更新最后更新时间失败 {chat_id}-{user_id}: {e}")
 
-    async def get_user_activity_count(
-        self, chat_id: int, user_id: int, activity: str
-    ) -> int:
-        """获取用户今日活动次数"""
-        today = datetime.now().date()
-        async with self.pool.acquire() as conn:
-            row = await conn.fetchrow(
-                "SELECT activity_count FROM user_activities WHERE chat_id = $1 AND user_id = $2 AND activity_date = $3 AND activity_name = $4",
-                chat_id,
-                user_id,
-                today,
-                activity,
-            )
-            count = row["activity_count"] if row else 0
-            logger.debug(f"📊 获取活动计数: 用户{user_id} 活动{activity} 计数{count}")
-            return count
-
     async def get_user_activity_time(
         self, chat_id: int, user_id: int, activity: str
     ) -> int:
@@ -711,43 +694,46 @@ class PostgreSQLDatabase:
             )
             return row["accumulated_time"] if row else 0
 
+    async def get_user_all_activities(
+        self,
+        chat_id: int,
+        user_id: int,
+        period_start: date = None,
+        period_end: date = None,
+    ) -> Dict[str, Dict]:
+        """获取用户活动数据 - 支持重置周期"""
+        # 如果没有指定周期，使用当天（保持向后兼容）
+        if period_start is None or period_end is None:
+            today = datetime.now().date()
+            period_start = today
+            period_end = today
 
-async def get_user_all_activities(
-    self, chat_id: int, user_id: int, period_start: date = None, period_end: date = None
-) -> Dict[str, Dict]:
-    """获取用户活动数据 - 支持重置周期"""
-    # 如果没有指定周期，使用当天（保持向后兼容）
-    if period_start is None or period_end is None:
-        today = datetime.now().date()
-        period_start = today
-        period_end = today
-
-    async with self.pool.acquire() as conn:
-        rows = await conn.fetch(
-            """
-            SELECT activity_name, SUM(activity_count) as activity_count, 
+        async with self.pool.acquire() as conn:
+            rows = await conn.fetch(
+                """
+                SELECT activity_name, SUM(activity_count) as activity_count, 
                    SUM(accumulated_time) as accumulated_time 
-            FROM user_activities 
-            WHERE chat_id = $1 AND user_id = $2 
-            AND activity_date >= $3 AND activity_date <= $4
-            GROUP BY activity_name
-            """,
-            chat_id,
-            user_id,
-            period_start,
-            period_end,
-        )
+                FROM user_activities 
+                WHERE chat_id = $1 AND user_id = $2 
+                AND activity_date >= $3 AND activity_date <= $4
+                GROUP BY activity_name
+                """,
+                chat_id,
+                user_id,
+                period_start,
+                period_end,
+            )
 
-        activities = {}
-        for row in rows:
-            activities[row["activity_name"]] = {
-                "count": row["activity_count"] or 0,
-                "time": row["accumulated_time"] or 0,
-                "time_formatted": self.format_seconds_to_hms(
-                    row["accumulated_time"] or 0
-                ),
-            }
-        return activities
+            activities = {}
+            for row in rows:
+                activities[row["activity_name"]] = {
+                    "count": row["activity_count"] or 0,
+                    "time": row["accumulated_time"] or 0,
+                    "time_formatted": self.format_seconds_to_hms(
+                        row["accumulated_time"] or 0
+                    ),
+                }
+            return activities
 
     async def get_user_activity_count(
         self,
