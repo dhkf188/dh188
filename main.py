@@ -3531,31 +3531,29 @@ async def handle_other_text_messages(message: types.Message):
 
 # ==================== 用户功能优化 ====================
 async def show_history(message: types.Message):
-    """显示用户历史记录 - 明确显示重置周期"""
+    """显示用户历史记录 - 明确显示时间段"""
     chat_id = message.chat.id
     uid = message.from_user.id
 
     # 🎯 获取重置周期
     period_start, period_end, reset_time = await get_reset_period(chat_id)
-
-    logger.info(f"🔍 显示记录 - 用户{uid}")
-    logger.info(f"🔍 传入数据库的周期: {period_start.date()} - {period_end.date()}")
-
+    
     # 🎯 使用重置周期查询数据
-    user_activities = await db.get_user_all_activities(
-        chat_id, uid, period_start.date(), period_end.date()
-    )
-
-    logger.info(f"🔍 从数据库返回的数据: {user_activities}")
-
+    user_activities = await db.get_user_all_activities(chat_id, uid, period_start.date(), period_end.date())
+    
     async with OptimizedUserContext(chat_id, uid) as user:
-        first_line = (
-            f"👤 用户：{MessageFormatter.format_user_link(uid, user['nickname'])}"
-        )
-
-        # 🎯 明确显示重置周期
-        period_text = f"{period_start.strftime('%m/%d %H:%M')} - {period_end.strftime('%m/%d %H:%M')}"
-        text = f"{first_line}\n📊 重置周期记录：<code>{period_text}</code>\n\n"
+        first_line = f"👤 用户：{MessageFormatter.format_user_link(uid, user['nickname'])}"
+        
+        # 🎯 更明确的时间段显示
+        now = get_beijing_time()
+        if now < period_end:
+            # 当前周期还未结束
+            period_display = f"{period_start.strftime('%m/%d %H:%M')} - 现在 (进行中)"
+        else:
+            # 当前周期已结束
+            period_display = f"{period_start.strftime('%m/%d %H:%M')} - {period_end.strftime('%m/%d %H:%M')}"
+            
+        text = f"{first_line}\n📊 当前周期记录\n⏰ 时间段: <code>{period_display}</code>\n\n"
 
         has_records = False
         activity_limits = await db.get_activity_limits_cached()
@@ -3565,7 +3563,7 @@ async def show_history(message: types.Message):
             total_time = activity_info.get("time", 0)
             count = activity_info.get("count", 0)
             max_times = activity_limits[act]["max_times"]
-
+            
             if total_time > 0 or count > 0:
                 status = "✅" if count < max_times else "❌"
                 time_str = MessageFormatter.format_time(int(total_time))
@@ -3573,30 +3571,40 @@ async def show_history(message: types.Message):
                 has_records = True
 
         if not has_records:
-            text += "本重置周期暂无记录，请先进行打卡活动"
+            text += "🆕 当前周期暂无记录，请开始打卡！"
+
+        # 🎯 添加重置信息提示
+        text += f"\n💡 提示：数据在 <code>{reset_time.strftime('%H:%M')}</code> 自动重置"
+        
+        # 🎯 添加下次重置时间
+        next_reset = reset_time + timedelta(days=1)
+        text += f"\n⏳ 下次重置：<code>{next_reset.strftime('%m/%d %H:%M')}</code>"
 
         await message.answer(
             text,
-            reply_markup=await get_main_keyboard(
-                chat_id=chat_id, show_admin=await is_admin(uid)
-            ),
+            reply_markup=await get_main_keyboard(chat_id=chat_id, show_admin=await is_admin(uid)),
             parse_mode="HTML",
         )
 
-
 async def show_rank(message: types.Message):
-    """显示排行榜 - 使用重置周期版本"""
+    """显示排行榜 - 明确显示时间段"""
     chat_id = message.chat.id
     uid = message.from_user.id
 
     # 🎯 获取重置周期
     period_start, period_end, reset_time = await get_reset_period(chat_id)
-
+    
     await db.init_group(chat_id)
     activity_limits = await db.get_activity_limits_cached()
-
-    rank_text = f"🏆 本重置周期活动排行榜\n"
-    rank_text += f"🔄 周期：<code>{period_start.strftime('%m/%d %H:%M')} - {period_end.strftime('%m/%d %H:%M')}</code>\n\n"
+    
+    # 🎯 更明确的时间段显示
+    now = get_beijing_time()
+    if now < period_end:
+        period_display = f"{period_start.strftime('%m/%d %H:%M')} - 现在 (进行中)"
+    else:
+        period_display = f"{period_start.strftime('%m/%d %H:%M')} - {period_end.strftime('%m/%d %H:%M')}"
+    
+    rank_text = f"🏆 当前周期排行榜\n⏰ 时间段: <code>{period_display}</code>\n\n"
 
     any_result = False
     async with db.pool.acquire() as conn:
@@ -3615,11 +3623,7 @@ async def show_rank(message: types.Message):
                 ORDER BY total_time DESC
                 LIMIT $5
                 """,
-                chat_id,
-                act,
-                period_start.date(),
-                period_end.date(),
-                3,
+                chat_id, act, period_start.date(), period_end.date(), 3
             )
 
             if rows:
@@ -3634,13 +3638,11 @@ async def show_rank(message: types.Message):
                 rank_text += "\n"
 
     if not any_result:
-        rank_text += "暂时没有任何活动记录，大家快去打卡吧！"
+        rank_text += "🆕 当前周期暂无记录，大家快去打卡吧！"
 
     await message.answer(
         rank_text,
-        reply_markup=await get_main_keyboard(
-            chat_id=chat_id, show_admin=await is_admin(uid)
-        ),
+        reply_markup=await get_main_keyboard(chat_id=chat_id, show_admin=await is_admin(uid)),
         parse_mode="HTML",
     )
 
