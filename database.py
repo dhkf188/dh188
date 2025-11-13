@@ -1253,24 +1253,48 @@ class PostgreSQLDatabase:
                 logger.error(f"💥 未知错误（get_all_groups）：{e}")
                 return []
 
-    async def get_group_members(self, chat_id: int) -> List[Dict]:
-        """获取群组成员"""
-        today = datetime.now().date()
+    # database.py — 替换原 get_group_members
+    async def get_group_members(
+        self,
+        chat_id: int,
+        target_date: Optional[date] = None,
+        include_all: bool = False,
+    ) -> List[Dict]:
+        """
+        获取群组成员
+        - 默认行为（target_date is None and include_all is False）：返回 last_updated == 今天 的成员（与之前兼容）
+        - target_date 提供时：返回 last_updated == target_date 的成员（用于导出/按历史日期查询）
+        - include_all=True 时：返回群组中所有用户（不按 last_updated 过滤），用于后台批量操作/重置
+        """
         async with self.pool.acquire() as conn:
-            rows = await conn.fetch(
-                "SELECT user_id, nickname, current_activity, activity_start_time, total_accumulated_time, total_activity_count, total_fines, overtime_count, total_overtime_time FROM users WHERE chat_id = $1 AND last_updated = $2",
-                chat_id,
-                today,
-            )
+            if include_all:
+                rows = await conn.fetch(
+                    "SELECT user_id, nickname, current_activity, activity_start_time, total_accumulated_time, total_activity_count, total_fines, overtime_count, total_overtime_time FROM users WHERE chat_id = $1",
+                    chat_id,
+                )
+            else:
+                # 使用明确的日期（如果未给 target_date，使用北京时区的今天）
+                if target_date is None:
+                    # 不要用 datetime.now()，请从调用方传入或使用统一时间函数
+                    today = datetime.now().date()
+                else:
+                    today = target_date
+                rows = await conn.fetch(
+                    "SELECT user_id, nickname, current_activity, activity_start_time, total_accumulated_time, total_activity_count, total_fines, overtime_count, total_overtime_time FROM users WHERE chat_id = $1 AND last_updated = $2",
+                    chat_id,
+                    today,
+                )
 
             result = []
             for row in rows:
                 user_data = dict(row)
                 user_data["total_accumulated_time_formatted"] = (
-                    self.format_seconds_to_hms(user_data["total_accumulated_time"])
+                    self.format_seconds_to_hms(
+                        user_data.get("total_accumulated_time", 0)
+                    )
                 )
                 user_data["total_overtime_time_formatted"] = self.format_seconds_to_hms(
-                    user_data["total_overtime_time"]
+                    user_data.get("total_overtime_time", 0)
                 )
                 result.append(user_data)
 
