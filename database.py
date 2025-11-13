@@ -2,11 +2,12 @@
 import logging
 import asyncio
 import time
-import asyncpg
 from datetime import datetime, timedelta, date
 from typing import Dict, Any, List, Optional
-from config import Config, get_beijing_time
+from config import Config
+import asyncpg
 from asyncpg.pool import Pool
+from datetime import date, datetime
 
 logger = logging.getLogger("GroupCheckInBot")
 
@@ -681,35 +682,31 @@ class PostgreSQLDatabase:
     async def get_user_activity_count(
         self, chat_id: int, user_id: int, activity: str
     ) -> int:
-        """获取用户当前周期的活动次数"""
-        period_date = await self.get_current_period_date(chat_id)
-
+        """获取用户今日活动次数"""
+        today = datetime.now().date()
         async with self.pool.acquire() as conn:
             row = await conn.fetchrow(
                 "SELECT activity_count FROM user_activities WHERE chat_id = $1 AND user_id = $2 AND activity_date = $3 AND activity_name = $4",
                 chat_id,
                 user_id,
-                period_date,
+                today,
                 activity,
             )
             count = row["activity_count"] if row else 0
-            logger.debug(
-                f"📊 获取活动计数: 用户{user_id} 活动{activity} 周期{period_date} 计数{count}"
-            )
+            logger.debug(f"📊 获取活动计数: 用户{user_id} 活动{activity} 计数{count}")
             return count
 
     async def get_user_activity_time(
         self, chat_id: int, user_id: int, activity: str
     ) -> int:
-        """获取用户当前周期的活动累计时间"""
-        period_date = await self.get_current_period_date(chat_id)
-
+        """获取用户今日活动累计时间"""
+        today = datetime.now().date()
         async with self.pool.acquire() as conn:
             row = await conn.fetchrow(
                 "SELECT accumulated_time FROM user_activities WHERE chat_id = $1 AND user_id = $2 AND activity_date = $3 AND activity_name = $4",
                 chat_id,
                 user_id,
-                period_date,
+                today,
                 activity,
             )
             return row["accumulated_time"] if row else 0
@@ -717,15 +714,14 @@ class PostgreSQLDatabase:
     async def get_user_all_activities(
         self, chat_id: int, user_id: int
     ) -> Dict[str, Dict]:
-        """获取用户当前周期的所有活动数据"""
-        period_date = await self.get_current_period_date(chat_id)
-
+        """获取用户所有活动数据"""
+        today = datetime.now().date()
         async with self.pool.acquire() as conn:
             rows = await conn.fetch(
                 "SELECT activity_name, activity_count, accumulated_time FROM user_activities WHERE chat_id = $1 AND user_id = $2 AND activity_date = $3",
                 chat_id,
                 user_id,
-                period_date,
+                today,
             )
 
             activities = {}
@@ -737,11 +733,82 @@ class PostgreSQLDatabase:
                         row["accumulated_time"]
                     ),
                 }
-
-            logger.debug(
-                f"📊 获取用户活动: 用户{user_id} 周期{period_date} 活动数{len(activities)}"
-            )
             return activities
+
+    async def get_user_activities_by_date(
+        self, chat_id: int, user_id: int, target_date: date
+    ) -> Dict[str, Dict]:
+        """按指定日期获取用户活动数据"""
+        async with self.pool.acquire() as conn:
+            rows = await conn.fetch(
+                "SELECT activity_name, activity_count, accumulated_time FROM user_activities WHERE chat_id = $1 AND user_id = $2 AND activity_date = $3",
+                chat_id,
+                user_id,
+                target_date,
+            )
+
+            activities = {}
+            for row in rows:
+                activities[row["activity_name"]] = {
+                    "count": row["activity_count"],
+                    "time": row["accumulated_time"],
+                    "time_formatted": self.format_seconds_to_hms(
+                        row["accumulated_time"]
+                    ),
+                }
+            return activities
+
+    async def get_user_data_by_date(
+        self, chat_id: int, user_id: int, target_date: date
+    ) -> Optional[Dict]:
+        """按指定日期获取用户数据"""
+        async with self.pool.acquire() as conn:
+            row = await conn.fetchrow(
+                "SELECT * FROM users WHERE chat_id = $1 AND user_id = $2 AND last_updated = $3",
+                chat_id,
+                user_id,
+                target_date,
+            )
+            return dict(row) if row else None
+
+    async def get_rank_data_by_date(
+        self, chat_id: int, target_date: date, activity_names: List[str]
+    ) -> Dict[str, List]:
+        """按指定日期获取排行榜数据"""
+        async with self.pool.acquire() as conn:
+            rankings = {}
+
+            for activity in activity_names:
+                rows = await conn.fetch(
+                    """
+                    SELECT 
+                        ua.user_id,
+                        u.nickname,
+                        ua.accumulated_time as total_time,
+                        ua.activity_count as total_count
+                    FROM user_activities ua
+                    JOIN users u ON ua.chat_id = u.chat_id AND ua.user_id = u.user_id
+                    WHERE ua.chat_id = $1 AND ua.activity_name = $2 AND ua.activity_date = $3
+                    ORDER BY ua.accumulated_time DESC
+                    LIMIT 10
+                    """,
+                    chat_id,
+                    activity,
+                    target_date,
+                )
+
+                formatted_rows = []
+                for row in rows:
+                    user_data = dict(row)
+                    user_data["total_time"] = user_data["total_time"] or 0
+                    user_data["total_time_formatted"] = self.format_seconds_to_hms(
+                        user_data["total_time"]
+                    )
+                    formatted_rows.append(user_data)
+
+                rankings[activity] = formatted_rows
+
+            return rankings
 
     # ========== 上下班记录操作 ==========
     async def add_work_record(
@@ -1629,51 +1696,6 @@ class PostgreSQLDatabase:
             "initialized": self._initialized,
             "cache_size": len(self._cache),
         }
-
-    # ========== 日期计算工具函数 ==========
-    async def get_current_period_date(self, chat_id: int) -> date:
-        """
-        🎯 根据管理员设定的重置时间获取当前周期日期
-        返回：当前应该显示和统计的日期（基于重置时间计算）
-        """
-        now = get_beijing_time()
-        group_info = await self.get_group_cached(chat_id)
-
-        reset_hour = group_info.get("reset_hour", Config.DAILY_RESET_HOUR)
-        reset_minute = group_info.get("reset_minute", Config.DAILY_RESET_MINUTE)
-
-        # 计算今天的重置时间点
-        reset_time_today = now.replace(
-            hour=reset_hour, minute=reset_minute, second=0, microsecond=0
-        )
-
-        if now < reset_time_today:
-            # 还没到今天的重置点 → 当前周期是昨天
-            period_date = (reset_time_today - timedelta(days=1)).date()
-            logger.debug(
-                f"📅 周期计算: 当前时间{now} < 重置时间{reset_time_today} → 周期日期: {period_date}"
-            )
-        else:
-            # 已经过了重置点 → 当前周期是今天
-            period_date = reset_time_today.date()
-            logger.debug(
-                f"📅 周期计算: 当前时间{now} >= 重置时间{reset_time_today} → 周期日期: {period_date}"
-            )
-
-        return period_date
-
-    async def get_period_date_range(self, chat_id: int) -> tuple[date, date]:
-        """
-        🎯 获取当前周期的日期范围（用于月度统计等）
-        返回：(周期开始日期, 周期结束日期)
-        """
-        current_period_date = await self.get_current_period_date(chat_id)
-
-        # 当前周期就是一天
-        period_start = current_period_date
-        period_end = current_period_date
-
-        return period_start, period_end
 
     async def get_database_size(self) -> int:
         """获取数据库大小"""
