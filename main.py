@@ -4318,7 +4318,7 @@ async def daily_reset_task():
                     yesterday = now - timedelta(days=1)
 
                     # 执行每日数据重置（带用户锁防并发）
-                    group_members = await db.get_group_members(chat_id, include_all=True)
+                    group_members = await db.get_group_members(chat_id)
                     for user_data in group_members:
                         user_lock = get_user_lock(chat_id, user_data["user_id"])
                         async with user_lock:
