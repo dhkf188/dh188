@@ -1506,6 +1506,54 @@ async def cmd_debug_reset(message: types.Message):
         await message.answer(f"❌ 调试失败: {e}")
 
 
+@dp.message(Command("check_rank_data"))
+@admin_required
+async def cmd_check_rank_data(message: types.Message):
+    """检查排行榜数据源"""
+    chat_id = message.chat.id
+    today = datetime.now().date()
+
+    try:
+        async with db.pool.acquire() as conn:
+            # 检查 users 表数据（实时数据）
+            users_data = await conn.fetch(
+                "SELECT user_id, nickname, total_accumulated_time FROM users WHERE chat_id = $1 AND last_updated = $2 ORDER BY total_accumulated_time DESC",
+                chat_id, today
+            )
+            
+            # 检查 user_activities 表数据（历史数据）
+            activities_data = await conn.fetch(
+                "SELECT user_id, SUM(accumulated_time) as total_time FROM user_activities WHERE chat_id = $1 AND activity_date = $2 GROUP BY user_id ORDER BY total_time DESC",
+                chat_id, today
+            )
+
+        result_info = (
+            f"🔍 排行榜数据源检查\n\n"
+            f"📊 users表数据（实时，重置后应该为0）:\n"
+        )
+        
+        if users_data:
+            for i, row in enumerate(users_data, 1):
+                result_info += f"  {i}. {row['nickname']}: {row['total_accumulated_time']}秒\n"
+        else:
+            result_info += "  暂无数据\n"
+            
+        result_info += f"\n📊 user_activities表数据（历史，不受重置影响）:\n"
+        
+        if activities_data:
+            for i, row in enumerate(activities_data, 1):
+                result_info += f"  {i}. 用户{row['user_id']}: {row['total_time']}秒\n"
+        else:
+            result_info += "  暂无数据\n"
+            
+        result_info += f"\n💡 排行榜应该使用 users 表数据"
+
+        await message.answer(result_info, parse_mode="HTML")
+
+    except Exception as e:
+        await message.answer(f"❌ 数据检查失败: {e}")
+
+
 @dp.message(Command("reset_test"))
 @admin_required
 async def cmd_reset_test(message: types.Message):
@@ -3630,9 +3678,12 @@ async def handle_other_text_messages(message: types.Message):
 
 # ==================== 用户功能优化 ====================
 async def show_history(message: types.Message):
-    """显示用户历史记录 - 优化版本"""
+    """显示用户历史记录 - 修复重置版本"""
     chat_id = message.chat.id
     uid = message.from_user.id
+
+    # 🆕 强制清理缓存确保获取最新数据
+    db._cache.pop(f"user:{chat_id}:{uid}", None)
 
     async with OptimizedUserContext(chat_id, uid) as user:
         first_line = (
@@ -3642,35 +3693,40 @@ async def show_history(message: types.Message):
 
         has_records = False
         activity_limits = await db.get_activity_limits_cached()
-        user_activities = await db.get_user_all_activities(chat_id, uid)
 
-        for act in activity_limits.keys():
-            activity_info = user_activities.get(act, {})
-            total_time = activity_info.get("time", 0)
-            count = activity_info.get("count", 0)
-            max_times = activity_limits[act]["max_times"]
-            if total_time > 0 or count > 0:
-                status = "✅" if count < max_times else "❌"
-                time_str = MessageFormatter.format_time(int(total_time))
-                text += f"• <code>{act}</code>：<code>{time_str}</code>，次数：<code>{count}</code>/<code>{max_times}</code> {status}\n"
-                has_records = True
-
+        # 🆕 修复：只使用 users 表的实时数据，不使用 user_activities 历史数据
         total_time_all = user.get("total_accumulated_time", 0)
         total_count_all = user.get("total_activity_count", 0)
         total_fine = user.get("total_fines", 0)
         overtime_count = user.get("overtime_count", 0)
         total_overtime = user.get("total_overtime_time", 0)
 
+        # 🆕 如果有活动数据才显示详细活动
+        if total_count_all > 0:
+            # 获取今日活动详情（仅用于显示，不用于计数）
+            user_activities = await db.get_user_all_activities(chat_id, uid)
+            for act in activity_limits.keys():
+                activity_info = user_activities.get(act, {})
+                total_time = activity_info.get("time", 0)
+                count = activity_info.get("count", 0)
+                max_times = activity_limits[act]["max_times"]
+                if count > 0:  # 只显示有次数的活动
+                    status = "✅" if count < max_times else "❌"
+                    time_str = MessageFormatter.format_time(int(total_time))
+                    text += f"• <code>{act}</code>：<code>{time_str}</code>，次数：<code>{count}</code>/<code>{max_times}</code> {status}\n"
+                    has_records = True
+
         text += f"\n📈 今日总统计：\n"
         text += f"• 总累计时间：<code>{MessageFormatter.format_time(int(total_time_all))}</code>\n"
         text += f"• 总活动次数：<code>{total_count_all}</code> 次\n"
+
         if overtime_count > 0:
             text += f"• 超时次数：<code>{overtime_count}</code> 次\n"
             text += f"• 总超时时间：<code>{MessageFormatter.format_time(int(total_overtime))}</code>\n"
         if total_fine > 0:
             text += f"• 累计罚款：<code>{total_fine}</code> 元"
 
-        if not has_records and total_count_all == 0:
+        if total_count_all == 0:
             text += "暂无记录，请先进行打卡活动"
 
         await message.answer(
@@ -3683,14 +3739,16 @@ async def show_history(message: types.Message):
 
 
 async def show_rank(message: types.Message):
-    """显示排行榜（修复版）——直接从 user_activities 聚合当天数据，避免依赖 last_updated"""
+    """显示排行榜 - 修复重置版本（使用实时数据）"""
     chat_id = message.chat.id
     uid = message.from_user.id
 
-    # 确保群组初始化（如果你 init_group 有副作用）
+    # 🆕 清理群组缓存确保获取最新数据
+    db._cache.pop(f"group:{chat_id}", None)
+
     await db.init_group(chat_id)
 
-    # 读取活动列表（带缓存）
+    # 读取活动列表
     activity_limits = await db.get_activity_limits_cached()
     if not activity_limits:
         await message.answer(
@@ -3705,53 +3763,71 @@ async def show_rank(message: types.Message):
     rank_text = "🏆 今日活动排行榜\n\n"
     today = datetime.now().date()
 
-    # 为避免大量单次连接开销，我们直接用连接一次性查询每个活动的 TopN
-    top_n = 3
+    # 🆕 修复：直接从 users 表获取实时数据，而不是 user_activities 历史数据
     async with db.pool.acquire() as conn:
         any_result = False
+
+        # 🆕 方法1：总体排行榜（按总时长）
+        rank_text += "📊 <b>今日总时长排行榜</b>\n"
+        overall_rank = await conn.fetch(
+            """
+            SELECT 
+                user_id,
+                nickname,
+                total_accumulated_time as total_time
+            FROM users 
+            WHERE chat_id = $1 AND last_updated = $2 AND total_accumulated_time > 0
+            ORDER BY total_accumulated_time DESC
+            LIMIT 10
+            """,
+            chat_id,
+            today,
+        )
+
+        if overall_rank:
+            any_result = True
+            for i, row in enumerate(overall_rank, start=1):
+                user_id = row["user_id"]
+                name = row["nickname"] or str(user_id)
+                time_sec = row["total_time"] or 0
+                time_str = MessageFormatter.format_time(int(time_sec))
+                rank_text += f"  <code>{i}.</code> {MessageFormatter.format_user_link(user_id, name)} - <code>{time_str}</code>\n"
+            rank_text += "\n"
+        else:
+            rank_text += "  暂无数据\n\n"
+
+        # 🆕 方法2：按活动分类排行榜
         for act in activity_limits.keys():
+            # 对于每个活动，从 user_activities 获取今日数据（但仅用于活动分类排名）
             rows = await conn.fetch(
                 """
                 SELECT
                     u.user_id,
                     u.nickname,
-                    ua.accumulated_time as total_time
-                FROM user_activities ua
-                JOIN users u ON ua.chat_id = u.chat_id AND ua.user_id = u.user_id
-                WHERE ua.chat_id = $1 AND ua.activity_name = $2 AND ua.activity_date = $3
+                    COALESCE(ua.accumulated_time, 0) as total_time
+                FROM users u
+                LEFT JOIN user_activities ua ON u.chat_id = ua.chat_id AND u.user_id = ua.user_id 
+                    AND ua.activity_name = $2 AND ua.activity_date = $3
+                WHERE u.chat_id = $1 AND u.last_updated = $3 AND COALESCE(ua.accumulated_time, 0) > 0
                 ORDER BY ua.accumulated_time DESC
-                LIMIT $4
+                LIMIT 3
                 """,
                 chat_id,
                 act,
                 today,
-                top_n,
             )
 
-            if not rows:
-                # 跳过没有数据的活动（也可以显示“暂无记录”）
-                continue
-
-            any_result = True
-            rank_text += f"📈 <code>{act}</code>：\n"
-            for i, row in enumerate(rows, start=1):
-                user_id = row["user_id"]
-                name = row["nickname"] or str(user_id)
-                time_sec = row["total_time"] or 0
-                # 你的 MessageFormatter.format_time / format_seconds_to_hms 根据项目定义来用
-                # 这里尽量使用项目里已有的工具：
-                try:
-                    time_str = MessageFormatter.format_time(int(time_sec))
-                except Exception:
-                    # 兜底格式化为秒->时分秒
-                    time_str = (
-                        db.format_seconds_to_hms(int(time_sec))
-                        if hasattr(db, "format_seconds_to_hms")
-                        else f"{int(time_sec)}s"
-                    )
-
-                rank_text += f"  <code>{i}.</code> {MessageFormatter.format_user_link(user_id, name)} - <code>{time_str}</code>\n"
-            rank_text += "\n"
+            if rows and any(row["total_time"] > 0 for row in rows):
+                any_result = True
+                rank_text += f"📈 <code>{act}</code>：\n"
+                for i, row in enumerate(rows, start=1):
+                    if row["total_time"] > 0:
+                        user_id = row["user_id"]
+                        name = row["nickname"] or str(user_id)
+                        time_sec = row["total_time"] or 0
+                        time_str = MessageFormatter.format_time(int(time_sec))
+                        rank_text += f"  <code>{i}.</code> {MessageFormatter.format_user_link(user_id, name)} - <code>{time_str}</code>\n"
+                rank_text += "\n"
 
     if not any_result:
         rank_text = "🏆 今日活动排行榜\n\n暂时没有任何活动记录，大家快去打卡吧！"
