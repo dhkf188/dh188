@@ -33,7 +33,6 @@ from aiohttp import web
 from config import Config, beijing_tz
 from database import PostgreSQLDatabase as AsyncDatabase
 from heartbeat import heartbeat_manager
-from aiogram import types
 
 from contextlib import suppress
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
@@ -639,7 +638,7 @@ async def calculate_work_fine(checkin_type: str, late_minutes: float) -> int:
 async def reset_daily_data_if_needed(chat_id: int, uid: int):
     """
     🎯 精确版每日数据重置 - 基于管理员设定的重置时间点
-    逻辑：如果用户最后更新时间在上个重置周期之前，就重置数据
+    修复：正确使用群组特定的重置时间
     """
     from datetime import date, datetime, timedelta
 
@@ -653,8 +652,15 @@ async def reset_daily_data_if_needed(chat_id: int, uid: int):
             await db.init_group(chat_id)
             group_info = await db.get_group_cached(chat_id)
 
-        reset_hour = group_info.get("reset_hour", Config.DAILY_RESET_HOUR)
-        reset_minute = group_info.get("reset_minute", Config.DAILY_RESET_MINUTE)
+        # 🆕 关键修复：正确获取群组特定的重置时间
+        reset_hour = group_info.get("reset_hour")
+        reset_minute = group_info.get("reset_minute")
+
+        # 如果群组没有设置重置时间，使用默认配置
+        if reset_hour is None:
+            reset_hour = Config.DAILY_RESET_HOUR
+        if reset_minute is None:
+            reset_minute = Config.DAILY_RESET_MINUTE
 
         # 计算当前重置周期开始时间
         reset_time_today = now.replace(
@@ -4286,7 +4292,7 @@ async def auto_daily_export_task():
 
 async def daily_reset_task():
     """
-    每日自动重置任务（重置 + 延迟导出昨日数据）- 修复版
+    每日自动重置任务（使用群组特定的重置时间）
     """
     while True:
         now = get_beijing_time()
@@ -4307,6 +4313,7 @@ async def daily_reset_task():
                 if not group_data:
                     continue
 
+                # 🆕 关键修复：使用群组特定的重置时间
                 reset_hour = group_data.get("reset_hour", Config.DAILY_RESET_HOUR)
                 reset_minute = group_data.get("reset_minute", Config.DAILY_RESET_MINUTE)
 
@@ -5021,20 +5028,18 @@ async def optimized_on_shutdown():
     logger.info("🛑 机器人正在关闭...")
 
     try:
-        # 并行清理任务
-        cleanup_tasks = [
-            performance_optimizer.memory_cleanup(),
-            db.cleanup_cache(),
-            heartbeat_manager.stop(),  # 停止心跳管理器
-        ]
-
-        # 取消所有活动任务
+        # 先取消定时器任务
         await timer_manager.cancel_all_timers()
-        await asyncio.gather(*cleanup_tasks, return_exceptions=True)
+
+        # 使用 TaskGroup 并行清理（Python 3.11+）
+        async with asyncio.TaskGroup() as tg:
+            tg.create_task(performance_optimizer.memory_cleanup())
+            tg.create_task(db.cleanup_cache())
+            tg.create_task(heartbeat_manager.stop())
 
         logger.info("✅ 优化清理完成")
-    except Exception as e:
-        logger.error(f"❌ 关闭过程中出错: {e}")
+    except Exception:
+        logger.exception("❌ 关闭过程中出错")
 
 
 # ========== 主启动函数优化 ==========
