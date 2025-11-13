@@ -702,6 +702,16 @@ class PostgreSQLDatabase:
         period_end: date = None,
     ) -> Dict[str, Dict]:
         """获取用户所有活动数据 - 使用周期参数"""
+
+        cache_keys_to_clear = [
+            f"user:{chat_id}:{user_id}",
+            "activity_limits",
+            "push_settings",
+        ]
+        for key in cache_keys_to_clear:
+            self._cache.pop(key, None)
+            self._cache_ttl.pop(key, None)
+
         # 🎯 如果没有传入周期，使用当天（保持兼容）
         if period_start is None or period_end is None:
             today = datetime.now().date()
