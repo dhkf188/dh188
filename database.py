@@ -711,104 +711,77 @@ class PostgreSQLDatabase:
             )
             return row["accumulated_time"] if row else 0
 
-    async def get_user_all_activities(
-        self, chat_id: int, user_id: int
-    ) -> Dict[str, Dict]:
-        """获取用户所有活动数据"""
+
+async def get_user_all_activities(
+    self, chat_id: int, user_id: int, period_start: date = None, period_end: date = None
+) -> Dict[str, Dict]:
+    """获取用户活动数据 - 支持重置周期"""
+    # 如果没有指定周期，使用当天（保持向后兼容）
+    if period_start is None or period_end is None:
         today = datetime.now().date()
-        async with self.pool.acquire() as conn:
-            rows = await conn.fetch(
-                "SELECT activity_name, activity_count, accumulated_time FROM user_activities WHERE chat_id = $1 AND user_id = $2 AND activity_date = $3",
-                chat_id,
-                user_id,
-                today,
-            )
+        period_start = today
+        period_end = today
 
-            activities = {}
-            for row in rows:
-                activities[row["activity_name"]] = {
-                    "count": row["activity_count"],
-                    "time": row["accumulated_time"],
-                    "time_formatted": self.format_seconds_to_hms(
-                        row["accumulated_time"]
-                    ),
-                }
-            return activities
+    async with self.pool.acquire() as conn:
+        rows = await conn.fetch(
+            """
+            SELECT activity_name, SUM(activity_count) as activity_count, 
+                   SUM(accumulated_time) as accumulated_time 
+            FROM user_activities 
+            WHERE chat_id = $1 AND user_id = $2 
+            AND activity_date >= $3 AND activity_date <= $4
+            GROUP BY activity_name
+            """,
+            chat_id,
+            user_id,
+            period_start,
+            period_end,
+        )
 
-    async def get_user_activities_by_date(
-        self, chat_id: int, user_id: int, target_date: date
-    ) -> Dict[str, Dict]:
-        """按指定日期获取用户活动数据"""
-        async with self.pool.acquire() as conn:
-            rows = await conn.fetch(
-                "SELECT activity_name, activity_count, accumulated_time FROM user_activities WHERE chat_id = $1 AND user_id = $2 AND activity_date = $3",
-                chat_id,
-                user_id,
-                target_date,
-            )
+        activities = {}
+        for row in rows:
+            activities[row["activity_name"]] = {
+                "count": row["activity_count"] or 0,
+                "time": row["accumulated_time"] or 0,
+                "time_formatted": self.format_seconds_to_hms(
+                    row["accumulated_time"] or 0
+                ),
+            }
+        return activities
 
-            activities = {}
-            for row in rows:
-                activities[row["activity_name"]] = {
-                    "count": row["activity_count"],
-                    "time": row["accumulated_time"],
-                    "time_formatted": self.format_seconds_to_hms(
-                        row["accumulated_time"]
-                    ),
-                }
-            return activities
+    async def get_user_activity_count(
+        self,
+        chat_id: int,
+        user_id: int,
+        activity: str,
+        period_start: date = None,
+        period_end: date = None,
+    ) -> int:
+        """获取用户活动次数 - 支持重置周期"""
+        if period_start is None or period_end is None:
+            today = datetime.now().date()
+            period_start = today
+            period_end = today
 
-    async def get_user_data_by_date(
-        self, chat_id: int, user_id: int, target_date: date
-    ) -> Optional[Dict]:
-        """按指定日期获取用户数据"""
         async with self.pool.acquire() as conn:
             row = await conn.fetchrow(
-                "SELECT * FROM users WHERE chat_id = $1 AND user_id = $2 AND last_updated = $3",
+                """
+                SELECT SUM(activity_count) as activity_count
+                FROM user_activities 
+                WHERE chat_id = $1 AND user_id = $2 AND activity_name = $3
+                AND activity_date >= $4 AND activity_date <= $5
+                """,
                 chat_id,
                 user_id,
-                target_date,
+                activity,
+                period_start,
+                period_end,
             )
-            return dict(row) if row else None
-
-    async def get_rank_data_by_date(
-        self, chat_id: int, target_date: date, activity_names: List[str]
-    ) -> Dict[str, List]:
-        """按指定日期获取排行榜数据"""
-        async with self.pool.acquire() as conn:
-            rankings = {}
-
-            for activity in activity_names:
-                rows = await conn.fetch(
-                    """
-                    SELECT 
-                        ua.user_id,
-                        u.nickname,
-                        ua.accumulated_time as total_time,
-                        ua.activity_count as total_count
-                    FROM user_activities ua
-                    JOIN users u ON ua.chat_id = u.chat_id AND ua.user_id = u.user_id
-                    WHERE ua.chat_id = $1 AND ua.activity_name = $2 AND ua.activity_date = $3
-                    ORDER BY ua.accumulated_time DESC
-                    LIMIT 10
-                    """,
-                    chat_id,
-                    activity,
-                    target_date,
-                )
-
-                formatted_rows = []
-                for row in rows:
-                    user_data = dict(row)
-                    user_data["total_time"] = user_data["total_time"] or 0
-                    user_data["total_time_formatted"] = self.format_seconds_to_hms(
-                        user_data["total_time"]
-                    )
-                    formatted_rows.append(user_data)
-
-                rankings[activity] = formatted_rows
-
-            return rankings
+            count = row["activity_count"] if row else 0
+            logger.debug(
+                f"📊 获取活动计数(周期): 用户{user_id} 活动{activity} 计数{count}"
+            )
+            return count
 
     # ========== 上下班记录操作 ==========
     async def add_work_record(
