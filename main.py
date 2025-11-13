@@ -770,22 +770,24 @@ async def reset_daily_data_if_needed(chat_id: int, uid: int):
 
 
 async def check_activity_limit(chat_id: int, uid: int, act: str):
-    """检查活动次数是否达到上限 - 使用重置周期版本"""
+    """检查活动次数是否达到上限 - 添加空值保护"""
     await db.init_group(chat_id)
     await db.init_user(chat_id, uid)
 
     # 🎯 获取重置周期
     period_start, period_end, reset_time = await get_reset_period(chat_id)
-
+    
     # 🎯 使用重置周期查询当前次数
-    current_count = await db.get_user_activity_count(
-        chat_id, uid, act, period_start.date(), period_end.date()
-    )
+    current_count = await db.get_user_activity_count(chat_id, uid, act, period_start.date(), period_end.date())
     max_times = await db.get_activity_max_times(act)
+    
+    # ✅ 添加空值保护
+    if current_count is None:
+        current_count = 0
+    if max_times is None:
+        max_times = 0
 
-    logger.info(
-        f"🔍 活动次数检查(周期): 用户{uid} 活动{act} 当前{current_count}次 上限{max_times}次"
-    )
+    logger.info(f"🔍 活动次数检查(周期): 用户{uid} 活动{act} 当前{current_count}次 上限{max_times}次")
 
     return current_count < max_times, current_count, max_times
 
