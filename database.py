@@ -576,35 +576,23 @@ class PostgreSQLDatabase:
         self, chat_id: int, user_id: int, target_date: date | None = None
     ):
         """
-        ✅ 修复版：重置用户每日数据但保留历史记录
-        只重置累计统计和当前状态，不删除历史记录
+        ✅ 紧急修复版：确保重置后状态正确
         """
         try:
-            # 验证和设置目标日期
             if target_date is None:
                 target_date = datetime.now().date()
-            elif not isinstance(target_date, date):
-                raise ValueError(
-                    f"target_date必须是date类型，得到: {type(target_date)}"
-                )
 
-            # 获取重置前的用户状态（用于日志）
-            user_before = await self.get_user(chat_id, user_id)
-
-            # 🆕 计算新的日期（重置后的日期）
             new_date = target_date
-            # 如果是重置昨天的数据，那么新的日期应该是今天
             if target_date < datetime.now().date():
                 new_date = datetime.now().date()
 
+            logger.info(
+                f"🔄 [重置开始] 用户{user_id} 目标日期{target_date} 新日期{new_date}"
+            )
+
             async with self.pool.acquire() as conn:
                 async with conn.transaction():
-                    # 🆕 关键修改：不再删除历史记录！
-                    # ❌ 删除这2个DELETE操作：
-                    # - 不要删除 user_activities 记录（保留导出所需的历史数据）
-                    # - 不要删除 work_records 记录（保留上下班打卡历史）
-
-                    # 3. 只重置用户统计数据和状态
+                    # 🆕 关键修复：确保 last_updated 正确设置为新日期
                     await conn.execute(
                         """
                         UPDATE users SET
@@ -615,42 +603,37 @@ class PostgreSQLDatabase:
                             total_fines = 0,
                             current_activity = NULL,
                             activity_start_time = NULL,
-                            last_updated = $3,  
+                            last_updated = $3,  -- 🆕 确保设置为新日期
                             updated_at = CURRENT_TIMESTAMP
                         WHERE chat_id = $1 AND user_id = $2
                         """,
                         chat_id,
                         user_id,
-                        new_date,  # 🆕 使用新的日期
+                        new_date,  # 🆕 使用新日期
                     )
 
-            # 4. 清理相关缓存
-            cache_keys = [
-                f"user:{chat_id}:{user_id}",
-                f"group:{chat_id}",
-                "activity_limits",
-            ]
-            for key in cache_keys:
-                self._cache.pop(key, None)
-                self._cache_ttl.pop(key, None)
+                    # 🆕 验证更新是否成功
+                    updated_user = await conn.fetchrow(
+                        "SELECT last_updated FROM users WHERE chat_id = $1 AND user_id = $2",
+                        chat_id,
+                        user_id,
+                    )
 
-            # 记录详细的重置日志
+            # 清理缓存
+            self._cache.pop(f"user:{chat_id}:{user_id}", None)
+
             logger.info(
-                f"✅ 数据重置完成（保留历史记录）: 用户 {user_id} (群组 {chat_id})\n"
-                f"   📅 重置日期: {target_date} → {new_date}\n"
-                f"   💾 历史记录: 已保留（支持后续导出）\n"
-                f"   📊 重置前状态:\n"
-                f"       - 活动次数: {user_before.get('total_activity_count', 0) if user_before else 0}\n"
-                f"       - 累计时长: {user_before.get('total_accumulated_time', 0) if user_before else 0}秒\n"
-                f"       - 罚款金额: {user_before.get('total_fines', 0) if user_before else 0}元\n"
-                f"       - 超时次数: {user_before.get('overtime_count', 0) if user_before else 0}\n"
-                f"       - 当前活动: {user_before.get('current_activity', '无') if user_before else '无'}"
+                f"✅ [重置完成] 用户{user_id}\n"
+                f"   目标日期: {target_date}\n"
+                f"   新日期: {new_date}\n"
+                f"   最后更新: {updated_user['last_updated'] if updated_user else '未知'}\n"
+                f"   状态: {'成功' if updated_user and updated_user['last_updated'] == new_date else '可能失败'}"
             )
 
             return True
 
         except Exception as e:
-            logger.error(f"❌ 重置用户数据失败 {chat_id}-{user_id}: {e}")
+            logger.error(f"❌ [重置失败] 用户{user_id}: {e}")
             return False
 
     async def update_user_last_updated(
@@ -682,35 +665,49 @@ class PostgreSQLDatabase:
     async def get_user_activity_count(
         self, chat_id: int, user_id: int, activity: str
     ) -> int:
-        """获取用户今日活动次数 - 修复版本（基于last_updated过滤）"""
+        """获取用户今日活动次数 - 紧急修复版本"""
         today = datetime.now().date()
 
-        # 🆕 首先检查用户最后更新时间，确保处于今日状态
+        logger.debug(f"🔍 [计数查询开始] 用户{user_id} 活动{activity} 日期{today}")
+
+        # 🆕 详细检查用户状态
         user_data = await self.get_user(chat_id, user_id)
-        if not user_data or user_data.get("last_updated") != today:
-            # 用户需要重置或者不在今日状态，返回0次
-            logger.debug(f"📊 用户{user_id} 不在今日状态，活动{activity} 计数返回0")
+        if not user_data:
+            logger.debug(f"🔍 [计数查询] 用户{user_id} 无数据，返回0")
+            return 0
+
+        user_last_updated = user_data.get("last_updated")
+        logger.debug(
+            f"🔍 [计数查询] 用户{user_id} 最后更新: {user_last_updated}, 今日: {today}"
+        )
+
+        if user_last_updated != today:
+            logger.debug(
+                f"🔍 [计数查询] 用户{user_id} 不在今日状态({user_last_updated} != {today})，返回0"
+            )
             return 0
 
         async with self.pool.acquire() as conn:
+            # 🆕 使用更严格的查询，确保只返回今日数据
             row = await conn.fetchrow(
                 """
                 SELECT ua.activity_count 
                 FROM user_activities ua
-                JOIN users u ON ua.chat_id = u.chat_id AND ua.user_id = u.user_id
+                INNER JOIN users u ON ua.chat_id = u.chat_id AND ua.user_id = u.user_id
                 WHERE ua.chat_id = $1 
                     AND ua.user_id = $2 
                     AND ua.activity_date = $3 
                     AND ua.activity_name = $4
-                    AND u.last_updated = $3  -- 🆕 关键：确保用户处于今日状态
+                    AND u.last_updated = $3  -- 🆕 关键过滤条件
                 """,
                 chat_id,
                 user_id,
                 today,
                 activity,
             )
+
             count = row["activity_count"] if row else 0
-            logger.debug(f"📊 获取活动计数: 用户{user_id} 活动{activity} 计数{count}")
+            logger.debug(f"🔍 [计数查询结果] 用户{user_id} 活动{activity} 计数{count}")
             return count
 
     async def get_user_activity_time(
