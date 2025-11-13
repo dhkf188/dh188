@@ -701,18 +701,20 @@ class PostgreSQLDatabase:
         period_start: date = None,
         period_end: date = None,
     ) -> Dict[str, Dict]:
-        """获取用户活动数据 - 支持重置周期"""
-        # 如果没有指定周期，使用当天（保持向后兼容）
+        """获取用户所有活动数据 - 使用周期参数"""
+        # 🎯 如果没有传入周期，使用当天（保持兼容）
         if period_start is None or period_end is None:
             today = datetime.now().date()
             period_start = today
             period_end = today
 
+        logger.info(f"🔍 数据库查询: 周期范围 {period_start} - {period_end}")
+
         async with self.pool.acquire() as conn:
             rows = await conn.fetch(
                 """
                 SELECT activity_name, SUM(activity_count) as activity_count, 
-                   SUM(accumulated_time) as accumulated_time 
+                    SUM(accumulated_time) as accumulated_time 
                 FROM user_activities 
                 WHERE chat_id = $1 AND user_id = $2 
                 AND activity_date >= $3 AND activity_date <= $4
@@ -733,6 +735,8 @@ class PostgreSQLDatabase:
                         row["accumulated_time"] or 0
                     ),
                 }
+
+            logger.info(f"🔍 数据库查询结果: {activities}")
             return activities
 
     async def get_user_activity_count(
@@ -743,11 +747,13 @@ class PostgreSQLDatabase:
         period_start: date = None,
         period_end: date = None,
     ) -> int:
-        """获取用户活动次数 - 支持重置周期"""
+        """获取用户活动次数 - 使用周期参数"""
         if period_start is None or period_end is None:
             today = datetime.now().date()
             period_start = today
             period_end = today
+
+        logger.info(f"🔍 次数查询: 活动{activity} 周期{period_start}-{period_end}")
 
         async with self.pool.acquire() as conn:
             row = await conn.fetchrow(
@@ -763,10 +769,12 @@ class PostgreSQLDatabase:
                 period_start,
                 period_end,
             )
-            count = row["activity_count"] if row else 0
-            logger.debug(
-                f"📊 获取活动计数(周期): 用户{user_id} 活动{activity} 计数{count}"
+            count = (
+                row["activity_count"]
+                if row and row["activity_count"] is not None
+                else 0
             )
+            logger.info(f"🔍 次数查询结果: {count}")
             return count
 
     # ========== 上下班记录操作 ==========
