@@ -575,35 +575,26 @@ class PostgreSQLDatabase:
     async def reset_user_daily_data(
         self, chat_id: int, user_id: int, target_date: date | None = None
     ):
-        """
-        ✅ 修正版：按管理员设定时间重置用户每日数据（包括打卡次数、我的记录、排行榜）
-        保留历史数据以支持月度统计。
-        """
+        """✅ 修复版：重置用户每日数据但保留历史记录"""
         try:
+            # 验证和设置目标日期
             if target_date is None:
                 target_date = datetime.now().date()
+            elif not isinstance(target_date, date):
+                raise ValueError(
+                    f"target_date必须是date类型，得到: {type(target_date)}"
+                )
 
+            # 获取重置前的用户状态（用于日志）
             user_before = await self.get_user(chat_id, user_id)
+
+            # 🆕 关键修复：总是使用当前日期作为新的日期
+            new_date = datetime.now().date()
 
             async with self.pool.acquire() as conn:
                 async with conn.transaction():
-                    # 1️⃣ 清空当天 user_activities 表中用户的活动计数与累计时长
-                    await conn.execute(
-                        """
-                        UPDATE user_activities
-                        SET activity_count = 0,
-                            accumulated_time = 0,
-                            updated_at = CURRENT_TIMESTAMP
-                        WHERE chat_id = $1
-                          AND user_id = $2
-                          AND activity_date = $3
-                        """,
-                        chat_id,
-                        user_id,
-                        target_date,
-                    )
 
-                    # 2️⃣ 重置 users 表的统计字段
+                    # 3. 只重置用户统计数据和状态
                     await conn.execute(
                         """
                         UPDATE users SET
@@ -614,16 +605,16 @@ class PostgreSQLDatabase:
                             total_fines = 0,
                             current_activity = NULL,
                             activity_start_time = NULL,
-                            last_updated = $3,
+                            last_updated = $3,  
                             updated_at = CURRENT_TIMESTAMP
                         WHERE chat_id = $1 AND user_id = $2
                         """,
                         chat_id,
                         user_id,
-                        target_date,
+                        new_date,
                     )
 
-            # 3️⃣ 清理缓存，确保排行榜、记录界面立即刷新
+            # 4. 清理相关缓存
             cache_keys = [
                 f"user:{chat_id}:{user_id}",
                 f"group:{chat_id}",
@@ -633,9 +624,19 @@ class PostgreSQLDatabase:
                 self._cache.pop(key, None)
                 self._cache_ttl.pop(key, None)
 
+            # 记录详细的重置日志
             logger.info(
-                f"✅ 已按重置时间清零用户统计: {user_id} (群 {chat_id}) | 日期: {target_date}"
+                f"✅ 数据重置完成（保留历史记录）: 用户 {user_id} (群组 {chat_id})\n"
+                f"   📅 重置日期: {new_date}\n"
+                f"   💾 历史记录: 已保留（支持后续导出）\n"
+                f"   📊 重置前状态:\n"
+                f"       - 活动次数: {user_before.get('total_activity_count', 0) if user_before else 0}\n"
+                f"       - 累计时长: {user_before.get('total_accumulated_time', 0) if user_before else 0}秒\n"
+                f"       - 罚款金额: {user_before.get('total_fines', 0) if user_before else 0}元\n"
+                f"       - 超时次数: {user_before.get('overtime_count', 0) if user_before else 0}\n"
+                f"       - 当前活动: {user_before.get('current_activity', '无') if user_before else '无'}"
             )
+
             return True
 
         except Exception as e:
