@@ -1403,35 +1403,6 @@ async def cmd_setchannel(message: types.Message):
             ),
         )
 
-@dp.message(Command("reset_status"))
-async def cmd_reset_status(message: types.Message):
-    """检查重置状态"""
-    chat_id = message.chat.id
-    uid = message.from_user.id
-    
-    # 获取重置周期
-    period_start, period_end, reset_time = await get_reset_period(chat_id)
-    
-    # 获取当前时间
-    now = get_beijing_time()
-    
-    # 检查当前处于哪个周期
-    if now < reset_time:
-        current_period = "昨天重置时间 ~ 今天重置时间"
-    else:
-        current_period = "今天重置时间 ~ 明天重置时间"
-    
-    status_info = (
-        f"🔄 重置状态检查\n\n"
-        f"⏰ 当前时间: {now.strftime('%Y-%m-%d %H:%M:%S')}\n"
-        f"🎯 重置时间: {reset_time.strftime('%H:%M')}\n"
-        f"📅 当前周期: {current_period}\n"
-        f"🕒 周期范围: {period_start.strftime('%m/%d %H:%M')} - {period_end.strftime('%m/%d %H:%M')}\n"
-        f"👤 你的数据: 显示以上周期内的打卡记录"
-    )
-    
-    await message.answer(status_info)
-
 
 @dp.message(Command("setgroup"))
 @admin_required
@@ -3567,10 +3538,15 @@ async def show_history(message: types.Message):
     # 🎯 获取重置周期
     period_start, period_end, reset_time = await get_reset_period(chat_id)
 
+    logger.info(f"🔍 显示记录 - 用户{uid}")
+    logger.info(f"🔍 传入数据库的周期: {period_start.date()} - {period_end.date()}")
+
     # 🎯 使用重置周期查询数据
     user_activities = await db.get_user_all_activities(
         chat_id, uid, period_start.date(), period_end.date()
     )
+
+    logger.info(f"🔍 从数据库返回的数据: {user_activities}")
 
     async with OptimizedUserContext(chat_id, uid) as user:
         first_line = (
