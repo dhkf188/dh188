@@ -33,6 +33,7 @@ from aiohttp import web
 from config import Config, beijing_tz
 from database import PostgreSQLDatabase as AsyncDatabase
 from heartbeat import heartbeat_manager
+from aiogram import types
 
 from contextlib import suppress
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
@@ -638,7 +639,7 @@ async def calculate_work_fine(checkin_type: str, late_minutes: float) -> int:
 async def reset_daily_data_if_needed(chat_id: int, uid: int):
     """
     🎯 精确版每日数据重置 - 基于管理员设定的重置时间点
-    修复：正确使用群组特定的重置时间
+    逻辑：如果用户最后更新时间在上个重置周期之前，就重置数据
     """
     from datetime import date, datetime, timedelta
 
@@ -652,15 +653,8 @@ async def reset_daily_data_if_needed(chat_id: int, uid: int):
             await db.init_group(chat_id)
             group_info = await db.get_group_cached(chat_id)
 
-        # 🆕 关键修复：正确获取群组特定的重置时间
-        reset_hour = group_info.get("reset_hour")
-        reset_minute = group_info.get("reset_minute")
-
-        # 如果群组没有设置重置时间，使用默认配置
-        if reset_hour is None:
-            reset_hour = Config.DAILY_RESET_HOUR
-        if reset_minute is None:
-            reset_minute = Config.DAILY_RESET_MINUTE
+        reset_hour = group_info.get("reset_hour", Config.DAILY_RESET_HOUR)
+        reset_minute = group_info.get("reset_minute", Config.DAILY_RESET_MINUTE)
 
         # 计算当前重置周期开始时间
         reset_time_today = now.replace(
@@ -3482,11 +3476,12 @@ async def handle_other_text_messages(message: types.Message):
 
 # ==================== 用户功能优化 ====================
 async def show_history(message: types.Message):
-    """显示用户历史记录 - 优化版本"""
+    """显示用户历史记录 - 使用每日数据"""
     chat_id = message.chat.id
     uid = message.from_user.id
 
     async with OptimizedUserContext(chat_id, uid) as user:
+        # 使用 users 和 user_activities 表的每日数据
         first_line = (
             f"👤 用户：{MessageFormatter.format_user_link(uid, user['nickname'])}"
         )
@@ -3507,6 +3502,7 @@ async def show_history(message: types.Message):
                 text += f"• <code>{act}</code>：<code>{time_str}</code>，次数：<code>{count}</code>/<code>{max_times}</code> {status}\n"
                 has_records = True
 
+        # 使用 users 表的每日统计数据
         total_time_all = user.get("total_accumulated_time", 0)
         total_count_all = user.get("total_activity_count", 0)
         total_fine = user.get("total_fines", 0)
@@ -3527,9 +3523,7 @@ async def show_history(message: types.Message):
 
         await message.answer(
             text,
-            reply_markup=await get_main_keyboard(
-                chat_id=chat_id, show_admin=await is_admin(uid)
-            ),
+            reply_markup=await get_main_keyboard(chat_id, await is_admin(uid)),
             parse_mode="HTML",
         )
 
@@ -4292,7 +4286,7 @@ async def auto_daily_export_task():
 
 async def daily_reset_task():
     """
-    每日自动重置任务（使用群组特定的重置时间）
+    每日自动重置任务（重置 + 延迟导出昨日数据）- 修复版
     """
     while True:
         now = get_beijing_time()
@@ -4313,7 +4307,6 @@ async def daily_reset_task():
                 if not group_data:
                     continue
 
-                # 🆕 关键修复：使用群组特定的重置时间
                 reset_hour = group_data.get("reset_hour", Config.DAILY_RESET_HOUR)
                 reset_minute = group_data.get("reset_minute", Config.DAILY_RESET_MINUTE)
 
@@ -4329,7 +4322,7 @@ async def daily_reset_task():
                     for user_data in group_members:
                         user_lock = get_user_lock(chat_id, user_data["user_id"])
                         async with user_lock:
-                            # 🆕 关键修复：传递昨天的日期
+                            # 🆕 关键修复：使用新的重置方法（只清除2个表）
                             await db.reset_user_daily_data(
                                 chat_id,
                                 user_data["user_id"],
@@ -4348,6 +4341,28 @@ async def daily_reset_task():
 
         # 每分钟检查一次
         await asyncio.sleep(60)
+
+
+# ========== 月度清理 =========
+async def monthly_data_cleanup_task():
+    """月度数据清理任务"""
+    while True:
+        now = get_beijing_time()
+
+        # 每月1号凌晨3点执行月度清理（避开重置时间）
+        if now.day == 1 and now.hour == 3 and now.minute == 0:
+            logger.info("🗑️ 开始执行月度数据清理...")
+            try:
+                # 清理12个月前的月度数据
+                await db.cleanup_old_monthly_data(12)
+                logger.info("✅ 月度数据清理完成")
+            except Exception as e:
+                logger.error(f"❌ 月度数据清理失败: {e}")
+
+            # 等待24小时避免重复执行
+            await asyncio.sleep(24 * 60 * 60)
+        else:
+            await asyncio.sleep(60)  # 每分钟检查一次
 
 
 async def delayed_export(chat_id: int, delay_minutes: int = 30):
@@ -5028,18 +5043,20 @@ async def optimized_on_shutdown():
     logger.info("🛑 机器人正在关闭...")
 
     try:
-        # 先取消定时器任务
-        await timer_manager.cancel_all_timers()
+        # 并行清理任务
+        cleanup_tasks = [
+            performance_optimizer.memory_cleanup(),
+            db.cleanup_cache(),
+            heartbeat_manager.stop(),  # 停止心跳管理器
+        ]
 
-        # 使用 TaskGroup 并行清理（Python 3.11+）
-        async with asyncio.TaskGroup() as tg:
-            tg.create_task(performance_optimizer.memory_cleanup())
-            tg.create_task(db.cleanup_cache())
-            tg.create_task(heartbeat_manager.stop())
+        # 取消所有活动任务
+        await timer_manager.cancel_all_timers()
+        await asyncio.gather(*cleanup_tasks, return_exceptions=True)
 
         logger.info("✅ 优化清理完成")
-    except Exception:
-        logger.exception("❌ 关闭过程中出错")
+    except Exception as e:
+        logger.error(f"❌ 关闭过程中出错: {e}")
 
 
 # ========== 主启动函数优化 ==========
@@ -5093,6 +5110,7 @@ async def optimized_main():
             asyncio.create_task(daily_reset_task()),
             asyncio.create_task(efficient_monthly_export_task()),
             asyncio.create_task(monthly_report_task()),
+            asyncio.create_task(monthly_data_cleanup_task()),
         ]
 
         all_tasks = critical_tasks + normal_tasks
