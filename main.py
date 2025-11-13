@@ -616,6 +616,23 @@ async def is_admin(uid):
     return uid in Config.ADMINS
 
 
+async def force_refresh_user_data(chat_id: int, uid: int):
+    """强制刷新用户数据缓存"""
+    # 清理所有相关缓存
+    cache_keys = [
+        f"user:{chat_id}:{uid}",
+        f"group:{chat_id}",
+    ]
+    for key in cache_keys:
+        db._cache.pop(key, None)
+        db._cache_ttl.pop(key, None)
+
+    # 重新加载数据
+    await db.get_user_cached(chat_id, uid)
+    await db.get_group_cached(chat_id)
+    logger.info(f"🔄 强制刷新用户数据缓存: {chat_id}-{uid}")
+
+
 # ==================== 重置周期计算函数 ====================
 async def get_reset_period(chat_id: int):
     """
@@ -644,7 +661,6 @@ async def get_reset_period(chat_id: int):
         period_start = reset_time_today
         period_end = reset_time_today + timedelta(days=1)
 
-    # 🎯 添加调试日志
     logger.info(
         f"🔍 重置周期计算: 当前时间={now.strftime('%m/%d %H:%M')}, 重置点={reset_time_today.strftime('%m/%d %H:%M')}"
     )
@@ -778,7 +794,7 @@ async def reset_daily_data_if_needed(chat_id: int, uid: int):
 
 
 async def check_activity_limit(chat_id: int, uid: int, act: str):
-    """检查活动次数是否达到上限 - 添加空值保护"""
+    """检查活动次数是否达到上限 - 使用重置周期"""
     await db.init_group(chat_id)
     await db.init_user(chat_id, uid)
 
