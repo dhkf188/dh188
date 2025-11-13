@@ -1509,22 +1509,30 @@ async def cmd_debug_reset(message: types.Message):
 @dp.message(Command("reset_test"))
 @admin_required
 async def cmd_reset_test(message: types.Message):
-    """测试重置功能"""
+    """测试重置功能 - 修复缓存问题版本"""
     chat_id = message.chat.id
     uid = message.from_user.id
 
     try:
+        # 🆕 强制清理缓存后重新获取数据
+        db._cache.pop(f"user:{chat_id}:{uid}", None)
+        db._cache_ttl.pop(f"user:{chat_id}:{uid}", None)
+
         # 重置前的状态
-        user_before = await db.get_user_cached(chat_id, uid)
+        user_before = await db.get_user(chat_id, uid)
 
         # 执行重置
         await reset_daily_data_if_needed(chat_id, uid)
 
+        # 🆕 再次强制清理缓存
+        db._cache.pop(f"user:{chat_id}:{uid}", None)
+        db._cache_ttl.pop(f"user:{chat_id}:{uid}", None)
+
         # 重置后的状态
-        user_after = await db.get_user_cached(chat_id, uid)
+        user_after = await db.get_user(chat_id, uid)
 
         result_info = (
-            f"🧪 重置测试结果\n\n"
+            f"🧪 重置测试结果 (修复缓存版本)\n\n"
             f"📊 重置前状态:\n"
             f"• 活动次数: {user_before.get('total_activity_count', 0)}\n"
             f"• 累计时长: {user_before.get('total_accumulated_time', 0)}秒\n"
@@ -1542,6 +1550,102 @@ async def cmd_reset_test(message: types.Message):
 
     except Exception as e:
         await message.answer(f"❌ 重置测试失败: {e}")
+
+
+@dp.message(Command("test_after_reset"))
+@admin_required
+async def cmd_test_after_reset(message: types.Message):
+    """重置后功能测试"""
+    chat_id = message.chat.id
+    uid = message.from_user.id
+
+    try:
+        # 1. 先执行重置
+        await reset_daily_data_if_needed(chat_id, uid)
+
+        # 2. 清理缓存
+        db._cache.pop(f"user:{chat_id}:{uid}", None)
+        db._cache_ttl.pop(f"user:{chat_id}:{uid}", None)
+
+        # 3. 模拟一次打卡
+        test_activity = "小厕"
+        if await db.activity_exists(test_activity):
+            # 开始活动
+            now = get_beijing_time()
+            await db.update_user_activity(
+                chat_id, uid, test_activity, str(now), "测试用户"
+            )
+            await asyncio.sleep(2)  # 等待2秒
+
+            # 结束活动
+            user_lock = get_user_lock(chat_id, uid)
+            async with user_lock:
+                user_data = await db.get_user(chat_id, uid)
+                if user_data and user_data.get("current_activity") == test_activity:
+                    await db.complete_user_activity(
+                        chat_id, uid, test_activity, 2, 0, False
+                    )
+
+            # 4. 检查结果
+            db._cache.pop(f"user:{chat_id}:{uid}", None)
+            final_data = await db.get_user(chat_id, uid)
+
+            result_info = (
+                f"🧪 重置后功能测试\n\n"
+                f"📝 测试活动: {test_activity}\n"
+                f"⏱️ 活动时长: 2秒\n\n"
+                f"📊 最终状态:\n"
+                f"• 活动次数: {final_data.get('total_activity_count', 0)}\n"
+                f"• 累计时长: {final_data.get('total_accumulated_time', 0)}秒\n\n"
+                f"✅ 测试结果: {'成功 - 重置后重新开始计数' if final_data.get('total_activity_count', 0) == 1 else '失败'}"
+            )
+        else:
+            result_info = f"❌ 测试活动 '{test_activity}' 不存在"
+
+        await message.answer(result_info, parse_mode="HTML")
+
+    except Exception as e:
+        await message.answer(f"❌ 测试失败: {e}")
+
+
+@dp.message(Command("check_real_status"))
+@admin_required
+async def cmd_check_real_status(message: types.Message):
+    """直接从数据库检查真实状态（绕过缓存）"""
+    chat_id = message.chat.id
+    uid = message.from_user.id
+
+    try:
+        # 🆕 直接从数据库查询，不经过缓存
+        async with db.pool.acquire() as conn:
+            user_data = await conn.fetchrow(
+                "SELECT total_activity_count, total_accumulated_time, total_fines, current_activity FROM users WHERE chat_id = $1 AND user_id = $2",
+                chat_id,
+                uid,
+            )
+
+            # 同时检查缓存状态
+            cached_data = db._get_cached(f"user:{chat_id}:{uid}")
+
+            if user_data:
+                result_info = (
+                    f"🔍 真实状态检查 (直接数据库查询)\n\n"
+                    f"📊 数据库状态:\n"
+                    f"• 活动次数: {user_data['total_activity_count']}\n"
+                    f"• 累计时长: {user_data['total_accumulated_time']}秒\n"
+                    f"• 罚款金额: {user_data['total_fines']}元\n"
+                    f"• 当前活动: {user_data['current_activity'] or '无'}\n\n"
+                    f"💾 缓存状态:\n"
+                    f"• 缓存存在: {'✅ 是' if cached_data else '❌ 否'}\n"
+                    f"• 缓存次数: {cached_data.get('total_activity_count', 'N/A') if cached_data else 'N/A'}\n"
+                )
+            else:
+                result_info = "❌ 用户数据不存在"
+
+        await message.answer(result_info, parse_mode="HTML")
+
+    except Exception as e:
+        await message.answer(f"❌ 状态检查失败: {e}")
 
 
 @dp.message(Command("set"))
