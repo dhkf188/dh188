@@ -2575,9 +2575,10 @@ async def cmd_exportmonthly(message: types.Message):
             await message.answer("❌ 请输入有效的年份和月份")
             return
 
-    await message.answer("⏳ 正在导出月度数据，请稍候...")
+    await message.answer("⏳ 正在导出月度数据（统一数据源），请稍候...")
 
     try:
+        # 这里调用 export_monthly_csv，它内部会处理导出逻辑
         await export_monthly_csv(chat_id, year, month)
         await message.answer("✅ 月度数据已导出并推送！")
     except Exception as e:
@@ -3916,6 +3917,85 @@ async def optimized_monthly_export(chat_id: int, year: int, month: int):
         return None
 
 
+async def optimized_monthly_export_unified(chat_id: int, year: int, month: int):
+    """优化版月度数据导出 - 使用统一数据源"""
+    try:
+        # 先同步数据确保准确性
+        await db.sync_monthly_statistics(chat_id, year, month)
+
+        # 使用统一数据源获取统计
+        monthly_stats = await db.get_monthly_statistics_unified(chat_id, year, month)
+
+        # 获取活动配置
+        activity_limits = await db.get_activity_limits_cached()
+        activity_names = list(activity_limits.keys())
+
+        csv_buffer = StringIO()
+        writer = csv.writer(csv_buffer)
+
+        # 构建表头
+        headers = ["用户ID", "用户昵称", "工作天数"]
+
+        # 为每个活动添加次数和时长的列
+        for act in activity_names:
+            headers.extend([f"{act}次数", f"{act}总时长"])
+
+        # 添加总计列
+        headers.extend(
+            [
+                "活动次数总计",
+                "活动用时总计",
+                "罚款总金额",
+                "超时次数",
+                "总超时时间",
+                "工作小时数",
+            ]
+        )
+
+        writer.writerow(headers)
+
+        if not monthly_stats:
+            return None
+
+        # 处理每个用户的数据
+        for user_stat in monthly_stats:
+            row = [
+                user_stat["user_id"],
+                user_stat.get("nickname", "未知用户"),
+                user_stat.get("work_days", 0),
+            ]
+
+            # 添加每个活动的次数和时长
+            for act in activity_names:
+                activity_info = user_stat["activities"].get(act, {})
+                count = activity_info.get("count", 0)
+                time_seconds = activity_info.get("time", 0)
+                time_formatted = db.format_time_for_csv(time_seconds)
+
+                row.append(count)
+                row.append(time_formatted)
+
+            # 添加总计信息
+            row.extend(
+                [
+                    user_stat.get("total_activity_count", 0),
+                    db.format_time_for_csv(user_stat.get("total_accumulated_time", 0)),
+                    user_stat.get("total_fines", 0),
+                    user_stat.get("overtime_count", 0),
+                    db.format_time_for_csv(user_stat.get("total_overtime_time", 0)),
+                    db.format_time_for_csv(user_stat.get("work_hours", 0)),
+                ]
+            )
+
+            writer.writerow(row)
+
+        return csv_buffer.getvalue()
+
+    except Exception as e:
+        logger.error(f"❌ 统一月度导出失败: {e}")
+        return None
+
+
 # main.py - 替换 export_and_push_csv 为下面版本
 async def export_and_push_csv(
     chat_id: int,
@@ -4038,6 +4118,7 @@ async def export_and_push_csv(
             pass
 
 
+# 找到这个函数
 async def export_monthly_csv(
     chat_id: int,
     year: int = None,
@@ -4045,7 +4126,7 @@ async def export_monthly_csv(
     to_admin_if_no_group: bool = True,
     file_name: str = None,
 ):
-    """导出月度数据为 CSV 并推送 - 优化版本"""
+    """导出月度数据 - 统一数据源版本"""
     if year is None or month is None:
         today = get_beijing_time()
         year = today.year
@@ -4054,57 +4135,66 @@ async def export_monthly_csv(
     if not file_name:
         file_name = f"group_{chat_id}_monthly_{year:04d}{month:02d}.csv"
 
-    # 使用优化版导出
-    csv_content = await optimized_monthly_export(chat_id, year, month)
+    # 🆕 删除这行，因为在这个函数中没有 message 变量
+    # await message.answer("⏳ 正在导出月度数据，请稍候...")
 
-    if not csv_content:
-        await bot.send_message(chat_id, f"⚠️ {year}年{month}月没有数据需要导出")
-        return
-
-    temp_file = f"temp_{file_name}"
     try:
-        async with aiofiles.open(temp_file, "w", encoding="utf-8-sig") as f:
-            await f.write(csv_content)
+        # 使用统一数据源导出
+        csv_content = await optimized_monthly_export_unified(chat_id, year, month)
 
-        chat_title = str(chat_id)
+        if not csv_content:
+            # 🆕 使用 bot.send_message 而不是 message.answer
+            await bot.send_message(chat_id, f"⚠️ {year}年{month}月没有数据需要导出")
+            return
+
+        temp_file = f"temp_{file_name}"
         try:
-            chat_info = await bot.get_chat(chat_id)
-            chat_title = chat_info.title or chat_title
-        except:
-            pass
+            async with aiofiles.open(temp_file, "w", encoding="utf-8-sig") as f:
+                await f.write(csv_content)
 
-        caption = (
-            f"📊 月度数据导出\n"
-            f"🏢 群组：<code>{chat_title}</code>\n"
-            f"📅 统计月份：<code>{year}年{month}月</code>\n"
-            f"⏰ 导出时间：<code>{get_beijing_time().strftime('%Y-%m-%d %H:%M:%S')}</code>\n"
-            f"{MessageFormatter.create_dashed_line()}\n"
-            f"💾 包含每个用户的月度活动统计"
-        )
+            chat_title = str(chat_id)
+            try:
+                chat_info = await bot.get_chat(chat_id)
+                chat_title = chat_info.title or chat_title
+            except:
+                pass
 
-        try:
-            csv_input_file = FSInputFile(temp_file, filename=file_name)
-            await bot.send_document(
-                chat_id, csv_input_file, caption=caption, parse_mode="HTML"
+            caption = (
+                f"📊 月度数据导出\n"
+                f"🏢 群组：<code>{chat_title}</code>\n"
+                f"📅 统计月份：<code>{year}年{month}月</code>\n"
+                f"⏰ 导出时间：<code>{get_beijing_time().strftime('%Y-%m-%d %H:%M:%S')}</code>\n"
+                f"🔒 数据源：已验证的月度统计表"
             )
+
+            try:
+                csv_input_file = FSInputFile(temp_file, filename=file_name)
+                await bot.send_document(
+                    chat_id, csv_input_file, caption=caption, parse_mode="HTML"
+                )
+            except Exception as e:
+                logger.error(f"❌ 发送到当前聊天失败: {e}")
+
+            await NotificationService.send_document(
+                chat_id, FSInputFile(temp_file, filename=file_name), caption
+            )
+
+            logger.info(f"✅ 月度数据导出并推送完成: {file_name}")
+
         except Exception as e:
-            logger.error(f"❌ 发送到当前聊天失败: {e}")
-
-        await NotificationService.send_document(
-            chat_id, FSInputFile(temp_file, filename=file_name), caption
-        )
-
-        logger.info(f"✅ 月度数据导出并推送完成: {file_name}")
+            logger.error(f"❌ 月度导出过程出错: {e}")
+            # 🆕 使用 bot.send_message 而不是 message.answer
+            await bot.send_message(chat_id, f"❌ 导出月度数据失败：{e}")
+        finally:
+            try:
+                if os.path.exists(temp_file):
+                    os.remove(temp_file)
+            except:
+                pass
 
     except Exception as e:
-        logger.error(f"❌ 月度导出过程出错: {e}")
-        await bot.send_message(chat_id, f"❌ 月度导出失败：{e}")
-    finally:
-        try:
-            if os.path.exists(temp_file):
-                os.remove(temp_file)
-        except:
-            pass
+        # 🆕 使用 bot.send_message 而不是 message.answer
+        await bot.send_message(chat_id, f"❌ 导出月度数据失败：{e}")
 
 
 async def generate_monthly_report(chat_id: int, year: int = None, month: int = None):
@@ -4574,10 +4664,8 @@ async def efficient_monthly_export_task():
                         logger.warning(f"⚠️ 内存使用较高，跳过群组 {chat_id} 的月度导出")
                         continue
 
-                    # 生成并推送月度报告
-                    await process_monthly_export_for_group(
-                        chat_id, last_year, last_month
-                    )
+                    # 🆕 修改这里：使用统一数据源版本
+                    await export_monthly_csv(chat_id, last_year, last_month)
 
                     # 每组处理完后休息一下，避免资源紧张
                     await asyncio.sleep(10)
@@ -4625,7 +4713,7 @@ async def monthly_report_task():
                             f"✅ 已发送 {last_year}年{last_month}月报告到群组 {chat_id}"
                         )
 
-                        # 导出CSV文件
+                        # 🆕 修改这里：使用统一数据源版本
                         await export_monthly_csv(chat_id, last_year, last_month)
                         logger.info(
                             f"✅ 已导出 {last_year}年{last_month}月数据到群组 {chat_id}"
