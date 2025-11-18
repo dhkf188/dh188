@@ -658,7 +658,7 @@ class PostgreSQLDatabase:
                         """,
                         chat_id,
                         user_id,
-                        target_date,
+                        new_date,
                     )
 
                     # 🆕 关键修改2：重置用户统计数据和状态
