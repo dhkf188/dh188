@@ -653,7 +653,8 @@ class PostgreSQLDatabase:
                     # 🆕 关键修改1：清理user_activities表中当天的记录
                     activities_deleted = await conn.execute(
                         """
-                        DELETE FROM user_activities 
+                        UPDATE user_activities 
+                        SET activity_count = 0, accumulated_time = 0, updated_at = CURRENT_TIMESTAMP
                         WHERE chat_id = $1 AND user_id = $2 AND activity_date = $3
                         """,
                         chat_id,
@@ -694,14 +695,14 @@ class PostgreSQLDatabase:
             # 记录详细的重置日志
             deleted_count = (
                 int(activities_deleted.split()[-1])
-                if activities_deleted and activities_deleted.startswith("DELETE")
+                if activities_deleted and activities_deleted.startswith("UPDATE")
                 else 0
             )
 
             logger.info(
                 f"✅ 完整数据重置完成（保留月度统计）: 用户 {user_id} (群组 {chat_id})\n"
                 f"   📅 重置日期: {target_date} → {new_date}\n"
-                f"   🗑️ 清理活动记录: {deleted_count} 条\n"
+                f"   🗑️ 更新活动记录: {deleted_count} 条\n"
                 f"   💾 月度统计: 已保留（不受重置影响）\n"
                 f"   📊 重置前状态:\n"
                 f"       - 活动次数: {user_before.get('total_activity_count', 0) if user_before else 0}\n"
