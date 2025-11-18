@@ -447,18 +447,26 @@ class PostgreSQLDatabase:
         )
 
     # ========== 用户相关操作 ==========
-    async def init_user(self, chat_id: int, user_id: int, nickname: str = None):
-        """初始化用户"""
-        today = self.get_beijing_date()
+    async def cleanup_inactive_users(self, days: int = 30):
+        """清理长期未活动的用户"""
+        cutoff_date = (self.get_beijing_time() - timedelta(days=days)).date()
+
         async with self.pool.acquire() as conn:
-            await conn.execute(
-                "INSERT INTO users (chat_id, user_id, nickname, last_updated) VALUES ($1, $2, $3, $4) ON CONFLICT (chat_id, user_id) DO NOTHING",
-                chat_id,
-                user_id,
-                nickname,
-                today,
+            # 删除长期未活动且没有月度统计的用户
+            deleted_count = await conn.execute(
+                """
+                DELETE FROM users 
+                WHERE last_updated < $1 
+                AND NOT EXISTS (
+                    SELECT 1 FROM monthly_statistics 
+                    WHERE monthly_statistics.chat_id = users.chat_id 
+                    AND monthly_statistics.user_id = users.user_id
+                )
+                """,
+                cutoff_date,
             )
-            self._cache.pop(f"user:{chat_id}:{user_id}", None)
+
+        logger.info(f"🧹 清理了 {deleted_count} 个长期未活动的用户")
 
     async def get_user(self, chat_id: int, user_id: int) -> Optional[Dict]:
         """获取用户数据"""
@@ -657,8 +665,8 @@ class PostgreSQLDatabase:
                         new_date,
                     )
 
-                    # 重置用户统计数据和状态
-                    await conn.execute(
+                    # 🆕 优化：条件更新，避免不必要的数据写入
+                    users_updated = await conn.execute(
                         """
                         UPDATE users SET
                             total_activity_count = 0,
@@ -671,6 +679,13 @@ class PostgreSQLDatabase:
                             last_updated = $3,  
                             updated_at = CURRENT_TIMESTAMP
                         WHERE chat_id = $1 AND user_id = $2
+                        AND (
+                            total_activity_count > 0 
+                            OR total_accumulated_time > 0 
+                            OR total_fines > 0
+                            OR overtime_count > 0
+                            OR current_activity IS NOT NULL
+                        )
                         """,
                         chat_id,
                         user_id,
@@ -687,17 +702,31 @@ class PostgreSQLDatabase:
                 self._cache.pop(key, None)
                 self._cache_ttl.pop(key, None)
 
-            # 记录详细的重置日志
-            deleted_count = (
-                int(activities_deleted.split()[-1])
-                if activities_deleted and activities_deleted.startswith("DELETE")
-                else 0
-            )
+            # 🆕 修复：安全的删除计数解析
+            deleted_count = 0
+            if activities_deleted:
+                parts = activities_deleted.split()
+                if len(parts) >= 2 and parts[0] == "DELETE":
+                    try:
+                        deleted_count = int(parts[-1])
+                    except (ValueError, IndexError):
+                        deleted_count = 0
+
+            # 🆕 修复：安全的更新计数解析
+            updated_count = 0
+            if users_updated:
+                parts = users_updated.split()
+                if len(parts) >= 2 and parts[0] == "UPDATE":
+                    try:
+                        updated_count = int(parts[-1])
+                    except (ValueError, IndexError):
+                        updated_count = 0
 
             logger.info(
                 f"✅ 完整数据清除完成（保留月度统计）: 用户 {user_id} (群组 {chat_id})\n"
                 f"   📅 清除日期: {target_date} → {new_date}\n"
                 f"   🗑️ 删除活动记录: {deleted_count} 条\n"
+                f"   🔄 更新用户记录: {updated_count} 条\n"
                 f"   💾 月度统计: 已保留（不受清除影响）\n"
                 f"   📊 清除前状态:\n"
                 f"       - 活动次数: {user_before.get('total_activity_count', 0) if user_before else 0}\n"
