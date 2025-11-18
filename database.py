@@ -624,8 +624,7 @@ class PostgreSQLDatabase:
         self, chat_id: int, user_id: int, target_date: date | None = None
     ):
         """
-        ✅ 修复版：重置用户每日数据但保留月度统计
-        重置users表和user_activities表的当日数据，但保留月度统计
+        ✅ 修复版：真正清除用户每日数据但保留月度统计
         """
         try:
             # 验证和设置目标日期
@@ -638,23 +637,19 @@ class PostgreSQLDatabase:
 
             # 获取重置前的用户状态（用于日志）
             user_before = await self.get_user(chat_id, user_id)
-
-            # 获取重置前的活动记录（用于日志）
             activities_before = await self.get_user_all_activities(chat_id, user_id)
 
-            # 🆕 计算新的日期（重置后的日期）
+            # 计算新的日期
             new_date = target_date
-            # 如果是重置昨天的数据，那么新的日期应该是今天
             if target_date < self.get_beijing_date():
                 new_date = self.get_beijing_date()
 
             async with self.pool.acquire() as conn:
                 async with conn.transaction():
-                    # 🆕 关键修改1：清理user_activities表中当天的记录
+                    # 🆕 关键修改：使用 DELETE 真正清除记录
                     activities_deleted = await conn.execute(
                         """
-                        UPDATE user_activities 
-                        SET activity_count = 0, accumulated_time = 0, updated_at = CURRENT_TIMESTAMP
+                        DELETE FROM user_activities 
                         WHERE chat_id = $1 AND user_id = $2 AND activity_date = $3
                         """,
                         chat_id,
@@ -662,7 +657,7 @@ class PostgreSQLDatabase:
                         new_date,
                     )
 
-                    # 🆕 关键修改2：重置用户统计数据和状态
+                    # 重置用户统计数据和状态
                     await conn.execute(
                         """
                         UPDATE users SET
@@ -679,7 +674,7 @@ class PostgreSQLDatabase:
                         """,
                         chat_id,
                         user_id,
-                        new_date,  # 🆕 使用新的日期
+                        new_date,
                     )
 
             # 清理相关缓存
@@ -695,16 +690,16 @@ class PostgreSQLDatabase:
             # 记录详细的重置日志
             deleted_count = (
                 int(activities_deleted.split()[-1])
-                if activities_deleted and activities_deleted.startswith("UPDATE")
+                if activities_deleted and activities_deleted.startswith("DELETE")
                 else 0
             )
 
             logger.info(
-                f"✅ 完整数据重置完成（保留月度统计）: 用户 {user_id} (群组 {chat_id})\n"
-                f"   📅 重置日期: {target_date} → {new_date}\n"
-                f"   🗑️ 更新活动记录: {deleted_count} 条\n"
-                f"   💾 月度统计: 已保留（不受重置影响）\n"
-                f"   📊 重置前状态:\n"
+                f"✅ 完整数据清除完成（保留月度统计）: 用户 {user_id} (群组 {chat_id})\n"
+                f"   📅 清除日期: {target_date} → {new_date}\n"
+                f"   🗑️ 删除活动记录: {deleted_count} 条\n"
+                f"   💾 月度统计: 已保留（不受清除影响）\n"
+                f"   📊 清除前状态:\n"
                 f"       - 活动次数: {user_before.get('total_activity_count', 0) if user_before else 0}\n"
                 f"       - 累计时长: {user_before.get('total_accumulated_time', 0) if user_before else 0}秒\n"
                 f"       - 罚款金额: {user_before.get('total_fines', 0) if user_before else 0}元\n"
@@ -716,7 +711,7 @@ class PostgreSQLDatabase:
             return True
 
         except Exception as e:
-            logger.error(f"❌ 重置用户数据失败 {chat_id}-{user_id}: {e}")
+            logger.error(f"❌ 清除用户数据失败 {chat_id}-{user_id}: {e}")
             return False
 
     async def update_user_last_updated(
