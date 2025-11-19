@@ -469,25 +469,54 @@ class PostgreSQLDatabase:
             self._cache.pop(f"user:{chat_id}:{user_id}", None)
 
     async def cleanup_inactive_users(self, days: int = 30):
-        """清理长期未活动的用户"""
+        """清理长期未活动用户及其记录（安全版）"""
+
         cutoff_date = (self.get_beijing_time() - timedelta(days=days)).date()
 
         async with self.pool.acquire() as conn:
-            # 删除长期未活动且没有月度统计的用户
-            deleted_count = await conn.execute(
-                """
-                DELETE FROM users 
-                WHERE last_updated < $1 
-                AND NOT EXISTS (
-                    SELECT 1 FROM monthly_statistics 
-                    WHERE monthly_statistics.chat_id = users.chat_id 
-                    AND monthly_statistics.user_id = users.user_id
-                )
-                """,
-                cutoff_date,
-            )
+            async with conn.transaction():
 
-        logger.info(f"🧹 清理了 {deleted_count} 个长期未活动的用户")
+                # 找出要删除的用户列表（避免直接删）
+                users_to_delete = await conn.fetch(
+                    """
+                    SELECT user_id 
+                    FROM users
+                    WHERE last_updated < $1
+                    AND NOT EXISTS (
+                        SELECT 1 FROM monthly_statistics 
+                        WHERE monthly_statistics.chat_id = users.chat_id 
+                        AND monthly_statistics.user_id = users.user_id
+                    )
+                    """,
+                    cutoff_date,
+                )
+
+                user_ids = [u["user_id"] for u in users_to_delete]
+
+                if not user_ids:
+                    logger.info("🧹 无需清理用户")
+                    return 0
+
+                # 删除用户的日常记录
+                await conn.execute(
+                    "DELETE FROM user_activities WHERE user_id = ANY($1)",
+                    user_ids,
+                )
+
+                # 删除上下班记录（如果你需要）
+                await conn.execute(
+                    "DELETE FROM work_records WHERE user_id = ANY($1)",
+                    user_ids,
+                )
+
+                # 最后删除用户
+                deleted_count = await conn.execute(
+                    "DELETE FROM users WHERE user_id = ANY($1)",
+                    user_ids,
+                )
+
+        logger.info(f"🧹 清理了 {deleted_count} 个长期未活动的用户以及他们的所有记录")
+        return deleted_count
 
     async def get_user(self, chat_id: int, user_id: int) -> Optional[Dict]:
         """获取用户数据"""
