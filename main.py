@@ -2078,6 +2078,34 @@ async def cmd_monthly_stats_status(message: types.Message):
         await message.answer(f"❌ 查看月度统计状态失败: {e}")
 
 
+@dp.message(Command("cleanup_inactive"))
+@admin_required
+async def cmd_cleanup_inactive(message: types.Message):
+    args = message.text.split()
+
+    # 默认清理 30 天未活动的用户
+    days = 30
+
+    # 如果用户手动传入天数
+    if len(args) > 1:
+        try:
+            days = int(args[1])
+        except ValueError:
+            return await message.reply("❌ 天数必须是数字，例如：/cleanup_inactive 60")
+
+    await message.reply(f"⏳ 正在清理 {days} 天未活动的用户，请稍候...")
+
+    try:
+        deleted_count = await db.cleanup_inactive_users(days)
+
+        await message.reply(
+            f"🧹 清理完成：删除了 **{deleted_count}** 个长期未活动的用户\n"
+            f"（包括 users、user_activities、work_records ）"
+        )
+    except Exception as e:
+        await message.reply(f"❌ 清理失败：{e}")
+
+
 # ==================== 上下班命令优化 ====================
 @dp.message(Command("setworktime"))
 @admin_required
@@ -3518,6 +3546,7 @@ async def handle_admin_panel_button(message: types.Message):
         "• /cleanup_monthly - 清理月度统计数据\n"
         "• /cleanup_monthly 2024 1 - 清理指定年月数据\n"
         "• /monthly_stats_status - 查看月度统计状态\n\n"
+        "• /cleanup_inactive - 清理user与user_activities默认30天\n\n"
         "• /performance 查看性能\n"
         "• /refresh_keyboard - 强制刷新键盘显示新活动\n"
         "• /debug_work - 调试上下班功能状态\n"
