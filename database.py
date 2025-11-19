@@ -447,6 +447,27 @@ class PostgreSQLDatabase:
         )
 
     # ========== 用户相关操作 ==========
+    async def init_user(self, chat_id: int, user_id: int, nickname: str = None):
+        """初始化用户"""
+        today = self.get_beijing_date()
+        async with self.pool.acquire() as conn:
+            await conn.execute(
+                """
+                INSERT INTO users (chat_id, user_id, nickname, last_updated) 
+                VALUES ($1, $2, $3, $4) 
+                ON CONFLICT (chat_id, user_id) 
+                DO UPDATE SET 
+                    nickname = COALESCE($3, users.nickname),
+                    last_updated = $4,
+                    updated_at = CURRENT_TIMESTAMP
+                """,
+                chat_id,
+                user_id,
+                nickname,
+                today,
+            )
+            self._cache.pop(f"user:{chat_id}:{user_id}", None)
+
     async def cleanup_inactive_users(self, days: int = 30):
         """清理长期未活动的用户"""
         cutoff_date = (self.get_beijing_time() - timedelta(days=days)).date()
