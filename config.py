@@ -30,13 +30,11 @@ class Config:
 
     # 数据库配置
     DATABASE_URL = os.getenv("DATABASE_URL", "")
-    DB_MIN_CONNECTIONS = int(os.getenv("DB_MIN_CONNECTIONS", "3"))
+    DB_MIN_CONNECTIONS = int(os.getenv("DB_MIN_CONNECTIONS", "2"))
     DB_MAX_CONNECTIONS = int(os.getenv("DB_MAX_CONNECTIONS", "10"))
-    DB_POOL_RECYCLE = int(os.getenv("DB_POOL_RECYCLE", "3600"))
+    DB_POOL_RECYCLE = int(os.getenv("DB_POOL_RECYCLE", "1800"))
     DB_CONNECTION_TIMEOUT = int(os.getenv("DB_CONNECTION_TIMEOUT", "60"))
-    DB_HEALTH_CHECK_INTERVAL = int(
-        os.getenv("DB_HEALTH_CHECK_INTERVAL", "30")
-    )  # 30秒检查一次
+    DB_HEALTH_CHECK_INTERVAL = int(os.getenv("DB_HEALTH_CHECK_INTERVAL", "30"))
 
     # 运行模式
     BOT_MODE = os.getenv("BOT_MODE", "polling")  # polling 或 webhook
@@ -82,7 +80,8 @@ class Config:
     DATA_RETENTION_DAYS = int(os.getenv("DATA_RETENTION_DAYS", "30"))
 
     # 清理间隔（秒）
-    CLEANUP_INTERVAL = int(os.getenv("CLEANUP_INTERVAL", "300"))
+    CLEANUP_INTERVAL = int(os.getenv("CLEANUP_INTERVAL", "600"))
+    MEMORY_CLEANUP_INTERVAL = 300
 
     # 自动导出设置
     AUTO_EXPORT_SETTINGS = {
@@ -90,6 +89,11 @@ class Config:
         "enable_group_push": True,
         "enable_admin_push": True,
     }
+
+    # 🆕 保活配置
+    KEEPALIVE_ENABLED = os.getenv("KEEPALIVE_ENABLED", "true").lower() == "true"
+    KEEPALIVE_INTERVAL = int(os.getenv("KEEPALIVE_INTERVAL", "600"))
+    EXTERNAL_MONITORING_URLS = os.getenv("EXTERNAL_MONITORING_URLS", "").split(",")
 
     # 消息模板
     MESSAGES = {
