@@ -625,34 +625,21 @@ class PostgreSQLDatabase:
 
     # ========== 缓存管理 ==========
     def _get_cached(self, key: str):
-        """🆕 带LRU管理的缓存获取"""
+        """获取缓存数据"""
         if key in self._cache_ttl and time.time() < self._cache_ttl[key]:
-            # 更新LRU顺序
-            if key in self._cache_access_order:
-                self._cache_access_order.remove(key)
-            self._cache_access_order.append(key)
             return self._cache.get(key)
         else:
-            self._cache.pop(key, None)
-            self._cache_ttl.pop(key, None)
-            if key in self._cache_access_order:
-                self._cache_access_order.remove(key)
+            # 清理过期缓存
+            if key in self._cache:
+                del self._cache[key]
+            if key in self._cache_ttl:
+                del self._cache_ttl[key]
             return None
 
     def _set_cached(self, key: str, value: Any, ttl: int = 60):
-        """🆕 带LRU管理的缓存设置"""
-        # 检查缓存大小，超限时移除最久未使用的
-        if len(self._cache) >= self._cache_max_size and self._cache_access_order:
-            oldest_key = self._cache_access_order.pop(0)
-            self._cache.pop(oldest_key, None)
-            self._cache_ttl.pop(oldest_key, None)
-            logger.debug(f"LRU缓存清理: 移除最旧键 {oldest_key}")
-
+        """设置缓存数据"""
         self._cache[key] = value
         self._cache_ttl[key] = time.time() + ttl
-        if key in self._cache_access_order:
-            self._cache_access_order.remove(key)
-        self._cache_access_order.append(key)
 
     async def cleanup_cache(self):
         """🆕 增强的缓存清理 - 过期清理 + LRU清理"""
