@@ -630,10 +630,14 @@ async def has_active_activity(chat_id: int, uid: int) -> tuple[bool, Optional[st
 
 
 async def can_perform_activities(chat_id: int, uid: int) -> tuple[bool, str]:
-    """快速检查是否可以执行活动"""
+    """快速检查是否可以执行活动 - 修复版：使用重置周期"""
     if not await db.has_work_hours_enabled(chat_id):
         return True, ""
 
+    # 🆕 先执行重置检查，确保数据状态正确
+    await reset_daily_data_if_needed(chat_id, uid)
+
+    # 使用修复后的 get_today_work_records（现在基于重置周期）
     today_records = await db.get_today_work_records(chat_id, uid)
 
     if "work_start" not in today_records:
@@ -941,6 +945,7 @@ async def start_activity(message: types.Message, act: str):
 
     user_lock = user_lock_manager.get_lock(chat_id, uid)
     async with user_lock:
+        await reset_daily_data_if_needed(chat_id, uid)
         # 快速检查
         if not await db.activity_exists(act):
             await message.answer(f"❌ 活动 '{act}' 不存在")
@@ -1169,6 +1174,7 @@ async def process_work_checkin(message: types.Message, checkin_type: str):
     user_lock = get_user_lock(chat_id, uid)
     async with user_lock:
         # ✅ 初始化群组与用户数据
+        await reset_daily_data_if_needed(chat_id, uid)
         try:
             await db.init_group(chat_id)
             await db.init_user(chat_id, uid)
@@ -1799,6 +1805,71 @@ async def cmd_cleanup_inactive(message: types.Message):
     except Exception as e:
         logger.error(f"❌ 清理未活动用户失败: {e}")
         await message.answer(f"❌ 清理未活动用户失败: {e}")
+
+
+# ========== 重置用户命令 ==========
+@admin_required
+@rate_limit(rate=3, per=30)
+async def cmd_reset_user(message: types.Message):
+    """重置指定用户的今日数据"""
+    args = message.text.split()
+    if len(args) != 2:
+        await message.answer(
+            "❌ 用法：/resetuser <用户ID>\n" "💡 示例：/resetuser 123456789",
+            reply_markup=await get_main_keyboard(
+                chat_id=message.chat.id, show_admin=True
+            ),
+        )
+        return
+
+    try:
+        chat_id = message.chat.id
+        target_user_id = int(args[1])
+
+        await message.answer(f"⏳ 正在重置用户 {target_user_id} 的今日数据...")
+
+        # 执行重置
+        success = await db.reset_user_daily_data(chat_id, target_user_id)
+
+        if success:
+            await message.answer(
+                f"✅ 已重置用户 <code>{target_user_id}</code> 的今日数据\n\n"
+                f"🗑️ 已清除：\n"
+                f"• 今日活动记录\n"
+                f"• 今日统计计数\n"
+                f"• 当前活动状态\n"
+                f"• 罚款计数（保留总罚款）",
+                parse_mode="HTML",
+                reply_markup=await get_main_keyboard(
+                    chat_id=message.chat.id, show_admin=True
+                ),
+            )
+            logger.info(
+                f"👑 管理员 {message.from_user.id} 重置了用户 {target_user_id} 的数据"
+            )
+        else:
+            await message.answer(
+                f"❌ 重置用户 {target_user_id} 数据失败",
+                reply_markup=await get_main_keyboard(
+                    chat_id=message.chat.id, show_admin=True
+                ),
+            )
+
+    except ValueError:
+        await message.answer(
+            "❌ 用户ID必须是数字",
+            reply_markup=await get_main_keyboard(
+                chat_id=message.chat.id, show_admin=True
+            ),
+        )
+    except Exception as e:
+        logger.error(f"重置用户数据失败: {e}")
+        await message.answer(
+            f"❌ 重置失败：{e}",
+            reply_markup=await get_main_keyboard(
+                chat_id=message.chat.id, show_admin=True
+            ),
+        )
 
 
 # ========== 导出每日数据命令 ==========
@@ -3414,6 +3485,8 @@ async def export_and_push_csv(
             f"📊 群组：<b>{chat_title}</b>\n"
             f"📅 统计日期：<code>{(target_date.strftime('%Y-%m-%d') if target_date else get_beijing_time().strftime('%Y-%m-%d'))}</code>\n"
             f"⏰ 导出时间：<code>{get_beijing_time().strftime('%Y-%m-%d %H:%M:%S')}</code>"
+            f"{MessageFormatter.create_dashed_line()}\n"
+            f"💾 包含每个用户的每日活动统计"
         )
 
         # 先把文件发回到当前 chat（可选）
@@ -3443,7 +3516,6 @@ async def export_and_push_csv(
             pass
 
 
-# ========== 定时任务 ==========
 # ========== 定时任务 ==========
 async def daily_reset_task():
     """每日自动重置任务"""
@@ -3756,6 +3828,7 @@ async def register_handlers():
     dp.message.register(cmd_cleanup_monthly, Command("cleanup_monthly"))
     dp.message.register(cmd_monthly_stats_status, Command("monthly_stats_status"))
     dp.message.register(cmd_cleanup_inactive, Command("cleanup_inactive"))
+    dp.message.register(cmd_reset_user, Command("resetuser"))
 
     # 按钮处理器
     dp.message.register(
