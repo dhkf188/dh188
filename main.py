@@ -3585,60 +3585,120 @@ async def start_health_server():
 
 # ========== 服务初始化 ==========
 async def initialize_services():
-    """初始化所有服务 - 更新版本"""
+    """初始化所有服务 - 最终完整版"""
     logger.info("🔄 初始化服务...")
 
     try:
-        # 初始化数据库
+        # 1. 初始化数据库
         await db.initialize()
         logger.info("✅ 数据库初始化完成")
 
-        # 启动数据库连接维护任务
+        # 2. 启动数据库连接维护任务
         await db.start_connection_maintenance()
         logger.info("✅ 数据库维护任务已启动")
 
-        # 初始化Bot管理器
+        # 3. 初始化Bot管理器
         await bot_manager.initialize()
         logger.info("✅ Bot管理器初始化完成")
 
-        # 重新获取初始化的bot和dispatcher
+        # 4. 重新获取初始化的bot和dispatcher
         global bot, dp
         bot = bot_manager.bot
         dp = bot_manager.dispatcher
 
-        # 设置NotificationService的bot_manager实例
+        # 🎯 关键：验证 bot 和 bot_manager 是否真的初始化了
+        if not bot:
+            logger.error("❌ bot 实例初始化失败")
+            raise RuntimeError("bot 实例初始化失败")
+        if not hasattr(bot_manager, "send_message_with_retry"):
+            logger.error("❌ bot_manager 方法不完整")
+            raise RuntimeError("bot_manager 方法不完整")
+
+        # 5. 🎯 核心修复：双重设置 NotificationService
         notification_service.bot_manager = bot_manager
+        notification_service.bot = bot  # 直接使用上面获取的 bot 实例
+
+        # 🎯 验证设置是否成功
+        if not notification_service.bot_manager:
+            logger.error("❌ notification_service.bot_manager 设置失败")
+        if not notification_service.bot:
+            logger.error("❌ notification_service.bot 设置失败")
+
         logger.info("✅ 通知服务配置完成")
 
-        # 设置定时器回调
+        # 6. 设置定时器回调
         timer_manager.set_activity_timer_callback(activity_timer)
         logger.info("✅ 定时器管理器配置完成")
 
-        # 初始化心跳管理器
+        # 7. 初始化心跳管理器
         await heartbeat_manager.initialize()
         logger.info("✅ 心跳管理器初始化完成")
 
-        # 启动Bot健康监控
+        # 8. 启动Bot健康监控
         await bot_manager.start_health_monitor()
         logger.info("✅ Bot健康监控已启动")
 
-        # 注册日志中间件
+        # 9. 注册日志中间件
         dp.message.middleware(LoggingMiddleware())
         logger.info("✅ 日志中间件已注册")
 
-        # 注册所有消息处理器
+        # 10. 注册所有消息处理器
         await register_handlers()
         logger.info("✅ 消息处理器注册完成")
 
-        # 恢复过期活动
+        # 11. 恢复过期活动
         recovered_count = await recover_expired_activities()
         logger.info(f"✅ 过期活动恢复完成: {recovered_count} 个活动已处理")
 
-        logger.info("🎉 所有服务初始化完成")
+        # 12. 🎯 最终健康检查
+        health_status = await check_services_health()
+        if all(health_status.values()):
+            logger.info("🎉 所有服务初始化完成且健康")
+        else:
+            logger.warning(f"⚠️ 服务初始化完成但有警告: {health_status}")
 
     except Exception as e:
         logger.error(f"❌ 服务初始化失败: {e}")
+        # 🎯 记录详细的调试信息
+        logger.error(f"调试信息 - bot: {bot}, bot_manager: {bot_manager}")
+        logger.error(
+            f"调试信息 - notification_service.bot_manager: {getattr(notification_service, 'bot_manager', '未设置')}"
+        )
+        logger.error(
+            f"调试信息 - notification_service.bot: {getattr(notification_service, 'bot', '未设置')}"
+        )
         raise
+
+
+async def check_services_health():
+    """完整的服务健康检查"""
+    health_status = {
+        "database": await db.health_check(),
+        "bot_manager_exists": bot_manager is not None,
+        "bot_manager_has_bot": hasattr(bot_manager, "bot") if bot_manager else False,
+        "bot_instance": bot is not None,
+        "notification_service_bot_manager": notification_service.bot_manager
+        is not None,
+        "notification_service_bot": notification_service.bot is not None,
+        "notification_service_has_methods": all(
+            hasattr(notification_service, attr)
+            for attr in ["_last_notification_time", "_rate_limit_window"]
+        ),
+        "timestamp": time.time(),
+    }
+
+    # 记录详细的健康状态
+    healthy_services = [k for k, v in health_status.items() if v]
+    unhealthy_services = [
+        k for k, v in health_status.items() if not v and k != "timestamp"
+    ]
+
+    if unhealthy_services:
+        logger.warning(f"⚠️ 不健康服务: {unhealthy_services}")
+    else:
+        logger.info(f"✅ 所有服务健康: {healthy_services}")
+
+    return health_status
 
 
 async def register_handlers():
