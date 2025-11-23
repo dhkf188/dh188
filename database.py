@@ -1271,31 +1271,61 @@ class PostgreSQLDatabase:
     async def has_work_record_today(
         self, chat_id: int, user_id: int, checkin_type: str
     ) -> bool:
-        """检查今天是否有上下班记录"""
-        today = self.get_beijing_date()
+        """检查今天是否有上下班记录 - 修复版：使用重置周期"""
+        # 获取重置时间
+        group_data = await self.get_group_cached(chat_id)
+        reset_hour = group_data.get("reset_hour", Config.DAILY_RESET_HOUR)
+        reset_minute = group_data.get("reset_minute", Config.DAILY_RESET_MINUTE)
+
+        now = self.get_beijing_time()
+
+        # 计算当前重置周期开始时间（与reset_daily_data_if_needed保持一致）
+        reset_time_today = now.replace(
+            hour=reset_hour, minute=reset_minute, second=0, microsecond=0
+        )
+        if now < reset_time_today:
+            period_start = reset_time_today - timedelta(days=1)
+        else:
+            period_start = reset_time_today
+
         self._ensure_pool_initialized()
         async with self.pool.acquire() as conn:
             row = await conn.fetchrow(
-                "SELECT 1 FROM work_records WHERE chat_id = $1 AND user_id = $2 AND record_date = $3 AND checkin_type = $4",
+                "SELECT 1 FROM work_records WHERE chat_id = $1 AND user_id = $2 AND checkin_type = $3 AND record_date >= $4",
                 chat_id,
                 user_id,
-                today,
                 checkin_type,
+                period_start.date(),  # 使用重置周期开始日期
             )
             return row is not None
 
     async def get_today_work_records(
         self, chat_id: int, user_id: int
     ) -> Dict[str, Dict]:
-        """获取用户今天的上下班记录"""
-        today = self.get_beijing_date()
+        """获取用户今天的上下班记录 - 修复版：使用重置周期"""
+        # 获取重置时间
+        group_data = await self.get_group_cached(chat_id)
+        reset_hour = group_data.get("reset_hour", Config.DAILY_RESET_HOUR)
+        reset_minute = group_data.get("reset_minute", Config.DAILY_RESET_MINUTE)
+
+        now = self.get_beijing_time()
+
+        # 计算当前重置周期开始时间
+        reset_time_today = now.replace(
+            hour=reset_hour, minute=reset_minute, second=0, microsecond=0
+        )
+        if now < reset_time_today:
+            period_start = reset_time_today - timedelta(days=1)
+        else:
+            period_start = reset_time_today
+
         self._ensure_pool_initialized()
         async with self.pool.acquire() as conn:
             rows = await conn.fetch(
-                "SELECT * FROM work_records WHERE chat_id = $1 AND user_id = $2 AND record_date = $3",
+                "SELECT * FROM work_records WHERE chat_id = $1 AND user_id = $2 AND record_date >= $3",
                 chat_id,
                 user_id,
-                today,
+                period_start.date(),  # 使用重置周期开始日期
             )
 
             records = {}
