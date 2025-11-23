@@ -179,10 +179,6 @@ async def calculate_work_fine(checkin_type: str, late_minutes: float) -> int:
 async def send_startup_notification():
     """发送启动通知给管理员"""
     try:
-        if not notification_service.bot_manager and not notification_service.bot:
-            logger.warning("无法发送启动通知: bot 和 bot_manager 都不可用")
-            return
-
         startup_time = get_beijing_time().strftime("%Y-%m-%d %H:%M:%S")
         message = (
             f"🤖 <b>打卡机器人已启动</b>\n"
@@ -204,8 +200,6 @@ async def send_startup_notification():
             except Exception as e:
                 logger.error(f"发送启动通知给管理员 {admin_id} 失败: {e}")
 
-        await notification_service.send_notification(0, message)
-
     except Exception as e:
         logger.error(f"发送启动通知失败: {e}")
 
@@ -213,9 +207,6 @@ async def send_startup_notification():
 async def send_shutdown_notification():
     """发送关闭通知给管理员"""
     try:
-        if not notification_service.bot_manager and not notification_service.bot:
-            logger.warning("无法发送关闭通知: bot 和 bot_manager 都不可用")
-            return
         shutdown_time = get_beijing_time().strftime("%Y-%m-%d %H:%M:%S")
         uptime = time.time() - start_time
         uptime_str = MessageFormatter.format_time(int(uptime))
@@ -239,8 +230,6 @@ async def send_shutdown_notification():
                     logger.debug(f"发送关闭通知给管理员 {admin_id} 失败")
             except Exception as e:
                 logger.debug(f"发送关闭通知失败: {e}")
-
-        await notification_service.send_notification(0, message)
 
     except Exception as e:
         logger.debug(f"准备关闭通知失败: {e}")
@@ -641,26 +630,17 @@ async def has_active_activity(chat_id: int, uid: int) -> tuple[bool, Optional[st
 
 async def can_perform_activities(chat_id: int, uid: int) -> tuple[bool, str]:
     """快速检查是否可以执行活动"""
-    logger.info(f"🔍 [can_perform_activities] 检查用户 {uid} 是否可以执行活动")
-
     if not await db.has_work_hours_enabled(chat_id):
-        logger.info(f"✅ [can_perform_activities] 工作时间功能未启用，允许活动")
         return True, ""
 
     today_records = await db.get_today_work_records(chat_id, uid)
-    logger.info(
-        f"📊 [can_perform_activities] 今日工作记录: {list(today_records.keys())}"
-    )
 
     if "work_start" not in today_records:
-        logger.warning(f"❌ [can_perform_activities] 未打上班卡")
         return False, "❌ 请先打上班卡！"
 
     if "work_end" in today_records:
-        logger.warning(f"❌ [can_perform_activities] 已打下班卡")
         return False, "❌ 已下班，无法进行活动！"
 
-    logger.info(f"✅ [can_perform_activities] 允许执行活动")
     return True, ""
 
 
@@ -958,43 +938,28 @@ async def start_activity(message: types.Message, act: str):
     chat_id = message.chat.id
     uid = message.from_user.id
 
-    logger.info(f"🔄 [start_activity] 开始处理活动: {act} - 用户 {uid}")
-
-    user_lock = user_lock_manager.get_lock(chat_id, uid, "write")
-    logger.info(f"🔒 [start_activity] 等待获取锁: {chat_id}-{uid}")
+    user_lock = user_lock_manager.get_lock(chat_id, uid)
     async with user_lock:
-        logger.info(f"✅ [start_activity] 成功获取锁，开始处理")
-
         # 快速检查
-        logger.info(f"🔍 [start_activity] 检查活动是否存在: {act}")
         if not await db.activity_exists(act):
-            logger.warning(f"❌ [start_activity] 活动不存在: {act}")
             await message.answer(f"❌ 活动 '{act}' 不存在")
             return
-        logger.info(f"✅ [start_activity] 活动存在: {act}")
 
         # 检查活动限制
-        logger.info(f"🔍 [start_activity] 检查活动限制")
         can_perform, reason = await can_perform_activities(chat_id, uid)
         if not can_perform:
-            logger.warning(f"❌ [start_activity] 活动限制检查失败: {reason}")
             await message.answer(reason)
             return
-        logger.info(f"✅ [start_activity] 活动限制检查通过")
 
         # 开始活动逻辑
         name = message.from_user.full_name
         now = get_beijing_time()
-        logger.info(f"⏰ [start_activity] 当前时间: {now}")
 
         # 检查活动人数限制
-        logger.info(f"🔍 [start_activity] 检查活动人数限制: {act}")
         user_limit = await db.get_activity_user_limit(act)
         if user_limit > 0:
             current_users = await db.get_current_activity_users(chat_id, act)
-            logger.info(f"👥 [start_activity] 活动人数: {current_users}/{user_limit}")
             if current_users >= user_limit:
-                logger.warning(f"❌ [start_activity] 活动人数已满: {act}")
                 await message.answer(
                     f"❌ 打卡失败~ 活动 '<code>{act}</code>' 人数已满！\n\n"
                     f"📊 当前状态：\n"
@@ -1008,13 +973,9 @@ async def start_activity(message: types.Message, act: str):
                     parse_mode="HTML",
                 )
                 return
-        logger.info(f"✅ [start_activity] 活动人数检查通过")
 
-        # 检查是否有活动在进行
-        logger.info(f"🔍 [start_activity] 检查是否有活动在进行")
         has_active, current_act = await has_active_activity(chat_id, uid)
         if has_active:
-            logger.warning(f"❌ [start_activity] 已有活动在进行: {current_act}")
             await message.answer(
                 Config.MESSAGES["has_activity"].format(current_act),
                 reply_markup=await get_main_keyboard(
@@ -1022,22 +983,14 @@ async def start_activity(message: types.Message, act: str):
                 ),
             )
             return
-        logger.info(f"✅ [start_activity] 无活动在进行")
 
         # 先重置数据（如果需要）
-        logger.info(f"🔄 [start_activity] 检查是否需要重置数据")
         await reset_daily_data_if_needed(chat_id, uid)
-        logger.info(f"✅ [start_activity] 重置检查完成")
 
-        # 检查活动次数限制
-        logger.info(f"🔍 [start_activity] 检查活动次数限制: {act}")
         can_start, current_count, max_times = await check_activity_limit(
             chat_id, uid, act
         )
         if not can_start:
-            logger.warning(
-                f"❌ [start_activity] 活动次数已达上限: {current_count}/{max_times}"
-            )
             await message.answer(
                 Config.MESSAGES["max_times_reached"].format(act, max_times),
                 reply_markup=await get_main_keyboard(
@@ -1045,22 +998,12 @@ async def start_activity(message: types.Message, act: str):
                 ),
             )
             return
-        logger.info(
-            f"✅ [start_activity] 活动次数检查通过: {current_count}/{max_times}"
-        )
 
-        # 更新用户活动
-        logger.info(f"📝 [start_activity] 更新用户活动到数据库")
         await db.update_user_activity(chat_id, uid, act, str(now), name)
         time_limit = await db.get_activity_time_limit(act)
-        logger.info(f"⏰ [start_activity] 活动时间限制: {time_limit}分钟")
 
-        # 启动定时器
-        logger.info(f"⏱️ [start_activity] 启动活动定时器")
         await timer_manager.start_timer(chat_id, uid, act, time_limit)
 
-        # 发送成功消息
-        logger.info(f"📨 [start_activity] 发送成功消息")
         await message.answer(
             MessageFormatter.format_activity_message(
                 uid,
@@ -1077,8 +1020,6 @@ async def start_activity(message: types.Message, act: str):
             parse_mode="HTML",
         )
 
-        logger.info(f"🎉 [start_activity] 活动开始完成: {act} - 用户 {uid}")
-
 
 # ========== 回座功能 ==========
 async def process_back(message: types.Message):
@@ -1086,7 +1027,7 @@ async def process_back(message: types.Message):
     chat_id = message.chat.id
     uid = message.from_user.id
 
-    user_lock = user_lock_manager.get_lock(chat_id, uid, "write")
+    user_lock = user_lock_manager.get_lock(chat_id, uid)
     async with user_lock:
         await _process_back_locked(message, chat_id, uid)
 
@@ -1176,12 +1117,8 @@ async def _process_back_locked(message: types.Message, chat_id: int, uid: int):
             try:
                 chat_title = str(chat_id)
                 try:
-                    # 🆕 安全检查：确保 bot 可用
-                    if bot:
-                        chat_info = await bot.get_chat(chat_id)
-                        chat_title = chat_info.title or chat_title
-                    else:
-                        logger.warning("bot 不可用，使用默认群组标题")
+                    chat_info = await bot.get_chat(chat_id)
+                    chat_title = chat_info.title or chat_title
                 except Exception:
                     pass
 
@@ -1195,15 +1132,9 @@ async def _process_back_locked(message: types.Message, chat_id: int, uid: int):
                     f"⏱️ 超时：<code>{MessageFormatter.format_time(int(overtime_seconds))}</code>\n"
                     f"💰 罚款：<code>{fine_amount}</code> 元"
                 )
-
-                # 🆕 使用修复后的通知服务（已经支持 bot_manager）
-                sent = await notification_service.send_notification(chat_id, notif_text)
-                if not sent:
-                    logger.warning("超时通知发送失败，但回座操作已完成")
-
+                await notification_service.send_notification(chat_id, notif_text)
             except Exception as e:
                 logger.error(f"超时通知推送异常: {e}")
-                # 🆕 通知失败不影响主流程
 
     except Exception as e:
         logger.error(f"回座处理异常: {e}")
@@ -1232,15 +1163,9 @@ async def process_work_checkin(message: types.Message, checkin_type: str):
     today = str(now.date())
     trace_id = f"{chat_id}-{uid}-{int(time.time())}"
 
-    if not bot and (
-        not notification_service.bot_manager or not notification_service.bot
-    ):
-        logger.error(f"打卡失败: bot 和 bot_manager 都不可用")
-        return
-
     logger.info(f"🟢[{trace_id}] 开始处理 {checkin_type} 打卡请求：{name}({uid})")
 
-    user_lock = user_lock_manager.get_lock(chat_id, uid, "write")
+    user_lock = get_user_lock(chat_id, uid)
     async with user_lock:
         # ✅ 初始化群组与用户数据
         try:
@@ -1645,6 +1570,236 @@ async def cmd_admin(message: types.Message):
     await message.answer("👑 管理员面板", reply_markup=get_admin_keyboard())
 
 
+# ========== 月度数据清理命令 ==========
+@admin_required
+@rate_limit(rate=2, per=60)
+async def cmd_cleanup_monthly(message: types.Message):
+    """清理月度统计数据"""
+    args = message.text.split()
+
+    target_date = None
+    if len(args) >= 3:
+        try:
+            year = int(args[1])
+            month = int(args[2])
+            if month < 1 or month > 12:
+                await message.answer("❌ 月份必须在1-12之间")
+                return
+            target_date = date(year, month, 1)
+        except ValueError:
+            await message.answer("❌ 请输入有效的年份和月份")
+            return
+    elif len(args) == 2 and args[1].lower() == "all":
+        # 特殊命令：清理所有月度数据（谨慎使用）
+        await message.answer(
+            "⚠️ <b>危险操作确认</b>\n\n"
+            "您即将删除<u>所有</u>月度统计数据！\n"
+            "此操作不可恢复！\n\n"
+            "请输入 <code>/cleanup_monthly confirm_all</code> 确认执行",
+            parse_mode="HTML",
+        )
+        return
+    elif len(args) == 2 and args[1].lower() == "confirm_all":
+        # 确认清理所有数据
+        try:
+            async with db.pool.acquire() as conn:
+                result = await conn.execute("DELETE FROM monthly_statistics")
+                deleted_count = (
+                    int(result.split()[-1])
+                    if result and result.startswith("DELETE")
+                    else 0
+                )
+
+            await message.answer(
+                f"🗑️ <b>已清理所有月度统计数据</b>\n"
+                f"删除记录: <code>{deleted_count}</code> 条\n\n"
+                f"⚠️ 所有月度统计已被清空，月度报告将无法生成历史数据",
+                parse_mode="HTML",
+            )
+            logger.warning(f"👑 管理员 {message.from_user.id} 清理了所有月度统计数据")
+            return
+        except Exception as e:
+            await message.answer(f"❌ 清理所有数据失败: {e}")
+            return
+
+    await message.answer("⏳ 正在清理月度统计数据...")
+
+    try:
+        if target_date:
+            # 清理指定月份
+            deleted_count = await db.cleanup_specific_month(
+                target_date.year, target_date.month
+            )
+            date_str = target_date.strftime("%Y年%m月")
+            await message.answer(
+                f"✅ <b>月度统计清理完成</b>\n"
+                f"📅 清理月份: <code>{date_str}</code>\n"
+                f"🗑️ 删除记录: <code>{deleted_count}</code> 条",
+                parse_mode="HTML",
+            )
+        else:
+            # 默认清理3个月前的数据
+            deleted_count = await db.cleanup_monthly_data()
+            today = get_beijing_time()
+            cutoff_date = (today - timedelta(days=90)).date().replace(day=1)
+            cutoff_str = cutoff_date.strftime("%Y年%m月")
+
+            await message.answer(
+                f"✅ <b>月度统计自动清理完成</b>\n"
+                f"📅 清理截止: <code>{cutoff_str}</code> 之前\n"
+                f"🗑️ 删除记录: <code>{deleted_count}</code> 条\n\n"
+                f"💡 保留了最近3个月的月度统计数据",
+                parse_mode="HTML",
+            )
+
+    except Exception as e:
+        logger.error(f"❌ 清理月度数据失败: {e}")
+        await message.answer(f"❌ 清理月度数据失败: {e}")
+
+
+@admin_required
+@rate_limit(rate=5, per=60)
+async def cmd_monthly_stats_status(message: types.Message):
+    """查看月度统计数据状态"""
+    chat_id = message.chat.id
+
+    try:
+        async with db.pool.acquire() as conn:
+            # 获取月度统计的日期范围
+            date_range = await conn.fetch(
+                "SELECT MIN(statistic_date) as earliest, MAX(statistic_date) as latest, COUNT(*) as total FROM monthly_statistics WHERE chat_id = $1",
+                chat_id,
+            )
+
+            # 获取各月份数据量
+            monthly_counts = await conn.fetch(
+                "SELECT statistic_date, COUNT(*) as count FROM monthly_statistics WHERE chat_id = $1 GROUP BY statistic_date ORDER BY statistic_date DESC",
+                chat_id,
+            )
+
+            # 获取总用户数
+            user_count = await conn.fetchval(
+                "SELECT COUNT(DISTINCT user_id) FROM monthly_statistics WHERE chat_id = $1",
+                chat_id,
+            )
+
+            # 获取活动类型数量
+            activity_count = await conn.fetchval(
+                "SELECT COUNT(DISTINCT activity_name) FROM monthly_statistics WHERE chat_id = $1",
+                chat_id,
+            )
+
+        if not date_range or not date_range[0]["earliest"]:
+            await message.answer(
+                "📊 <b>月度统计数据状态</b>\n\n" "暂无月度统计数据", parse_mode="HTML"
+            )
+            return
+
+        earliest = date_range[0]["earliest"]
+        latest = date_range[0]["latest"]
+        total_records = date_range[0]["total"]
+
+        status_text = (
+            f"📊 <b>月度统计数据状态</b>\n\n"
+            f"📅 数据范围: <code>{earliest.strftime('%Y年%m月')}</code> - <code>{latest.strftime('%Y年%m月')}</code>\n"
+            f"👥 统计用户: <code>{user_count}</code> 人\n"
+            f"📝 活动类型: <code>{activity_count}</code> 种\n"
+            f"💾 总记录数: <code>{total_records}</code> 条\n\n"
+            f"<b>各月份数据量:</b>\n"
+        )
+
+        for row in monthly_counts[:12]:  # 显示最近12个月
+            month_str = row["statistic_date"].strftime("%Y年%m月")
+            count = row["count"]
+            status_text += f"• {month_str}: <code>{count}</code> 条\n"
+
+        if len(monthly_counts) > 12:
+            status_text += f"• ... 还有 {len(monthly_counts) - 12} 个月份\n"
+
+        status_text += (
+            f"\n💡 <b>可用命令:</b>\n"
+            f"• <code>/cleanup_monthly</code> - 自动清理（保留3个月）\n"
+            f"• <code>/cleanup_monthly 2024 1</code> - 清理指定月份\n"
+            f"• <code>/cleanup_monthly all</code> - 清理所有数据（危险）"
+        )
+
+        await message.answer(status_text, parse_mode="HTML")
+
+    except Exception as e:
+        logger.error(f"❌ 查看月度统计状态失败: {e}")
+        await message.answer(f"❌ 查看月度统计状态失败: {e}")
+
+
+@admin_required
+async def cmd_cleanup_inactive(message: types.Message):
+    """清理长期未活动的用户数据"""
+    args = message.text.split()
+
+    # 默认清理 30 天未活动的用户
+    days = 30
+
+    # 如果用户手动传入天数
+    if len(args) > 1:
+        try:
+            days = int(args[1])
+            if days < 7:
+                await message.answer("❌ 天数不能少于7天，避免误删活跃用户")
+                return
+        except ValueError:
+            await message.answer("❌ 天数必须是数字，例如：/cleanup_inactive 60")
+            return
+
+    await message.answer(f"⏳ 正在清理 {days} 天未活动的用户，请稍候...")
+
+    try:
+        cutoff_date = (get_beijing_time() - timedelta(days=days)).date()
+
+        async with db.pool.acquire() as conn:
+            # 删除长期未活动的用户
+            result = await conn.execute(
+                "DELETE FROM users WHERE last_updated < $1", cutoff_date
+            )
+            deleted_users = (
+                int(result.split()[-1]) if result and result.startswith("DELETE") else 0
+            )
+
+            # 删除对应的活动记录
+            result2 = await conn.execute(
+                "DELETE FROM user_activities WHERE activity_date < $1", cutoff_date
+            )
+            deleted_activities = (
+                int(result2.split()[-1])
+                if result2 and result2.startswith("DELETE")
+                else 0
+            )
+
+            # 删除对应的工作记录
+            result3 = await conn.execute(
+                "DELETE FROM work_records WHERE record_date < $1", cutoff_date
+            )
+            deleted_work_records = (
+                int(result3.split()[-1])
+                if result3 and result3.startswith("DELETE")
+                else 0
+            )
+
+        total_deleted = deleted_users + deleted_activities + deleted_work_records
+
+        await message.answer(
+            f"🧹 <b>长期未活动用户清理完成</b>\n\n"
+            f"📅 清理截止: <code>{cutoff_date}</code> 之前\n"
+            f"🗑️ 删除用户: <code>{deleted_users}</code> 个\n"
+            f"🗑️ 删除活动记录: <code>{deleted_activities}</code> 条\n"
+            f"🗑️ 删除工作记录: <code>{deleted_work_records}</code> 条\n\n"
+            f"📊 总计删除: <code>{total_deleted}</code> 条记录",
+            parse_mode="HTML",
+        )
+
+    except Exception as e:
+        logger.error(f"❌ 清理未活动用户失败: {e}")
+        await message.answer(f"❌ 清理未活动用户失败: {e}")
+
+
 # ========== 导出每日数据命令 ==========
 @admin_required
 @rate_limit(rate=2, per=60)
@@ -1662,7 +1817,7 @@ async def cmd_export(message: types.Message):
 
 # ========== 月度报告函数 ==========
 async def optimized_monthly_export(chat_id: int, year: int, month: int):
-    """完整修复版月度数据导出"""
+    """紧急修复版月度数据导出"""
     try:
         # 获取活动配置
         activity_limits = await db.get_activity_limits_cached()
@@ -1671,7 +1826,7 @@ async def optimized_monthly_export(chat_id: int, year: int, month: int):
         csv_buffer = StringIO()
         writer = csv.writer(csv_buffer)
 
-        # 🆕 修复：完整的表头
+        # 构建表头
         headers = ["用户ID", "用户昵称"]
         for act in activity_names:
             headers.extend([f"{act}次数", f"{act}总时长"])
@@ -1688,22 +1843,37 @@ async def optimized_monthly_export(chat_id: int, year: int, month: int):
         )
         writer.writerow(headers)
 
-        # 使用修复后的月度统计方法
+        # 使用现有的月度统计方法
         monthly_stats = await db.get_monthly_statistics(chat_id, year, month)
 
         if not monthly_stats:
             logger.warning(f"月度统计表中没有找到 {year}年{month}月 的数据")
             return None
 
+        # 🆕 紧急修复：检查数据结构
+        logger.info(
+            f"月度统计数据样本类型: {type(monthly_stats[0]) if monthly_stats else '无数据'}"
+        )
+        logger.info(
+            f"月度统计数据样本: {monthly_stats[0] if monthly_stats else '无数据'}"
+        )
+
         # 处理每个用户的数据
         for user_stat in monthly_stats:
-            # 安全获取字段
+            # 🆕 紧急修复：确保 user_stat 是字典
+            if not isinstance(user_stat, dict):
+                logger.warning(
+                    f"跳过非字典类型的用户数据: {type(user_stat)} - {user_stat}"
+                )
+                continue
+
+            # 🆕 安全获取字段
             user_id = user_stat.get("user_id", "未知")
             nickname = user_stat.get("nickname", "未知用户")
 
             row = [user_id, nickname]
 
-            # 安全获取 activities
+            # 🆕 紧急修复：安全获取 activities
             user_activities = user_stat.get("activities", {})
             if isinstance(user_activities, str):
                 try:
@@ -1728,18 +1898,16 @@ async def optimized_monthly_export(chat_id: int, year: int, month: int):
                 row.append(count)
                 row.append(time_formatted)
 
-            # 🆕 修复：安全获取所有统计字段
+            # 🆕 安全获取统计字段
             row.extend(
                 [
                     user_stat.get("total_activity_count", 0),
                     db.format_time_for_csv(user_stat.get("total_accumulated_time", 0)),
                     user_stat.get("total_fines", 0),
-                    user_stat.get("overtime_count", 0),  # 超时次数
-                    db.format_time_for_csv(
-                        user_stat.get("total_overtime_time", 0)
-                    ),  # 总超时时间
-                    user_stat.get("work_days", 0),  # 工作天数
-                    db.format_time_for_csv(user_stat.get("work_hours", 0)),  # 工作时长
+                    user_stat.get("overtime_count", 0),
+                    db.format_time_for_csv(user_stat.get("total_overtime_time", 0)),
+                    user_stat.get("work_days", 0),
+                    db.format_time_for_csv(user_stat.get("work_hours", 0)),
                 ]
             )
 
@@ -1748,7 +1916,7 @@ async def optimized_monthly_export(chat_id: int, year: int, month: int):
         return csv_buffer.getvalue()
 
     except Exception as e:
-        logger.error(f"❌ 月度导出失败: {e}")
+        logger.error(f"❌ 月度导出优化版失败: {e}")
         import traceback
 
         logger.error(traceback.format_exc())
@@ -2700,187 +2868,6 @@ async def cmd_showsettings(message: types.Message):
     )
 
 
-# ========= 清理月度数据命令 =========
-@admin_required
-@rate_limit(rate=2, per=60)
-async def cmd_cleanup_monthly(message: types.Message):
-    """清理月度统计数据"""
-    args = message.text.split()
-
-    target_date = None
-    if len(args) >= 3:
-        try:
-            year = int(args[1])
-            month = int(args[2])
-            if month < 1 or month > 12:
-                await message.answer("❌ 月份必须在1-12之间")
-                return
-            target_date = date(year, month, 1)
-        except ValueError:
-            await message.answer("❌ 请输入有效的年份和月份")
-            return
-    elif len(args) == 2 and args[1].lower() == "all":
-        # 特殊命令：清理所有月度数据（谨慎使用）
-        await message.answer(
-            "⚠️ <b>危险操作确认</b>\n\n"
-            "您即将删除<u>所有</u>月度统计数据！\n"
-            "此操作不可恢复！\n\n"
-            "请输入 <code>/cleanup_monthly confirm_all</code> 确认执行",
-            parse_mode="HTML",
-        )
-        return
-    elif len(args) == 2 and args[1].lower() == "confirm_all":
-        # 确认清理所有数据
-        async with db.pool.acquire() as conn:
-            result = await conn.execute("DELETE FROM monthly_statistics")
-            deleted_count = (
-                int(result.split()[-1]) if result and result.startswith("DELETE") else 0
-            )
-
-        await message.answer(
-            f"🗑️ <b>已清理所有月度统计数据</b>\n"
-            f"删除记录: <code>{deleted_count}</code> 条\n\n"
-            f"⚠️ 所有月度统计已被清空，月度报告将无法生成历史数据",
-            parse_mode="HTML",
-        )
-        logger.warning(f"👑 管理员 {message.from_user.id} 清理了所有月度统计数据")
-        return
-
-    await message.answer("⏳ 正在清理月度统计数据...")
-
-    try:
-        if target_date:
-            # 清理指定月份
-            deleted_count = await db.cleanup_specific_month(
-                target_date.year, target_date.month
-            )
-            date_str = target_date.strftime("%Y年%m月")
-            await message.answer(
-                f"✅ <b>月度统计清理完成</b>\n"
-                f"📅 清理月份: <code>{date_str}</code>\n"
-                f"🗑️ 删除记录: <code>{deleted_count}</code> 条",
-                parse_mode="HTML",
-            )
-        else:
-            # 默认清理3个月前的数据
-            deleted_count = await db.cleanup_monthly_data()
-            today = get_beijing_time()
-            cutoff_date = (today - timedelta(days=90)).date().replace(day=1)
-            cutoff_str = cutoff_date.strftime("%Y年%m月")
-
-            await message.answer(
-                f"✅ <b>月度统计自动清理完成</b>\n"
-                f"📅 清理截止: <code>{cutoff_str}</code> 之前\n"
-                f"🗑️ 删除记录: <code>{deleted_count}</code> 条\n\n"
-                f"💡 保留了最近3个月的月度统计数据",
-                parse_mode="HTML",
-            )
-
-    except Exception as e:
-        logger.error(f"❌ 清理月度数据失败: {e}")
-        await message.answer(f"❌ 清理月度数据失败: {e}")
-
-
-@admin_required
-@rate_limit(rate=5, per=60)
-async def cmd_monthly_stats_status(message: types.Message):
-    """查看月度统计数据状态"""
-    chat_id = message.chat.id
-
-    try:
-        async with db.pool.acquire() as conn:
-            # 获取月度统计的日期范围
-            date_range = await conn.fetch(
-                "SELECT MIN(statistic_date) as earliest, MAX(statistic_date) as latest, COUNT(*) as total FROM monthly_statistics WHERE chat_id = $1",
-                chat_id,
-            )
-
-            # 获取各月份数据量
-            monthly_counts = await conn.fetch(
-                "SELECT statistic_date, COUNT(*) as count FROM monthly_statistics WHERE chat_id = $1 GROUP BY statistic_date ORDER BY statistic_date DESC",
-                chat_id,
-            )
-
-            # 获取总用户数
-            user_count = await conn.fetchval(
-                "SELECT COUNT(DISTINCT user_id) FROM monthly_statistics WHERE chat_id = $1",
-                chat_id,
-            )
-
-            # 获取活动类型数量
-            activity_count = await conn.fetchval(
-                "SELECT COUNT(DISTINCT activity_name) FROM monthly_statistics WHERE chat_id = $1",
-                chat_id,
-            )
-
-        if not date_range or not date_range[0]["earliest"]:
-            await message.answer(
-                "📊 <b>月度统计数据状态</b>\n\n" "暂无月度统计数据", parse_mode="HTML"
-            )
-            return
-
-        earliest = date_range[0]["earliest"]
-        latest = date_range[0]["latest"]
-        total_records = date_range[0]["total"]
-
-        status_text = (
-            f"📊 <b>月度统计数据状态</b>\n\n"
-            f"📅 数据范围: <code>{earliest.strftime('%Y年%m月')}</code> - <code>{latest.strftime('%Y年%m月')}</code>\n"
-            f"👥 统计用户: <code>{user_count}</code> 人\n"
-            f"📝 活动类型: <code>{activity_count}</code> 种\n"
-            f"💾 总记录数: <code>{total_records}</code> 条\n\n"
-            f"<b>各月份数据量:</b>\n"
-        )
-
-        for row in monthly_counts[:12]:  # 显示最近12个月
-            month_str = row["statistic_date"].strftime("%Y年%m月")
-            count = row["count"]
-            status_text += f"• {month_str}: <code>{count}</code> 条\n"
-
-        if len(monthly_counts) > 12:
-            status_text += f"• ... 还有 {len(monthly_counts) - 12} 个月份\n"
-
-        status_text += (
-            f"\n💡 <b>可用命令:</b>\n"
-            f"• <code>/cleanup_monthly</code> - 自动清理（保留3个月）\n"
-            f"• <code>/cleanup_monthly 2024 1</code> - 清理指定月份\n"
-            f"• <code>/cleanup_monthly all</code> - 清理所有数据（危险）"
-        )
-
-        await message.answer(status_text, parse_mode="HTML")
-
-    except Exception as e:
-        logger.error(f"❌ 查看月度统计状态失败: {e}")
-        await message.answer(f"❌ 查看月度统计状态失败: {e}")
-
-
-@admin_required
-async def cmd_cleanup_inactive(message: types.Message):
-    args = message.text.split()
-
-    # 默认清理 30 天未活动的用户
-    days = 30
-
-    # 如果用户手动传入天数
-    if len(args) > 1:
-        try:
-            days = int(args[1])
-        except ValueError:
-            return await message.reply("❌ 天数必须是数字，例如：/cleanup_inactive 60")
-
-    await message.reply(f"⏳ 正在清理 {days} 天未活动的用户，请稍候...")
-
-    try:
-        deleted_count = await db.cleanup_inactive_users(days)
-
-        await message.reply(
-            f"🧹 清理完成：删除了 **{deleted_count}** 个长期未活动的用户\n"
-            f"（包括 users、user_activities、work_records ）"
-        )
-    except Exception as e:
-        await message.reply(f"❌ 清理失败：{e}")
-
-
 # ========== 查看工作时间命令 =========
 @admin_required
 @rate_limit(rate=5, per=60)
@@ -2952,7 +2939,7 @@ async def handle_my_record(message: types.Message):
     chat_id = message.chat.id
     uid = message.from_user.id
 
-    user_lock = user_lock_manager.get_lock(chat_id, uid, "read")
+    user_lock = user_lock_manager.get_lock(chat_id, uid)
     async with user_lock:
         await show_history(message)
 
@@ -2964,7 +2951,7 @@ async def handle_rank(message: types.Message):
     chat_id = message.chat.id
     uid = message.from_user.id
 
-    user_lock = user_lock_manager.get_lock(chat_id, uid, "read")
+    user_lock = user_lock_manager.get_lock(chat_id, uid)
     async with user_lock:
         await show_rank(message)
 
@@ -3011,11 +2998,11 @@ async def handle_admin_panel_button(message: types.Message):
         "• /export - 导出当前数据\n"
         "• /exportmonthly [年份] [月份] - 导出月度数据\n"
         "• /monthlyreport [年份] [月份] - 生成月度报告\n"
-        "• /monthly_stats_status - 查看月度统计状态\n"
         "• /cleanup_monthly [年份] [月份] - 清理月度数据\n"
-        "• /cleanup_inactive [天数] - 清理不活跃用户\n\n"
-        "📊 数据管理：\n"
-        "• /performance - 查看性能报告\n\n"
+        "• /monthly_stats_status - 查看月度统计状态\n"
+        "• /cleanup_inactive [天数] - 清理未活动用户\n\n"
+        "💾 数据显示：\n"
+        "• /performance - 查看性能报告\n"
         "• /showsettings - 显示所有当前设置\n\n"
     )
     await message.answer(admin_text, reply_markup=get_admin_keyboard())
@@ -3200,7 +3187,6 @@ async def show_rank(message: types.Message):
     )
 
 
-
 # ========== 快速回座回调 ==========
 async def handle_quick_back(callback_query: types.CallbackQuery):
     """处理快速回座按钮"""
@@ -3316,12 +3302,6 @@ async def export_and_push_csv(
     target_date=None,
 ):
     """导出群组数据为 CSV 并推送 - 支持从月度表恢复数据"""
-    if not bot and (
-        not notification_service.bot_manager or not notification_service.bot
-    ):
-        logger.error("导出失败: bot 和 bot_manager 都不可用")
-        return
-
     await db.init_group(chat_id)
 
     # 规范 target_date
@@ -3505,30 +3485,15 @@ async def daily_reset_task():
 
 
 async def delayed_export(chat_id: int, delay_minutes: int = 30):
-    """在每日重置后延迟导出昨日数据 - 零影响修复版本"""
+    """在每日重置后延迟导出昨日数据"""
     try:
         logger.info(f"群组 {chat_id} 将在 {delay_minutes} 分钟后导出昨日数据...")
-
-        # 🆕 关键修复：在等待之前记录当前时间，避免时区变化影响
-        wait_start_time = get_beijing_time()
         await asyncio.sleep(delay_minutes * 60)
 
-        # 🆕 关键修复：使用等待开始时间计算昨日日期，避免跨天问题
-        yesterday_date = (wait_start_time - timedelta(days=1)).date()
-        file_name = (
-            f"group_{chat_id}_statistics_{yesterday_date.strftime('%Y%m%d')}.csv"
-        )
+        yesterday_dt = get_beijing_time() - timedelta(days=1)
+        yesterday_date = yesterday_dt.date()
+        file_name = f"group_{chat_id}_statistics_{yesterday_dt.strftime('%Y%m%d')}.csv"
 
-        if not bot and (
-            not notification_service.bot_manager or not notification_service.bot
-        ):
-            logger.error(f"延迟导出失败: bot 和 bot_manager 都不可用")
-            return
-
-        # 🆕 添加调试日志
-        logger.info(f"开始导出群组 {chat_id} 的昨日数据，日期: {yesterday_date}")
-
-        # 完全保持原有调用方式不变
         await export_and_push_csv(chat_id, True, file_name, yesterday_date)
         logger.info(f"群组 {chat_id} 昨日数据导出并推送完成")
 
@@ -3565,33 +3530,56 @@ async def health_monitoring_task():
 
 # ========== Web服务器 ==========
 async def health_check(request):
-    """健康检查接口"""
-    return web.json_response({"status": "ok", "timestamp": time.time()})
+    """增强版健康检查接口"""
+    try:
+        # 检查数据库连接
+        db_healthy = await db.health_check()
 
-
-# 在 main.py 中修改健康检查服务器
-async def start_health_server():
-    """启动健康检查服务器 - 简化版"""
-    from aiohttp import web
-
-    async def health_check(request):
-        # 🆕 简化的健康检查，减少资源消耗
-        return web.json_response(
-            {"status": "ok", "timestamp": time.time(), "service": "checkin-bot"}
+        # 检查Bot状态
+        bot_healthy = (
+            bot_manager.is_healthy() if hasattr(bot_manager, "is_healthy") else True
         )
 
+        # 检查内存状态
+        memory_ok = performance_optimizer.memory_usage_ok()
+
+        status = "healthy" if all([db_healthy, bot_healthy, memory_ok]) else "degraded"
+
+        return web.json_response(
+            {
+                "status": status,
+                "timestamp": time.time(),
+                "services": {
+                    "database": db_healthy,
+                    "bot": bot_healthy,
+                    "memory": memory_ok,
+                },
+                "version": "1.0",
+                "environment": os.environ.get("BOT_MODE", "polling"),
+            }
+        )
+    except Exception as e:
+        logger.error(f"健康检查失败: {e}")
+        return web.json_response(
+            {"status": "unhealthy", "error": str(e), "timestamp": time.time()},
+            status=500,
+        )
+
+
+async def start_health_server():
+    """启动健康检查服务器"""
     app = web.Application()
+    app.router.add_get("/", health_check)
     app.router.add_get("/health", health_check)
-    # 🆕 移除不必要的路由
-    # app.router.add_get("/", health_check)
 
     runner = web.AppRunner(app)
     await runner.setup()
 
-    port = int(os.environ.get("PORT", 8080))
+    port = int(os.environ.get("PORT", Config.WEB_SERVER_CONFIG["PORT"]))
     site = web.TCPSite(runner, "0.0.0.0", port)
     await site.start()
-    logger.info(f"健康检查服务器启动在端口 {port}")
+    logger.info(f"Web server started on port {port}")
+
     return site
 
 
@@ -3728,6 +3716,73 @@ async def register_handlers():
     logger.info("✅ 所有消息处理器注册完成")
 
 
+# ========= render部署用的代码 ========
+async def external_keepalive():
+    """外部保活服务调用 - 防止 Render 休眠"""
+    keepalive_urls = [
+        # 可以添加 UptimeRobot 或其他免费监控服务
+    ]
+
+    for url in keepalive_urls:
+        try:
+            # 使用 aiohttp 发起请求
+            pass
+        except Exception as e:
+            logger.debug(f"保活请求失败 {url}: {e}")
+
+
+async def keepalive_loop():
+    """Render 专用保活循环 - 防止免费服务休眠"""
+    while True:
+        try:
+            # 🆕 每5分钟执行一次保活（Render 免费版15分钟不活动会休眠）
+            await asyncio.sleep(300)
+
+            current_time = get_beijing_time()
+            logger.debug(
+                f"🔵 Render 保活检查: {current_time.strftime('%Y-%m-%d %H:%M:%S')}"
+            )
+
+            # 1. 调用自己的健康检查端点
+            try:
+                import aiohttp
+
+                port = int(os.environ.get("PORT", 8080))
+                async with aiohttp.ClientSession(
+                    timeout=aiohttp.ClientTimeout(total=10)
+                ) as session:
+                    async with session.get(f"http://localhost:{port}/health") as resp:
+                        if resp.status == 200:
+                            logger.debug("✅ 内部健康检查保活成功")
+            except Exception as e:
+                logger.warning(f"内部保活检查失败: {e}")
+
+            # 2. 数据库连接保活
+            try:
+                await db.connection_health_check()
+                logger.debug("✅ 数据库连接保活成功")
+            except Exception as e:
+                logger.warning(f"数据库保活失败: {e}")
+
+            # 3. 内存清理
+            try:
+                await performance_optimizer.memory_cleanup()
+                # 🆕 强制垃圾回收
+                import gc
+
+                collected = gc.collect()
+                if collected > 0:
+                    logger.debug(f"🧹 保活期间GC回收 {collected} 个对象")
+            except Exception as e:
+                logger.debug(f"保活期间内存清理失败: {e}")
+
+        except asyncio.CancelledError:
+            break
+        except Exception as e:
+            logger.error(f"Render 保活循环异常: {e}")
+            await asyncio.sleep(60)  # 异常后等待1分钟
+
+
 # ========== 启动流程 ==========
 async def on_startup():
     """启动时执行 - 更新版本"""
@@ -3775,42 +3830,57 @@ async def on_shutdown():
 
 
 async def main():
-    """主函数 - 集成重连机制的版本"""
+    """主函数 - Render 适配版"""
+    # Render 环境检测
+    is_render = os.environ.get("RENDER", False) or "RENDER" in os.environ
+
+    if is_render:
+        logger.info("🎯 检测到 Render 环境，应用优化配置")
+        # 应用 Render 特定配置
+        Config.DB_MAX_CONNECTIONS = 3
+        Config.ENABLE_FILE_LOGGING = False
+
     try:
         logger.info("🚀 启动打卡机器人系统...")
 
-        # 首先初始化所有服务
+        # 初始化服务
         await initialize_services()
 
-        # 启动健康检查服务器
+        # 启动健康检查服务器（Render 必需）
         await start_health_server()
+
+        # 🆕 Render 必需：更频繁的保活
+        keepalive_task = asyncio.create_task(keepalive_loop(), name="render_keepalive")
 
         # 启动定时任务
         asyncio.create_task(daily_reset_task(), name="daily_reset")
         asyncio.create_task(memory_cleanup_task(), name="memory_cleanup")
         asyncio.create_task(health_monitoring_task(), name="health_monitoring")
 
-        # 启动机器人 - 使用健壮的重连机制
+        # 启动机器人
         logger.info("🤖 启动机器人（带自动重连机制）...")
-
-        # 设置启动完成标志
         await on_startup()
 
-        # 开始轮询 - 使用新的Bot管理器
+        # 开始轮询
         await bot_manager.start_polling_with_retry()
 
     except KeyboardInterrupt:
         logger.info("🛑 机器人被用户中断")
     except Exception as e:
         logger.error(f"❌ 机器人启动失败: {e}")
-        # 尝试优雅关闭
-        try:
-            await on_shutdown()
-        except Exception as shutdown_error:
-            logger.error(f"关闭过程中出错: {shutdown_error}")
+        # 🆕 Render 环境下需要正常退出码
+        if is_render:
+            sys.exit(1)
         raise
     finally:
-        # 确保关闭清理被执行
+        # 🆕 确保保活任务被正确取消
+        if "keepalive_task" in locals():
+            keepalive_task.cancel()
+            try:
+                await keepalive_task
+            except asyncio.CancelledError:
+                pass
+
         await on_shutdown()
 
 
