@@ -255,6 +255,45 @@ class RobustBotManager:
                 logger.error(f"健康监控异常: {e}")
                 await asyncio.sleep(30)
 
+    async def send_message_with_retry_emergency(
+        self, chat_id: int, text: str, **kwargs
+    ) -> bool:
+        """紧急消息发送 - 超时缩短"""
+        max_attempts = 2  # 减少重试次数
+        base_delay = 1
+
+        for attempt in range(1, max_attempts + 1):
+            try:
+                # 设置短超时
+                async with asyncio.timeout(10):  # 10秒超时
+                    await self.bot.send_message(chat_id, text, **kwargs)
+                return True
+            except asyncio.TimeoutError:
+                logger.warning(f"📤 发送消息超时 (尝试 {attempt}/{max_attempts})")
+                if attempt == max_attempts:
+                    return False
+            except Exception as e:
+                error_msg = str(e).lower()
+
+                # 只重试网络错误
+                if any(
+                    keyword in error_msg
+                    for keyword in ["timeout", "connection", "network"]
+                ):
+                    if attempt == max_attempts:
+                        logger.error(f"📤 发送消息重试{max_attempts}次后失败: {e}")
+                        return False
+
+                    delay = base_delay * attempt
+                    await asyncio.sleep(delay)
+                    continue
+                else:
+                    # 其他错误不重试
+                    logger.warning(f"📤 发送消息失败(不重试): {e}")
+                    return False
+
+        return False
+
 
 # 全局Bot管理器实例
 bot_manager = RobustBotManager(Config.TOKEN)
