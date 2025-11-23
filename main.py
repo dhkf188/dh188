@@ -45,6 +45,7 @@ from utils import (
     performance_optimizer,
     heartbeat_manager,
     notification_service,
+    NotificationService,
     get_beijing_time,
     calculate_cross_day_time_diff,
     is_valid_checkin_time,
@@ -3345,14 +3346,28 @@ async def export_and_push_csv(
 
     # 后续代码保持不变...
     for user_data in group_stats:
+        # 🆕 最小修复：只在需要的地方添加保护
+        if not isinstance(user_data, dict):
+            continue
+
+        # 安全处理 activities 字段
+        user_activities = user_data.get("activities", {})
+        if not isinstance(user_activities, dict):
+            user_activities = {}
+
         total_count = user_data.get("total_activity_count", 0)
         total_time = user_data.get("total_accumulated_time", 0)
-        if total_count > 0 or (total_time and total_time > 0):
+        if total_count > 0 or total_time > 0:
             has_data = True
 
-        row = [user_data["user_id"], user_data.get("nickname", "未知用户")]
+        row = [user_data.get("user_id", "未知"), user_data.get("nickname", "未知用户")]
+
         for act in activity_limits.keys():
-            activity_info = user_data.get("activities", {}).get(act, {})
+            activity_info = user_activities.get(act, {})
+            # 🆕 安全获取活动数据
+            if not isinstance(activity_info, dict):
+                activity_info = {}
+
             count = activity_info.get("count", 0)
             total_seconds = int(activity_info.get("time", 0))
             time_str = MessageFormatter.format_time_for_csv(total_seconds)
@@ -3485,20 +3500,30 @@ async def daily_reset_task():
 
 
 async def delayed_export(chat_id: int, delay_minutes: int = 30):
-    """在每日重置后延迟导出昨日数据"""
+    """在每日重置后延迟导出昨日数据 - 安全修复版"""
     try:
         logger.info(f"群组 {chat_id} 将在 {delay_minutes} 分钟后导出昨日数据...")
         await asyncio.sleep(delay_minutes * 60)
 
         yesterday_dt = get_beijing_time() - timedelta(days=1)
         yesterday_date = yesterday_dt.date()
-        file_name = f"group_{chat_id}_statistics_{yesterday_dt.strftime('%Y%m%d')}.csv"
 
+        # 🆕 先检查是否有数据
+        monthly_stats = await db.get_monthly_statistics(
+            chat_id, yesterday_date.year, yesterday_date.month
+        )
+
+        if not monthly_stats:
+            logger.info(f"群组 {chat_id} 昨日无数据，跳过导出")
+            return
+
+        file_name = f"group_{chat_id}_statistics_{yesterday_dt.strftime('%Y%m%d')}.csv"
         await export_and_push_csv(chat_id, True, file_name, yesterday_date)
-        logger.info(f"群组 {chat_id} 昨日数据导出并推送完成")
+        logger.info(f"✅ 群组 {chat_id} 昨日数据导出完成")
 
     except Exception as e:
-        logger.error(f"群组 {chat_id} 延迟导出昨日数据失败: {e}")
+        logger.error(f"❌ 群组 {chat_id} 延迟导出昨日数据失败: {e}")
+        # 不重新抛出异常，避免影响其他任务
 
 
 async def memory_cleanup_task():
@@ -3607,12 +3632,9 @@ async def initialize_services():
         dp = bot_manager.dispatcher
 
         # 🎯 关键：验证 bot 和 bot_manager 是否真的初始化了
-        if not bot:
-            logger.error("❌ bot 实例初始化失败")
-            raise RuntimeError("bot 实例初始化失败")
-        if not hasattr(bot_manager, "send_message_with_retry"):
-            logger.error("❌ bot_manager 方法不完整")
-            raise RuntimeError("bot_manager 方法不完整")
+        global notification_service
+        notification_service = NotificationService(bot_manager=bot_manager)
+        notification_service.bot = bot
 
         # 5. 🎯 核心修复：双重设置 NotificationService
         notification_service.bot_manager = bot_manager
