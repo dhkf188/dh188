@@ -94,8 +94,9 @@ class RobustBotManager:
             logger.info("Bot会话已关闭")
 
     async def send_message_with_retry(self, chat_id: int, text: str, **kwargs) -> bool:
-        """带重试的消息发送"""
+        """带重试的消息发送 - 增强版"""
         max_attempts = 3
+        base_delay = 2
 
         for attempt in range(1, max_attempts + 1):
             try:
@@ -105,7 +106,7 @@ class RobustBotManager:
             except Exception as e:
                 error_msg = str(e).lower()
 
-                # 如果是网络问题或限流，进行重试
+                # 网络相关错误 - 重试
                 if any(
                     keyword in error_msg
                     for keyword in [
@@ -114,23 +115,52 @@ class RobustBotManager:
                         "network",
                         "flood",
                         "retry",
+                        "cannot connect",
+                        "connectorerror",
+                        "ssl",
+                        "socket",
                     ]
                 ):
                     if attempt == max_attempts:
                         logger.error(f"📤 发送消息重试{max_attempts}次后失败: {e}")
                         return False
 
-                    delay = attempt * 2  # 线性退避
+                    delay = base_delay * (2 ** (attempt - 1))  # 指数退避
+                    delay = min(delay, 30)  # 最大延迟30秒
+
+                    logger.warning(
+                        f"📤 发送消息失败(网络问题)，{delay}秒后第{attempt + 1}次重试: {e}"
+                    )
+                    await asyncio.sleep(delay)
+                    continue
+
+                # 权限相关错误 - 不重试
+                elif any(
+                    keyword in error_msg
+                    for keyword in [
+                        "forbidden",
+                        "blocked",
+                        "unauthorized",
+                        "chat not found",
+                        "bot was blocked",
+                        "user is deactivated",
+                    ]
+                ):
+                    logger.warning(f"📤 发送消息失败(权限问题): {e}")
+                    return False
+
+                # 其他错误 - 重试
+                else:
+                    if attempt == max_attempts:
+                        logger.error(f"📤 发送消息重试{max_attempts}次后失败: {e}")
+                        return False
+
+                    delay = base_delay * attempt
                     logger.warning(
                         f"📤 发送消息失败，{delay}秒后第{attempt + 1}次重试: {e}"
                     )
                     await asyncio.sleep(delay)
                     continue
-
-                # 其他错误（如权限不足、chat不存在等）不重试
-                else:
-                    logger.error(f"📤 发送消息失败（不重试）: {e}")
-                    return False
 
         return False
 
