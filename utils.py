@@ -166,24 +166,115 @@ class MessageFormatter:
 
 
 class NotificationService:
-    """统一推送服务"""
+    """统一推送服务 - 完整修复版"""
 
-    def __init__(self, bot=None):
-        self.bot = bot
+    def __init__(self, bot_manager=None):
+        self.bot_manager = bot_manager
+        self.bot = None  # 🆕 添加直接 bot 实例作为备用
+        self._last_notification_time = {}
+        self._rate_limit_window = 60  # 60秒内不重复发送相同通知
 
     async def send_notification(
         self, chat_id: int, text: str, notification_type: str = "all"
     ):
-        """发送通知到绑定的频道和群组"""
-        if not self.bot:
-            logger.warning("NotificationService: bot 实例未初始化")
+        """发送通知到绑定的频道和群组 - 完整修复版"""
+        # 🆕 双重检查：优先使用 bot_manager，备用使用 bot
+        if not self.bot_manager and not self.bot:
+            logger.warning("NotificationService: bot_manager 和 bot 都未初始化")
             return False
+
+        # 检查速率限制
+        notification_key = f"{chat_id}:{hash(text)}"
+        current_time = time.time()
+        if (
+            notification_key in self._last_notification_time
+            and current_time - self._last_notification_time[notification_key]
+            < self._rate_limit_window
+        ):
+            logger.debug(f"跳过重复通知: {notification_key}")
+            return True
 
         sent = False
         push_settings = await db.get_push_settings()
 
         # 获取群组数据
         group_data = await db.get_group_cached(chat_id)
+
+        # 🆕 优先使用 bot_manager 的带重试方法
+        if self.bot_manager and hasattr(self.bot_manager, "send_message_with_retry"):
+            sent = await self._send_with_bot_manager(
+                chat_id, text, group_data, push_settings
+            )
+        # 🆕 备用：直接使用 bot 实例
+        elif self.bot:
+            sent = await self._send_with_bot(chat_id, text, group_data, push_settings)
+
+        if sent:
+            self._last_notification_time[notification_key] = current_time
+
+        return sent
+
+    async def _send_with_bot_manager(
+        self, chat_id: int, text: str, group_data: dict, push_settings: dict
+    ) -> bool:
+        """使用 bot_manager 发送通知"""
+        sent = False
+
+        # 发送到频道
+        if (
+            push_settings.get("enable_channel_push")
+            and group_data
+            and group_data.get("channel_id")
+        ):
+            try:
+                success = await self.bot_manager.send_message_with_retry(
+                    group_data["channel_id"], text, parse_mode="HTML"
+                )
+                if success:
+                    sent = True
+                    logger.info(f"✅ 已发送到频道: {group_data['channel_id']}")
+            except Exception as e:
+                logger.error(f"❌ 发送到频道失败: {e}")
+
+        # 发送到通知群组
+        if (
+            push_settings.get("enable_group_push")
+            and group_data
+            and group_data.get("notification_group_id")
+        ):
+            try:
+                success = await self.bot_manager.send_message_with_retry(
+                    group_data["notification_group_id"], text, parse_mode="HTML"
+                )
+                if success:
+                    sent = True
+                    logger.info(
+                        f"✅ 已发送到通知群组: {group_data['notification_group_id']}"
+                    )
+            except Exception as e:
+                logger.error(f"❌ 发送到通知群组失败: {e}")
+
+        # 管理员兜底推送
+        if not sent and push_settings.get("enable_admin_push"):
+            for admin_id in Config.ADMINS:
+                try:
+                    success = await self.bot_manager.send_message_with_retry(
+                        admin_id, text, parse_mode="HTML"
+                    )
+                    if success:
+                        logger.info(f"✅ 已发送给管理员: {admin_id}")
+                        sent = True
+                        break
+                except Exception as e:
+                    logger.error(f"❌ 发送给管理员失败: {e}")
+
+        return sent
+
+    async def _send_with_bot(
+        self, chat_id: int, text: str, group_data: dict, push_settings: dict
+    ) -> bool:
+        """直接使用 bot 实例发送通知（备用方案）"""
+        sent = False
 
         # 发送到频道
         if (
@@ -196,9 +287,9 @@ class NotificationService:
                     group_data["channel_id"], text, parse_mode="HTML"
                 )
                 sent = True
-                logger.info(f"已发送到频道: {group_data['channel_id']}")
+                logger.info(f"✅ 已发送到频道: {group_data['channel_id']}")
             except Exception as e:
-                logger.error(f"发送到频道失败: {e}")
+                logger.error(f"❌ 发送到频道失败: {e}")
 
         # 发送到通知群组
         if (
@@ -211,79 +302,144 @@ class NotificationService:
                     group_data["notification_group_id"], text, parse_mode="HTML"
                 )
                 sent = True
-                logger.info(f"已发送到通知群组: {group_data['notification_group_id']}")
+                logger.info(
+                    f"✅ 已发送到通知群组: {group_data['notification_group_id']}"
+                )
             except Exception as e:
-                logger.error(f"发送到通知群组失败: {e}")
+                logger.error(f"❌ 发送到通知群组失败: {e}")
 
         # 管理员兜底推送
         if not sent and push_settings.get("enable_admin_push"):
             for admin_id in Config.ADMINS:
                 try:
                     await self.bot.send_message(admin_id, text, parse_mode="HTML")
-                    logger.info(f"已发送给管理员: {admin_id}")
+                    logger.info(f"✅ 已发送给管理员: {admin_id}")
+                    sent = True
+                    break
                 except Exception as e:
-                    logger.error(f"发送给管理员失败: {e}")
+                    logger.error(f"❌ 发送给管理员失败: {e}")
 
         return sent
 
     async def send_document(self, chat_id: int, document, caption: str = ""):
-        """发送文档到绑定的频道和群组"""
-        if not self.bot:
-            logger.warning("NotificationService: bot 实例未初始化")
+        """发送文档到绑定的频道和群组 - 完整修复版"""
+        # 🆕 双重检查
+        if not self.bot_manager and not self.bot:
+            logger.warning("NotificationService: bot_manager 和 bot 都未初始化")
             return False
 
         sent = False
         push_settings = await db.get_push_settings()
         group_data = await db.get_group_cached(chat_id)
 
-        # 发送到频道
-        if (
-            push_settings.get("enable_channel_push")
-            and group_data
-            and group_data.get("channel_id")
-        ):
-            try:
-                await self.bot.send_document(
-                    group_data["channel_id"],
-                    document,
-                    caption=caption,
-                    parse_mode="HTML",
-                )
-                sent = True
-                logger.info(f"已发送文档到频道: {group_data['channel_id']}")
-            except Exception as e:
-                logger.error(f"发送文档到频道失败: {e}")
+        # 🆕 优先使用 bot_manager 的带重试方法
+        if self.bot_manager and hasattr(self.bot_manager, "send_document_with_retry"):
+            # 发送到频道
+            if (
+                push_settings.get("enable_channel_push")
+                and group_data
+                and group_data.get("channel_id")
+            ):
+                try:
+                    success = await self.bot_manager.send_document_with_retry(
+                        group_data["channel_id"],
+                        document,
+                        caption=caption,
+                        parse_mode="HTML",
+                    )
+                    if success:
+                        sent = True
+                        logger.info(f"✅ 已发送文档到频道: {group_data['channel_id']}")
+                except Exception as e:
+                    logger.error(f"❌ 发送文档到频道失败: {e}")
 
-        # 发送到通知群组
-        if (
-            push_settings.get("enable_group_push")
-            and group_data
-            and group_data.get("notification_group_id")
-        ):
-            try:
-                await self.bot.send_document(
-                    group_data["notification_group_id"],
-                    document,
-                    caption=caption,
-                    parse_mode="HTML",
-                )
-                sent = True
-                logger.info(
-                    f"已发送文档到通知群组: {group_data['notification_group_id']}"
-                )
-            except Exception as e:
-                logger.error(f"发送文档到通知群组失败: {e}")
+            # 发送到通知群组
+            if (
+                push_settings.get("enable_group_push")
+                and group_data
+                and group_data.get("notification_group_id")
+            ):
+                try:
+                    success = await self.bot_manager.send_document_with_retry(
+                        group_data["notification_group_id"],
+                        document,
+                        caption=caption,
+                        parse_mode="HTML",
+                    )
+                    if success:
+                        sent = True
+                        logger.info(
+                            f"✅ 已发送文档到通知群组: {group_data['notification_group_id']}"
+                        )
+                except Exception as e:
+                    logger.error(f"❌ 发送文档到通知群组失败: {e}")
 
-        # 管理员兜底推送
-        if not sent and push_settings.get("enable_admin_push"):
-            for admin_id in Config.ADMINS:
+            # 管理员兜底推送
+            if not sent and push_settings.get("enable_admin_push"):
+                for admin_id in Config.ADMINS:
+                    try:
+                        success = await self.bot_manager.send_document_with_retry(
+                            admin_id, document, caption=caption, parse_mode="HTML"
+                        )
+                        if success:
+                            logger.info(f"✅ 已发送文档给管理员: {admin_id}")
+                            sent = True
+                            break
+                    except Exception as e:
+                        logger.error(f"❌ 发送文档给管理员失败: {e}")
+
+        # 🆕 备用：直接使用 bot 实例
+        elif self.bot:
+            # 发送到频道
+            if (
+                push_settings.get("enable_channel_push")
+                and group_data
+                and group_data.get("channel_id")
+            ):
                 try:
                     await self.bot.send_document(
-                        admin_id, document, caption=caption, parse_mode="HTML"
+                        group_data["channel_id"],
+                        document,
+                        caption=caption,
+                        parse_mode="HTML",
                     )
-                    logger.info(f"已发送文档给管理员: {admin_id}")
+                    sent = True
+                    logger.info(f"✅ 已发送文档到频道: {group_data['channel_id']}")
                 except Exception as e:
-                    logger.error(f"发送文档给管理员失败: {e}")
+                    logger.error(f"❌ 发送文档到频道失败: {e}")
+
+            # 发送到通知群组
+            if (
+                push_settings.get("enable_group_push")
+                and group_data
+                and group_data.get("notification_group_id")
+            ):
+                try:
+                    await self.bot.send_document(
+                        group_data["notification_group_id"],
+                        document,
+                        caption=caption,
+                        parse_mode="HTML",
+                    )
+                    sent = True
+                    logger.info(
+                        f"✅ 已发送文档到通知群组: {group_data['notification_group_id']}"
+                    )
+                except Exception as e:
+                    logger.error(f"❌ 发送文档到通知群组失败: {e}")
+
+            # 管理员兜底推送
+            if not sent and push_settings.get("enable_admin_push"):
+                for admin_id in Config.ADMINS:
+                    try:
+                        await self.bot.send_document(
+                            admin_id, document, caption=caption, parse_mode="HTML"
+                        )
+                        logger.info(f"✅ 已发送文档给管理员: {admin_id}")
+                        sent = True
+                        break
+                    except Exception as e:
+                        logger.error(f"❌ 发送文档给管理员失败: {e}")
 
         return sent
 
