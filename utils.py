@@ -158,7 +158,7 @@ class MessageFormatter:
 
         for act, count in activity_counts.items():
             if count > 0:
-                message += f"🔹 本日{MessageFormatter.format_copyable_text(act)}次数：{MessageFormatter.format_copyable_text(str(count))} 次\n"
+                message += f"🔹 今日{MessageFormatter.format_copyable_text(act)}次数：{MessageFormatter.format_copyable_text(str(count))} 次\n"
 
         message += f"\n📊 今日总活动次数：{MessageFormatter.format_copyable_text(str(total_count))} 次"
 
