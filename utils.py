@@ -1,12 +1,17 @@
+import os
 import time
 import asyncio
 import logging
+import gc
+import psutil
+
 from datetime import datetime, timedelta
 from typing import Dict, Any, List, Optional, Tuple
 from config import Config, beijing_tz
 from functools import wraps
 from aiogram import types
 from database import db
+from performance import global_cache, task_manager
 
 
 logger = logging.getLogger("GroupCheckInBot")
@@ -389,7 +394,6 @@ class ActivityTimerManager:
         self._cleanup_interval = 300
         self._last_cleanup = time.time()
         self.activity_timer_callback = None  # 回调函数
-        self._max_locks = 5000  # 最大锁数量限制
 
     def set_activity_timer_callback(self, callback):
         """设置活动定时器回调"""
@@ -466,199 +470,204 @@ class ActivityTimerManager:
         return {"active_timers": len(self._timers)}
 
 
+# class EnhancedPerformanceOptimizer:
+#     """增强版性能优化器"""
+
+#     def __init__(self):
+#         self.last_cleanup = time.time()
+#         self.cleanup_interval = 300
+
+#     async def memory_cleanup(self):
+#         """智能内存清理"""
+#         try:
+#             current_time = time.time()
+#             if current_time - self.last_cleanup < self.cleanup_interval:
+#                 return
+
+#             # 并行清理任务
+#             from performance import task_manager, global_cache
+
+#             cleanup_tasks = [
+#                 task_manager.cleanup_tasks(),
+#                 global_cache.clear_expired(),
+#                 db.cleanup_cache(),
+#             ]
+
+#             await asyncio.gather(*cleanup_tasks, return_exceptions=True)
+
+#             # 强制GC
+#             import gc
+
+#             collected = gc.collect()
+#             logger.info(f"内存清理完成 - 回收对象: {collected}")
+
+#             self.last_cleanup = current_time
+#         except Exception as e:
+#             logger.error(f"内存清理失败: {e}")
+
+#     def memory_usage_ok(self) -> bool:
+#         """检查内存使用是否正常"""
+#         try:
+#             import psutil
+
+#             process = psutil.Process()
+#             memory_percent = process.memory_percent()
+#             return memory_percent < 80  # 内存使用率低于80%视为正常
+#         except ImportError:
+#             return True
+
+
 class EnhancedPerformanceOptimizer:
-    """增强版性能优化器 - Render 免费版优化"""
+    """增强版性能优化器 - 现在包含智能内存管理"""
 
     def __init__(self):
+        # 定期清理间隔（秒）
+        self.cleanup_interval = 300
         self.last_cleanup = time.time()
-        self.cleanup_interval = 600  # 🆕 延长到10分钟，减少频繁清理
-        self._emergency_mode = False  # 🆕 紧急模式标志
-        self._consecutive_high_memory = 0  # 🆕 连续高内存计数
+
+        # 自动判断是否为 Render 环境
+        self.is_render = self._detect_render_environment()
+
+        # Render 内存阈值（单位 MB）
+        self.render_memory_limit = 400  # 留 100MB 缓冲区（Render 免费版=512MB）
+
+        logger.info(
+            f"🧠 EnhancedPerformanceOptimizer 初始化 - Render 环境: {self.is_render}"
+        )
+
+    def _detect_render_environment(self) -> bool:
+        """检测是否运行在 Render 环境"""
+        # 方法1: 检查 RENDER 环境变量
+        if os.environ.get("RENDER"):
+            return True
+
+        # 方法2: 检查 Render 特定的环境变量
+        if "RENDER_EXTERNAL_URL" in os.environ:
+            return True
+
+        # 方法3: 检查 PORT 环境变量（Render 会自动设置）
+        if os.environ.get("PORT"):
+            return True
+
+        return False
 
     async def memory_cleanup(self):
-        """智能内存清理 - Render 免费版优化"""
+        """
+        智能内存清理 - 替换原有的实现
+        """
+        if self.is_render:
+            return await self._render_cleanup()
+        else:
+            await self._regular_cleanup()
+            return None
+
+    # ---------------------------------------------------------
+    # 1️⃣ Render 紧急保护模式
+    # ---------------------------------------------------------
+    async def _render_cleanup(self) -> float:
+        """Render 环境专用清理（带紧急 OOM 防护）"""
         try:
-            current_time = time.time()
-
-            # 🆕 智能检查频率：紧急模式更频繁，正常模式较少
-            if self._emergency_mode:
-                check_interval = 60  # 紧急模式1分钟检查一次
-            else:
-                check_interval = self.cleanup_interval
-
-            if current_time - self.last_cleanup < check_interval:
-                return
-
-            # 🆕 检查内存状态，决定清理强度
-            memory_status = self._check_memory_status()
-
-            if memory_status == "critical":
-                logger.warning("🆘 内存严重不足，执行强制清理")
-                await self._emergency_cleanup()
-                self._emergency_mode = True
-            elif memory_status == "warning":
-                logger.info("⚠️ 内存使用较高，执行增强清理")
-                await self._enhanced_cleanup()
-                self._emergency_mode = True
-            else:
-                # 正常清理
-                await self._normal_cleanup()
-                self._emergency_mode = False
-
-            # 强制GC
-            import gc
-
-            collected = gc.collect()
-
-            logger.info(
-                f"内存清理完成 - 回收对象: {collected}, "
-                f"紧急模式: {self._emergency_mode}, "
-                f"状态: {memory_status}"
-            )
-
-            self.last_cleanup = current_time
-
-        except Exception as e:
-            logger.error(f"内存清理失败: {e}")
-
-    def _check_memory_status(self) -> str:
-        """检查内存状态 - Render 免费版专用"""
-        try:
-            import psutil
-
             process = psutil.Process()
             memory_mb = process.memory_info().rss / 1024 / 1024
-            memory_percent = process.memory_percent()
 
-            # 🆕 Render 免费版专用阈值（约512MB内存）
-            if memory_mb > 400 or memory_percent > 85:
-                self._consecutive_high_memory += 1
-                if self._consecutive_high_memory >= 2:  # 连续2次高内存
-                    return "critical"
-                return "warning"
-            else:
-                self._consecutive_high_memory = 0
-                return "normal"
+            # 输出 Render 专用监控日志
+            logger.debug(f"🔵 Render 内存监测: {memory_mb:.1f} MB")
 
-        except ImportError:
-            return "normal"
+            # 如果内存太高，执行紧急清理
+            if memory_mb > self.render_memory_limit:
+                logger.warning(f"🚨 Render 内存过高 {memory_mb:.1f}MB，执行紧急清理")
 
-    async def _normal_cleanup(self):
-        """正常强度清理"""
-        from performance import task_manager, global_cache
+                # 清理缓存
+                old_cache_size = global_cache.get_stats().get("size", 0)
+                global_cache.clear_all()
 
-        cleanup_tasks = [
-            task_manager.cleanup_tasks(),
-            global_cache.clear_expired(),
-            db.cleanup_cache(),
-        ]
+                # 清理已完成任务
+                await task_manager.cleanup_tasks()
 
-        await asyncio.gather(*cleanup_tasks, return_exceptions=True)
+                # 清理数据库缓存
+                await db.cleanup_cache()
 
-    async def _enhanced_cleanup(self):
-        """增强强度清理"""
-        from performance import task_manager, global_cache
+                # 强制 GC
+                collected = gc.collect()
 
-        cleanup_tasks = [
-            task_manager.cleanup_tasks(),
-            global_cache.clear_expired(),
-            db.cleanup_cache(),
-            self._force_cache_reduction(),  # 🆕 强制减少缓存
-        ]
-
-        # 🆕 增强清理：等待所有任务完成
-        results = await asyncio.gather(*cleanup_tasks, return_exceptions=True)
-
-        # 记录清理结果
-        for i, result in enumerate(results):
-            if isinstance(result, Exception):
-                logger.warning(f"清理任务 {i} 失败: {result}")
-
-    async def _emergency_cleanup(self):
-        """紧急强度清理"""
-        from performance import task_manager, global_cache
-
-        # 🆕 紧急清理：顺序执行，确保关键清理完成
-        try:
-            # 1. 清理任务
-            await task_manager.cleanup_tasks()
-
-            # 2. 强制清理缓存（不等待过期）
-            await global_cache.clear_all()  # 🆕 清空所有缓存
-
-            # 3. 数据库缓存清理
-            await db.cleanup_cache()
-
-            # 4. 额外GC
-            import gc
-
-            gc.collect(2)  # 🆕 更积极的GC
-
-        except Exception as e:
-            logger.error(f"紧急清理失败: {e}")
-
-    async def _force_cache_reduction(self):
-        """强制减少缓存占用"""
-        try:
-            from performance import global_cache
-
-            # 🆕 获取当前缓存统计
-            stats = global_cache.get_stats()
-            current_size = stats.get("size", 0)
-
-            if current_size > 500:  # 🆕 如果缓存超过500项
-                # 清理一半的缓存
-                target_size = current_size // 2
-                logger.info(f"强制缓存缩减: {current_size} -> {target_size}")
-
-                # 这里可以添加更激进的缓存清理逻辑
-                # 比如清理最旧的缓存项
-
-        except Exception as e:
-            logger.debug(f"强制缓存缩减失败: {e}")
-
-    def memory_usage_ok(self) -> bool:
-        """检查内存使用是否正常 - Render 免费版优化"""
-        try:
-            import psutil
-
-            process = psutil.Process()
-            memory_mb = process.memory_info().rss / 1024 / 1024
-            memory_percent = process.memory_percent()
-
-            # 🆕 Render 免费版更严格的限制
-            # 总内存约512MB，设置安全阈值
-            memory_ok = memory_mb < 350 and memory_percent < 75
-
-            if not memory_ok:
-                logger.warning(
-                    f"内存使用警告: {memory_mb:.1f}MB, {memory_percent:.1f}%"
+                logger.info(
+                    f"🆘 紧急清理完成: 清缓存 {old_cache_size} 项, GC 回收 {collected} 对象"
                 )
 
-            return memory_ok
+            return memory_mb
 
+        except Exception as e:
+            logger.error(f"Render 内存清理失败: {e}")
+            return 0.0
+
+    # ---------------------------------------------------------
+    # 2️⃣ 常规服务器智能清理模式
+    # ---------------------------------------------------------
+    async def _regular_cleanup(self):
+        """普通环境的智能周期清理"""
+        try:
+            now = time.time()
+            if now - self.last_cleanup < self.cleanup_interval:
+                return  # 未到周期，无需清理
+
+            logger.debug("🟢 执行周期性内存清理...")
+
+            # 并行执行多个清理任务
+            tasks = [
+                task_manager.cleanup_tasks(),
+                global_cache.clear_expired(),
+                db.cleanup_cache(),
+            ]
+
+            await asyncio.gather(*tasks, return_exceptions=True)
+
+            # 强制 GC
+            collected = gc.collect()
+            if collected > 0:
+                logger.info(f"周期清理完成 - GC 回收对象: {collected}")
+            else:
+                logger.debug("周期清理完成 - 无需要回收的对象")
+
+            self.last_cleanup = now
+
+        except Exception as e:
+            logger.error(f"周期清理失败: {e}")
+
+    def memory_usage_ok(self) -> bool:
+        """检查内存使用是否正常 - 保持原有接口"""
+        try:
+            process = psutil.Process()
+            memory_percent = process.memory_percent()
+            memory_mb = process.memory_info().rss / 1024 / 1024
+
+            # Render 环境使用绝对值检查，其他环境使用百分比
+            if self.is_render:
+                return memory_mb < self.render_memory_limit
+            else:
+                return memory_percent < 80  # 原有逻辑
         except ImportError:
             return True
 
-    def get_memory_status(self) -> dict:
-        """获取内存状态详情 - 用于监控"""
+    def get_memory_info(self) -> dict:
+        """获取当前内存信息"""
         try:
-            import psutil
-
             process = psutil.Process()
             memory_mb = process.memory_info().rss / 1024 / 1024
             memory_percent = process.memory_percent()
 
             return {
-                "memory_mb": round(memory_mb, 1),
+                "memory_usage_mb": round(memory_mb, 1),
                 "memory_percent": round(memory_percent, 1),
-                "emergency_mode": self._emergency_mode,
-                "consecutive_high_memory": self._consecutive_high_memory,
-                "last_cleanup": self.last_cleanup,
-                "status": self._check_memory_status(),
+                "is_render": self.is_render,
+                "render_memory_limit": self.render_memory_limit,
+                "needs_cleanup": (
+                    memory_mb > self.render_memory_limit if self.is_render else False
+                ),
+                "status": "healthy" if self.memory_usage_ok() else "warning",
             }
-        except ImportError:
-            return {"error": "psutil not available"}
+        except Exception as e:
+            logger.error(f"获取内存信息失败: {e}")
+            return {"error": str(e)}
 
 
 class HeartbeatManager:
@@ -823,110 +832,8 @@ def rate_limit(rate: int = 1, per: int = 1):
     return decorator
 
 
-class SmartLockManager:
-    """🆕 智能锁管理器 - 读/写锁分离"""
-
-    def __init__(self):
-        self._read_locks = {}  # 读锁（共享）
-        self._write_locks = {}  # 写锁（排他）
-        self._access_times = {}
-        self._max_locks = 500
-        self._cleanup_interval = 1800
-        self._last_cleanup = time.time()
-
-    def get_lock(self, chat_id: int, uid: int, operation_type: str = "write"):
-        """
-        获取智能锁
-        operation_type: 'read' 或 'write'
-        """
-        # 🆕 读操作使用群组级共享锁，写操作使用用户级排他锁
-        if operation_type == "read":
-            key = f"read:{chat_id}"  # 群组级读锁
-            lock_dict = self._read_locks
-        else:
-            key = f"write:{chat_id}:{uid}"  # 用户级写锁
-            lock_dict = self._write_locks
-
-        # 检查数量限制
-        if len(lock_dict) >= self._max_locks:
-            self._emergency_cleanup()
-
-        # 记录访问时间
-        self._access_times[key] = time.time()
-
-        # 检查是否需要清理
-        self._maybe_cleanup()
-
-        # 返回或创建锁
-        if key not in lock_dict:
-            lock_dict[key] = asyncio.Lock()
-
-        return lock_dict[key]
-
-    def _maybe_cleanup(self):
-        """按需清理"""
-        current_time = time.time()
-        if current_time - self._last_cleanup < self._cleanup_interval:
-            return
-
-        self._cleanup_old_locks()
-        self._last_cleanup = current_time
-
-    def _cleanup_old_locks(self):
-        """清理过期锁"""
-        now = time.time()
-        max_age = 86400  # 24小时
-
-        # 清理读锁
-        old_read_keys = [
-            key
-            for key, last_used in self._access_times.items()
-            if key.startswith("read:") and now - last_used > max_age
-        ]
-
-        # 清理写锁
-        old_write_keys = [
-            key
-            for key, last_used in self._access_times.items()
-            if key.startswith("write:") and now - last_used > max_age
-        ]
-
-        for key in old_read_keys + old_write_keys:
-            if key.startswith("read:"):
-                self._read_locks.pop(key, None)
-            else:
-                self._write_locks.pop(key, None)
-            self._access_times.pop(key, None)
-
-        if old_read_keys or old_write_keys:
-            logger.info(
-                f"智能锁清理: 读锁{len(old_read_keys)}, 写锁{len(old_write_keys)}"
-            )
-
-    def _emergency_cleanup(self):
-        """紧急清理"""
-        now = time.time()
-        max_age = 3600  # 1小时
-
-        # 清理所有类型的旧锁
-        old_keys = [
-            key
-            for key, last_used in self._access_times.items()
-            if now - last_used > max_age
-        ]
-
-        for key in old_keys:
-            if key.startswith("read:"):
-                self._read_locks.pop(key, None)
-            else:
-                self._write_locks.pop(key, None)
-            self._access_times.pop(key, None)
-
-        logger.warning(f"智能锁紧急清理: 移除了 {len(old_keys)} 个锁")
-
-
 # 全局实例
-user_lock_manager = SmartLockManager()
+user_lock_manager = UserLockManager()
 timer_manager = ActivityTimerManager()
 performance_optimizer = EnhancedPerformanceOptimizer()
 heartbeat_manager = HeartbeatManager()
