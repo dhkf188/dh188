@@ -179,6 +179,10 @@ async def calculate_work_fine(checkin_type: str, late_minutes: float) -> int:
 async def send_startup_notification():
     """发送启动通知给管理员"""
     try:
+        if not notification_service.bot_manager and not notification_service.bot:
+            logger.warning("无法发送启动通知: bot 和 bot_manager 都不可用")
+            return
+
         startup_time = get_beijing_time().strftime("%Y-%m-%d %H:%M:%S")
         message = (
             f"🤖 <b>打卡机器人已启动</b>\n"
@@ -200,6 +204,8 @@ async def send_startup_notification():
             except Exception as e:
                 logger.error(f"发送启动通知给管理员 {admin_id} 失败: {e}")
 
+        await notification_service.send_notification(0, message)
+
     except Exception as e:
         logger.error(f"发送启动通知失败: {e}")
 
@@ -207,6 +213,9 @@ async def send_startup_notification():
 async def send_shutdown_notification():
     """发送关闭通知给管理员"""
     try:
+        if not notification_service.bot_manager and not notification_service.bot:
+            logger.warning("无法发送关闭通知: bot 和 bot_manager 都不可用")
+            return
         shutdown_time = get_beijing_time().strftime("%Y-%m-%d %H:%M:%S")
         uptime = time.time() - start_time
         uptime_str = MessageFormatter.format_time(int(uptime))
@@ -230,6 +239,8 @@ async def send_shutdown_notification():
                     logger.debug(f"发送关闭通知给管理员 {admin_id} 失败")
             except Exception as e:
                 logger.debug(f"发送关闭通知失败: {e}")
+
+        await notification_service.send_notification(0, message)
 
     except Exception as e:
         logger.debug(f"准备关闭通知失败: {e}")
@@ -1165,8 +1176,12 @@ async def _process_back_locked(message: types.Message, chat_id: int, uid: int):
             try:
                 chat_title = str(chat_id)
                 try:
-                    chat_info = await bot.get_chat(chat_id)
-                    chat_title = chat_info.title or chat_title
+                    # 🆕 安全检查：确保 bot 可用
+                    if bot:
+                        chat_info = await bot.get_chat(chat_id)
+                        chat_title = chat_info.title or chat_title
+                    else:
+                        logger.warning("bot 不可用，使用默认群组标题")
                 except Exception:
                     pass
 
@@ -1180,9 +1195,15 @@ async def _process_back_locked(message: types.Message, chat_id: int, uid: int):
                     f"⏱️ 超时：<code>{MessageFormatter.format_time(int(overtime_seconds))}</code>\n"
                     f"💰 罚款：<code>{fine_amount}</code> 元"
                 )
-                await notification_service.send_notification(chat_id, notif_text)
+
+                # 🆕 使用修复后的通知服务（已经支持 bot_manager）
+                sent = await notification_service.send_notification(chat_id, notif_text)
+                if not sent:
+                    logger.warning("超时通知发送失败，但回座操作已完成")
+
             except Exception as e:
                 logger.error(f"超时通知推送异常: {e}")
+                # 🆕 通知失败不影响主流程
 
     except Exception as e:
         logger.error(f"回座处理异常: {e}")
@@ -1210,6 +1231,12 @@ async def process_work_checkin(message: types.Message, checkin_type: str):
     current_time = now.strftime("%H:%M")
     today = str(now.date())
     trace_id = f"{chat_id}-{uid}-{int(time.time())}"
+
+    if not bot and (
+        not notification_service.bot_manager or not notification_service.bot
+    ):
+        logger.error(f"打卡失败: bot 和 bot_manager 都不可用")
+        return
 
     logger.info(f"🟢[{trace_id}] 开始处理 {checkin_type} 打卡请求：{name}({uid})")
 
@@ -3056,53 +3083,50 @@ async def show_history(message: types.Message):
     chat_id = message.chat.id
     uid = message.from_user.id
 
-    # 🆕 添加读锁（共享锁）
-    user_lock = user_lock_manager.get_lock(chat_id, uid, "read")
-    async with user_lock:
-        await db.init_group(chat_id)
-        await db.init_user(chat_id, uid)
-        user_data = await db.get_user_cached(chat_id, uid)
+    await db.init_group(chat_id)
+    await db.init_user(chat_id, uid)
+    user_data = await db.get_user_cached(chat_id, uid)
 
-        first_line = (
-            f"👤 用户：{MessageFormatter.format_user_link(uid, user_data['nickname'])}"
-        )
-        text = f"{first_line}\n📊 今日记录：\n\n"
+    first_line = (
+        f"👤 用户：{MessageFormatter.format_user_link(uid, user_data['nickname'])}"
+    )
+    text = f"{first_line}\n📊 今日记录：\n\n"
 
-        has_records = False
-        activity_limits = await db.get_activity_limits_cached()
-        user_activities = await db.get_user_all_activities(chat_id, uid)
+    has_records = False
+    activity_limits = await db.get_activity_limits_cached()
+    user_activities = await db.get_user_all_activities(chat_id, uid)
 
-        for act in activity_limits.keys():
-            activity_info = user_activities.get(act, {})
-            total_time = activity_info.get("time", 0)
-            count = activity_info.get("count", 0)
-            max_times = activity_limits[act]["max_times"]
-            if total_time > 0 or count > 0:
-                status = "✅" if count < max_times else "❌"
-                time_str = MessageFormatter.format_time(int(total_time))
-                text += f"• <code>{act}</code>：<code>{time_str}</code>，次数：<code>{count}</code>/<code>{max_times}</code> {status}\n"
-                has_records = True
+    for act in activity_limits.keys():
+        activity_info = user_activities.get(act, {})
+        total_time = activity_info.get("time", 0)
+        count = activity_info.get("count", 0)
+        max_times = activity_limits[act]["max_times"]
+        if total_time > 0 or count > 0:
+            status = "✅" if count < max_times else "❌"
+            time_str = MessageFormatter.format_time(int(total_time))
+            text += f"• <code>{act}</code>：<code>{time_str}</code>，次数：<code>{count}</code>/<code>{max_times}</code> {status}\n"
+            has_records = True
 
-        total_time_all = user_data.get("total_accumulated_time", 0)
-        total_count_all = user_data.get("total_activity_count", 0)
-        total_fine = user_data.get("total_fines", 0)
+    total_time_all = user_data.get("total_accumulated_time", 0)
+    total_count_all = user_data.get("total_activity_count", 0)
+    total_fine = user_data.get("total_fines", 0)
 
-        text += f"\n📈 今日总统计：\n"
-        text += f"• 总累计时间：<code>{MessageFormatter.format_time(int(total_time_all))}</code>\n"
-        text += f"• 总活动次数：<code>{total_count_all}</code> 次\n"
-        if total_fine > 0:
-            text += f"• 累计罚款：<code>{total_fine}</code> 元"
+    text += f"\n📈 今日总统计：\n"
+    text += f"• 总累计时间：<code>{MessageFormatter.format_time(int(total_time_all))}</code>\n"
+    text += f"• 总活动次数：<code>{total_count_all}</code> 次\n"
+    if total_fine > 0:
+        text += f"• 累计罚款：<code>{total_fine}</code> 元"
 
-        if not has_records and total_count_all == 0:
-            text += "暂无记录，请先进行打卡活动"
+    if not has_records and total_count_all == 0:
+        text += "暂无记录，请先进行打卡活动"
 
-        await message.answer(
-            text,
-            reply_markup=await get_main_keyboard(
-                chat_id=chat_id, show_admin=await is_admin(uid)
-            ),
-            parse_mode="HTML",
-        )
+    await message.answer(
+        text,
+        reply_markup=await get_main_keyboard(
+            chat_id=chat_id, show_admin=await is_admin(uid)
+        ),
+        parse_mode="HTML",
+    )
 
 
 async def show_rank(message: types.Message):
@@ -3110,73 +3134,71 @@ async def show_rank(message: types.Message):
     chat_id = message.chat.id
     uid = message.from_user.id
 
-    # 🆕 添加读锁（共享锁）
-    user_lock = user_lock_manager.get_lock(chat_id, uid, "read")
-    async with user_lock:
-        await db.init_group(chat_id)
-        activity_limits = await db.get_activity_limits_cached()
+    await db.init_group(chat_id)
+    activity_limits = await db.get_activity_limits_cached()
 
-        if not activity_limits:
-            await message.answer("⚠️ 当前没有配置任何活动，无法生成排行榜。")
-            return
+    if not activity_limits:
+        await message.answer("⚠️ 当前没有配置任何活动，无法生成排行榜。")
+        return
 
-        rank_text = "🏆 今日活动排行榜\n\n"
-        today = db.get_beijing_date()
-        found_any_data = False
+    rank_text = "🏆 今日活动排行榜\n\n"
+    today = db.get_beijing_date()
+    found_any_data = False
 
-        for act in activity_limits.keys():
-            # 获取活动排名数据
-            group_members = await db.get_group_members(chat_id)
-            activity_users = []
+    for act in activity_limits.keys():
+        # 获取活动排名数据
+        group_members = await db.get_group_members(chat_id)
+        activity_users = []
 
-            for user_data in group_members:
-                user_activities = await db.get_user_all_activities(
-                    chat_id, user_data["user_id"]
-                )
-                activity_info = user_activities.get(act, {})
-                total_time = activity_info.get("time", 0)
-                count = activity_info.get("count", 0)
-
-                if total_time > 0 or user_data.get("current_activity") == act:
-                    activity_users.append(
-                        {
-                            "user_id": user_data["user_id"],
-                            "nickname": user_data["nickname"],
-                            "total_time": total_time,
-                            "count": count,
-                            "is_active": user_data.get("current_activity") == act,
-                        }
-                    )
-
-            # 按时间排序
-            activity_users.sort(key=lambda x: x["total_time"], reverse=True)
-
-            if activity_users:
-                found_any_data = True
-                rank_text += f"📈 <code>{act}</code>：\n"
-
-                for i, user in enumerate(activity_users[:5], 1):
-                    if user["is_active"]:
-                        rank_text += f"  <code>{i}.</code> 🟡 {MessageFormatter.format_user_link(user['user_id'], user['nickname'])} - 进行中\n"
-                    elif user["total_time"] > 0:
-                        time_str = MessageFormatter.format_time(int(user["total_time"]))
-                        rank_text += f"  <code>{i}.</code> 🟢 {MessageFormatter.format_user_link(user['user_id'], user['nickname'])} - {time_str} ({user['count']}次)\n"
-
-                rank_text += "\n"
-
-        if not found_any_data:
-            rank_text = (
-                "🏆 今日活动排行榜\n\n"
-                "📊 今日还没有活动记录\n"
-                "💪 开始第一个活动吧！\n\n"
-                "💡 提示：开始活动后会立即显示在这里"
+        for user_data in group_members:
+            user_activities = await db.get_user_all_activities(
+                chat_id, user_data["user_id"]
             )
+            activity_info = user_activities.get(act, {})
+            total_time = activity_info.get("time", 0)
+            count = activity_info.get("count", 0)
 
-        await message.answer(
-            rank_text,
-            reply_markup=await get_main_keyboard(chat_id, await is_admin(uid)),
-            parse_mode="HTML",
+            if total_time > 0 or user_data.get("current_activity") == act:
+                activity_users.append(
+                    {
+                        "user_id": user_data["user_id"],
+                        "nickname": user_data["nickname"],
+                        "total_time": total_time,
+                        "count": count,
+                        "is_active": user_data.get("current_activity") == act,
+                    }
+                )
+
+        # 按时间排序
+        activity_users.sort(key=lambda x: x["total_time"], reverse=True)
+
+        if activity_users:
+            found_any_data = True
+            rank_text += f"📈 <code>{act}</code>：\n"
+
+            for i, user in enumerate(activity_users[:5], 1):
+                if user["is_active"]:
+                    rank_text += f"  <code>{i}.</code> 🟡 {MessageFormatter.format_user_link(user['user_id'], user['nickname'])} - 进行中\n"
+                elif user["total_time"] > 0:
+                    time_str = MessageFormatter.format_time(int(user["total_time"]))
+                    rank_text += f"  <code>{i}.</code> 🟢 {MessageFormatter.format_user_link(user['user_id'], user['nickname'])} - {time_str} ({user['count']}次)\n"
+
+            rank_text += "\n"
+
+    if not found_any_data:
+        rank_text = (
+            "🏆 今日活动排行榜\n\n"
+            "📊 今日还没有活动记录\n"
+            "💪 开始第一个活动吧！\n\n"
+            "💡 提示：开始活动后会立即显示在这里"
         )
+
+    await message.answer(
+        rank_text,
+        reply_markup=await get_main_keyboard(chat_id, await is_admin(uid)),
+        parse_mode="HTML",
+    )
+
 
 
 # ========== 快速回座回调 ==========
@@ -3294,6 +3316,12 @@ async def export_and_push_csv(
     target_date=None,
 ):
     """导出群组数据为 CSV 并推送 - 支持从月度表恢复数据"""
+    if not bot and (
+        not notification_service.bot_manager or not notification_service.bot
+    ):
+        logger.error("导出失败: bot 和 bot_manager 都不可用")
+        return
+
     await db.init_group(chat_id)
 
     # 规范 target_date
@@ -3490,6 +3518,12 @@ async def delayed_export(chat_id: int, delay_minutes: int = 30):
         file_name = (
             f"group_{chat_id}_statistics_{yesterday_date.strftime('%Y%m%d')}.csv"
         )
+
+        if not bot and (
+            not notification_service.bot_manager or not notification_service.bot
+        ):
+            logger.error(f"延迟导出失败: bot 和 bot_manager 都不可用")
+            return
 
         # 🆕 添加调试日志
         logger.info(f"开始导出群组 {chat_id} 的昨日数据，日期: {yesterday_date}")
