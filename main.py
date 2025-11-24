@@ -77,14 +77,6 @@ import os
 from io import StringIO
 import aiofiles
 
-# # 初始化bot
-# bot = Bot(token=Config.TOKEN)
-# dp = Dispatcher(storage=MemoryStorage())
-
-# 使用新的管理器
-# bot = bot_manager.bot
-# dp = bot_manager.dispatcher
-
 bot = None
 dp = None
 
@@ -1038,7 +1030,7 @@ async def process_back(message: types.Message):
 
 
 async def _process_back_locked(message: types.Message, chat_id: int, uid: int):
-    """线程安全的回座逻辑 - 优化响应版本"""
+    """线程安全的回座逻辑 - 修复超时通知问题"""
     start_time = time.time()
     key = f"{chat_id}:{uid}"
 
@@ -1065,6 +1057,10 @@ async def _process_back_locked(message: types.Message, chat_id: int, uid: int):
         start_time_dt = datetime.fromisoformat(user_data["activity_start_time"])
         elapsed = (now - start_time_dt).total_seconds()
 
+        # 🎯 【关键修复】在数据库操作前保存活动开始时间
+        original_activity_start_time = user_data["activity_start_time"]
+        original_nickname = user_data.get("nickname", "未知用户")
+
         # 🎯 【优化点1】并行计算时间限制和罚款
         time_limit_task = asyncio.create_task(db.get_activity_time_limit(act))
 
@@ -1080,14 +1076,13 @@ async def _process_back_locked(message: types.Message, chat_id: int, uid: int):
             fine_amount = await calculate_fine(act, overtime_minutes)
 
         # 🎯 【优化点2】准备消息数据（在数据库操作前）
-        nickname = user_data.get("nickname", "未知用户")
         elapsed_time_str = MessageFormatter.format_time(int(elapsed))
         time_str = now.strftime("%m/%d %H:%M:%S")
 
         # 预生成消息的基础部分
         base_message_data = {
             "user_id": uid,
-            "user_name": nickname,
+            "user_name": original_nickname,
             "activity": act,
             "time_str": time_str,
             "elapsed_time": elapsed_time_str,
@@ -1122,7 +1117,7 @@ async def _process_back_locked(message: types.Message, chat_id: int, uid: int):
         await message.answer(
             MessageFormatter.format_back_message(
                 user_id=uid,
-                user_name=user_data.get("nickname", nickname),  # 使用更新后的昵称
+                user_name=user_data.get("nickname", original_nickname),  # 使用更新后的昵称
                 activity=act,
                 time_str=time_str,
                 elapsed_time=elapsed_time_str,
@@ -1144,11 +1139,19 @@ async def _process_back_locked(message: types.Message, chat_id: int, uid: int):
             parse_mode="HTML",
         )
 
-        # 🎯 【优化点5】异步发送超时通知（不阻塞主流程）
+        # 🎯 【优化点5】异步发送超时通知（使用原始数据）
         if is_overtime and fine_amount > 0:
+            # 🎯 【关键修复】创建包含原始开始时间的用户数据
+            notification_user_data = {
+                "user_id": uid,
+                "nickname": original_nickname,
+                "activity_start_time": original_activity_start_time,  # 🎯 使用保存的原始时间
+                "current_activity": act  # 🎯 保存活动名称用于调试
+            }
+            
             asyncio.create_task(
                 send_overtime_notification_async(
-                    chat_id, uid, user_data, act, fine_amount, now
+                    chat_id, uid, notification_user_data, act, fine_amount, now
                 )
             )
 
@@ -1161,8 +1164,6 @@ async def _process_back_locked(message: types.Message, chat_id: int, uid: int):
         duration = round(time.time() - start_time, 2)
         logger.info(f"回座结束 chat_id={chat_id}, uid={uid}，耗时 {duration}s")
 
-
-# 🎯 【新增】异步发送超时通知函数
 async def send_overtime_notification_async(
     chat_id: int, uid: int, user_data: dict, act: str, fine_amount: int, now: datetime
 ):
@@ -1183,7 +1184,7 @@ async def send_overtime_notification_async(
             f"🔍 超时通知调试 - 用户{uid}, 活动{act}, 开始时间: {start_time_str}, 类型: {type(start_time_str)}"
         )
 
-        if start_time_str:
+        if start_time_str and start_time_str != "None":
             try:
                 # 确保是字符串格式
                 if not isinstance(start_time_str, str):
@@ -1259,12 +1260,14 @@ async def send_overtime_notification_async(
                             continue
                 except Exception as e2:
                     logger.error(f"❌ 所有时间格式解析都失败: {e2}")
+                    overtime_str = "时间格式错误"
 
             except Exception as e:
                 logger.error(f"❌ 计算超时时长失败: {e}")
                 overtime_str = "计算失败"
         else:
-            logger.warning(f"❌ 活动开始时间为空: user_data={user_data}")
+            logger.warning(f"❌ 活动开始时间为空或无效: {start_time_str}")
+            overtime_str = "时间信息缺失"
 
         notif_text = (
             f"🚨 <b>超时回座通知</b>\n"
@@ -1284,7 +1287,6 @@ async def send_overtime_notification_async(
 
     except Exception as e:
         logger.error(f"❌ 超时通知推送异常: {e}")
-        logger.error(f"超时通知推送异常: {e}")
 
 
 # ========== 上下班打卡功能 ==========
