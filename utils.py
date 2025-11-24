@@ -607,6 +607,31 @@ class ActivityTimerManager:
         logger.info(f"已取消所有定时器: {cancelled_count}/{len(keys)} 个")
         return cancelled_count
 
+    async def cancel_all_timers_for_group(self, chat_id: int) -> int:
+        """取消指定群组的所有定时器"""
+        cancelled_count = 0
+        keys_to_remove = []
+
+        # 查找属于该群组的所有定时器
+        for key in list(self._timers.keys()):
+            if key.startswith(f"{chat_id}-"):
+                task = self._timers[key]
+                if not task.done():
+                    task.cancel()
+                    try:
+                        await task
+                    except asyncio.CancelledError:
+                        pass
+                    cancelled_count += 1
+                keys_to_remove.append(key)
+
+        # 移除已取消的定时器
+        for key in keys_to_remove:
+            del self._timers[key]
+
+        logger.info(f"已取消群组 {chat_id} 的 {cancelled_count} 个定时器")
+        return cancelled_count
+
     async def cleanup_finished_timers(self):
         """清理已完成定时器"""
         if time.time() - self._last_cleanup < self._cleanup_interval:
