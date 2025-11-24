@@ -37,7 +37,6 @@ from performance import (
     message_deduplicate,
     handle_database_errors,
     handle_telegram_errors,
-    send_reset_notification,
 )
 from utils import (
     MessageFormatter,
@@ -52,6 +51,7 @@ from utils import (
     is_valid_checkin_time,
     rate_limit,
     get_group_reset_period_start,
+    send_reset_notification,
 )
 
 from bot_manager import bot_manager
