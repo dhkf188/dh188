@@ -37,6 +37,7 @@ from performance import (
     message_deduplicate,
     handle_database_errors,
     handle_telegram_errors,
+    send_reset_notification,
 )
 from utils import (
     MessageFormatter,
@@ -3554,7 +3555,7 @@ async def export_and_push_csv(
 
 # ========== 定时任务 ==========
 async def daily_reset_task():
-    """每日自动重置任务 - 每个群组独立重置时间"""
+    """每日自动重置任务 - 完整版本：先结束活动再重置数据"""
     while True:
         now = get_beijing_time()
         logger.debug(f"重置任务检查，当前时间: {now}")
@@ -3578,8 +3579,34 @@ async def daily_reset_task():
                 # 检查是否到达该群组的重置时间
                 if now.hour == reset_hour and now.minute == reset_minute:
                     logger.info(
-                        f"群组 {chat_id} 到达重置时间 {reset_hour:02d}:{reset_minute:02d}，正在重置数据..."
+                        f"群组 {chat_id} 到达重置时间 {reset_hour:02d}:{reset_minute:02d}，开始处理..."
                     )
+
+                    # 🎯 第一步：批量处理未结束活动
+                    completion_result = (
+                        await db.complete_all_pending_activities_before_reset(
+                            chat_id, now
+                        )
+                    )
+                    completed_count = completion_result.get("completed_count", 0)
+
+                    if completed_count > 0:
+                        logger.info(f"重置前结束了 {completed_count} 个进行中的活动")
+                        # 发送活动结束通知
+                        asyncio.create_task(
+                            send_reset_notification(chat_id, completion_result, now)
+                        )
+
+                    # 🎯 第二步：取消所有定时器
+                    cancelled_count = await timer_manager.cancel_all_timers_for_group(
+                        chat_id
+                    )
+                    if cancelled_count > 0:
+                        logger.info(f"取消了 {cancelled_count} 个活动定时器")
+
+                    # 🎯 第三步：执行纯净的数据重置
+                    group_members = await db.get_group_members(chat_id)
+                    reset_count = 0
 
                     # 计算该群组的重置周期开始时间
                     reset_time_today = now.replace(
@@ -3590,9 +3617,6 @@ async def daily_reset_task():
                     else:
                         period_start = reset_time_today
 
-                    # 执行该群组的每日数据重置
-                    group_members = await db.get_group_members(chat_id)
-                    reset_count = 0
                     for user_data in group_members:
                         user_lock = user_lock_manager.get_lock(
                             chat_id, user_data["user_id"]
@@ -3605,7 +3629,11 @@ async def daily_reset_task():
                                 reset_count += 1
 
                     logger.info(
-                        f"群组 {chat_id} 数据重置完成，重置了 {reset_count} 个用户 (重置时间: {reset_hour:02d}:{reset_minute:02d})"
+                        f"群组 {chat_id} 数据重置完成: "
+                        f"结束活动 {completed_count} 个, "
+                        f"取消定时器 {cancelled_count} 个, "
+                        f"重置用户 {reset_count} 个 "
+                        f"(重置时间: {reset_hour:02d}:{reset_minute:02d})"
                     )
 
                     # 启动延迟导出任务
