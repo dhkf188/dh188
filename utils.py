@@ -626,53 +626,6 @@ class ActivityTimerManager:
         return {"active_timers": len(self._timers)}
 
 
-# class EnhancedPerformanceOptimizer:
-#     """增强版性能优化器"""
-
-#     def __init__(self):
-#         self.last_cleanup = time.time()
-#         self.cleanup_interval = 300
-
-#     async def memory_cleanup(self):
-#         """智能内存清理"""
-#         try:
-#             current_time = time.time()
-#             if current_time - self.last_cleanup < self.cleanup_interval:
-#                 return
-
-#             # 并行清理任务
-#             from performance import task_manager, global_cache
-
-#             cleanup_tasks = [
-#                 task_manager.cleanup_tasks(),
-#                 global_cache.clear_expired(),
-#                 db.cleanup_cache(),
-#             ]
-
-#             await asyncio.gather(*cleanup_tasks, return_exceptions=True)
-
-#             # 强制GC
-#             import gc
-
-#             collected = gc.collect()
-#             logger.info(f"内存清理完成 - 回收对象: {collected}")
-
-#             self.last_cleanup = current_time
-#         except Exception as e:
-#             logger.error(f"内存清理失败: {e}")
-
-#     def memory_usage_ok(self) -> bool:
-#         """检查内存使用是否正常"""
-#         try:
-#             import psutil
-
-#             process = psutil.Process()
-#             memory_percent = process.memory_percent()
-#             return memory_percent < 80  # 内存使用率低于80%视为正常
-#         except ImportError:
-#             return True
-
-
 class EnhancedPerformanceOptimizer:
     """增强版性能优化器 - 现在包含智能内存管理"""
 
@@ -1024,6 +977,66 @@ async def get_group_reset_period_start(
             second=0,
             microsecond=0,
         )
+
+
+# ========== 重置通知函数 ==========
+async def send_reset_notification(
+    chat_id: int, completion_result: Dict[str, Any], reset_time: datetime
+):
+    """发送重置通知"""
+    try:
+        completed_count = completion_result.get("completed_count", 0)
+        total_fines = completion_result.get("total_fines", 0)
+        details = completion_result.get("details", [])
+
+        if completed_count == 0:
+            # 没有活动被结束，发送简单通知
+            notification_text = (
+                f"🔄 <b>系统重置完成</b>\n"
+                f"🏢 群组: <code>{chat_id}</code>\n"
+                f"⏰ 重置时间: <code>{reset_time.strftime('%m/%d %H:%M')}</code>\n"
+                f"✅ 没有进行中的活动需要结束"
+            )
+        else:
+            # 有活动被结束，发送详细通知
+            notification_text = (
+                f"🔄 <b>系统重置完成通知</b>\n"
+                f"🏢 群组: <code>{chat_id}</code>\n"
+                f"⏰ 重置时间: <code>{reset_time.strftime('%m/%d %H:%M')}</code>\n"
+                f"📊 自动结束活动: <code>{completed_count}</code> 个\n"
+                f"💰 总罚款金额: <code>{total_fines}</code> 元\n"
+            )
+
+            if details:
+                notification_text += f"\n📋 <b>活动结束详情:</b>\n"
+                for i, detail in enumerate(details[:5], 1):  # 最多显示5条详情
+                    user_link = MessageFormatter.format_user_link(
+                        detail["user_id"], detail.get("nickname", "用户")
+                    )
+                    time_str = MessageFormatter.format_time(detail["elapsed_time"])
+                    fine_info = (
+                        f" (罚款: {detail['fine_amount']}元)"
+                        if detail["fine_amount"] > 0
+                        else ""
+                    )
+                    overtime_info = " ⏰超时" if detail["is_overtime"] else ""
+
+                    notification_text += (
+                        f"{i}. {user_link} - {detail['activity']} "
+                        f"({time_str}){fine_info}{overtime_info}\n"
+                    )
+
+                if len(details) > 5:
+                    notification_text += f"... 还有 {len(details) - 5} 个活动\n"
+
+            notification_text += f"\n💡 所有进行中的活动已自动结束并计入月度统计"
+
+        # 发送通知
+        await notification_service.send_notification(chat_id, notification_text)
+        logger.info(f"重置通知发送成功: {chat_id}")
+
+    except Exception as e:
+        logger.error(f"发送重置通知失败 {chat_id}: {e}")
 
 
 # 全局实例
