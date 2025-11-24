@@ -1194,7 +1194,9 @@ async def send_overtime_notification_async(
                 if start_time_str.endswith("Z"):
                     start_time_str = start_time_str.replace("Z", "+00:00")
 
-                start_time = datetime.fromisoformat(start_time_str)
+                # 🎯 【关键修复】使用完整的模块路径，避免命名冲突
+                from datetime import datetime as dt
+                start_time = dt.fromisoformat(start_time_str)
 
                 # 获取活动时间限制
                 time_limit_minutes = await db.get_activity_time_limit(act)
@@ -1224,15 +1226,14 @@ async def send_overtime_notification_async(
                 logger.error(f"❌ 时间格式解析失败: {start_time_str}, 错误: {e}")
                 # 尝试其他时间格式
                 try:
-                    from datetime import datetime
-
+                    # 🎯 【修复】使用重命名的 dt
                     for fmt in [
                         "%Y-%m-%d %H:%M:%S",
                         "%Y-%m-%d %H:%M:%S.%f",
                         "%m/%d %H:%M:%S",
                     ]:
                         try:
-                            start_time = datetime.strptime(start_time_str, fmt)
+                            start_time = dt.strptime(start_time_str, fmt)
                             total_elapsed = int((now - start_time).total_seconds())
                             time_limit_seconds = (
                                 await db.get_activity_time_limit(act)
