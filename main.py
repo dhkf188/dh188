@@ -1166,7 +1166,7 @@ async def _process_back_locked(message: types.Message, chat_id: int, uid: int):
 async def send_overtime_notification_async(
     chat_id: int, uid: int, user_data: dict, act: str, fine_amount: int, now: datetime
 ):
-    """异步发送超时通知 - 修复版本"""
+    """异步发送超时通知 - 修复超时时间显示"""
     try:
         chat_title = str(chat_id)
         try:
@@ -1175,27 +1175,96 @@ async def send_overtime_notification_async(
         except Exception:
             pass
 
-        # 🎯 修复：安全处理活动开始时间
-        start_time_str = user_data.get('activity_start_time')
-        overtime_str = "未知时长"  # 默认值
-        
+        # 🎯 修复：详细调试活动开始时间
+        start_time_str = user_data.get("activity_start_time")
+        overtime_str = "未知时长"
+
+        logger.info(
+            f"🔍 超时通知调试 - 用户{uid}, 活动{act}, 开始时间: {start_time_str}, 类型: {type(start_time_str)}"
+        )
+
         if start_time_str:
             try:
-                # 确保是字符串类型
+                # 确保是字符串格式
                 if not isinstance(start_time_str, str):
                     start_time_str = str(start_time_str)
-                
+
+                # 处理时间格式（可能包含时区信息）
+                if start_time_str.endswith("Z"):
+                    start_time_str = start_time_str.replace("Z", "+00:00")
+
                 start_time = datetime.fromisoformat(start_time_str)
+
+                # 获取活动时间限制
+                time_limit_minutes = await db.get_activity_time_limit(act)
+                time_limit_seconds = time_limit_minutes * 60
+
+                # 计算总活动时长
                 total_elapsed = int((now - start_time).total_seconds())
-                time_limit_seconds = (await db.get_activity_time_limit(act)) * 60
-                overtime_duration = max(0, total_elapsed - time_limit_seconds)  # 🆕 确保非负数
-                overtime_str = MessageFormatter.format_time(overtime_duration)
-                
-            except (ValueError, TypeError) as e:
-                logger.warning(f"解析活动开始时间失败: {e}, 时间值: {start_time_str}")
-                overtime_str = "时长计算失败"
+
+                # 🆕 优化：显示更友好的超时信息
+                if total_elapsed > time_limit_seconds:
+                    overtime_seconds = total_elapsed - time_limit_seconds
+                    overtime_str = MessageFormatter.format_time(overtime_seconds)
+                    # 🆕 添加总时长和限制时长的显示
+                    total_duration = MessageFormatter.format_time(total_elapsed)
+                    limit_duration = MessageFormatter.format_time(time_limit_seconds)
+                    overtime_str = (
+                        f"{overtime_str} (总时长{total_duration}，限制{limit_duration})"
+                    )
+                else:
+                    overtime_str = "未超时"
+
+                logger.info(
+                    f"✅ 超时计算成功: 活动={act}, 开始时间={start_time}, 总时长={total_elapsed}秒, 限制={time_limit_seconds}秒, 超时={overtime_seconds}秒"
+                )
+
+            except ValueError as e:
+                logger.error(f"❌ 时间格式解析失败: {start_time_str}, 错误: {e}")
+                # 尝试其他时间格式
+                try:
+                    from datetime import datetime
+
+                    for fmt in [
+                        "%Y-%m-%d %H:%M:%S",
+                        "%Y-%m-%d %H:%M:%S.%f",
+                        "%m/%d %H:%M:%S",
+                    ]:
+                        try:
+                            start_time = datetime.strptime(start_time_str, fmt)
+                            total_elapsed = int((now - start_time).total_seconds())
+                            time_limit_seconds = (
+                                await db.get_activity_time_limit(act)
+                            ) * 60
+
+                            # 🆕 同样优化显示格式
+                            if total_elapsed > time_limit_seconds:
+                                overtime_seconds = total_elapsed - time_limit_seconds
+                                overtime_str = MessageFormatter.format_time(
+                                    overtime_seconds
+                                )
+                                total_duration = MessageFormatter.format_time(
+                                    total_elapsed
+                                )
+                                limit_duration = MessageFormatter.format_time(
+                                    time_limit_seconds
+                                )
+                                overtime_str = f"{overtime_str} (总时长{total_duration}，限制{limit_duration})"
+                            else:
+                                overtime_str = "未超时"
+
+                            logger.info(f"✅ 使用格式 {fmt} 解析时间成功")
+                            break
+                        except ValueError:
+                            continue
+                except Exception as e2:
+                    logger.error(f"❌ 所有时间格式解析都失败: {e2}")
+
+            except Exception as e:
+                logger.error(f"❌ 计算超时时长失败: {e}")
+                overtime_str = "计算失败"
         else:
-            logger.warning(f"活动开始时间为空: 用户{uid}, 活动{act}")
+            logger.warning(f"❌ 活动开始时间为空: user_data={user_data}")
 
         notif_text = (
             f"🚨 <b>超时回座通知</b>\n"
@@ -1204,11 +1273,17 @@ async def send_overtime_notification_async(
             f"👤 用户：{MessageFormatter.format_user_link(uid, user_data.get('nickname', '未知用户'))}\n"
             f"📝 活动：<code>{act}</code>\n"
             f"⏰ 回座时间：<code>{now.strftime('%m/%d %H:%M:%S')}</code>\n"
-            f"⏱️ 超时：<code>{overtime_str}</code>\n"
-            f"💰 罚款：<code>{fine_amount}</code> 元"
+            f"⏱️ 超时时长：<code>{overtime_str}</code>\n"
+            f"💰 罚款金额：<code>{fine_amount}</code> 元"
         )
+
         await notification_service.send_notification(chat_id, notif_text)
+        logger.info(
+            f"✅ 超时通知发送成功: {chat_id} - 用户{uid} - {act} - 超时{overtime_str}"
+        )
+
     except Exception as e:
+        logger.error(f"❌ 超时通知推送异常: {e}")
         logger.error(f"超时通知推送异常: {e}")
 
 
