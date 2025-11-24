@@ -626,6 +626,53 @@ class ActivityTimerManager:
         return {"active_timers": len(self._timers)}
 
 
+# class EnhancedPerformanceOptimizer:
+#     """增强版性能优化器"""
+
+#     def __init__(self):
+#         self.last_cleanup = time.time()
+#         self.cleanup_interval = 300
+
+#     async def memory_cleanup(self):
+#         """智能内存清理"""
+#         try:
+#             current_time = time.time()
+#             if current_time - self.last_cleanup < self.cleanup_interval:
+#                 return
+
+#             # 并行清理任务
+#             from performance import task_manager, global_cache
+
+#             cleanup_tasks = [
+#                 task_manager.cleanup_tasks(),
+#                 global_cache.clear_expired(),
+#                 db.cleanup_cache(),
+#             ]
+
+#             await asyncio.gather(*cleanup_tasks, return_exceptions=True)
+
+#             # 强制GC
+#             import gc
+
+#             collected = gc.collect()
+#             logger.info(f"内存清理完成 - 回收对象: {collected}")
+
+#             self.last_cleanup = current_time
+#         except Exception as e:
+#             logger.error(f"内存清理失败: {e}")
+
+#     def memory_usage_ok(self) -> bool:
+#         """检查内存使用是否正常"""
+#         try:
+#             import psutil
+
+#             process = psutil.Process()
+#             memory_percent = process.memory_percent()
+#             return memory_percent < 80  # 内存使用率低于80%视为正常
+#         except ImportError:
+#             return True
+
+
 class EnhancedPerformanceOptimizer:
     """增强版性能优化器 - 现在包含智能内存管理"""
 
@@ -939,44 +986,6 @@ def rate_limit(rate: int = 1, per: int = 1):
         return wrapper
 
     return decorator
-
-
-async def get_group_reset_period_start(
-    chat_id: int, current_time: datetime = None
-) -> datetime:
-    """获取群组的重置周期开始时间 - 统一版本"""
-    if current_time is None:
-        current_time = get_beijing_time()
-
-    try:
-        # 使用全局 db 实例
-        group_data = await db.get_group_cached(chat_id)
-        if not group_data:
-            # 如果群组不存在，初始化群组
-            await db.init_group(chat_id)
-            group_data = await db.get_group_cached(chat_id)
-
-        reset_hour = group_data.get("reset_hour", Config.DAILY_RESET_HOUR)
-        reset_minute = group_data.get("reset_minute", Config.DAILY_RESET_MINUTE)
-
-        reset_time_today = current_time.replace(
-            hour=reset_hour, minute=reset_minute, second=0, microsecond=0
-        )
-
-        if current_time < reset_time_today:
-            return reset_time_today - timedelta(days=1)
-        else:
-            return reset_time_today
-
-    except Exception as e:
-        logger.error(f"计算重置周期失败 {chat_id}: {e}")
-        # 出错时返回默认重置时间
-        return current_time.replace(
-            hour=Config.DAILY_RESET_HOUR,
-            minute=Config.DAILY_RESET_MINUTE,
-            second=0,
-            microsecond=0,
-        )
 
 
 # 全局实例
