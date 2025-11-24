@@ -50,6 +50,7 @@ from utils import (
     calculate_cross_day_time_diff,
     is_valid_checkin_time,
     rate_limit,
+    get_group_reset_period_start,
 )
 
 from bot_manager import bot_manager
@@ -541,24 +542,19 @@ async def recover_expired_activities():
 
 # ========== 每日重置逻辑 =========
 async def reset_daily_data_if_needed(chat_id: int, uid: int):
-    """精确版每日数据重置"""
+    """精确版每日数据重置 - 每个群组独立重置时间"""
     try:
         now = get_beijing_time()
 
-        # 获取群组自定义重置时间
-        group_info = await db.get_group_cached(chat_id)
-        if not group_info:
-            await db.init_group(chat_id)
-            group_info = await db.get_group_cached(chat_id)
-
-        reset_hour = group_info.get("reset_hour", Config.DAILY_RESET_HOUR)
-        reset_minute = group_info.get("reset_minute", Config.DAILY_RESET_MINUTE)
+        # 🎯 每个群组独立的重置时间
+        group_data = await db.get_group_cached(chat_id)
+        reset_hour = group_data.get("reset_hour", Config.DAILY_RESET_HOUR)
+        reset_minute = group_data.get("reset_minute", Config.DAILY_RESET_MINUTE)
 
         # 计算当前重置周期开始时间
         reset_time_today = now.replace(
             hour=reset_hour, minute=reset_minute, second=0, microsecond=0
         )
-
         if now < reset_time_today:
             current_period_start = reset_time_today - timedelta(days=1)
         else:
@@ -572,7 +568,7 @@ async def reset_daily_data_if_needed(chat_id: int, uid: int):
 
         last_updated_str = user_data.get("last_updated")
         if not last_updated_str:
-            await db.reset_user_daily_data(chat_id, uid, now.date())
+            await db.reset_user_daily_data(chat_id, uid, current_period_start.date())
             await db.update_user_last_updated(chat_id, uid, now.date())
             return
 
@@ -593,9 +589,11 @@ async def reset_daily_data_if_needed(chat_id: int, uid: int):
         else:
             last_updated = now
 
-        # 比较最后更新时间是否在当前重置周期之前
+        # 🎯 比较最后更新时间是否在当前群组的重置周期之前
         if last_updated.date() < current_period_start.date():
-            logger.info(f"重置用户数据: {chat_id}-{uid}")
+            logger.info(
+                f"重置用户数据: {chat_id}-{uid} (重置时间: {reset_hour:02d}:{reset_minute:02d})"
+            )
             await db.reset_user_daily_data(chat_id, uid, current_period_start.date())
             await db.update_user_last_updated(chat_id, uid, now.date())
 
@@ -3389,6 +3387,7 @@ async def get_group_stats_from_monthly(chat_id: int, target_date: date) -> List[
 
 
 # ========== 数据导出功能 ==========
+# ========== 数据导出功能 ==========
 async def export_and_push_csv(
     chat_id: int,
     to_admin_if_no_group: bool = True,
@@ -3424,7 +3423,15 @@ async def export_and_push_csv(
     for act in activity_limits.keys():
         headers.extend([f"{act}次数", f"{act}总时长"])
     headers.extend(
-        ["活动次数总计", "活动用时总计", "罚款总金额", "超时次数", "总超时时间"]
+        [
+            "活动次数总计",
+            "活动用时总计",
+            "罚款总金额",
+            "超时次数",
+            "总超时时间",
+            "工作天数",  # 🆕 新增工作天数
+            "工作时长",  # 🆕 新增工作时长
+        ]
     )
     writer.writerow(headers)
 
@@ -3437,7 +3444,7 @@ async def export_and_push_csv(
         # 正常导出：从日常表获取数据
         group_stats = await db.get_group_statistics(chat_id, target_date)
 
-    # 后续代码保持不变...
+    # 处理每个用户的数据
     for user_data in group_stats:
         # 🆕 最小修复：只在需要的地方添加保护
         if not isinstance(user_data, dict):
@@ -3473,6 +3480,11 @@ async def export_and_push_csv(
         overtime_seconds = int(user_data.get("total_overtime_time", 0) or 0)
         overtime_str = MessageFormatter.format_time_for_csv(overtime_seconds)
 
+        # 🆕 安全获取工作相关字段
+        work_days = user_data.get("work_days", 0)
+        work_hours = int(user_data.get("work_hours", 0) or 0)
+        work_hours_str = MessageFormatter.format_time_for_csv(work_hours)
+
         row.extend(
             [
                 total_count,
@@ -3480,6 +3492,8 @@ async def export_and_push_csv(
                 user_data.get("total_fines", 0),
                 user_data.get("overtime_count", 0),
                 overtime_str,
+                work_days,  # 🆕 工作天数
+                work_hours_str,  # 🆕 工作时长
             ]
         )
         writer.writerow(row)
@@ -3540,10 +3554,10 @@ async def export_and_push_csv(
 
 # ========== 定时任务 ==========
 async def daily_reset_task():
-    """每日自动重置任务"""
+    """每日自动重置任务 - 每个群组独立重置时间"""
     while True:
         now = get_beijing_time()
-        logger.info(f"重置任务检查，当前时间: {now}")
+        logger.debug(f"重置任务检查，当前时间: {now}")
 
         try:
             all_groups = await db.get_all_groups()
@@ -3552,20 +3566,31 @@ async def daily_reset_task():
             await asyncio.sleep(60)
             continue
 
+        reset_executed = False
+
         for chat_id in all_groups:
             try:
+                # 🎯 每个群组独立的重置时间
                 group_data = await db.get_group_cached(chat_id)
-                if not group_data:
-                    continue
-
                 reset_hour = group_data.get("reset_hour", Config.DAILY_RESET_HOUR)
                 reset_minute = group_data.get("reset_minute", Config.DAILY_RESET_MINUTE)
 
-                # 到达重置时间
+                # 检查是否到达该群组的重置时间
                 if now.hour == reset_hour and now.minute == reset_minute:
-                    logger.info(f"到达重置时间，正在重置群组 {chat_id} 的数据...")
+                    logger.info(
+                        f"群组 {chat_id} 到达重置时间 {reset_hour:02d}:{reset_minute:02d}，正在重置数据..."
+                    )
 
-                    # 执行每日数据重置
+                    # 计算该群组的重置周期开始时间
+                    reset_time_today = now.replace(
+                        hour=reset_hour, minute=reset_minute, second=0, microsecond=0
+                    )
+                    if now < reset_time_today:
+                        period_start = reset_time_today - timedelta(days=1)
+                    else:
+                        period_start = reset_time_today
+
+                    # 执行该群组的每日数据重置
                     group_members = await db.get_group_members(chat_id)
                     reset_count = 0
                     for user_data in group_members:
@@ -3574,20 +3599,26 @@ async def daily_reset_task():
                         )
                         async with user_lock:
                             success = await db.reset_user_daily_data(
-                                chat_id, user_data["user_id"]
+                                chat_id, user_data["user_id"], period_start.date()
                             )
                             if success:
                                 reset_count += 1
 
                     logger.info(
-                        f"群组 {chat_id} 数据重置完成，重置了 {reset_count} 个用户"
+                        f"群组 {chat_id} 数据重置完成，重置了 {reset_count} 个用户 (重置时间: {reset_hour:02d}:{reset_minute:02d})"
                     )
 
                     # 启动延迟导出任务
                     asyncio.create_task(delayed_export(chat_id, 30))
+                    reset_executed = True
 
             except Exception as e:
                 logger.error(f"群组 {chat_id} 重置失败: {e}")
+
+        if reset_executed:
+            logger.info(
+                f"本轮重置任务完成，处理时间: {get_beijing_time().strftime('%H:%M:%S')}"
+            )
 
         # 每分钟检查一次
         await asyncio.sleep(60)
