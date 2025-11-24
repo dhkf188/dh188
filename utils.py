@@ -988,6 +988,44 @@ def rate_limit(rate: int = 1, per: int = 1):
     return decorator
 
 
+async def get_group_reset_period_start(
+    chat_id: int, current_time: datetime = None
+) -> datetime:
+    """获取群组的重置周期开始时间 - 统一版本"""
+    if current_time is None:
+        current_time = get_beijing_time()
+
+    try:
+        # 使用全局 db 实例
+        group_data = await db.get_group_cached(chat_id)
+        if not group_data:
+            # 如果群组不存在，初始化群组
+            await db.init_group(chat_id)
+            group_data = await db.get_group_cached(chat_id)
+
+        reset_hour = group_data.get("reset_hour", Config.DAILY_RESET_HOUR)
+        reset_minute = group_data.get("reset_minute", Config.DAILY_RESET_MINUTE)
+
+        reset_time_today = current_time.replace(
+            hour=reset_hour, minute=reset_minute, second=0, microsecond=0
+        )
+
+        if current_time < reset_time_today:
+            return reset_time_today - timedelta(days=1)
+        else:
+            return reset_time_today
+
+    except Exception as e:
+        logger.error(f"计算重置周期失败 {chat_id}: {e}")
+        # 出错时返回默认重置时间
+        return current_time.replace(
+            hour=Config.DAILY_RESET_HOUR,
+            minute=Config.DAILY_RESET_MINUTE,
+            second=0,
+            microsecond=0,
+        )
+
+
 # 全局实例
 user_lock_manager = UserLockManager()
 timer_manager = ActivityTimerManager()
