@@ -607,31 +607,6 @@ class ActivityTimerManager:
         logger.info(f"已取消所有定时器: {cancelled_count}/{len(keys)} 个")
         return cancelled_count
 
-    async def cancel_all_timers_for_group(self, chat_id: int) -> int:
-        """取消指定群组的所有定时器"""
-        cancelled_count = 0
-        keys_to_remove = []
-
-        # 查找属于该群组的所有定时器
-        for key in list(self._timers.keys()):
-            if key.startswith(f"{chat_id}-"):
-                task = self._timers[key]
-                if not task.done():
-                    task.cancel()
-                    try:
-                        await task
-                    except asyncio.CancelledError:
-                        pass
-                    cancelled_count += 1
-                keys_to_remove.append(key)
-
-        # 移除已取消的定时器
-        for key in keys_to_remove:
-            del self._timers[key]
-
-        logger.info(f"已取消群组 {chat_id} 的 {cancelled_count} 个定时器")
-        return cancelled_count
-
     async def cleanup_finished_timers(self):
         """清理已完成定时器"""
         if time.time() - self._last_cleanup < self._cleanup_interval:
@@ -1002,66 +977,6 @@ async def get_group_reset_period_start(
             second=0,
             microsecond=0,
         )
-
-
-# ========== 重置通知函数 ==========
-async def send_reset_notification(
-    chat_id: int, completion_result: Dict[str, Any], reset_time: datetime
-):
-    """发送重置通知"""
-    try:
-        completed_count = completion_result.get("completed_count", 0)
-        total_fines = completion_result.get("total_fines", 0)
-        details = completion_result.get("details", [])
-
-        if completed_count == 0:
-            # 没有活动被结束，发送简单通知
-            notification_text = (
-                f"🔄 <b>系统重置完成</b>\n"
-                f"🏢 群组: <code>{chat_id}</code>\n"
-                f"⏰ 重置时间: <code>{reset_time.strftime('%m/%d %H:%M')}</code>\n"
-                f"✅ 没有进行中的活动需要结束"
-            )
-        else:
-            # 有活动被结束，发送详细通知
-            notification_text = (
-                f"🔄 <b>系统重置完成通知</b>\n"
-                f"🏢 群组: <code>{chat_id}</code>\n"
-                f"⏰ 重置时间: <code>{reset_time.strftime('%m/%d %H:%M')}</code>\n"
-                f"📊 自动结束活动: <code>{completed_count}</code> 个\n"
-                f"💰 总罚款金额: <code>{total_fines}</code> 元\n"
-            )
-
-            if details:
-                notification_text += f"\n📋 <b>活动结束详情:</b>\n"
-                for i, detail in enumerate(details[:5], 1):  # 最多显示5条详情
-                    user_link = MessageFormatter.format_user_link(
-                        detail["user_id"], detail.get("nickname", "用户")
-                    )
-                    time_str = MessageFormatter.format_time(detail["elapsed_time"])
-                    fine_info = (
-                        f" (罚款: {detail['fine_amount']}元)"
-                        if detail["fine_amount"] > 0
-                        else ""
-                    )
-                    overtime_info = " ⏰超时" if detail["is_overtime"] else ""
-
-                    notification_text += (
-                        f"{i}. {user_link} - {detail['activity']} "
-                        f"({time_str}){fine_info}{overtime_info}\n"
-                    )
-
-                if len(details) > 5:
-                    notification_text += f"... 还有 {len(details) - 5} 个活动\n"
-
-            notification_text += f"\n💡 所有进行中的活动已自动结束并计入月度统计"
-
-        # 发送通知
-        await notification_service.send_notification(chat_id, notification_text)
-        logger.info(f"重置通知发送成功: {chat_id}")
-
-    except Exception as e:
-        logger.error(f"发送重置通知失败 {chat_id}: {e}")
 
 
 # 全局实例
