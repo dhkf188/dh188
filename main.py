@@ -1166,7 +1166,7 @@ async def _process_back_locked(message: types.Message, chat_id: int, uid: int):
 async def send_overtime_notification_async(
     chat_id: int, uid: int, user_data: dict, act: str, fine_amount: int, now: datetime
 ):
-    """异步发送超时通知"""
+    """异步发送超时通知 - 修复版本"""
     try:
         chat_title = str(chat_id)
         try:
@@ -1175,6 +1175,28 @@ async def send_overtime_notification_async(
         except Exception:
             pass
 
+        # 🎯 修复：安全处理活动开始时间
+        start_time_str = user_data.get('activity_start_time')
+        overtime_str = "未知时长"  # 默认值
+        
+        if start_time_str:
+            try:
+                # 确保是字符串类型
+                if not isinstance(start_time_str, str):
+                    start_time_str = str(start_time_str)
+                
+                start_time = datetime.fromisoformat(start_time_str)
+                total_elapsed = int((now - start_time).total_seconds())
+                time_limit_seconds = (await db.get_activity_time_limit(act)) * 60
+                overtime_duration = max(0, total_elapsed - time_limit_seconds)  # 🆕 确保非负数
+                overtime_str = MessageFormatter.format_time(overtime_duration)
+                
+            except (ValueError, TypeError) as e:
+                logger.warning(f"解析活动开始时间失败: {e}, 时间值: {start_time_str}")
+                overtime_str = "时长计算失败"
+        else:
+            logger.warning(f"活动开始时间为空: 用户{uid}, 活动{act}")
+
         notif_text = (
             f"🚨 <b>超时回座通知</b>\n"
             f"🏢 群组：<code>{chat_title}</code>\n"
@@ -1182,7 +1204,7 @@ async def send_overtime_notification_async(
             f"👤 用户：{MessageFormatter.format_user_link(uid, user_data.get('nickname', '未知用户'))}\n"
             f"📝 活动：<code>{act}</code>\n"
             f"⏰ 回座时间：<code>{now.strftime('%m/%d %H:%M:%S')}</code>\n"
-            f"⏱️ 超时：<code>{MessageFormatter.format_time(int((now - datetime.fromisoformat(user_data['activity_start_time'])).total_seconds() - (await db.get_activity_time_limit(act)) * 60))}</code>\n"
+            f"⏱️ 超时：<code>{overtime_str}</code>\n"
             f"💰 罚款：<code>{fine_amount}</code> 元"
         )
         await notification_service.send_notification(chat_id, notif_text)
