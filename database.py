@@ -946,33 +946,75 @@ class PostgreSQLDatabase:
         start_time: str,
         nickname: str = None,
     ):
-        """更新用户活动状态 - 带重试"""
-        if nickname:
-            await self.execute_with_retry(
-                "更新用户活动",
-                """
-                UPDATE users SET current_activity = $1, activity_start_time = $2, nickname = $3, updated_at = CURRENT_TIMESTAMP 
-                WHERE chat_id = $4 AND user_id = $5
-                """,
-                activity,
-                start_time,
-                nickname,
-                chat_id,
-                user_id,
+        """更新用户活动状态 - 确保时间格式正确"""
+        try:
+            # 🎯 确保时间格式正确
+            original_type = type(start_time).__name__
+
+            if hasattr(start_time, "isoformat"):
+                # 如果是datetime对象，转换为ISO格式字符串
+                start_time_str = start_time.isoformat()
+                logger.debug(
+                    f"🔄 转换datetime对象为ISO格式: {original_type} -> {start_time_str}"
+                )
+            elif isinstance(start_time, str):
+                # 如果是字符串，确保格式正确
+                start_time_str = start_time
+                # 🆕 可选：验证字符串是否是有效的时间格式
+                try:
+                    from datetime import datetime
+
+                    # 快速验证是否是有效的时间字符串
+                    datetime.fromisoformat(start_time_str.replace("Z", "+00:00"))
+                except ValueError:
+                    logger.warning(f"⚠️ 时间字符串格式可能无效: {start_time_str}")
+            else:
+                # 其他类型转换为字符串
+                start_time_str = str(start_time)
+                logger.debug(
+                    f"🔄 转换其他类型为字符串: {original_type} -> {start_time_str}"
+                )
+
+            logger.info(
+                f"💾 保存活动时间: 用户{user_id}, 活动{activity}, 时间{start_time_str}"
             )
-        else:
-            await self.execute_with_retry(
-                "更新用户活动",
-                """
-                UPDATE users SET current_activity = $1, activity_start_time = $2, updated_at = CURRENT_TIMESTAMP 
-                WHERE chat_id = $3 AND user_id = $4
-                """,
-                activity,
-                start_time,
-                chat_id,
-                user_id,
+
+            if nickname:
+                await self.execute_with_retry(
+                    "更新用户活动",
+                    """
+                    UPDATE users SET current_activity = $1, activity_start_time = $2, nickname = $3, updated_at = CURRENT_TIMESTAMP 
+                    WHERE chat_id = $4 AND user_id = $5
+                    """,
+                    activity,
+                    start_time_str,
+                    nickname,
+                    chat_id,
+                    user_id,
+                )
+            else:
+                await self.execute_with_retry(
+                    "更新用户活动",
+                    """
+                    UPDATE users SET current_activity = $1, activity_start_time = $2, updated_at = CURRENT_TIMESTAMP 
+                    WHERE chat_id = $3 AND user_id = $4
+                    """,
+                    activity,
+                    start_time_str,
+                    chat_id,
+                    user_id,
+                )
+            self._cache.pop(f"user:{chat_id}:{user_id}", None)
+
+            logger.debug(f"✅ 用户活动更新成功: {chat_id}-{user_id} -> {activity}")
+
+        except Exception as e:
+            logger.error(f"❌ 更新用户活动失败 {chat_id}-{user_id}: {e}")
+            # 🆕 记录更多上下文信息用于调试
+            logger.error(
+                f"❌ 失败时的参数 - activity: {activity}, start_time: {start_time}, nickname: {nickname}"
             )
-        self._cache.pop(f"user:{chat_id}:{user_id}", None)
+            raise  # 🆕 重新抛出异常，让调用者知道操作失败
 
     async def complete_user_activity(
         self,
