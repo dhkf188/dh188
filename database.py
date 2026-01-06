@@ -2037,6 +2037,173 @@ class PostgreSQLDatabase:
 
             return result
 
+    async def get_user_activities_for_reset_period(
+        self, chat_id: int, user_id: int
+    ) -> Dict[str, Dict]:
+        """获取用户在重置周期内的活动数据（兼容现有数据库结构）"""
+        try:
+            # 获取重置时间配置
+            group_data = await self.get_group_cached(chat_id)
+            reset_hour = group_data.get("reset_hour", Config.DAILY_RESET_HOUR)
+            reset_minute = group_data.get("reset_minute", Config.DAILY_RESET_MINUTE)
+
+            now = self.get_beijing_time()
+
+            # 计算当前重置周期的开始和结束时间
+            reset_time_today = now.replace(
+                hour=reset_hour,
+                minute=reset_minute,
+                second=0,
+                microsecond=0,
+            )
+
+            if now < reset_time_today:
+                period_start = reset_time_today - timedelta(days=1)
+                period_end = reset_time_today
+            else:
+                period_start = reset_time_today
+                period_end = reset_time_today + timedelta(days=1)
+
+            # 查询重置周期内的所有活动记录
+            rows = await self.fetch_with_retry(
+                "获取重置周期活动数据",
+                """
+                SELECT
+                    activity_name,
+                    SUM(activity_count) AS total_count,
+                    SUM(accumulated_time) AS total_time
+                FROM user_activities
+                WHERE chat_id = $1
+                  AND user_id = $2
+                  AND activity_date >= $3
+                  AND activity_date < $4
+                GROUP BY activity_name
+                """,
+                chat_id,
+                user_id,
+                period_start.date(),
+                period_end.date(),
+            )
+
+            activities: Dict[str, Dict] = {}
+            for row in rows:
+                activities[row["activity_name"]] = {
+                    "count": row["total_count"],
+                    "time": row["total_time"],
+                }
+
+            return activities
+
+        except Exception as e:
+            logger.error(f"获取重置周期活动数据失败 {chat_id}-{user_id}: {e}")
+            return {}
+
+    async def get_user_activity_count_for_reset_period(
+        self, chat_id: int, user_id: int, activity: str
+    ) -> int:
+        """获取用户在重置周期内的活动次数"""
+        try:
+            activities = await self.get_user_activities_for_reset_period(
+                chat_id, user_id
+            )
+            return activities.get(activity, {}).get("count", 0)
+
+        except Exception as e:
+            logger.error(
+                f"获取重置周期活动次数失败 {chat_id}-{user_id}-{activity}: {e}"
+            )
+            return 0
+
+    async def get_group_activities_for_reset_period(
+        self, chat_id: int
+    ) -> Dict[str, List[Dict]]:
+        """获取群组在重置周期内的活动统计"""
+        try:
+            # 获取重置时间配置
+            group_data = await self.get_group_cached(chat_id)
+            reset_hour = group_data.get("reset_hour", Config.DAILY_RESET_HOUR)
+            reset_minute = group_data.get("reset_minute", Config.DAILY_RESET_MINUTE)
+
+            now = self.get_beijing_time()
+
+            # 计算当前重置周期的开始和结束时间
+            reset_time_today = now.replace(
+                hour=reset_hour,
+                minute=reset_minute,
+                second=0,
+                microsecond=0,
+            )
+
+            if now < reset_time_today:
+                period_start = reset_time_today - timedelta(days=1)
+                period_end = reset_time_today
+            else:
+                period_start = reset_time_today
+                period_end = reset_time_today + timedelta(days=1)
+
+            # 查询群组在重置周期内的活动统计
+            rows = await self.fetch_with_retry(
+                "获取群组重置周期活动统计",
+                """
+                SELECT
+                    ua.user_id,
+                    u.nickname,
+                    ua.activity_name,
+                    SUM(ua.activity_count) AS total_count,
+                    SUM(ua.accumulated_time) AS total_time,
+                    CASE
+                        WHEN u.current_activity = ua.activity_name
+                        THEN TRUE
+                        ELSE FALSE
+                    END AS is_active
+                FROM user_activities ua
+                LEFT JOIN users u
+                    ON ua.chat_id = u.chat_id
+                   AND ua.user_id = u.user_id
+                WHERE ua.chat_id = $1
+                  AND ua.activity_date >= $2
+                  AND ua.activity_date < $3
+                  AND (
+                        ua.accumulated_time > 0
+                        OR u.current_activity = ua.activity_name
+                  )
+                GROUP BY
+                    ua.user_id,
+                    u.nickname,
+                    ua.activity_name,
+                    u.current_activity
+                ORDER BY
+                    ua.activity_name,
+                    total_time DESC
+                """,
+                chat_id,
+                period_start.date(),
+                period_end.date(),
+            )
+
+            # 按活动分组整理数据
+            result: Dict[str, List[Dict]] = {}
+            for row in rows:
+                activity = row["activity_name"]
+                if activity not in result:
+                    result[activity] = []
+
+                result[activity].append(
+                    {
+                        "user_id": row["user_id"],
+                        "nickname": row["nickname"],
+                        "total_count": row["total_count"],
+                        "total_time": row["total_time"],
+                        "is_active": row["is_active"],
+                    }
+                )
+
+            return result
+
+        except Exception as e:
+            logger.error(f"获取群组重置周期活动统计失败 {chat_id}: {e}")
+            return {}
+
     async def get_all_groups(self) -> List[int]:
         """获取所有群组ID"""
         self._ensure_pool_initialized()
