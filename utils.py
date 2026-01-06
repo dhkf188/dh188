@@ -5,7 +5,7 @@ import logging
 import gc
 import psutil
 
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, date
 from typing import Dict, Any, List, Optional, Tuple
 from config import Config, beijing_tz
 from functools import wraps
@@ -163,6 +163,30 @@ class MessageFormatter:
         message += f"\n📊 今日总活动次数：{MessageFormatter.format_copyable_text(str(total_count))} 次"
 
         return message
+
+    @staticmethod
+    def format_duration(seconds: int) -> str:
+        seconds = int(seconds)
+
+        h = seconds // 3600
+        m = (seconds % 3600) // 60
+        s = seconds % 60
+
+        parts = []
+
+        if h > 0:
+            parts.append(f"{h}小时")
+
+        if m > 0:
+            parts.append(f"{m}分钟")
+
+        if s > 0:
+            parts.append(f"{s}秒")
+
+        if not parts:
+            return "0分钟"
+
+        return "".join(parts)
 
 
 class NotificationService:
@@ -607,6 +631,31 @@ class ActivityTimerManager:
         logger.info(f"已取消所有定时器: {cancelled_count}/{len(keys)} 个")
         return cancelled_count
 
+    async def cancel_all_timers_for_group(self, chat_id: int) -> int:
+        """取消指定群组的所有定时器"""
+        cancelled_count = 0
+        keys_to_remove = []
+
+        # 查找属于该群组的所有定时器
+        for key in list(self._timers.keys()):
+            if key.startswith(f"{chat_id}-"):
+                task = self._timers[key]
+                if not task.done():
+                    task.cancel()
+                    try:
+                        await task
+                    except asyncio.CancelledError:
+                        pass
+                    cancelled_count += 1
+                keys_to_remove.append(key)
+
+        # 移除已取消的定时器
+        for key in keys_to_remove:
+            del self._timers[key]
+
+        logger.info(f"已取消群组 {chat_id} 的 {cancelled_count} 个定时器")
+        return cancelled_count
+
     async def cleanup_finished_timers(self):
         """清理已完成定时器"""
         if time.time() - self._last_cleanup < self._cleanup_interval:
@@ -624,53 +673,6 @@ class ActivityTimerManager:
     def get_stats(self) -> Dict[str, Any]:
         """获取定时器统计"""
         return {"active_timers": len(self._timers)}
-
-
-# class EnhancedPerformanceOptimizer:
-#     """增强版性能优化器"""
-
-#     def __init__(self):
-#         self.last_cleanup = time.time()
-#         self.cleanup_interval = 300
-
-#     async def memory_cleanup(self):
-#         """智能内存清理"""
-#         try:
-#             current_time = time.time()
-#             if current_time - self.last_cleanup < self.cleanup_interval:
-#                 return
-
-#             # 并行清理任务
-#             from performance import task_manager, global_cache
-
-#             cleanup_tasks = [
-#                 task_manager.cleanup_tasks(),
-#                 global_cache.clear_expired(),
-#                 db.cleanup_cache(),
-#             ]
-
-#             await asyncio.gather(*cleanup_tasks, return_exceptions=True)
-
-#             # 强制GC
-#             import gc
-
-#             collected = gc.collect()
-#             logger.info(f"内存清理完成 - 回收对象: {collected}")
-
-#             self.last_cleanup = current_time
-#         except Exception as e:
-#             logger.error(f"内存清理失败: {e}")
-
-#     def memory_usage_ok(self) -> bool:
-#         """检查内存使用是否正常"""
-#         try:
-#             import psutil
-
-#             process = psutil.Process()
-#             memory_percent = process.memory_percent()
-#             return memory_percent < 80  # 内存使用率低于80%视为正常
-#         except ImportError:
-#             return True
 
 
 class EnhancedPerformanceOptimizer:
@@ -884,7 +886,7 @@ def get_beijing_time() -> datetime:
 
 def calculate_cross_day_time_diff(
     current_dt: datetime, expected_time: str, checkin_type: str
-) -> Tuple[float, datetime]:
+) -> Tuple[float, int, datetime]:
     """
     智能化的时间差计算（支持跨天和最近匹配）
     """
@@ -907,7 +909,8 @@ def calculate_cross_day_time_diff(
         # 计算时间差（单位：分钟）
         time_diff_minutes = (current_dt - expected_dt).total_seconds() / 60
 
-        return time_diff_minutes, expected_dt
+        time_diff_seconds = int((current_dt - expected_dt).total_seconds())
+        return time_diff_minutes, time_diff_seconds, expected_dt
 
     except Exception as e:
         logger.error(f"时间差计算出错: {e}")
@@ -1024,6 +1027,233 @@ async def get_group_reset_period_start(
             second=0,
             microsecond=0,
         )
+
+
+# 在 utils.py 中添加以下函数
+
+
+async def get_reset_period_date(chat_id: int, target_date: datetime = None) -> date:
+    """根据群组重置时间获取重置周期日期"""
+    if target_date is None:
+        target_date = get_beijing_time()
+
+    try:
+        # 获取群组重置时间
+        group_data = await db.get_group_cached(chat_id)
+        if not group_data:
+            await db.init_group(chat_id)
+            group_data = await db.get_group_cached(chat_id)
+
+        reset_hour = group_data.get("reset_hour", Config.DAILY_RESET_HOUR)
+        reset_minute = group_data.get("reset_minute", Config.DAILY_RESET_MINUTE)
+
+        # 计算重置时间点
+        reset_time = target_date.replace(
+            hour=reset_hour, minute=reset_minute, second=0, microsecond=0
+        )
+
+        # 判断当前时间是否在重置周期内
+        if target_date < reset_time:
+            # 当前时间在今天重置时间之前，属于昨天的周期
+            return (reset_time - timedelta(days=1)).date()
+        else:
+            # 当前时间在今天重置时间之后，属于今天的周期
+            return reset_time.date()
+
+    except Exception as e:
+        logger.error(f"计算重置周期日期失败 {chat_id}: {e}")
+        return target_date.date()
+
+
+async def get_reset_period_start_datetime(
+    chat_id: int, target_dt: datetime = None
+) -> datetime:
+    """获取重置周期开始的完整日期时间"""
+    if target_dt is None:
+        target_dt = get_beijing_time()
+
+    try:
+        group_data = await db.get_group_cached(chat_id)
+        reset_hour = group_data.get("reset_hour", Config.DAILY_RESET_HOUR)
+        reset_minute = group_data.get("reset_minute", Config.DAILY_RESET_MINUTE)
+
+        reset_time_today = target_dt.replace(
+            hour=reset_hour, minute=reset_minute, second=0, microsecond=0
+        )
+
+        if target_dt < reset_time_today:
+            return reset_time_today - timedelta(days=1)
+        else:
+            return reset_time_today
+
+    except Exception as e:
+        logger.error(f"获取重置周期开始时间失败 {chat_id}: {e}")
+        return target_dt.replace(
+            hour=Config.DAILY_RESET_HOUR,
+            minute=Config.DAILY_RESET_MINUTE,
+            second=0,
+            microsecond=0,
+        )
+
+
+# ========== 二次重置相关函数 ==========
+async def get_current_reset_period(
+    chat_id: int, user_id: int, current_time: datetime = None
+) -> tuple[str, datetime]:
+    """
+    获取当前所处的重置周期
+    返回: (reset_type, period_start_datetime)
+    reset_type: 'first' 或 'second'
+    """
+    if current_time is None:
+        current_time = get_beijing_time()
+
+    # 获取第一次重置时间
+    first_reset_start = await get_group_reset_period_start(chat_id, current_time)
+    first_reset_end = first_reset_start + timedelta(days=1)
+
+    # 获取用户数据
+    user_data = await db.get_user_cached(chat_id, user_id)
+
+    # 如果未启用第二次重置，默认为第一次重置
+    if not user_data or not user_data.get("second_reset_enabled", False):
+        return "first", first_reset_start
+
+    # 获取第二次重置时间
+    second_reset_hour = user_data.get(
+        "second_reset_hour", Config.DEFAULT_SECOND_RESET_HOUR
+    )
+    second_reset_minute = user_data.get(
+        "second_reset_minute", Config.DEFAULT_SECOND_RESET_MINUTE
+    )
+
+    # 计算今天的第二次重置时间点
+    second_reset_today = current_time.replace(
+        hour=second_reset_hour, minute=second_reset_minute, second=0, microsecond=0
+    )
+
+    # 确定当前第二次重置周期的开始时间
+    if current_time < second_reset_today:
+        second_reset_start = second_reset_today - timedelta(days=1)
+    else:
+        second_reset_start = second_reset_today
+
+    second_reset_end = second_reset_start + timedelta(days=1)
+
+    # 判断当前时间属于哪个重置周期
+    # 规则：如果当前时间在第二次重置周期内，并且第二次重置时间在第一次重置时间之后
+    if (
+        current_time >= second_reset_start
+        and current_time < second_reset_end
+        and second_reset_start > first_reset_start
+    ):
+        return "second", second_reset_start
+    else:
+        return "first", first_reset_start
+
+
+async def get_reset_period_info(
+    chat_id: int, user_id: int, current_time: datetime = None
+) -> dict:
+    """
+    获取完整的重置周期信息
+    """
+    if current_time is None:
+        current_time = get_beijing_time()
+
+    reset_type, period_start = await get_current_reset_period(
+        chat_id, user_id, current_time
+    )
+
+    # 获取重置时间详情
+    group_data = await db.get_group_cached(chat_id)
+    first_reset_hour = group_data.get("reset_hour", Config.DAILY_RESET_HOUR)
+    first_reset_minute = group_data.get("reset_minute", Config.DAILY_RESET_MINUTE)
+
+    user_data = await db.get_user_cached(chat_id, user_id)
+    second_reset_enabled = (
+        user_data.get("second_reset_enabled", False) if user_data else False
+    )
+    second_reset_hour = (
+        user_data.get("second_reset_hour", Config.DEFAULT_SECOND_RESET_HOUR)
+        if user_data
+        else Config.DEFAULT_SECOND_RESET_HOUR
+    )
+    second_reset_minute = (
+        user_data.get("second_reset_minute", Config.DEFAULT_SECOND_RESET_MINUTE)
+        if user_data
+        else Config.DEFAULT_SECOND_RESET_MINUTE
+    )
+
+    return {
+        "current_type": reset_type,
+        "current_period_start": period_start,
+        "first_reset_hour": first_reset_hour,
+        "first_reset_minute": first_reset_minute,
+        "second_reset_enabled": second_reset_enabled,
+        "second_reset_hour": second_reset_hour,
+        "second_reset_minute": second_reset_minute,
+    }
+
+
+# ========== 重置通知函数 ==========
+async def send_reset_notification(
+    chat_id: int, completion_result: Dict[str, Any], reset_time: datetime
+):
+    """发送重置通知"""
+    try:
+        completed_count = completion_result.get("completed_count", 0)
+        total_fines = completion_result.get("total_fines", 0)
+        details = completion_result.get("details", [])
+
+        if completed_count == 0:
+            # 没有活动被结束，发送简单通知
+            notification_text = (
+                f"🔄 <b>系统重置完成</b>\n"
+                f"🏢 群组: <code>{chat_id}</code>\n"
+                f"⏰ 重置时间: <code>{reset_time.strftime('%m/%d %H:%M')}</code>\n"
+                f"✅ 没有进行中的活动需要结束"
+            )
+        else:
+            # 有活动被结束，发送详细通知
+            notification_text = (
+                f"🔄 <b>系统重置完成通知</b>\n"
+                f"🏢 群组: <code>{chat_id}</code>\n"
+                f"⏰ 重置时间: <code>{reset_time.strftime('%m/%d %H:%M')}</code>\n"
+                f"📊 自动结束活动: <code>{completed_count}</code> 个\n"
+                f"💰 总罚款金额: <code>{total_fines}</code> 元\n"
+            )
+
+            if details:
+                notification_text += f"\n📋 <b>活动结束详情:</b>\n"
+                for i, detail in enumerate(details[:5], 1):  # 最多显示5条详情
+                    user_link = MessageFormatter.format_user_link(
+                        detail["user_id"], detail.get("nickname", "用户")
+                    )
+                    time_str = MessageFormatter.format_time(detail["elapsed_time"])
+                    fine_info = (
+                        f" (罚款: {detail['fine_amount']}元)"
+                        if detail["fine_amount"] > 0
+                        else ""
+                    )
+                    overtime_info = " ⏰超时" if detail["is_overtime"] else ""
+
+                    notification_text += (
+                        f"{i}. {user_link} - {detail['activity']} "
+                        f"({time_str}){fine_info}{overtime_info}\n"
+                    )
+
+                if len(details) > 5:
+                    notification_text += f"... 还有 {len(details) - 5} 个活动\n"
+
+            notification_text += f"\n💡 所有进行中的活动已自动结束并计入月度统计"
+
+        # 发送通知
+        await notification_service.send_notification(chat_id, notification_text)
+        logger.info(f"重置通知发送成功: {chat_id}")
+
+    except Exception as e:
+        logger.error(f"发送重置通知失败 {chat_id}: {e}")
 
 
 # 全局实例
