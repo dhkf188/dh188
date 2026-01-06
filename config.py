@@ -76,13 +76,6 @@ class Config:
     # 默认活动时间限制（分钟）
     DEFAULT_ACTIVITY_LIMIT_MINUTES = 120
 
-    # 默认第二次重置时间
-    DEFAULT_SECOND_RESET_HOUR = 14  # 下午2点
-    DEFAULT_SECOND_RESET_MINUTE = 0
-
-    # 默认是否启用第二次重置
-    DEFAULT_SECOND_RESET_ENABLED = False
-
     # 日常数据保留天数
     DATA_RETENTION_DAYS = int(os.getenv("DATA_RETENTION_DAYS", "30"))
     # 月度数据配置
