@@ -30,8 +30,8 @@ class Config:
 
     # 数据库配置
     DATABASE_URL = os.getenv("DATABASE_URL", "")
-    DB_MIN_CONNECTIONS = int(os.getenv("DB_MIN_CONNECTIONS", "5"))
-    DB_MAX_CONNECTIONS = int(os.getenv("DB_MAX_CONNECTIONS", "15"))
+    DB_MIN_CONNECTIONS = int(os.getenv("DB_MIN_CONNECTIONS", "3"))
+    DB_MAX_CONNECTIONS = int(os.getenv("DB_MAX_CONNECTIONS", "10"))
     DB_POOL_RECYCLE = int(os.getenv("DB_POOL_RECYCLE", "1800"))
     DB_CONNECTION_TIMEOUT = int(os.getenv("DB_CONNECTION_TIMEOUT", "60"))
     DB_HEALTH_CHECK_INTERVAL = int(os.getenv("DB_HEALTH_CHECK_INTERVAL", "30"))
@@ -76,8 +76,17 @@ class Config:
     # 默认活动时间限制（分钟）
     DEFAULT_ACTIVITY_LIMIT_MINUTES = 120
 
-    # 数据保留天数
+    # 默认第二次重置时间
+    DEFAULT_SECOND_RESET_HOUR = 14  # 下午2点
+    DEFAULT_SECOND_RESET_MINUTE = 0
+
+    # 默认是否启用第二次重置
+    DEFAULT_SECOND_RESET_ENABLED = False
+
+    # 日常数据保留天数
     DATA_RETENTION_DAYS = int(os.getenv("DATA_RETENTION_DAYS", "30"))
+    # 月度数据配置
+    MONTHLY_DATA_RETENTION_DAYS = int(os.getenv("MONTHLY_DATA_RETENTION_DAYS", "40"))
 
     # 清理间隔（秒）
     CLEANUP_INTERVAL = int(os.getenv("CLEANUP_INTERVAL", "600"))
