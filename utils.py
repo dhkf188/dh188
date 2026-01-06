@@ -994,58 +994,39 @@ def rate_limit(rate: int = 1, per: int = 1):
 async def get_group_reset_period_start(
     chat_id: int, current_time: datetime = None
 ) -> datetime:
-    """获取群组的重置周期开始时间 - 修复版"""
+    """获取群组的重置周期开始时间 - 统一版本"""
     if current_time is None:
         current_time = get_beijing_time()
 
     try:
-        # 🎯 获取群组特定的重置时间
+        # 使用全局 db 实例
         group_data = await db.get_group_cached(chat_id)
         if not group_data:
             # 如果群组不存在，初始化群组
             await db.init_group(chat_id)
             group_data = await db.get_group_cached(chat_id)
 
-        # 🎯 使用群组特定的重置时间
         reset_hour = group_data.get("reset_hour", Config.DAILY_RESET_HOUR)
         reset_minute = group_data.get("reset_minute", Config.DAILY_RESET_MINUTE)
 
-        # 计算今天的重置时间点
         reset_time_today = current_time.replace(
             hour=reset_hour, minute=reset_minute, second=0, microsecond=0
         )
 
-        # 判断当前时间在重置周期中的位置
         if current_time < reset_time_today:
-            # 当前时间在今天重置时间之前，属于昨天的周期
-            period_start = reset_time_today - timedelta(days=1)
+            return reset_time_today - timedelta(days=1)
         else:
-            # 当前时间在今天重置时间之后，属于今天的周期
-            period_start = reset_time_today
-
-        logger.debug(
-            f"群组 {chat_id} 重置周期计算:\n"
-            f"  当前时间: {current_time}\n"
-            f"  重置时间: {reset_hour:02d}:{reset_minute:02d}\n"
-            f"  周期开始: {period_start}\n"
-            f"  配置: 群组={reset_hour:02d}:{reset_minute:02d}, 全局={Config.DAILY_RESET_HOUR:02d}:{Config.DAILY_RESET_MINUTE:02d}"
-        )
-
-        return period_start
+            return reset_time_today
 
     except Exception as e:
         logger.error(f"计算重置周期失败 {chat_id}: {e}")
         # 出错时返回默认重置时间
-        default_reset = current_time.replace(
+        return current_time.replace(
             hour=Config.DAILY_RESET_HOUR,
             minute=Config.DAILY_RESET_MINUTE,
             second=0,
             microsecond=0,
         )
-        if current_time < default_reset:
-            return default_reset - timedelta(days=1)
-        else:
-            return default_reset
 
 
 # 在 utils.py 中添加以下函数
