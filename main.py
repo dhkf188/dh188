@@ -610,11 +610,12 @@ async def reset_daily_data_if_needed(chat_id: int, uid: int):
 async def check_activity_limit(
     chat_id: int, uid: int, act: str
 ) -> tuple[bool, int, int]:
-    """检查活动次数是否达到上限"""
+    """检查活动次数是否达到上限 - 修复为重置周期"""
     await db.init_group(chat_id)
     await db.init_user(chat_id, uid)
 
-    current_count = await db.get_user_activity_count(chat_id, uid, act)
+    # 🎯 修复：使用重置周期内的活动次数
+    current_count = await db.get_user_activity_count_for_reset_period(chat_id, uid, act)
     max_times = await db.get_activity_max_times(act)
 
     return current_count < max_times, current_count, max_times
@@ -3348,30 +3349,8 @@ async def show_history(message: types.Message):
     has_records = False
     activity_limits = await db.get_activity_limits_cached()
 
-    # 使用重置周期日期查询用户活动
-    user_activities = {}
-    try:
-        today = reset_period_date
-        rows = await db.fetch_with_retry(
-            "获取用户周期活动",
-            """
-            SELECT activity_name, activity_count, accumulated_time
-            FROM user_activities
-            WHERE chat_id = $1 AND user_id = $2 AND activity_date = $3
-            """,
-            chat_id,
-            uid,
-            today,
-        )
-
-        for row in rows:
-            user_activities[row["activity_name"]] = {
-                "count": row["activity_count"],
-                "time": row["accumulated_time"],
-            }
-    except Exception as e:
-        logger.error(f"查询用户活动失败: {e}")
-        user_activities = await db.get_user_all_activities(chat_id, uid)
+    # 🎯 修复：使用新的重置周期查询方法
+    user_activities = await db.get_user_activities_for_reset_period(chat_id, uid)
 
     for act in activity_limits.keys():
         activity_info = user_activities.get(act, {})
@@ -3432,57 +3411,32 @@ async def show_rank(message: types.Message):
         f"⏰ 重置时间：<code>{reset_hour:02d}:{reset_minute:02d}</code>\n\n"
     )
 
+    # 🎯 修复：使用新的重置周期查询方法
+    group_activities = await db.get_group_activities_for_reset_period(chat_id)
+
     found_any_data = False
 
     for act in activity_limits.keys():
-        # 🎯 修复：使用重置周期日期查询活动数据
-        try:
-            rows = await db.fetch_with_retry(
-                "获取活动排行榜",
-                """
-                SELECT 
-                    ua.user_id,
-                    u.nickname,
-                    ua.accumulated_time as total_time,
-                    ua.activity_count as total_count,
-                    CASE WHEN u.current_activity = $1 THEN TRUE ELSE FALSE END as is_active
-                FROM user_activities ua
-                LEFT JOIN users u ON ua.chat_id = u.chat_id AND ua.user_id = u.user_id
-                WHERE ua.chat_id = $2 
-                AND ua.activity_date = $3 
-                AND ua.activity_name = $4
-                AND (ua.accumulated_time > 0 OR u.current_activity = $1)
-                ORDER BY ua.accumulated_time DESC
-                LIMIT 10
-                """,
-                act,
-                chat_id,
-                reset_period_date,
-                act,
-            )
+        activity_ranking = group_activities.get(act, [])
 
-            if rows:
-                found_any_data = True
-                rank_text += f"📈 <code>{act}</code>：\n"
+        if activity_ranking:
+            found_any_data = True
+            rank_text += f"📈 <code>{act}</code>：\n"
 
-                for i, row in enumerate(rows, 1):
-                    user_id = row["user_id"]
-                    nickname = row["nickname"]
-                    total_time = row["total_time"]
-                    count = row["total_count"]
-                    is_active = row["is_active"]
+            for i, user in enumerate(activity_ranking[:10], 1):  # 显示前10名
+                user_id = user["user_id"]
+                nickname = user["nickname"]
+                total_time = user["total_time"]
+                count = user["total_count"]
+                is_active = user["is_active"]
 
-                    if is_active:
-                        rank_text += f"  <code>{i}.</code> 🟡 {MessageFormatter.format_user_link(user_id, nickname)} - 进行中\n"
-                    elif total_time > 0:
-                        time_str = MessageFormatter.format_time(int(total_time))
-                        rank_text += f"  <code>{i}.</code> 🟢 {MessageFormatter.format_user_link(user_id, nickname)} - {time_str} ({count}次)\n"
+                if is_active:
+                    rank_text += f"  <code>{i}.</code> 🟡 {MessageFormatter.format_user_link(user_id, nickname)} - 进行中\n"
+                elif total_time > 0:
+                    time_str = MessageFormatter.format_time(int(total_time))
+                    rank_text += f"  <code>{i}.</code> 🟢 {MessageFormatter.format_user_link(user_id, nickname)} - {time_str} ({count}次)\n"
 
-                rank_text += "\n"
-
-        except Exception as e:
-            logger.error(f"查询活动 {act} 排行榜失败: {e}")
-            continue
+            rank_text += "\n"
 
     if not found_any_data:
         rank_text = (
