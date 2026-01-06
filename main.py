@@ -3310,9 +3310,9 @@ async def handle_my_record(message: types.Message):
     chat_id = message.chat.id
     uid = message.from_user.id
 
-    user_lock = user_lock_manager.get_lock(chat_id, uid)
-    async with user_lock:
-        await show_history(message)
+    # user_lock = user_lock_manager.get_lock(chat_id, uid)
+    # async with user_lock:
+    await show_history(message)
 
 
 @rate_limit(rate=10, per=60)
@@ -3322,9 +3322,9 @@ async def handle_rank(message: types.Message):
     chat_id = message.chat.id
     uid = message.from_user.id
 
-    user_lock = user_lock_manager.get_lock(chat_id, uid)
-    async with user_lock:
-        await show_rank(message)
+    # user_lock = user_lock_manager.get_lock(chat_id, uid)
+    # async with user_lock:
+    await show_rank(message)
 
 
 @rate_limit(rate=5, per=60)
