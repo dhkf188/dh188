@@ -994,39 +994,58 @@ def rate_limit(rate: int = 1, per: int = 1):
 async def get_group_reset_period_start(
     chat_id: int, current_time: datetime = None
 ) -> datetime:
-    """获取群组的重置周期开始时间 - 统一版本"""
+    """获取群组的重置周期开始时间 - 修复版"""
     if current_time is None:
         current_time = get_beijing_time()
 
     try:
-        # 使用全局 db 实例
+        # 🎯 获取群组特定的重置时间
         group_data = await db.get_group_cached(chat_id)
         if not group_data:
             # 如果群组不存在，初始化群组
             await db.init_group(chat_id)
             group_data = await db.get_group_cached(chat_id)
 
+        # 🎯 使用群组特定的重置时间
         reset_hour = group_data.get("reset_hour", Config.DAILY_RESET_HOUR)
         reset_minute = group_data.get("reset_minute", Config.DAILY_RESET_MINUTE)
 
+        # 计算今天的重置时间点
         reset_time_today = current_time.replace(
             hour=reset_hour, minute=reset_minute, second=0, microsecond=0
         )
 
+        # 判断当前时间在重置周期中的位置
         if current_time < reset_time_today:
-            return reset_time_today - timedelta(days=1)
+            # 当前时间在今天重置时间之前，属于昨天的周期
+            period_start = reset_time_today - timedelta(days=1)
         else:
-            return reset_time_today
+            # 当前时间在今天重置时间之后，属于今天的周期
+            period_start = reset_time_today
+
+        logger.debug(
+            f"群组 {chat_id} 重置周期计算:\n"
+            f"  当前时间: {current_time}\n"
+            f"  重置时间: {reset_hour:02d}:{reset_minute:02d}\n"
+            f"  周期开始: {period_start}\n"
+            f"  配置: 群组={reset_hour:02d}:{reset_minute:02d}, 全局={Config.DAILY_RESET_HOUR:02d}:{Config.DAILY_RESET_MINUTE:02d}"
+        )
+
+        return period_start
 
     except Exception as e:
         logger.error(f"计算重置周期失败 {chat_id}: {e}")
         # 出错时返回默认重置时间
-        return current_time.replace(
+        default_reset = current_time.replace(
             hour=Config.DAILY_RESET_HOUR,
             minute=Config.DAILY_RESET_MINUTE,
             second=0,
             microsecond=0,
         )
+        if current_time < default_reset:
+            return default_reset - timedelta(days=1)
+        else:
+            return default_reset
 
 
 # 在 utils.py 中添加以下函数
@@ -1094,106 +1113,6 @@ async def get_reset_period_start_datetime(
             second=0,
             microsecond=0,
         )
-
-
-# ========== 二次重置相关函数 ==========
-async def get_current_reset_period(
-    chat_id: int, user_id: int, current_time: datetime = None
-) -> tuple[str, datetime]:
-    """
-    获取当前所处的重置周期
-    返回: (reset_type, period_start_datetime)
-    reset_type: 'first' 或 'second'
-    """
-    if current_time is None:
-        current_time = get_beijing_time()
-
-    # 获取第一次重置时间
-    first_reset_start = await get_group_reset_period_start(chat_id, current_time)
-    first_reset_end = first_reset_start + timedelta(days=1)
-
-    # 获取用户数据
-    user_data = await db.get_user_cached(chat_id, user_id)
-
-    # 如果未启用第二次重置，默认为第一次重置
-    if not user_data or not user_data.get("second_reset_enabled", False):
-        return "first", first_reset_start
-
-    # 获取第二次重置时间
-    second_reset_hour = user_data.get(
-        "second_reset_hour", Config.DEFAULT_SECOND_RESET_HOUR
-    )
-    second_reset_minute = user_data.get(
-        "second_reset_minute", Config.DEFAULT_SECOND_RESET_MINUTE
-    )
-
-    # 计算今天的第二次重置时间点
-    second_reset_today = current_time.replace(
-        hour=second_reset_hour, minute=second_reset_minute, second=0, microsecond=0
-    )
-
-    # 确定当前第二次重置周期的开始时间
-    if current_time < second_reset_today:
-        second_reset_start = second_reset_today - timedelta(days=1)
-    else:
-        second_reset_start = second_reset_today
-
-    second_reset_end = second_reset_start + timedelta(days=1)
-
-    # 判断当前时间属于哪个重置周期
-    # 规则：如果当前时间在第二次重置周期内，并且第二次重置时间在第一次重置时间之后
-    if (
-        current_time >= second_reset_start
-        and current_time < second_reset_end
-        and second_reset_start > first_reset_start
-    ):
-        return "second", second_reset_start
-    else:
-        return "first", first_reset_start
-
-
-async def get_reset_period_info(
-    chat_id: int, user_id: int, current_time: datetime = None
-) -> dict:
-    """
-    获取完整的重置周期信息
-    """
-    if current_time is None:
-        current_time = get_beijing_time()
-
-    reset_type, period_start = await get_current_reset_period(
-        chat_id, user_id, current_time
-    )
-
-    # 获取重置时间详情
-    group_data = await db.get_group_cached(chat_id)
-    first_reset_hour = group_data.get("reset_hour", Config.DAILY_RESET_HOUR)
-    first_reset_minute = group_data.get("reset_minute", Config.DAILY_RESET_MINUTE)
-
-    user_data = await db.get_user_cached(chat_id, user_id)
-    second_reset_enabled = (
-        user_data.get("second_reset_enabled", False) if user_data else False
-    )
-    second_reset_hour = (
-        user_data.get("second_reset_hour", Config.DEFAULT_SECOND_RESET_HOUR)
-        if user_data
-        else Config.DEFAULT_SECOND_RESET_HOUR
-    )
-    second_reset_minute = (
-        user_data.get("second_reset_minute", Config.DEFAULT_SECOND_RESET_MINUTE)
-        if user_data
-        else Config.DEFAULT_SECOND_RESET_MINUTE
-    )
-
-    return {
-        "current_type": reset_type,
-        "current_period_start": period_start,
-        "first_reset_hour": first_reset_hour,
-        "first_reset_minute": first_reset_minute,
-        "second_reset_enabled": second_reset_enabled,
-        "second_reset_hour": second_reset_hour,
-        "second_reset_minute": second_reset_minute,
-    }
 
 
 # ========== 重置通知函数 ==========
