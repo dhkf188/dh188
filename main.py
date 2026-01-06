@@ -50,8 +50,8 @@ from utils import (
     calculate_cross_day_time_diff,
     is_valid_checkin_time,
     rate_limit,
-    get_group_reset_period_start,
     send_reset_notification,
+    get_group_reset_period_start,
 )
 
 from bot_manager import bot_manager
@@ -1355,10 +1355,7 @@ async def process_work_checkin(message: types.Message, checkin_type: str):
         try:
             await db.init_group(chat_id)
             await db.init_user(chat_id, uid)
-
-            # 🎯 【重要补充】重置检查
             await reset_daily_data_if_needed(chat_id, uid)
-
             user_data = await db.get_user_cached(chat_id, uid)
         except Exception as e:
             logger.error(f"[{trace_id}] ❌ 初始化用户/群组失败: {e}")
@@ -1375,7 +1372,7 @@ async def process_work_checkin(message: types.Message, checkin_type: str):
             has_record_today = False
 
         if has_record_today:
-            today_records = await db.get_today_work_records(chat_id, uid)
+            today_records = await db.get_today_work_records_fixed(chat_id, uid)
             existing_record = today_records.get(checkin_type)
             action_text = "上班" if checkin_type == "work_start" else "下班"
             status_msg = f"🚫 您今天已经打过{action_text}卡了！"
@@ -1396,13 +1393,13 @@ async def process_work_checkin(message: types.Message, checkin_type: str):
             logger.info(f"[{trace_id}] 🔁 检测到重复{action_text}打卡，终止处理。")
             return
 
-        # 🆕 异常：下班后再上班
+        # 🆕 添加异常情况检查：已经下班但又打上班卡
         if checkin_type == "work_start":
             has_work_end_today = await db.has_work_record_today(
                 chat_id, uid, "work_end"
             )
             if has_work_end_today:
-                today_records = await db.get_today_work_records(chat_id, uid)
+                today_records = await db.get_today_work_records_fixed(chat_id, uid)
                 end_record = today_records.get("work_end")
                 end_time = end_record["checkin_time"] if end_record else "未知时间"
 
@@ -1417,7 +1414,7 @@ async def process_work_checkin(message: types.Message, checkin_type: str):
                 logger.info(f"[{trace_id}] 🔁 检测到异常：下班后再次上班打卡")
                 return
 
-        # ✅ 下班前必须已上班
+        # ✅ 下班前检查上班记录
         if checkin_type == "work_end":
             has_work_start_today = await db.has_work_record_today(
                 chat_id, uid, "work_start"
@@ -1434,7 +1431,7 @@ async def process_work_checkin(message: types.Message, checkin_type: str):
                 logger.warning(f"[{trace_id}] ⚠️ 用户试图下班打卡但未上班")
                 return
 
-        # 🆕 时间范围检查
+        # 🆕 添加时间范围检查
         try:
             valid_time, expected_dt = await is_valid_checkin_time(
                 chat_id, checkin_type, now
@@ -1461,7 +1458,9 @@ async def process_work_checkin(message: types.Message, checkin_type: str):
                 ),
                 parse_mode="HTML",
             )
-            logger.info(f"[{trace_id}] ⏰ 时间范围校验失败")
+            logger.info(
+                f"[{trace_id}] ⏰ 打卡时间范围检查失败（不在 ±7 小时内），终止处理"
+            )
             return
 
         # ✅ 获取预计算结果
@@ -1470,28 +1469,27 @@ async def process_work_checkin(message: types.Message, checkin_type: str):
             calculate_cross_day_time_diff(now, work_hours[checkin_type], checkin_type)
         )
 
-        # ✅ 自动结束活动
+        # ✅ 自动结束活动（仅下班）
         current_activity = user_data.get("current_activity")
         activity_auto_ended = False
         if checkin_type == "work_end" and current_activity:
             with suppress(Exception):
                 await auto_end_current_activity(chat_id, uid, user_data, now, message)
                 activity_auto_ended = True
+                logger.info(f"[{trace_id}] 🔄 已自动结束活动：{current_activity}")
 
         # =====================================
-        # 🎯 修复后的罚款 & 状态计算逻辑
+        # 🎯 迟到 / 早退展示修复区（唯一修改逻辑）
         # =====================================
         expected_time = work_hours[checkin_type]
         fine_amount = 0
         is_late_early = False
 
         if checkin_type == "work_start":
-            if time_diff_minutes > 0:
+            if time_diff_seconds > 0:
                 fine_amount = await calculate_work_fine("work_start", time_diff_minutes)
-                late_time_formatted = MessageFormatter.format_minutes_to_hms(
-                    time_diff_minutes
-                )
-                status = f"🚨 迟到 {late_time_formatted}"
+                duration = MessageFormatter.format_duration(time_diff_seconds)
+                status = f"🚨 迟到 {duration}"
                 if fine_amount:
                     status += f"（💰罚款 {fine_amount}元）"
                 emoji = "😅"
@@ -1501,14 +1499,12 @@ async def process_work_checkin(message: types.Message, checkin_type: str):
                 emoji = "👍"
             action_text = "上班"
         else:
-            if time_diff_minutes < 0:
+            if time_diff_seconds < 0:
                 fine_amount = await calculate_work_fine(
                     "work_end", abs(time_diff_minutes)
                 )
-                early_time_formatted = MessageFormatter.format_minutes_to_hms(
-                    abs(time_diff_minutes)
-                )
-                status = f"🚨 早退 {early_time_formatted}"
+                duration = MessageFormatter.format_duration(abs(time_diff_seconds))
+                status = f"🚨 早退 {duration}"
                 if fine_amount:
                     status += f"（💰罚款 {fine_amount}元）"
                 emoji = "🏃"
@@ -1518,10 +1514,7 @@ async def process_work_checkin(message: types.Message, checkin_type: str):
                 emoji = "👍"
             action_text = "下班"
 
-        # =====================================
-        # 后续数据库写入、反馈、通知 —— 全部保持不变
-        # =====================================
-
+        # ✅ 安全写入数据库（含重试）
         for attempt in range(2):
             try:
                 await db.add_work_record(
@@ -1547,6 +1540,7 @@ async def process_work_checkin(message: types.Message, checkin_type: str):
                     return
                 await asyncio.sleep(0.5)
 
+        # ✅ 所有数据操作成功后，立即显示完整结果
         expected_time_display = expected_dt.strftime("%m/%d %H:%M")
         result_msg = (
             f"{emoji} <b>{action_text}打卡完成</b>\n"
@@ -1569,11 +1563,11 @@ async def process_work_checkin(message: types.Message, checkin_type: str):
             parse_mode="HTML",
         )
 
-        # 智能通知模块保持原样……
+        # ✅ 智能通知模块（仅同步时间展示）
         if is_late_early:
             try:
                 status_type = "迟到" if checkin_type == "work_start" else "早退"
-                time_detail = f"{status_type} {MessageFormatter.format_minutes_to_hms(abs(time_diff_minutes))}"
+                duration = MessageFormatter.format_duration(abs(time_diff_seconds))
 
                 with suppress(Exception):
                     chat_info = await bot.get_chat(chat_id)
@@ -1586,7 +1580,7 @@ async def process_work_checkin(message: types.Message, checkin_type: str):
                     f"👤 用户：{MessageFormatter.format_user_link(uid, name)}\n"
                     f"⏰ 打卡时间：<code>{current_time}</code>\n"
                     f"📅 期望时间：<code>{expected_time_display}</code>\n"
-                    f"⏱️ {time_detail}"
+                    f"⏱️ {status_type} {duration}"
                 )
 
                 if fine_amount:
@@ -3314,13 +3308,13 @@ async def handle_all_text_messages(message: types.Message):
 
 # ========== 用户功能 ==========
 async def show_history(message: types.Message):
-    """显示用户历史记录 - 修复重置时间问题"""
+    """显示用户历史记录 - 修复版"""
     chat_id = message.chat.id
     uid = message.from_user.id
 
-    # 🎯 修复：使用现有的 get_group_reset_period_start 函数
+    # ✅ 获取重置周期开始时间和日期
     period_start_dt = await get_group_reset_period_start(chat_id)
-    reset_period_date = period_start_dt.date()  # 获取日期部分
+    reset_period_date = period_start_dt.date()
 
     await db.init_group(chat_id)
     await db.init_user(chat_id, uid)
@@ -3357,7 +3351,6 @@ async def show_history(message: types.Message):
     # 使用重置周期日期查询用户活动
     user_activities = {}
     try:
-        today = reset_period_date
         rows = await db.fetch_with_retry(
             "获取用户周期活动",
             """
@@ -3367,7 +3360,7 @@ async def show_history(message: types.Message):
             """,
             chat_id,
             uid,
-            today,
+            reset_period_date,  # ✅ 使用重置周期日期
         )
 
         for row in rows:
@@ -3377,8 +3370,10 @@ async def show_history(message: types.Message):
             }
     except Exception as e:
         logger.error(f"查询用户活动失败: {e}")
+        # 备选方案：使用 get_user_all_activities
         user_activities = await db.get_user_all_activities(chat_id, uid)
 
+    # 显示活动记录
     for act in activity_limits.keys():
         activity_info = user_activities.get(act, {})
         total_time = activity_info.get("time", 0)
@@ -3413,7 +3408,7 @@ async def show_history(message: types.Message):
 
 
 async def show_rank(message: types.Message):
-    """显示排行榜 - 修复重置时间问题"""
+    """显示排行榜 - 修复版"""
     chat_id = message.chat.id
     uid = message.from_user.id
 
@@ -3425,8 +3420,8 @@ async def show_rank(message: types.Message):
         return
 
     # 获取重置周期信息
-    current_date = get_beijing_time()
-    reset_period_date = await get_group_reset_period_start(chat_id, current_date)
+    reset_period_dt = await get_group_reset_period_start(chat_id)
+    reset_period_date = reset_period_dt.date()
 
     group_data = await db.get_group_cached(chat_id)
     reset_hour = group_data.get("reset_hour", Config.DAILY_RESET_HOUR)
@@ -3441,7 +3436,6 @@ async def show_rank(message: types.Message):
     found_any_data = False
 
     for act in activity_limits.keys():
-        # 🎯 修复：使用重置周期日期查询活动数据
         try:
             rows = await db.fetch_with_retry(
                 "获取活动排行榜",
@@ -3463,7 +3457,7 @@ async def show_rank(message: types.Message):
                 """,
                 act,
                 chat_id,
-                reset_period_date,
+                reset_period_date,  # ✅ 使用重置周期日期
                 act,
             )
 
@@ -3635,13 +3629,6 @@ async def export_and_push_csv(
             date_str = get_beijing_time().strftime("%Y%m%d_%H%M%S")
         file_name = f"group_{chat_id}_statistics_{date_str}.csv"
 
-    # 🆕 关键修复：检查是否是重置后的导出（目标日期是昨天）
-    now = get_beijing_time()
-    is_reset_export = False
-    if target_date and target_date == (now - timedelta(days=1)).date():
-        is_reset_export = True
-        logger.info(f"🔄 检测到重置后导出，将从月度表恢复 {target_date} 的数据")
-
     csv_buffer = StringIO()
     writer = csv.writer(csv_buffer)
 
@@ -3664,12 +3651,8 @@ async def export_and_push_csv(
 
     has_data = False
 
-    if is_reset_export:
-        # 🆕 重置后导出：从月度表获取数据
-        group_stats = await get_group_stats_from_monthly(chat_id, target_date)
-    else:
-        # 正常导出：从日常表获取数据
-        group_stats = await db.get_group_statistics(chat_id, target_date)
+    # ✅ 修改：直接调用 get_group_statistics，不再判断是否为重置后导出
+    group_stats = await db.get_group_statistics(chat_id, target_date)
 
     # 处理每个用户的数据
     for user_data in group_stats:
@@ -3781,7 +3764,7 @@ async def export_and_push_csv(
 
 # ========== 定时任务 ==========
 async def daily_reset_task():
-    """每日自动重置任务 - 完整修复版本"""
+    """每日自动重置任务 - 最终稳定版本（重置前导出数据）"""
     while True:
         now = get_beijing_time()
         logger.debug(f"重置任务检查，当前时间: {now}")
@@ -3793,7 +3776,7 @@ async def daily_reset_task():
             await asyncio.sleep(60)
             continue
 
-        reset_executed = False
+        executed_groups = []
 
         for chat_id in all_groups:
             try:
@@ -3802,13 +3785,36 @@ async def daily_reset_task():
                 reset_hour = group_data.get("reset_hour", Config.DAILY_RESET_HOUR)
                 reset_minute = group_data.get("reset_minute", Config.DAILY_RESET_MINUTE)
 
-                # 检查是否到达该群组的重置时间
+                # 是否到达该群组的重置时间
                 if now.hour == reset_hour and now.minute == reset_minute:
                     logger.info(
                         f"群组 {chat_id} 到达重置时间 {reset_hour:02d}:{reset_minute:02d}，开始处理..."
                     )
 
-                    # 🎯 第一步：批量处理未结束活动
+                    # 🧾 ① 重置前导出当日统计数据
+                    reset_time_today = now.replace(
+                        hour=reset_hour, minute=reset_minute, second=0, microsecond=0
+                    )
+                    if now < reset_time_today:
+                        period_start = reset_time_today - timedelta(days=1)
+                    else:
+                        period_start = reset_time_today
+                    export_date = period_start.date()
+                    file_name = f"group_{chat_id}_reset_period_{export_date.strftime('%Y%m%d')}_{reset_hour:02d}{reset_minute:02d}.csv"
+
+                    try:
+                        logger.info(f"🔄 重置前导出数据: {export_date}")
+                        await export_and_push_csv(
+                            chat_id,
+                            to_admin_if_no_group=True,
+                            file_name=file_name,
+                            target_date=export_date,
+                        )
+                        logger.info("✅ 重置前数据导出完成")
+                    except Exception as export_error:
+                        logger.error(f"❌ 重置前数据导出失败: {export_error}")
+
+                    # 🧹 ② 结束未完成活动
                     completion_result = (
                         await db.complete_all_pending_activities_before_reset(
                             chat_id, now
@@ -3819,9 +3825,7 @@ async def daily_reset_task():
                     if completed_count > 0:
                         logger.info(f"重置前结束了 {completed_count} 个进行中的活动")
 
-                        # 🎯 修复：确保通知服务可用
                         try:
-                            # 检查通知服务是否初始化
                             if not notification_service.bot_manager and bot_manager:
                                 notification_service.bot_manager = bot_manager
                             if not notification_service.bot and bot:
@@ -3834,44 +3838,36 @@ async def daily_reset_task():
                                 await send_reset_notification(
                                     chat_id, completion_result, now
                                 )
-                            else:
-                                logger.warning("通知服务未初始化，跳过发送重置通知")
                         except Exception as e:
                             logger.error(f"发送重置通知失败: {e}")
 
-                    # 🎯 第二步：取消所有定时器（关键补充！）
+                    # ⏱️ ③ 取消该群组所有定时器
                     cancelled_count = 0
                     try:
-                        # 方法1：如果有按群组取消的方法
                         if hasattr(timer_manager, "cancel_all_timers_for_group"):
                             cancelled_count = (
                                 await timer_manager.cancel_all_timers_for_group(chat_id)
                             )
                         else:
-                            # 方法2：遍历取消特定群组的定时器
-                            all_timer_keys = list(timer_manager._timers.keys())
-                            for key in all_timer_keys:
+                            for key in list(timer_manager._timers.keys()):
                                 if key.startswith(f"{chat_id}-"):
                                     await timer_manager.cancel_timer(key)
                                     cancelled_count += 1
-                            logger.info(
-                                f"取消群组 {chat_id} 定时器: {cancelled_count}个"
-                            )
                     except Exception as e:
                         logger.error(f"取消定时器失败 {chat_id}: {e}")
 
-                    # 🎯 第三步：执行纯净的数据重置
+                    # 🧬 ④ 执行数据重置
                     group_members = await db.get_group_members(chat_id)
                     reset_count = 0
 
-                    # 计算该群组的重置周期开始时间
                     reset_time_today = now.replace(
                         hour=reset_hour, minute=reset_minute, second=0, microsecond=0
                     )
-                    if now < reset_time_today:
-                        period_start = reset_time_today - timedelta(days=1)
-                    else:
-                        period_start = reset_time_today
+                    period_start = (
+                        reset_time_today - timedelta(days=1)
+                        if now < reset_time_today
+                        else reset_time_today
+                    )
 
                     for user_data in group_members:
                         user_lock = user_lock_manager.get_lock(
@@ -3892,47 +3888,18 @@ async def daily_reset_task():
                         f"(重置时间: {reset_hour:02d}:{reset_minute:02d})"
                     )
 
-                    # 启动延迟导出任务
-                    asyncio.create_task(delayed_export(chat_id, 30))
-                    reset_executed = True
+                    # 🚫 已完全移除重置后导出
+                    # asyncio.create_task(delayed_export(chat_id, 30))
+
+                    executed_groups.append(chat_id)
 
             except Exception as e:
                 logger.error(f"群组 {chat_id} 重置失败: {e}")
 
-        if reset_executed:
-            logger.info(
-                f"本轮重置任务完成，处理时间: {get_beijing_time().strftime('%H:%M:%S')}"
-            )
+        if executed_groups:
+            logger.info(f"本轮重置完成群组: {executed_groups}")
 
-        # 每分钟检查一次
         await asyncio.sleep(60)
-
-
-async def delayed_export(chat_id: int, delay_minutes: int = 30):
-    """在每日重置后延迟导出昨日数据 - 安全修复版"""
-    try:
-        logger.info(f"群组 {chat_id} 将在 {delay_minutes} 分钟后导出昨日数据...")
-        await asyncio.sleep(delay_minutes * 60)
-
-        yesterday_dt = get_beijing_time() - timedelta(days=1)
-        yesterday_date = yesterday_dt.date()
-
-        # 🆕 先检查是否有数据
-        monthly_stats = await db.get_monthly_statistics(
-            chat_id, yesterday_date.year, yesterday_date.month
-        )
-
-        if not monthly_stats:
-            logger.info(f"群组 {chat_id} 昨日无数据，跳过导出")
-            return
-
-        file_name = f"group_{chat_id}_statistics_{yesterday_dt.strftime('%Y%m%d')}.csv"
-        await export_and_push_csv(chat_id, True, file_name, yesterday_date)
-        logger.info(f"✅ 群组 {chat_id} 昨日数据导出完成")
-
-    except Exception as e:
-        logger.error(f"❌ 群组 {chat_id} 延迟导出昨日数据失败: {e}")
-        # 不重新抛出异常，避免影响其他任务
 
 
 async def memory_cleanup_task():
