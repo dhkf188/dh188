@@ -50,8 +50,8 @@ from utils import (
     calculate_cross_day_time_diff,
     is_valid_checkin_time,
     rate_limit,
-    send_reset_notification,
     get_group_reset_period_start,
+    send_reset_notification,
 )
 
 from bot_manager import bot_manager
@@ -3308,13 +3308,13 @@ async def handle_all_text_messages(message: types.Message):
 
 # ========== 用户功能 ==========
 async def show_history(message: types.Message):
-    """显示用户历史记录 - 修复版"""
+    """显示用户历史记录 - 修复重置时间问题"""
     chat_id = message.chat.id
     uid = message.from_user.id
 
-    # ✅ 获取重置周期开始时间和日期
+    # 🎯 修复：使用现有的 get_group_reset_period_start 函数
     period_start_dt = await get_group_reset_period_start(chat_id)
-    reset_period_date = period_start_dt.date()
+    reset_period_date = period_start_dt.date()  # 获取日期部分
 
     await db.init_group(chat_id)
     await db.init_user(chat_id, uid)
@@ -3351,6 +3351,7 @@ async def show_history(message: types.Message):
     # 使用重置周期日期查询用户活动
     user_activities = {}
     try:
+        today = reset_period_date
         rows = await db.fetch_with_retry(
             "获取用户周期活动",
             """
@@ -3360,7 +3361,7 @@ async def show_history(message: types.Message):
             """,
             chat_id,
             uid,
-            reset_period_date,  # ✅ 使用重置周期日期
+            today,
         )
 
         for row in rows:
@@ -3370,10 +3371,8 @@ async def show_history(message: types.Message):
             }
     except Exception as e:
         logger.error(f"查询用户活动失败: {e}")
-        # 备选方案：使用 get_user_all_activities
         user_activities = await db.get_user_all_activities(chat_id, uid)
 
-    # 显示活动记录
     for act in activity_limits.keys():
         activity_info = user_activities.get(act, {})
         total_time = activity_info.get("time", 0)
@@ -3408,7 +3407,7 @@ async def show_history(message: types.Message):
 
 
 async def show_rank(message: types.Message):
-    """显示排行榜 - 修复版"""
+    """显示排行榜 - 修复重置时间问题"""
     chat_id = message.chat.id
     uid = message.from_user.id
 
@@ -3420,8 +3419,8 @@ async def show_rank(message: types.Message):
         return
 
     # 获取重置周期信息
-    reset_period_dt = await get_group_reset_period_start(chat_id)
-    reset_period_date = reset_period_dt.date()
+    current_date = get_beijing_time()
+    reset_period_date = await get_group_reset_period_start(chat_id, current_date)
 
     group_data = await db.get_group_cached(chat_id)
     reset_hour = group_data.get("reset_hour", Config.DAILY_RESET_HOUR)
@@ -3436,6 +3435,7 @@ async def show_rank(message: types.Message):
     found_any_data = False
 
     for act in activity_limits.keys():
+        # 🎯 修复：使用重置周期日期查询活动数据
         try:
             rows = await db.fetch_with_retry(
                 "获取活动排行榜",
@@ -3457,7 +3457,7 @@ async def show_rank(message: types.Message):
                 """,
                 act,
                 chat_id,
-                reset_period_date,  # ✅ 使用重置周期日期
+                reset_period_date,
                 act,
             )
 
