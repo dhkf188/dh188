@@ -610,16 +610,56 @@ async def reset_daily_data_if_needed(chat_id: int, uid: int):
 
 
 async def check_activity_limit(
-    chat_id: int, uid: int, act: str
+    chat_id: int,
+    uid: int,
+    act: str,
+    override_current_count: Optional[int] = None,  # 🎯 新增可选参数
 ) -> tuple[bool, int, int]:
-    """检查活动次数是否达到上限"""
-    await db.init_group(chat_id)
-    await db.init_user(chat_id, uid)
+    """
+    检查活动次数是否达到上限 - 增强版
 
-    current_count = await db.get_user_activity_count(chat_id, uid, act)
-    max_times = await db.get_activity_max_times(act)
+    参数:
+        chat_id: 群组ID
+        uid: 用户ID
+        act: 活动名称
+        override_current_count: 可选的当前次数覆盖值（用于二次重置场景）
 
-    return current_count < max_times, current_count, max_times
+    返回:
+        tuple[是否可以开始, 当前次数, 最大次数]
+    """
+    try:
+        # 确保群组和用户已初始化
+        await db.init_group(chat_id)
+        await db.init_user(chat_id, uid)
+
+        # 🎯 核心修复：支持覆盖当前次数
+        if override_current_count is not None:
+            # 使用传入的覆盖值（通常来自二次重置统计）
+            current_count = override_current_count
+            logger.debug(f"使用覆盖次数: {act} - 用户{uid} = {current_count}")
+        else:
+            # 正常查询数据库
+            current_count = await db.get_user_activity_count(chat_id, uid, act)
+            logger.debug(f"数据库查询次数: {act} - 用户{uid} = {current_count}")
+
+        # 获取活动最大次数限制
+        max_times = await db.get_activity_max_times(act)
+
+        # 检查是否还可以开始
+        can_start = current_count < max_times
+
+        logger.info(
+            f"次数检查: {act} - 用户{uid} - "
+            f"当前: {current_count}/{max_times} - "
+            f"可以开始: {can_start}"
+        )
+
+        return can_start, current_count, max_times
+
+    except Exception as e:
+        logger.error(f"检查活动次数限制失败 {chat_id}-{uid}-{act}: {e}")
+        # 出错时默认不允许打卡，避免数据不一致
+        return False, 0, 0
 
 
 async def has_active_activity(chat_id: int, uid: int) -> tuple[bool, Optional[str]]:
@@ -1023,11 +1063,19 @@ async def start_activity(message: types.Message, act: str):
                 chat_id, uid, "second"
             )
             current_count = user_stats.get("total_activity_count", 0)
+            logger.info(f"🎯 二次重置周期统计次数: {current_count}")
         else:
             current_count = await db.get_user_activity_count(chat_id, uid, act)
+            logger.info(f"🎯 一次重置周期数据库次数: {current_count}")
 
-        can_start, _, max_times = await check_activity_limit(
+        # 🎯 修复：调用修改后的 check_activity_limit 函数
+        can_start, check_count, max_times = await check_activity_limit(
             chat_id, uid, act, override_current_count=current_count
+        )
+
+        # 🎯 验证检查结果
+        logger.info(
+            f"🎯 检查结果 - 可以开始: {can_start}, 检查次数: {check_count}, 最大次数: {max_times}"
         )
 
         if not can_start:
@@ -1053,7 +1101,8 @@ async def start_activity(message: types.Message, act: str):
                 name,
                 act,
                 now.strftime("%m/%d %H:%M:%S"),
-                current_count + 1,
+                current_count
+                + 1,  # 🎯 注意：这里应该用 current_count，不是 check_count
                 max_times,
                 time_limit,
             ),
@@ -2472,7 +2521,7 @@ async def cmd_resettime(message: types.Message):
 @admin_required
 @rate_limit(rate=3, per=30)
 async def cmd_setsecondreset(message: types.Message):
-    """设置第二次重置时间"""
+    """设置第二次重置时间 - 增强版"""
     args = message.text.split()
 
     if len(args) == 1:
@@ -2495,7 +2544,8 @@ async def cmd_setsecondreset(message: types.Message):
                 f"• /setsecondreset enable - 启用第二次重置\n"
                 f"• /setsecondreset disable - 禁用第二次重置\n"
                 f"• /setsecondreset 14 30 - 设置下午2:30重置\n"
-                f"• /setsecondreset all 14 30 - 为所有用户设置",
+                f"• /setsecondreset 14 30 all - 为所有用户设置\n"
+                f"• /setsecondreset init - 初始化用户数据",
                 parse_mode="HTML",
             )
         else:
@@ -2504,7 +2554,8 @@ async def cmd_setsecondreset(message: types.Message):
                 f"❌ 状态：<b>未启用</b>\n\n"
                 f"💡 使用方法：\n"
                 f"• /setsecondreset enable - 启用第二次重置\n"
-                f"• /setsecondreset 14 30 - 设置下午2:30重置并启用",
+                f"• /setsecondreset 14 30 - 设置下午2:30重置并启用\n"
+                f"• /setsecondreset init - 初始化用户数据",
                 parse_mode="HTML",
             )
         return
@@ -2515,6 +2566,9 @@ async def cmd_setsecondreset(message: types.Message):
         user_id = message.from_user.id
 
         if action == "enable":
+            # 🎯 确保用户已初始化
+            await db.init_user(chat_id, user_id, message.from_user.full_name)
+
             await db.update_second_reset_time(
                 chat_id,
                 user_id,
@@ -2531,6 +2585,9 @@ async def cmd_setsecondreset(message: types.Message):
         elif action == "disable":
             await db.update_second_reset_time(chat_id, user_id, 0, 0, False)
             await message.answer("✅ 已禁用第二次重置")
+        elif action == "init":
+            # 调用初始化函数
+            await cmd_initallusers(message)
         else:
             await message.answer("❌ 未知命令。使用 /setsecondreset help 查看帮助")
         return
@@ -2544,30 +2601,106 @@ async def cmd_setsecondreset(message: types.Message):
                 chat_id = message.chat.id
                 user_id = message.from_user.id
 
-                # 检查是否是设置所有用户
-                if len(args) == 4 and args[3].lower() == "all":
+                # 🎯 检查是否是设置所有用户
+                if len(args) >= 4 and args[3].lower() == "all":
                     # 为群组所有用户设置
-                    group_members = await db.get_group_members(chat_id)
+
+                    # 🎯 首先初始化管理员自己
+                    await db.init_user(chat_id, user_id, message.from_user.full_name)
+
+                    # 尝试获取群组成员
+                    group_members = []
+                    try:
+                        group_members = await db.get_group_members(chat_id)
+                    except Exception as e:
+                        logger.warning(f"获取群组成员失败: {e}")
+
+                    # 🎯 如果没有成员，初始化当前管理员
+                    if not group_members:
+                        group_members = [{"user_id": user_id}]
+                        logger.info(f"群组 {chat_id} 没有已记录的用户，初始化管理员")
+
+                    affected_count = 0
+                    failed_count = 0
+
                     for member in group_members:
-                        await db.update_second_reset_time(
-                            chat_id, member["user_id"], hour, minute, True
+                        try:
+                            member_user_id = member["user_id"]
+                            # 确保用户已初始化
+                            member_nickname = member.get(
+                                "nickname", f"用户{member_user_id}"
+                            )
+                            await db.init_user(chat_id, member_user_id, member_nickname)
+
+                            # 设置第二次重置时间
+                            await db.update_second_reset_time(
+                                chat_id, member_user_id, hour, minute, True
+                            )
+                            affected_count += 1
+
+                            logger.debug(
+                                f"为用户 {member_user_id} 设置第二次重置时间: {hour:02d}:{minute:02d}"
+                            )
+
+                        except Exception as e:
+                            logger.error(
+                                f"设置用户 {member.get('user_id', 'unknown')} 第二次重置失败: {e}"
+                            )
+                            failed_count += 1
+
+                    # 🎯 构建响应消息
+                    response = (
+                        f"✅ 已为群组用户设置第二次重置\n"
+                        f"⏰ 重置时间：<code>{hour:02d}:{minute:02d}</code>\n"
+                        f"👥 成功设置：<code>{affected_count}</code> 人\n"
+                    )
+
+                    if failed_count > 0:
+                        response += f"❌ 设置失败：<code>{failed_count}</code> 人\n"
+
+                    if affected_count == 0:
+                        response += (
+                            f"\n⚠️ <b>重要提示</b>\n\n"
+                            f"没有用户被成功设置！\n\n"
+                            f"📋 <b>请按以下步骤操作：</b>\n"
+                            f"1. 让群成员使用机器人（点击按钮或发送 /start）\n"
+                            f"2. 成员使用后会自动被初始化\n"
+                            f"3. 再次运行此命令\n\n"
+                            f"💡 <b>快捷方式：</b>\n"
+                            f"发送 /setsecondreset init 初始化用户"
+                        )
+                    elif affected_count == 1:
+                        response += (
+                            f"\n💡 提示：\n"
+                            f"• 目前只有您自己启用了第二次重置\n"
+                            f"• 其他成员使用机器人后会自动应用此设置\n"
+                            f"• 或让他们自行使用 /setsecondreset enable"
+                        )
+                    else:
+                        response += (
+                            f"\n💡 提示：\n"
+                            f"• 新用户使用机器人后会自动应用此设置\n"
+                            f"• 用户可使用 /setsecondreset 查看自己的设置"
                         )
 
-                    await message.answer(
-                        f"✅ 已为群组所有用户设置第二次重置\n"
-                        f"⏰ 重置时间：<code>{hour:02d}:{minute:02d}</code>\n"
-                        f"👥 影响用户：{len(group_members)} 人",
-                        parse_mode="HTML",
-                    )
+                    await message.answer(response, parse_mode="HTML")
+
                 else:
                     # 为当前用户设置
+                    # 🎯 确保用户已初始化
+                    await db.init_user(chat_id, user_id, message.from_user.full_name)
+
                     await db.update_second_reset_time(
                         chat_id, user_id, hour, minute, True
                     )
 
                     await message.answer(
-                        f"✅ 已设置第二次重置\n"
-                        f"⏰ 重置时间：<code>{hour:02d}:{minute:02d}</code>",
+                        f"✅ 已为您设置第二次重置\n"
+                        f"⏰ 重置时间：<code>{hour:02d}:{minute:02d}</code>\n\n"
+                        f"💡 提示：\n"
+                        f"• 您的活动统计将分两个周期计算\n"
+                        f"• 使用 /setsecondreset 查看设置\n"
+                        f"• 使用 /setsecondreset disable 关闭",
                         parse_mode="HTML",
                     )
             else:
@@ -2578,6 +2711,139 @@ async def cmd_setsecondreset(message: types.Message):
         except Exception as e:
             logger.error(f"设置第二次重置失败: {e}")
             await message.answer(f"❌ 设置失败：{e}")
+
+@admin_required
+@rate_limit(rate=2, per=60)
+async def cmd_initallusers(message: types.Message):
+    """初始化所有群成员 - 增强版"""
+    chat_id = message.chat.id
+    admin_id = message.from_user.id
+    
+    await message.answer("⏳ 正在初始化群成员...")
+    
+    try:
+        # 确保群组已初始化
+        await db.init_group(chat_id)
+        
+        # 🎯 初始化当前管理员
+        admin_name = message.from_user.full_name or f"用户{admin_id}"
+        await db.init_user(chat_id, admin_id, admin_name)
+        
+        # 🎯 获取已存在的用户
+        existing_users = []
+        try:
+            existing_users = await db.get_group_members(chat_id)
+        except Exception as e:
+            logger.warning(f"获取现有用户失败: {e}")
+        
+        # 🎯 尝试初始化一些历史记录中的用户
+        additional_users = 0
+        try:
+            # 从月度统计表中查找曾使用过的用户
+            async with db.pool.acquire() as conn:
+                rows = await conn.fetch(
+                    """
+                    SELECT DISTINCT user_id 
+                    FROM monthly_statistics 
+                    WHERE chat_id = $1
+                    LIMIT 20
+                    """,
+                    chat_id
+                )
+                
+                for row in rows:
+                    user_id = row["user_id"]
+                    # 检查是否已经存在
+                    if not any(u["user_id"] == user_id for u in existing_users):
+                        try:
+                            await db.init_user(chat_id, user_id, f"用户{user_id}")
+                            existing_users.append({"user_id": user_id})
+                            additional_users += 1
+                            logger.info(f"从历史记录初始化用户: {user_id}")
+                        except Exception as e:
+                            logger.debug(f"初始化历史用户 {user_id} 失败: {e}")
+        except Exception as e:
+            logger.debug(f"查找历史用户失败: {e}")
+        
+        initialized_count = len(existing_users) if existing_users else 1
+        
+        response = (
+            f"✅ 用户初始化完成\n"
+            f"👥 已初始化用户：<code>{initialized_count}</code> 人\n"
+        )
+        
+        if additional_users > 0:
+            response += f"📜 从历史记录恢复：<code>{additional_users}</code> 人\n\n"
+        else:
+            response += "\n"
+        
+        if initialized_count <= 1:
+            response += (
+                f"⚠️ <b>重要提示</b>\n\n"
+                f"由于 Telegram 隐私限制，机器人无法主动获取群成员列表。\n\n"
+                f"📋 <b>请按以下步骤操作：</b>\n"
+                f"1. 在群里通知所有成员使用机器人\n"
+                f"2. 让成员点击'我的记录'或发送 /start\n"
+                f"3. 成员使用后会自动被初始化\n"
+                f"4. 然后使用 <code>/setsecondreset 14 30 all</code> 为所有人设置\n\n"
+                f"💡 <b>快捷操作：</b>\n"
+                f"• 让成员点击这里 → /start\n"
+                f"• 或者发送群组邀请链接让成员加入\n\n"
+                f"🔄 <b>立即设置第二次重置：</b>\n"
+                f"<code>/setsecondreset 14 30 all</code>\n"
+                f"(这会对已初始化的 {initialized_count} 个用户生效)"
+            )
+        elif initialized_count <= 5:
+            response += (
+                f"✅ 现有用户已初始化完成\n\n"
+                f"💡 <b>建议操作：</b>\n"
+                f"1. 通知更多成员使用机器人\n"
+                f"2. 然后运行：<code>/setsecondreset 14 30 all</code>\n\n"
+                f"🔄 <b>立即设置第二次重置：</b>\n"
+                f"<code>/setsecondreset 14 30 all</code>\n"
+                f"(这会对 {initialized_count} 个已初始化的用户生效)"
+            )
+        else:
+            response += (
+                f"✅ 现有用户已全部初始化\n\n"
+                f"💡 <b>现在可以设置第二次重置：</b>\n"
+                f"<code>/setsecondreset 14 30 all</code>\n"
+                f"为所有 {initialized_count} 个用户设置第二次重置时间\n\n"
+                f"🔧 <b>其他选项：</b>\n"
+                f"• <code>/setsecondreset enable</code> - 为自己启用\n"
+                f"• <code>/setsecondreset 14 30</code> - 为自己设置时间"
+            )
+        
+        await message.answer(response, parse_mode="HTML")
+        
+        # 🎯 自动显示当前用户列表（如果用户较多则不显示）
+        if 1 < initialized_count <= 10:
+            try:
+                user_list = []
+                for user in existing_users:
+                    user_id = user.get("user_id")
+                    nickname = user.get("nickname", f"用户{user_id}")
+                    user_list.append(f"• {nickname} (ID: {user_id})")
+                
+                if user_list:
+                    list_text = "📋 <b>已初始化用户列表：</b>\n" + "\n".join(user_list[:10])
+                    if len(user_list) > 10:
+                        list_text += f"\n... 还有 {len(user_list) - 10} 个用户"
+                    
+                    await message.answer(list_text, parse_mode="HTML")
+            except Exception as e:
+                logger.debug(f"显示用户列表失败: {e}")
+        
+    except Exception as e:
+        logger.error(f"初始化用户失败: {e}")
+        await message.answer(
+            f"❌ 初始化失败：{str(e)[:100]}\n\n"
+            f"💡 请确保：\n"
+            f"1. 机器人已添加到群组\n"
+            f"2. 数据库连接正常\n"
+            f"3. 稍后重试或联系管理员",
+            parse_mode="HTML",
+        )
 
 
 @admin_required
