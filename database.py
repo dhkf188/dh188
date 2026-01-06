@@ -1611,62 +1611,34 @@ class PostgreSQLDatabase:
     async def has_work_record_today(
         self, chat_id: int, user_id: int, checkin_type: str
     ) -> bool:
-        """检查当前重置周期内是否有上下班记录 - 完整修复版"""
+        """检查今天是否有上下班记录 - 每个群组独立重置时间"""
         try:
-            # 🎯 获取群组重置时间
+            # 每个群组独立的重置时间计算
             group_data = await self.get_group_cached(chat_id)
             reset_hour = group_data.get("reset_hour", Config.DAILY_RESET_HOUR)
             reset_minute = group_data.get("reset_minute", Config.DAILY_RESET_MINUTE)
 
             now = self.get_beijing_time()
-
-            # 🎯 计算当前重置周期的开始和结束时间
             reset_time_today = now.replace(
                 hour=reset_hour, minute=reset_minute, second=0, microsecond=0
             )
 
+            # 计算当前重置周期开始时间
             if now < reset_time_today:
                 period_start = reset_time_today - timedelta(days=1)
             else:
                 period_start = reset_time_today
 
-            period_end = period_start + timedelta(days=1)
-
             self._ensure_pool_initialized()
             async with self.pool.acquire() as conn:
                 row = await conn.fetchrow(
-                    """
-                    SELECT 1 FROM work_records 
-                    WHERE chat_id = $1 
-                    AND user_id = $2 
-                    AND checkin_type = $3
-                    AND record_date >= $4 
-                    AND record_date < $5
-                    LIMIT 1
-                    """,
+                    "SELECT 1 FROM work_records WHERE chat_id = $1 AND user_id = $2 AND checkin_type = $3 AND record_date >= $4",
                     chat_id,
                     user_id,
                     checkin_type,
                     period_start.date(),
-                    period_end.date(),
                 )
-
-                result = row is not None
-
-                # 详细日志
-                if result:
-                    logger.debug(
-                        f"✅ 找到{checkin_type}记录: {chat_id}-{user_id}, "
-                        f"周期: {period_start.date()}~{period_end.date()}"
-                    )
-                else:
-                    logger.debug(
-                        f"❌ 未找到{checkin_type}记录: {chat_id}-{user_id}, "
-                        f"周期: {period_start.date()}~{period_end.date()}"
-                    )
-
-                return result
-
+                return row is not None
         except Exception as e:
             logger.error(f"检查工作记录失败 {chat_id}-{user_id}: {e}")
             return False
@@ -1675,125 +1647,61 @@ class PostgreSQLDatabase:
     async def get_today_work_records_fixed(
         self, chat_id: int, user_id: int
     ) -> Dict[str, Dict]:
-        """修复版：获取用户当前重置周期的上下班记录 - 完整修复版"""
+        """修复版：获取用户今天的上下班记录 - 每个群组独立重置时间"""
         try:
-            # 🎯 获取群组重置时间
+            # 获取群组重置时间
             group_data = await self.get_group_cached(chat_id)
             reset_hour = group_data.get("reset_hour", Config.DAILY_RESET_HOUR)
             reset_minute = group_data.get("reset_minute", Config.DAILY_RESET_MINUTE)
 
             now = self.get_beijing_time()
 
-            # 🎯 计算当前重置周期的开始时间
+            # 计算今天的重置时间点
             reset_time_today = now.replace(
                 hour=reset_hour, minute=reset_minute, second=0, microsecond=0
             )
 
+            # 确定当前重置周期的开始时间
             if now < reset_time_today:
                 period_start = reset_time_today - timedelta(days=1)
             else:
                 period_start = reset_time_today
 
-            # 🎯 计算当前重置周期的结束时间（下一个重置时间）
-            period_end = period_start + timedelta(days=1)
-
-            logger.debug(
-                f"工作记录查询参数: chat_id={chat_id}, user_id={user_id}, "
-                f"重置时间={reset_hour:02d}:{reset_minute:02d}, "
-                f"周期开始={period_start.date()}, 周期结束={period_end.date()}"
-            )
-
-            # 🎯 查询当前重置周期内的记录（包含开始，不包含结束）
+            # 查询从重置周期开始到现在的记录
             async with self.pool.acquire() as conn:
                 rows = await conn.fetch(
                     """
                     SELECT * FROM work_records 
                     WHERE chat_id = $1 
                     AND user_id = $2 
-                    AND record_date >= $3 
-                    AND record_date < $4
-                    ORDER BY record_date DESC, created_at DESC
+                    AND record_date >= $3
+                    AND record_date <= $4
+                    ORDER BY record_date DESC, checkin_type
                     """,
                     chat_id,
                     user_id,
                     period_start.date(),
-                    period_end.date(),
+                    now.date(),  # 添加上限，避免查询未来日期
                 )
 
                 records = {}
                 for row in rows:
-                    checkin_type = row["checkin_type"]
-                    record_date = row["record_date"]
-
-                    # 🎯 只保留每个类型的最新记录
-                    if checkin_type not in records:
-                        records[checkin_type] = dict(row)
-                    elif record_date > records[checkin_type]["record_date"]:
-                        records[checkin_type] = dict(row)
-                    elif record_date == records[checkin_type]["record_date"]:
-                        # 同一天有多个记录，取最新的（按创建时间）
-                        existing_time = records[checkin_type].get("created_at")
-                        current_time = row.get("created_at")
-                        if (
-                            current_time
-                            and existing_time
-                            and current_time > existing_time
-                        ):
-                            records[checkin_type] = dict(row)
-
-                # 🎯 检查是否有跨天的情况
-                if not records:
-                    # 如果当前周期没有记录，检查前一天是否有未结束的工作
-                    previous_day = period_start.date() - timedelta(days=1)
-                    previous_rows = await conn.fetch(
-                        """
-                        SELECT * FROM work_records 
-                        WHERE chat_id = $1 
-                        AND user_id = $2 
-                        AND record_date = $3
-                        AND checkin_type = 'work_start'
-                        ORDER BY created_at DESC
-                        LIMIT 1
-                        """,
-                        chat_id,
-                        user_id,
-                        previous_day,
-                    )
-
-                    if previous_rows:
-                        # 检查前一天是否有上班但没下班
-                        previous_work_end = await conn.fetch(
-                            """
-                            SELECT 1 FROM work_records 
-                            WHERE chat_id = $1 
-                            AND user_id = $2 
-                            AND record_date = $3
-                            AND checkin_type = 'work_end'
-                            LIMIT 1
-                            """,
-                            chat_id,
-                            user_id,
-                            previous_day,
-                        )
-
-                        if not previous_work_end:
-                            # 前一天有上班但没下班，跨天未结束工作
-                            records["work_start"] = dict(previous_rows[0])
-                            logger.debug(f"检测到跨天未结束工作: {chat_id}-{user_id}")
+                    # 按记录日期分组，只取每个类型的最新记录
+                    record_key = f"{row['record_date']}_{row['checkin_type']}"
+                    if (
+                        row["checkin_type"] not in records
+                        or row["record_date"]
+                        > records[row["checkin_type"]]["record_date"]
+                    ):
+                        records[row["checkin_type"]] = dict(row)
 
                 logger.debug(
-                    f"工作记录查询结果: {chat_id}-{user_id}, "
-                    f"周期: {period_start.date()} ({reset_hour:02d}:{reset_minute:02d}), "
-                    f"查询到记录: {len(rows)} 条, 处理后: {len(records)} 条"
+                    f"工作记录查询: {chat_id}-{user_id}, 重置周期: {period_start.date()}, 记录数: {len(records)}"
                 )
-
                 return records
 
         except Exception as e:
             logger.error(f"获取工作记录失败 {chat_id}-{user_id}: {e}")
-            import traceback
-
-            logger.error(f"详细错误: {traceback.format_exc()}")
             return {}
 
     # ========== 活动配置操作 ==========
