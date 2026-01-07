@@ -534,6 +534,7 @@ class PostgreSQLDatabase:
                     total_fines INTEGER DEFAULT 0,
                     overtime_count INTEGER DEFAULT 0,
                     total_overtime_time INTEGER DEFAULT 0,
+                    reset_period_start TIMESTAMP,
                     last_updated DATE,
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
@@ -919,29 +920,37 @@ class PostgreSQLDatabase:
         nickname: str = None,
         target_datetime: datetime = None,
     ):
-        """初始化用户 - 使用重置周期日期"""
+        """初始化用户（仅首次写入 reset_period_start）"""
         if target_datetime is None:
             target_datetime = self.get_beijing_time()
 
-        # 🎯 使用重置周期日期
+        # 🎯 计算当前重置周期起点
         period_date = await self.get_reset_period_date(chat_id, target_datetime)
 
         await self.execute_with_retry(
             "初始化用户",
             """
-            INSERT INTO users (chat_id, user_id, nickname, last_updated) 
-            VALUES ($1, $2, $3, $4) 
-            ON CONFLICT (chat_id, user_id) 
-            DO UPDATE SET 
-                nickname = COALESCE($3, users.nickname),
-                last_updated = $4,
+            INSERT INTO users (
+                chat_id,
+                user_id,
+                nickname,
+                reset_period_start,
+                last_updated
+            )
+            VALUES ($1, $2, $3, $4, $4)
+            ON CONFLICT (chat_id, user_id)
+            DO UPDATE SET
+                nickname = COALESCE(EXCLUDED.nickname, users.nickname),
+                last_updated = EXCLUDED.last_updated,
                 updated_at = CURRENT_TIMESTAMP
             """,
             chat_id,
             user_id,
             nickname,
-            period_date,  # 🎯 使用重置周期日期
+            period_date,
         )
+
+        # 🔴 非常重要：清理缓存
         self._cache.pop(f"user:{chat_id}:{user_id}", None)
 
     async def update_user_last_updated(
@@ -984,21 +993,34 @@ class PostgreSQLDatabase:
             return result
         return None
 
-    async def get_user_cached(self, chat_id: int, user_id: int) -> Optional[Dict]:
-        """带缓存的获取用户数据 - 优化版"""
+    async def get_user_cached(
+        self,
+        chat_id: int,
+        user_id: int,
+    ) -> Optional[Dict]:
+        """带缓存的获取用户数据（包含 reset_period_start）"""
         cache_key = f"user:{chat_id}:{user_id}"
         cached = self._get_cached(cache_key)
         if cached is not None:
             return cached
 
-        # 只查询需要的字段，避免 SELECT *
         row = await self.fetchrow_with_retry(
             "获取用户数据",
             """
-            SELECT user_id, nickname, current_activity, activity_start_time, 
-                total_accumulated_time, total_activity_count, total_fines,
-                overtime_count, total_overtime_time, last_updated
-            FROM users WHERE chat_id = $1 AND user_id = $2
+            SELECT
+                user_id,
+                nickname,
+                current_activity,
+                activity_start_time,
+                total_accumulated_time,
+                total_activity_count,
+                total_fines,
+                overtime_count,
+                total_overtime_time,
+                reset_period_start,   -- ⭐ 必须加
+                last_updated
+            FROM users
+            WHERE chat_id = $1 AND user_id = $2
             """,
             chat_id,
             user_id,
@@ -1007,8 +1029,9 @@ class PostgreSQLDatabase:
         if row:
             result = dict(row)
             # 用户数据变化频繁，设置较短缓存时间
-            self._set_cached(cache_key, result, 30)  # 30秒缓存
+            self._set_cached(cache_key, result, 30)
             return result
+
         return None
 
     async def update_user_activity(
@@ -1109,9 +1132,8 @@ class PostgreSQLDatabase:
         fine_amount: int = 0,
         is_overtime: bool = False,
     ):
-        """完成用户活动 - 修复版（不更新 users.total_*）"""
+        """完成用户活动（不负责重置周期）"""
         current_time = self.get_beijing_time()
-        period_date = await self.get_reset_period_date(chat_id, current_time)
         statistic_date = current_time.date().replace(day=1)
 
         # 计算超时
@@ -1124,7 +1146,8 @@ class PostgreSQLDatabase:
 
         async with self.pool.acquire() as conn:
             async with conn.transaction():
-                # ✅ 1. 只更新用户状态（不更新统计字段）
+
+                # ✅ 1. 只清理当前活动状态（⚠️ 不更新 reset_period_start）
                 await conn.execute(
                     """
                     UPDATE users SET
@@ -1132,34 +1155,29 @@ class PostgreSQLDatabase:
                         activity_start_time = NULL,
                         last_updated = $1,
                         updated_at = CURRENT_TIMESTAMP
-                    WHERE chat_id=$2 AND user_id=$3
+                    WHERE chat_id = $2 AND user_id = $3
                     """,
                     current_time,
                     chat_id,
                     user_id,
                 )
 
-                # ✅ 2. 更新周期活动表
+                # ✅ 2. 写入【原始活动日志】—— 用于日常统计（推荐）
                 await conn.execute(
                     """
-                    INSERT INTO user_activities
-                        (chat_id, user_id, activity_date, activity_name, activity_count, accumulated_time)
+                    INSERT INTO user_activity_log
+                        (chat_id, user_id, activity_name, start_time, elapsed_time)
                     VALUES
-                        ($1, $2, $3, $4, 1, $5)
-                    ON CONFLICT (chat_id, user_id, activity_date, activity_name)
-                    DO UPDATE SET
-                        activity_count = user_activities.activity_count + 1,
-                        accumulated_time = user_activities.accumulated_time + EXCLUDED.accumulated_time,
-                        updated_at = CURRENT_TIMESTAMP
+                        ($1, $2, $3, $4, $5)
                     """,
                     chat_id,
                     user_id,
-                    period_date,
                     activity,
+                    current_time,
                     elapsed_time,
                 )
 
-                # ✅ 3. 更新月度统计（用于历史报告）
+                # ✅ 3. 月度统计（完全保留，用于历史）
                 await conn.execute(
                     """
                     INSERT INTO monthly_statistics
@@ -1179,7 +1197,7 @@ class PostgreSQLDatabase:
                     elapsed_time,
                 )
 
-                # ✅ 4. 如果有罚款，记录到月度统计
+                # ✅ 4. 罚款（月度）
                 if fine_amount > 0:
                     await conn.execute(
                         """
@@ -1198,7 +1216,7 @@ class PostgreSQLDatabase:
                         fine_amount,
                     )
 
-                # ✅ 5. 如果有超时，记录到月度统计
+                # ✅ 5. 超时（月度）
                 if is_overtime and overtime_seconds > 0:
                     await conn.execute(
                         """
@@ -1498,24 +1516,28 @@ class PostgreSQLDatabase:
         activity: str,
         target_datetime: datetime = None,
     ) -> int:
-        """获取用户当前重置周期内的活动次数"""
+        """获取用户当前重置周期内的活动次数（基于 reset_period_start）"""
         try:
-            # 🎯 使用重置周期日期，而不是自然日
-            period_date = await self.get_reset_period_date(chat_id, target_datetime)
-
             self._ensure_pool_initialized()
+
             async with self.pool.acquire() as conn:
                 row = await conn.fetchrow(
                     """
-                    SELECT activity_count FROM user_activities 
-                    WHERE chat_id = $1 AND user_id = $2 
-                    AND activity_date = $3 AND activity_name = $4
+                    SELECT COUNT(*) AS activity_count
+                    FROM user_activity_log l
+                    JOIN users u
+                      ON u.chat_id = l.chat_id
+                     AND u.user_id = l.user_id
+                    WHERE l.chat_id = $1
+                      AND l.user_id = $2
+                      AND l.activity_name = $3
+                      AND l.start_time >= u.reset_period_start
                     """,
                     chat_id,
                     user_id,
-                    period_date,  # 🎯 关键：使用重置周期日期
                     activity,
                 )
+
                 return row["activity_count"] if row else 0
 
         except Exception as e:
