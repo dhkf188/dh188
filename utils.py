@@ -994,33 +994,32 @@ def rate_limit(rate: int = 1, per: int = 1):
 async def get_group_reset_period_start(
     chat_id: int, current_time: datetime = None
 ) -> datetime:
-    """获取群组的重置周期开始时间 - 统一版本"""
+    """获取群组的重置周期开始时间 - 增强版"""
     if current_time is None:
         current_time = get_beijing_time()
 
     try:
-        # 使用全局 db 实例
-        group_data = await db.get_group_cached(chat_id)
-        if not group_data:
-            # 如果群组不存在，初始化群组
-            await db.init_group(chat_id)
-            group_data = await db.get_group_cached(chat_id)
+        # 🎯 直接调用 database.py 中的统一方法
+        period_date = await db.get_reset_period_date(chat_id, current_time)
 
+        # 转换为完整的 datetime
+        group_data = await db.get_group_cached(chat_id)
         reset_hour = group_data.get("reset_hour", Config.DAILY_RESET_HOUR)
         reset_minute = group_data.get("reset_minute", Config.DAILY_RESET_MINUTE)
 
-        reset_time_today = current_time.replace(
-            hour=reset_hour, minute=reset_minute, second=0, microsecond=0
+        return datetime(
+            year=period_date.year,
+            month=period_date.month,
+            day=period_date.day,
+            hour=reset_hour,
+            minute=reset_minute,
+            second=0,
+            tzinfo=beijing_tz,
         )
-
-        if current_time < reset_time_today:
-            return reset_time_today - timedelta(days=1)
-        else:
-            return reset_time_today
 
     except Exception as e:
         logger.error(f"计算重置周期失败 {chat_id}: {e}")
-        # 出错时返回默认重置时间
+        # 后备方案
         return current_time.replace(
             hour=Config.DAILY_RESET_HOUR,
             minute=Config.DAILY_RESET_MINUTE,
@@ -1029,71 +1028,21 @@ async def get_group_reset_period_start(
         )
 
 
-# 在 utils.py 中添加以下函数
+async def get_current_period_date(chat_id: int, current_time: datetime = None) -> date:
+    """获取当前重置周期日期（快捷函数）"""
+    if current_time is None:
+        current_time = get_beijing_time()
+
+    return await db.get_reset_period_date(chat_id, current_time)
 
 
-async def get_reset_period_date(chat_id: int, target_date: datetime = None) -> date:
-    """根据群组重置时间获取重置周期日期"""
-    if target_date is None:
-        target_date = get_beijing_time()
-
-    try:
-        # 获取群组重置时间
-        group_data = await db.get_group_cached(chat_id)
-        if not group_data:
-            await db.init_group(chat_id)
-            group_data = await db.get_group_cached(chat_id)
-
-        reset_hour = group_data.get("reset_hour", Config.DAILY_RESET_HOUR)
-        reset_minute = group_data.get("reset_minute", Config.DAILY_RESET_MINUTE)
-
-        # 计算重置时间点
-        reset_time = target_date.replace(
-            hour=reset_hour, minute=reset_minute, second=0, microsecond=0
-        )
-
-        # 判断当前时间是否在重置周期内
-        if target_date < reset_time:
-            # 当前时间在今天重置时间之前，属于昨天的周期
-            return (reset_time - timedelta(days=1)).date()
-        else:
-            # 当前时间在今天重置时间之后，属于今天的周期
-            return reset_time.date()
-
-    except Exception as e:
-        logger.error(f"计算重置周期日期失败 {chat_id}: {e}")
-        return target_date.date()
-
-
-async def get_reset_period_start_datetime(
-    chat_id: int, target_dt: datetime = None
-) -> datetime:
-    """获取重置周期开始的完整日期时间"""
-    if target_dt is None:
-        target_dt = get_beijing_time()
-
-    try:
-        group_data = await db.get_group_cached(chat_id)
-        reset_hour = group_data.get("reset_hour", Config.DAILY_RESET_HOUR)
-        reset_minute = group_data.get("reset_minute", Config.DAILY_RESET_MINUTE)
-
-        reset_time_today = target_dt.replace(
-            hour=reset_hour, minute=reset_minute, second=0, microsecond=0
-        )
-
-        if target_dt < reset_time_today:
-            return reset_time_today - timedelta(days=1)
-        else:
-            return reset_time_today
-
-    except Exception as e:
-        logger.error(f"获取重置周期开始时间失败 {chat_id}: {e}")
-        return target_dt.replace(
-            hour=Config.DAILY_RESET_HOUR,
-            minute=Config.DAILY_RESET_MINUTE,
-            second=0,
-            microsecond=0,
-        )
+async def is_in_same_period(chat_id: int, dt1: datetime, dt2: datetime) -> bool:
+    """
+    判断两个时间点是否属于同一个重置周期
+    """
+    period1 = await db.get_reset_period_date(chat_id, dt1)
+    period2 = await db.get_reset_period_date(chat_id, dt2)
+    return period1 == period2
 
 
 # ========== 重置通知函数 ==========
