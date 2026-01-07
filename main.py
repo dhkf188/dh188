@@ -3347,19 +3347,16 @@ async def handle_all_text_messages(message: types.Message):
 
 # ========== 用户功能 ==========
 async def show_history(message: types.Message):
-    """显示用户历史记录（最终安全版，完全基于周期表统计）"""
+    """显示用户历史记录（最终正确版，基于 reset_period_start）"""
 
     chat_id = message.chat.id
     uid = message.from_user.id
     current_time = get_beijing_time()
 
-    # 🧠 确保执行周期重置
+    # 🧠 确保周期正确
     await reset_daily_data_if_needed(chat_id, uid, current_time)
 
-    # 🎯 当前重置周期日期
-    reset_period_date = await db.get_reset_period_date(chat_id, current_time)
-
-    # 读取用户基础信息
+    # 读取用户
     user_data = await db.get_user_cached(chat_id, uid)
     if not user_data:
         await message.answer(
@@ -3370,68 +3367,78 @@ async def show_history(message: types.Message):
         )
         return
 
-    first_line = (
-        f"👤 用户：{MessageFormatter.format_user_link(uid, user_data['nickname'])}"
-    )
-
     # 读取群组重置时间
     group_data = await db.get_group_cached(chat_id)
     reset_hour = group_data.get("reset_hour", Config.DAILY_RESET_HOUR)
     reset_minute = group_data.get("reset_minute", Config.DAILY_RESET_MINUTE)
 
-    text = (
-        f"{first_line}\n"
-        f"📅 统计周期：<code>{reset_period_date.strftime('%Y-%m-%d')}</code> "
-        f"（重置时间：{reset_hour:02d}:{reset_minute:02d}）\n"
-        f"📊 当前周期记录：\n\n"
+    first_line = (
+        f"👤 用户：{MessageFormatter.format_user_link(uid, user_data['nickname'])}"
     )
 
-    has_records = False
-    activity_limits = await db.get_activity_limits_cached()
+    text = (
+        f"{first_line}\n"
+        f"📊 当前统计周期记录\n"
+        f"⏰ 重置时间：{reset_hour:02d}:{reset_minute:02d}\n\n"
+    )
 
-    # 🎯 查询周期活动数据
-    user_activities = {}
+    activity_limits = await db.get_activity_limits_cached()
+    has_records = False
     period_total_time = 0
     period_total_count = 0
 
+    # ✅ 核心：只统计 reset_period_start 之后的数据
     rows = await db.fetch_with_retry(
-        "获取用户周期活动",
+        "获取当前周期用户活动",
         """
-        SELECT activity_name, activity_count, accumulated_time
-        FROM user_activities
-        WHERE chat_id = $1 AND user_id = $2 AND activity_date = $3
+        SELECT
+            l.activity_name,
+            COUNT(*) AS activity_count,
+            COALESCE(SUM(l.elapsed_time), 0) AS accumulated_time
+        FROM user_activity_log l
+        JOIN users u
+          ON u.chat_id = l.chat_id
+         AND u.user_id = l.user_id
+        WHERE l.chat_id = $1
+          AND l.user_id = $2
+          AND l.start_time >= u.reset_period_start
+        GROUP BY l.activity_name
         """,
         chat_id,
         uid,
-        reset_period_date,
     )
 
-    for row in rows:
-        name = row["activity_name"]
-        count = int(row["activity_count"])
-        time = int(row["accumulated_time"])
+    activity_map = {
+        row["activity_name"]: {
+            "count": int(row["activity_count"]),
+            "time": int(row["accumulated_time"]),
+        }
+        for row in rows
+    }
 
-        user_activities[name] = {"count": count, "time": time}
-        period_total_time += time
-        period_total_count += count
+    for act, limit in activity_limits.items():
+        info = activity_map.get(act)
+        if not info:
+            continue
 
-    # 展示每个活动
-    for act in activity_limits.keys():
-        info = user_activities.get(act, {})
-        count = info.get("count", 0)
-        time = info.get("time", 0)
-        max_times = activity_limits[act]["max_times"]
+        count = info["count"]
+        time = info["time"]
+        max_times = limit["max_times"]
 
         if count > 0 or time > 0:
             has_records = True
+            period_total_time += time
+            period_total_count += count
+
             status = "✅" if count < max_times else "❌"
             time_str = MessageFormatter.format_time(time)
+
             text += (
                 f"• <code>{act}</code>：<code>{time_str}</code>，"
                 f"次数：<code>{count}</code>/<code>{max_times}</code> {status}\n"
             )
 
-    # 💰 罚款：只从月度统计读取
+    # 💰 罚款只看月度（这是对的，不动）
     statistic_date = current_time.date().replace(day=1)
     total_fine = 0
 
@@ -3440,8 +3447,10 @@ async def show_history(message: types.Message):
             """
             SELECT COALESCE(SUM(accumulated_time), 0) AS total
             FROM monthly_statistics
-            WHERE chat_id = $1 AND user_id = $2
-              AND statistic_date = $3 AND activity_name = 'total_fines'
+            WHERE chat_id = $1
+              AND user_id = $2
+              AND statistic_date = $3
+              AND activity_name = 'total_fines'
             """,
             chat_id,
             uid,
@@ -3449,15 +3458,14 @@ async def show_history(message: types.Message):
         )
         total_fine = int(row["total"])
 
-    # 汇总显示
-    text += f"\n📈 当前周期总统计：\n"
+    text += "\n📈 当前周期总统计：\n"
     text += f"• 总累计时间：<code>{MessageFormatter.format_time(period_total_time)}</code>\n"
     text += f"• 总活动次数：<code>{period_total_count}</code> 次\n"
 
     if total_fine > 0:
         text += f"• 累计罚款：<code>{total_fine}</code> 元\n"
 
-    if not has_records and period_total_count == 0:
+    if not has_records:
         text += "暂无记录，请先进行打卡活动"
 
     await message.answer(
@@ -3470,19 +3478,14 @@ async def show_history(message: types.Message):
 
 
 async def show_rank(message: types.Message):
-    """显示排行榜（最终安全版，完全基于周期数据）"""
+    """显示排行榜（最终正确版，基于 reset_period_start）"""
 
     chat_id = message.chat.id
     uid = message.from_user.id
-
-    await db.init_group(chat_id)
-
     current_time = get_beijing_time()
 
-    # 🧠 确保周期正确
+    await db.init_group(chat_id)
     await reset_daily_data_if_needed(chat_id, uid, current_time)
-
-    period_date = await db.get_reset_period_date(chat_id, current_time)
 
     group_data = await db.get_group_cached(chat_id)
     reset_hour = group_data.get("reset_hour", Config.DAILY_RESET_HOUR)
@@ -3495,7 +3498,6 @@ async def show_rank(message: types.Message):
 
     rank_text = (
         f"🏆 当前周期活动排行榜\n"
-        f"📅 统计周期：<code>{period_date.strftime('%Y-%m-%d')}</code>\n"
         f"⏰ 重置时间：<code>{reset_hour:02d}:{reset_minute:02d}</code>\n\n"
     )
 
@@ -3509,20 +3511,26 @@ async def show_rank(message: types.Message):
                 SELECT
                     u.user_id,
                     u.nickname,
-                    COALESCE(ua.accumulated_time, 0) AS total_time,
-                    COALESCE(ua.activity_count, 0) AS total_count,
+                    COALESCE(t.total_time, 0) AS total_time,
+                    COALESCE(t.total_count, 0) AS total_count,
                     (u.current_activity = $1) AS is_active
                 FROM users u
-                LEFT JOIN user_activities ua
-                    ON u.chat_id = ua.chat_id
-                    AND u.user_id = ua.user_id
-                    AND ua.activity_name = $1
-                    AND ua.activity_date = $3
+                LEFT JOIN (
+                    SELECT
+                        l.user_id,
+                        COUNT(*) AS total_count,
+                        SUM(l.elapsed_time) AS total_time
+                    FROM user_activity_log l
+                    JOIN users u2
+                      ON u2.chat_id = l.chat_id
+                     AND u2.user_id = l.user_id
+                    WHERE l.chat_id = $2
+                      AND l.activity_name = $1
+                      AND l.start_time >= u2.reset_period_start
+                    GROUP BY l.user_id
+                ) t ON t.user_id = u.user_id
                 WHERE u.chat_id = $2
-                AND (
-                    ua.activity_count IS NOT NULL
-                    OR u.current_activity = $1
-                )
+                  AND (t.total_count IS NOT NULL OR u.current_activity = $1)
                 ORDER BY
                     total_time DESC,
                     is_active DESC
@@ -3530,43 +3538,40 @@ async def show_rank(message: types.Message):
                 """,
                 act,
                 chat_id,
-                period_date,
             )
 
-            if rows:
-                found_any_data = True
-                rank_text += f"📈 <code>{act}</code>：\n"
+            if not rows:
+                continue
 
-                for i, row in enumerate(rows, 1):
-                    uid2 = row["user_id"]
-                    nickname = row["nickname"]
-                    total_time = int(row["total_time"])
-                    count = int(row["total_count"])
-                    is_active = row["is_active"]
+            found_any_data = True
+            rank_text += f"📈 <code>{act}</code>：\n"
 
-                    if is_active:
-                        rank_text += (
-                            f"  <code>{i}.</code> 🟡 "
-                            f"{MessageFormatter.format_user_link(uid2, nickname)} - 进行中\n"
-                        )
-                    else:
-                        time_str = MessageFormatter.format_time(total_time)
-                        rank_text += (
-                            f"  <code>{i}.</code> 🟢 "
-                            f"{MessageFormatter.format_user_link(uid2, nickname)} - {time_str} ({count}次)\n"
-                        )
+            for i, row in enumerate(rows, 1):
+                uid2 = row["user_id"]
+                nickname = row["nickname"]
+                total_time = int(row["total_time"])
+                count = int(row["total_count"])
+                is_active = row["is_active"]
 
-                rank_text += "\n"
+                if is_active:
+                    rank_text += (
+                        f"  <code>{i}.</code> 🟡 "
+                        f"{MessageFormatter.format_user_link(uid2, nickname)} - 进行中\n"
+                    )
+                else:
+                    time_str = MessageFormatter.format_time(total_time)
+                    rank_text += (
+                        f"  <code>{i}.</code> 🟢 "
+                        f"{MessageFormatter.format_user_link(uid2, nickname)} - {time_str} ({count}次)\n"
+                    )
+
+            rank_text += "\n"
 
         except Exception as e:
             logger.error(f"查询活动 {act} 排行榜失败: {e}")
 
     if not found_any_data:
-        rank_text += (
-            "📊 当前周期还没有活动记录\n"
-            "💪 开始第一个活动吧！\n\n"
-            "💡 提示：开始活动后会立即显示在这里"
-        )
+        rank_text += "📊 当前周期还没有活动记录\n" "💪 开始第一个活动吧！"
 
     await message.answer(
         rank_text,
