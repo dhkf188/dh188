@@ -743,11 +743,6 @@ class PostgreSQLDatabase:
         self._ensure_pool_initialized()
         return await self.pool.acquire()
 
-    async def release_connection(self, conn):
-        """释放数据库连接"""
-        if self.pool:
-            await self.pool.release(conn)
-
     async def close(self):
         """关闭数据库连接"""
         try:
@@ -988,25 +983,6 @@ class PostgreSQLDatabase:
             self._set_cached(cache_key, result, 30)
             return result
         return None
-
-    async def get_activity_count(
-        self, chat_id: int, user_id: int, activity: str
-    ) -> int:
-        today = self.get_beijing_date()
-        count = await self.execute_with_retry(
-            "获取活动次数",
-            """
-            SELECT activity_count FROM user_activities 
-            WHERE chat_id = $1 AND user_id = $2 AND activity_date = $3 AND activity_name = $4
-            """,
-            chat_id,
-            user_id,
-            today,
-            activity,
-            fetchval=True,  # 🎯 只需要单个值
-            timeout=5,  # 🎯 简单查询设置短超时
-        )
-        return count if count else 0
 
     async def get_user_cached(self, chat_id: int, user_id: int) -> Optional[Dict]:
         """带缓存的获取用户数据 - 优化版"""
@@ -1742,102 +1718,6 @@ class PostgreSQLDatabase:
                     )
 
             self._cache.pop(f"user:{chat_id}:{user_id}", None)
-
-    async def has_work_record_today(
-        self, chat_id: int, user_id: int, checkin_type: str
-    ) -> bool:
-        """检查今天是否有上下班记录 - 每个群组独立重置时间"""
-        try:
-            # 每个群组独立的重置时间计算
-            group_data = await self.get_group_cached(chat_id)
-            reset_hour = group_data.get("reset_hour", Config.DAILY_RESET_HOUR)
-            reset_minute = group_data.get("reset_minute", Config.DAILY_RESET_MINUTE)
-
-            now = self.get_beijing_time()
-            reset_time_today = now.replace(
-                hour=reset_hour, minute=reset_minute, second=0, microsecond=0
-            )
-
-            # 计算当前重置周期开始时间
-            if now < reset_time_today:
-                period_start = reset_time_today - timedelta(days=1)
-            else:
-                period_start = reset_time_today
-
-            self._ensure_pool_initialized()
-            async with self.pool.acquire() as conn:
-                row = await conn.fetchrow(
-                    "SELECT 1 FROM work_records WHERE chat_id = $1 AND user_id = $2 AND checkin_type = $3 AND record_date >= $4",
-                    chat_id,
-                    user_id,
-                    checkin_type,
-                    period_start.date(),
-                )
-                return row is not None
-        except Exception as e:
-            logger.error(f"检查工作记录失败 {chat_id}-{user_id}: {e}")
-            return False
-
-    # 在 database.py 中添加修复后的函数
-    async def get_today_work_records_fixed(
-        self, chat_id: int, user_id: int
-    ) -> Dict[str, Dict]:
-        """修复版：获取用户今天的上下班记录 - 每个群组独立重置时间"""
-        try:
-            # 获取群组重置时间
-            group_data = await self.get_group_cached(chat_id)
-            reset_hour = group_data.get("reset_hour", Config.DAILY_RESET_HOUR)
-            reset_minute = group_data.get("reset_minute", Config.DAILY_RESET_MINUTE)
-
-            now = self.get_beijing_time()
-
-            # 计算今天的重置时间点
-            reset_time_today = now.replace(
-                hour=reset_hour, minute=reset_minute, second=0, microsecond=0
-            )
-
-            # 确定当前重置周期的开始时间
-            if now < reset_time_today:
-                period_start = reset_time_today - timedelta(days=1)
-            else:
-                period_start = reset_time_today
-
-            # 查询从重置周期开始到现在的记录
-            async with self.pool.acquire() as conn:
-                rows = await conn.fetch(
-                    """
-                    SELECT * FROM work_records 
-                    WHERE chat_id = $1 
-                    AND user_id = $2 
-                    AND record_date >= $3
-                    AND record_date <= $4
-                    ORDER BY record_date DESC, checkin_type
-                    """,
-                    chat_id,
-                    user_id,
-                    period_start.date(),
-                    now.date(),  # 添加上限，避免查询未来日期
-                )
-
-                records = {}
-                for row in rows:
-                    # 按记录日期分组，只取每个类型的最新记录
-                    record_key = f"{row['record_date']}_{row['checkin_type']}"
-                    if (
-                        row["checkin_type"] not in records
-                        or row["record_date"]
-                        > records[row["checkin_type"]]["record_date"]
-                    ):
-                        records[row["checkin_type"]] = dict(row)
-
-                logger.debug(
-                    f"工作记录查询: {chat_id}-{user_id}, 重置周期: {period_start.date()}, 记录数: {len(records)}"
-                )
-                return records
-
-        except Exception as e:
-            logger.error(f"获取工作记录失败 {chat_id}-{user_id}: {e}")
-            return {}
 
     # ========== 活动配置操作 ==========
     async def get_activity_limits(self) -> Dict:
@@ -2607,23 +2487,6 @@ class PostgreSQLDatabase:
 
     # ========== 工具方法 ==========
     @staticmethod
-    def format_seconds_to_hms(seconds: int) -> str:
-        """将秒数格式化为小时:分钟:秒的字符串"""
-        if not seconds:
-            return "0秒"
-
-        hours = seconds // 3600
-        minutes = (seconds % 3600) // 60
-        secs = seconds % 60
-
-        if hours > 0:
-            return f"{hours}小时{minutes}分{secs}秒"
-        elif minutes > 0:
-            return f"{minutes}分{secs}秒"
-        else:
-            return f"{secs}秒"
-
-    @staticmethod
     def format_time_for_csv(seconds: int) -> str:
         """为CSV导出格式化时间显示"""
         if not seconds:
@@ -2650,14 +2513,6 @@ class PostgreSQLDatabase:
         except Exception as e:
             logger.debug(f"数据库连接健康检查失败: {e}")
             return False
-
-    async def get_database_stats(self) -> Dict[str, Any]:
-        """获取数据库统计信息"""
-        return {
-            "type": "postgresql",
-            "initialized": self._initialized,
-            "cache_size": len(self._cache),
-        }
 
 
 # 全局数据库实例
