@@ -3428,9 +3428,16 @@ async def show_history(message: types.Message):
             )
             has_records = True
 
-    # 总计信息（保持你原有逻辑）
-    total_time_all = user_data.get("total_accumulated_time", 0)
-    total_count_all = user_data.get("total_activity_count", 0)
+    # 🧮 重新按当前周期汇总总数据（核心修复点）
+    period_total_time = 0
+    period_total_count = 0
+
+    for data in user_activities.values():
+        period_total_time += int(data.get("time", 0))
+        period_total_count += int(data.get("count", 0))
+
+    total_time_all = period_total_time
+    total_count_all = period_total_count
     total_fine = user_data.get("total_fines", 0)
 
     text += f"\n📈 当前周期总统计：\n"
