@@ -524,13 +524,6 @@ class UserLockManager:
         if old_keys:
             logger.info(f"用户锁清理: 移除了 {len(old_keys)} 个过期锁")
 
-    async def force_cleanup(self):
-        """强制立即清理"""
-        old_count = len(self._locks)
-        self._cleanup_old_locks()
-        new_count = len(self._locks)
-        logger.info(f"强制用户锁清理: {old_count} -> {new_count}")
-
     def get_stats(self) -> Dict[str, Any]:
         """获取锁管理器统计"""
         return {
@@ -806,27 +799,6 @@ class EnhancedPerformanceOptimizer:
         except ImportError:
             return True
 
-    def get_memory_info(self) -> dict:
-        """获取当前内存信息"""
-        try:
-            process = psutil.Process()
-            memory_mb = process.memory_info().rss / 1024 / 1024
-            memory_percent = process.memory_percent()
-
-            return {
-                "memory_usage_mb": round(memory_mb, 1),
-                "memory_percent": round(memory_percent, 1),
-                "is_render": self.is_render,
-                "render_memory_limit": self.render_memory_limit,
-                "needs_cleanup": (
-                    memory_mb > self.render_memory_limit if self.is_render else False
-                ),
-                "status": "healthy" if self.memory_usage_ok() else "warning",
-            }
-        except Exception as e:
-            logger.error(f"获取内存信息失败: {e}")
-            return {"error": str(e)}
-
 
 class HeartbeatManager:
     """心跳管理器"""
@@ -864,18 +836,6 @@ class HeartbeatManager:
             except Exception as e:
                 logger.error(f"心跳循环异常: {e}")
                 await asyncio.sleep(10)
-
-    def get_status(self) -> Dict[str, Any]:
-        """获取心跳状态"""
-        current_time = time.time()
-        last_heartbeat_ago = current_time - self._last_heartbeat
-
-        return {
-            "is_running": self._is_running,
-            "last_heartbeat": self._last_heartbeat,
-            "last_heartbeat_ago": last_heartbeat_ago,
-            "status": "healthy" if last_heartbeat_ago < 120 else "unhealthy",
-        }
 
 
 # 工具函数
@@ -1026,23 +986,6 @@ async def get_group_reset_period_start(
             second=0,
             microsecond=0,
         )
-
-
-async def get_current_period_date(chat_id: int, current_time: datetime = None) -> date:
-    """获取当前重置周期日期（快捷函数）"""
-    if current_time is None:
-        current_time = get_beijing_time()
-
-    return await db.get_reset_period_date(chat_id, current_time)
-
-
-async def is_in_same_period(chat_id: int, dt1: datetime, dt2: datetime) -> bool:
-    """
-    判断两个时间点是否属于同一个重置周期
-    """
-    period1 = await db.get_reset_period_date(chat_id, dt1)
-    period2 = await db.get_reset_period_date(chat_id, dt2)
-    return period1 == period2
 
 
 # ========== 重置通知函数 ==========
