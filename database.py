@@ -516,6 +516,7 @@ class PostgreSQLDatabase:
                     reset_minute INTEGER DEFAULT 0,
                     work_start_time TEXT DEFAULT '09:00',
                     work_end_time TEXT DEFAULT '18:00',
+                    last_reset_at TIMESTAMP,
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 )
@@ -534,7 +535,6 @@ class PostgreSQLDatabase:
                     total_fines INTEGER DEFAULT 0,
                     overtime_count INTEGER DEFAULT 0,
                     total_overtime_time INTEGER DEFAULT 0,
-                    reset_period_start TIMESTAMP,
                     last_updated DATE,
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
@@ -659,16 +659,35 @@ class PostgreSQLDatabase:
                 "CREATE INDEX IF NOT EXISTS idx_work_records_main ON work_records (chat_id, user_id, record_date)",
                 "CREATE INDEX IF NOT EXISTS idx_users_main ON users (chat_id, user_id)",
                 "CREATE INDEX IF NOT EXISTS idx_monthly_stats_main ON monthly_statistics (chat_id, user_id, statistic_date)",
+                "CREATE INDEX IF NOT EXISTS idx_user_activities_created_reset ON user_activities (chat_id, user_id, created_at)",
+                "CREATE INDEX IF NOT EXISTS idx_work_records_created_reset ON work_records (chat_id, user_id, created_at)",
+                "CREATE INDEX IF NOT EXISTS idx_groups_reset_time ON groups (chat_id, last_reset_at)",
+                "CREATE INDEX IF NOT EXISTS idx_user_activities_chat_user_created ON user_activities (chat_id, user_id, created_at)",
+                "CREATE INDEX IF NOT EXISTS idx_work_records_chat_user_created ON work_records (chat_id, user_id, created_at)",
             ]
 
             for index_sql in indexes:
                 try:
                     await conn.execute(index_sql)
-                    index_name = index_sql.split()[5]  # 获取索引名
+
+                    # 🎯 安全地提取索引名
+                    parts = index_sql.split()
+                    if "IF NOT EXISTS" in index_sql:
+                        index_name = parts[6]
+                    else:
+                        index_name = parts[2]
+
                     logger.info(f"✅ 创建索引: {index_name}")
+
                 except Exception as e:
                     logger.warning(f"创建索引失败: {e}")
-                    # 索引创建失败不阻止程序启动
+
+                    # 🎯 对于 last_reset_at / created_at 相关索引，记录更详细错误
+                    if "created_at" in index_sql or "last_reset_at" in index_sql:
+                        logger.error(
+                            f"❌ 关键索引创建失败，可能缺少字段: {index_sql[:50]}..."
+                        )
+
             logger.info("数据库索引创建完成")
 
     async def _initialize_default_data(self):
@@ -864,6 +883,54 @@ class PostgreSQLDatabase:
             )
             self._cache.pop(f"group:{chat_id}", None)
 
+    # ====== ✅ 放在这里 ======
+    async def get_group_last_reset_at(self, chat_id: int) -> datetime:
+        """
+        获取群组最后一次重置完成时间
+        ⚠️ 只读，不做时间推导
+        """
+        cache_key = f"group_last_reset:{chat_id}"
+        cached = self._get_cached(cache_key)
+        if cached is not None:
+            return cached
+
+        await self.init_group(chat_id)
+        self._ensure_pool_initialized()
+
+        async with self.pool.acquire() as conn:
+            row = await conn.fetchrow(
+                "SELECT last_reset_at FROM groups WHERE chat_id = $1", chat_id
+            )
+
+            if row and row["last_reset_at"]:
+                last_reset_at = row["last_reset_at"]
+            else:
+                last_reset_at = self.get_beijing_time()
+                await conn.execute(
+                    "UPDATE groups SET last_reset_at = $1 WHERE chat_id = $2",
+                    last_reset_at,
+                    chat_id,
+                )
+
+        self._set_cached(cache_key, last_reset_at, 300)
+        return last_reset_at
+
+    async def set_group_last_reset_at(self, chat_id: int, reset_time: datetime):
+        await self.execute_with_retry(
+            "更新 last_reset_at",
+            """
+            UPDATE groups
+            SET last_reset_at = $1,
+                updated_at = CURRENT_TIMESTAMP
+            WHERE chat_id = $2
+            """,
+            reset_time,
+            chat_id,
+        )
+
+        self._cache.pop(f"group:{chat_id}", None)
+        self._cache.pop(f"group_last_reset:{chat_id}", None)
+
     async def update_group_reset_time(self, chat_id: int, hour: int, minute: int):
         """更新群组重置时间"""
         self._ensure_pool_initialized()
@@ -920,37 +987,29 @@ class PostgreSQLDatabase:
         nickname: str = None,
         target_datetime: datetime = None,
     ):
-        """初始化用户（仅首次写入 reset_period_start）"""
+        """初始化用户 - 使用重置周期日期"""
         if target_datetime is None:
             target_datetime = self.get_beijing_time()
 
-        # 🎯 计算当前重置周期起点
+        # 🎯 使用重置周期日期
         period_date = await self.get_reset_period_date(chat_id, target_datetime)
 
         await self.execute_with_retry(
             "初始化用户",
             """
-            INSERT INTO users (
-                chat_id,
-                user_id,
-                nickname,
-                reset_period_start,
-                last_updated
-            )
-            VALUES ($1, $2, $3, $4, $4)
-            ON CONFLICT (chat_id, user_id)
-            DO UPDATE SET
-                nickname = COALESCE(EXCLUDED.nickname, users.nickname),
-                last_updated = EXCLUDED.last_updated,
+            INSERT INTO users (chat_id, user_id, nickname, last_updated) 
+            VALUES ($1, $2, $3, $4) 
+            ON CONFLICT (chat_id, user_id) 
+            DO UPDATE SET 
+                nickname = COALESCE($3, users.nickname),
+                last_updated = $4,
                 updated_at = CURRENT_TIMESTAMP
             """,
             chat_id,
             user_id,
             nickname,
-            period_date,
+            period_date,  # 🎯 使用重置周期日期
         )
-
-        # 🔴 非常重要：清理缓存
         self._cache.pop(f"user:{chat_id}:{user_id}", None)
 
     async def update_user_last_updated(
@@ -993,34 +1052,21 @@ class PostgreSQLDatabase:
             return result
         return None
 
-    async def get_user_cached(
-        self,
-        chat_id: int,
-        user_id: int,
-    ) -> Optional[Dict]:
-        """带缓存的获取用户数据（包含 reset_period_start）"""
+    async def get_user_cached(self, chat_id: int, user_id: int) -> Optional[Dict]:
+        """带缓存的获取用户数据 - 优化版"""
         cache_key = f"user:{chat_id}:{user_id}"
         cached = self._get_cached(cache_key)
         if cached is not None:
             return cached
 
+        # 只查询需要的字段，避免 SELECT *
         row = await self.fetchrow_with_retry(
             "获取用户数据",
             """
-            SELECT
-                user_id,
-                nickname,
-                current_activity,
-                activity_start_time,
-                total_accumulated_time,
-                total_activity_count,
-                total_fines,
-                overtime_count,
-                total_overtime_time,
-                reset_period_start,   -- ⭐ 必须加
-                last_updated
-            FROM users
-            WHERE chat_id = $1 AND user_id = $2
+            SELECT user_id, nickname, current_activity, activity_start_time, 
+                total_accumulated_time, total_activity_count, total_fines,
+                overtime_count, total_overtime_time, last_updated
+            FROM users WHERE chat_id = $1 AND user_id = $2
             """,
             chat_id,
             user_id,
@@ -1029,9 +1075,8 @@ class PostgreSQLDatabase:
         if row:
             result = dict(row)
             # 用户数据变化频繁，设置较短缓存时间
-            self._set_cached(cache_key, result, 30)
+            self._set_cached(cache_key, result, 30)  # 30秒缓存
             return result
-
         return None
 
     async def update_user_activity(
@@ -1122,7 +1167,6 @@ class PostgreSQLDatabase:
             )
             raise
 
-    # ===== 打卡活动 =======
     async def complete_user_activity(
         self,
         chat_id: int,
@@ -1132,60 +1176,68 @@ class PostgreSQLDatabase:
         fine_amount: int = 0,
         is_overtime: bool = False,
     ):
-        """完成用户活动（不负责重置周期）"""
+        """完成用户活动 - 使用重置周期日期（修复版）"""
+
+        # 🎯 当前真实时间（北京时间）
         current_time = self.get_beijing_time()
+
+        # 🎯 重置周期日期（用于日统计 / 活动归属）
+        period_date = await self.get_reset_period_date(chat_id, current_time)
+
+        # 🎯 月度统计日期（始终使用自然月）
         statistic_date = current_time.date().replace(day=1)
 
-        # 计算超时
+        # 🆕 计算超时相关数据
         overtime_seconds = 0
         if is_overtime:
-            limit = await self.get_activity_time_limit(activity) * 60
-            overtime_seconds = max(0, elapsed_time - limit)
+            time_limit = await self.get_activity_time_limit(activity)
+            time_limit_seconds = time_limit * 60
+            overtime_seconds = max(0, elapsed_time - time_limit_seconds)
 
         self._ensure_pool_initialized()
-
         async with self.pool.acquire() as conn:
             async with conn.transaction():
 
-                # ✅ 1. 只清理当前活动状态（⚠️ 不更新 reset_period_start）
+                # ✅ users 表：更新时间使用真实时间
                 await conn.execute(
                     """
-                    UPDATE users SET
-                        current_activity = NULL,
-                        activity_start_time = NULL,
-                        last_updated = $1,
-                        updated_at = CURRENT_TIMESTAMP
-                    WHERE chat_id = $2 AND user_id = $3
+                    INSERT INTO users (chat_id, user_id, last_updated) 
+                    VALUES ($1, $2, $3)
+                    ON CONFLICT (chat_id, user_id) 
+                    DO UPDATE SET last_updated = EXCLUDED.last_updated
                     """,
-                    current_time,
                     chat_id,
                     user_id,
+                    current_time,
                 )
 
-                # ✅ 2. 写入【原始活动日志】—— 用于日常统计（推荐）
+                # ✅ user_activities：活动日期使用重置周期日期
                 await conn.execute(
                     """
-                    INSERT INTO user_activity_log
-                        (chat_id, user_id, activity_name, start_time, elapsed_time)
-                    VALUES
-                        ($1, $2, $3, $4, $5)
+                    INSERT INTO user_activities 
+                    (chat_id, user_id, activity_date, activity_name, activity_count, accumulated_time)
+                    VALUES ($1, $2, $3, $4, 1, $5)
+                    ON CONFLICT (chat_id, user_id, activity_date, activity_name) 
+                    DO UPDATE SET 
+                        activity_count = user_activities.activity_count + 1,
+                        accumulated_time = user_activities.accumulated_time + EXCLUDED.accumulated_time,
+                        updated_at = CURRENT_TIMESTAMP
                     """,
                     chat_id,
                     user_id,
+                    period_date,
                     activity,
-                    current_time,
                     elapsed_time,
                 )
 
-                # ✅ 3. 月度统计（完全保留，用于历史）
+                # ✅ 月度统计表 - 活动数据
                 await conn.execute(
                     """
-                    INSERT INTO monthly_statistics
-                        (chat_id, user_id, statistic_date, activity_name, activity_count, accumulated_time)
-                    VALUES
-                        ($1, $2, $3, $4, 1, $5)
-                    ON CONFLICT (chat_id, user_id, statistic_date, activity_name)
-                    DO UPDATE SET
+                    INSERT INTO monthly_statistics 
+                    (chat_id, user_id, statistic_date, activity_name, activity_count, accumulated_time)
+                    VALUES ($1, $2, $3, $4, 1, $5)
+                    ON CONFLICT (chat_id, user_id, statistic_date, activity_name) 
+                    DO UPDATE SET 
                         activity_count = monthly_statistics.activity_count + 1,
                         accumulated_time = monthly_statistics.accumulated_time + EXCLUDED.accumulated_time,
                         updated_at = CURRENT_TIMESTAMP
@@ -1197,35 +1249,17 @@ class PostgreSQLDatabase:
                     elapsed_time,
                 )
 
-                # ✅ 4. 罚款（月度）
-                if fine_amount > 0:
-                    await conn.execute(
-                        """
-                        INSERT INTO monthly_statistics
-                            (chat_id, user_id, statistic_date, activity_name, accumulated_time)
-                        VALUES
-                            ($1, $2, $3, 'total_fines', $4)
-                        ON CONFLICT (chat_id, user_id, statistic_date, activity_name)
-                        DO UPDATE SET
-                            accumulated_time = monthly_statistics.accumulated_time + EXCLUDED.accumulated_time,
-                            updated_at = CURRENT_TIMESTAMP
-                        """,
-                        chat_id,
-                        user_id,
-                        statistic_date,
-                        fine_amount,
-                    )
-
-                # ✅ 5. 超时（月度）
+                # 🆕 超时统计（月度）
                 if is_overtime and overtime_seconds > 0:
+
+                    # 超时次数
                     await conn.execute(
                         """
-                        INSERT INTO monthly_statistics
-                            (chat_id, user_id, statistic_date, activity_name, activity_count)
-                        VALUES
-                            ($1, $2, $3, 'overtime_count', 1)
-                        ON CONFLICT (chat_id, user_id, statistic_date, activity_name)
-                        DO UPDATE SET
+                        INSERT INTO monthly_statistics 
+                        (chat_id, user_id, statistic_date, activity_name, activity_count, accumulated_time)
+                        VALUES ($1, $2, $3, 'overtime_count', 1, 0)
+                        ON CONFLICT (chat_id, user_id, statistic_date, activity_name) 
+                        DO UPDATE SET 
                             activity_count = monthly_statistics.activity_count + 1,
                             updated_at = CURRENT_TIMESTAMP
                         """,
@@ -1234,14 +1268,14 @@ class PostgreSQLDatabase:
                         statistic_date,
                     )
 
+                    # 超时时间
                     await conn.execute(
                         """
-                        INSERT INTO monthly_statistics
-                            (chat_id, user_id, statistic_date, activity_name, accumulated_time)
-                        VALUES
-                            ($1, $2, $3, 'overtime_time', $4)
-                        ON CONFLICT (chat_id, user_id, statistic_date, activity_name)
-                        DO UPDATE SET
+                        INSERT INTO monthly_statistics 
+                        (chat_id, user_id, statistic_date, activity_name, accumulated_time, activity_count)
+                        VALUES ($1, $2, $3, 'overtime_time', $4, 0)
+                        ON CONFLICT (chat_id, user_id, statistic_date, activity_name) 
+                        DO UPDATE SET 
                             accumulated_time = monthly_statistics.accumulated_time + EXCLUDED.accumulated_time,
                             updated_at = CURRENT_TIMESTAMP
                         """,
@@ -1251,8 +1285,56 @@ class PostgreSQLDatabase:
                         overtime_seconds,
                     )
 
-        self._cache.pop(f"user:{chat_id}:{user_id}", None)
-        logger.debug(f"✅ 活动完成: {chat_id}-{user_id} {activity} {elapsed_time}秒")
+                # 🆕 罚款统计（月度）
+                if fine_amount > 0:
+                    await conn.execute(
+                        """
+                        INSERT INTO monthly_statistics 
+                        (chat_id, user_id, statistic_date, activity_name, accumulated_time)
+                        VALUES ($1, $2, $3, 'total_fines', $4)
+                        ON CONFLICT (chat_id, user_id, statistic_date, activity_name) 
+                        DO UPDATE SET 
+                            accumulated_time = monthly_statistics.accumulated_time + EXCLUDED.accumulated_time,
+                            updated_at = CURRENT_TIMESTAMP
+                        """,
+                        chat_id,
+                        user_id,
+                        statistic_date,
+                        fine_amount,
+                    )
+
+                # ✅ users 表累计数据更新
+                update_fields = [
+                    "total_accumulated_time = total_accumulated_time + $1",
+                    "total_activity_count = total_activity_count + 1",
+                    "current_activity = NULL",
+                    "activity_start_time = NULL",
+                    "last_updated = $2",
+                    "updated_at = CURRENT_TIMESTAMP",
+                ]
+                params = [elapsed_time, current_time]
+
+                if fine_amount > 0:
+                    update_fields.append("total_fines = total_fines + $3")
+                    params.append(fine_amount)
+
+                if is_overtime:
+                    update_fields.append("overtime_count = overtime_count + 1")
+                    update_fields.append(
+                        "total_overtime_time = total_overtime_time + $4"
+                    )
+                    params.append(overtime_seconds)
+
+                params.extend([chat_id, user_id])
+
+                query = (
+                    f"UPDATE users SET {', '.join(update_fields)} "
+                    f"WHERE chat_id = ${len(params) - 1} AND user_id = ${len(params)}"
+                )
+                await conn.execute(query, *params)
+
+            # 清理缓存
+            self._cache.pop(f"user:{chat_id}:{user_id}", None)
 
     # ========= 重置前批量完成所有未结束活动 =========
     async def complete_all_pending_activities_before_reset(
@@ -1450,64 +1532,61 @@ class PostgreSQLDatabase:
         self,
         chat_id: int,
         user_id: int,
-        period_date: date,  # 明确要求 period_date
-        reset_stats: bool = True,
-    ) -> bool:
-        """重置用户指定周期的数据"""
+    ):
+        """
+        重置用户“当前周期状态”
+        ⚠️ 不删除任何历史数据
+        """
         try:
             self._ensure_pool_initialized()
 
             async with self.pool.acquire() as conn:
                 async with conn.transaction():
-                    # 1. 删除周期活动记录
+                    # ✅ 只重置 users 表中的“状态类字段”
                     await conn.execute(
                         """
-                        DELETE FROM user_activities
-                        WHERE chat_id = $1 AND user_id = $2 AND activity_date = $3
-                        """,
-                        chat_id,
-                        user_id,
-                        period_date,
-                    )
-
-                    # 2. 删除周期工作记录
-                    await conn.execute(
-                        """
-                        DELETE FROM work_records
-                        WHERE chat_id = $1 AND user_id = $2 AND record_date = $3
-                        """,
-                        chat_id,
-                        user_id,
-                        period_date,
-                    )
-
-                    # 3. 更新用户状态
-                    update_sql = """
-                    UPDATE users SET
-                        current_activity = NULL,
-                        activity_start_time = NULL,
-                        last_updated = $3,
-                        updated_at = CURRENT_TIMESTAMP
-                    """
-                    if reset_stats:
-                        update_sql += """,
+                        UPDATE users SET
                             total_activity_count = 0,
                             total_accumulated_time = 0,
+                            total_overtime_time = 0,
                             overtime_count = 0,
-                            total_overtime_time = 0
-                        """
+                            current_activity = NULL,
+                            activity_start_time = NULL,
+                            updated_at = CURRENT_TIMESTAMP
+                        WHERE chat_id = $1 AND user_id = $2
+                        """,
+                        chat_id,
+                        user_id,
+                    )
 
-                    update_sql += " WHERE chat_id = $1 AND user_id = $2"
+            # ✅ 清理缓存
+            self._cleanup_reset_cache(chat_id, user_id)
 
-                    await conn.execute(update_sql, chat_id, user_id, period_date)
-
-            # 4. 清理缓存
-            self._cache.pop(f"user:{chat_id}:{user_id}", None)
+            logger.info(f"✅ 用户当前周期状态已重置: {chat_id}-{user_id}")
             return True
 
         except Exception as e:
-            logger.error(f"重置用户数据失败 {chat_id}-{user_id}: {e}")
+            logger.error(f"❌ 重置用户状态失败 {chat_id}-{user_id}: {e}")
             return False
+
+    async def _cleanup_reset_cache(
+        self,
+        chat_id: int,
+        user_id: int,
+    ):
+        """清理重置相关缓存"""
+        cache_patterns = [
+            f"user:{chat_id}:{user_id}",
+            f"group:{chat_id}",
+            f"user_activities:{chat_id}:{user_id}:",
+            f"work_records:{chat_id}:{user_id}:",
+        ]
+
+        for pattern in cache_patterns:
+            for key in list(self._cache.keys()):
+                if pattern in key:
+                    self._cache.pop(key, None)
+                    self._cache_ttl.pop(key, None)
 
     async def get_user_activity_count(
         self,
@@ -1516,28 +1595,24 @@ class PostgreSQLDatabase:
         activity: str,
         target_datetime: datetime = None,
     ) -> int:
-        """获取用户当前重置周期内的活动次数（基于 reset_period_start）"""
+        """获取用户当前重置周期内的活动次数"""
         try:
-            self._ensure_pool_initialized()
+            # 🎯 使用重置周期日期，而不是自然日
+            period_date = await self.get_reset_period_date(chat_id, target_datetime)
 
+            self._ensure_pool_initialized()
             async with self.pool.acquire() as conn:
                 row = await conn.fetchrow(
                     """
-                    SELECT COUNT(*) AS activity_count
-                    FROM user_activity_log l
-                    JOIN users u
-                      ON u.chat_id = l.chat_id
-                     AND u.user_id = l.user_id
-                    WHERE l.chat_id = $1
-                      AND l.user_id = $2
-                      AND l.activity_name = $3
-                      AND l.start_time >= u.reset_period_start
+                    SELECT activity_count FROM user_activities 
+                    WHERE chat_id = $1 AND user_id = $2 
+                    AND activity_date = $3 AND activity_name = $4
                     """,
                     chat_id,
                     user_id,
+                    period_date,  # 🎯 关键：使用重置周期日期
                     activity,
                 )
-
                 return row["activity_count"] if row else 0
 
         except Exception as e:
@@ -1545,32 +1620,53 @@ class PostgreSQLDatabase:
             return 0
 
     async def get_user_all_activities(
-        self, chat_id: int, user_id: int, target_datetime: datetime = None
+        self,
+        chat_id: int,
+        user_id: int,
+        target_datetime: datetime = None,
     ) -> Dict[str, Dict]:
-        """获取用户当前重置周期内的所有活动数据"""
+        """获取用户当前周期的所有活动数据 - 使用 last_reset_at"""
         try:
-            # 🎯 使用重置周期日期，而不是自然日
-            period_date = await self.get_reset_period_date(chat_id, target_datetime)
+            # 🎯 获取重置边界
+            last_reset_at = await self.get_group_last_reset_at(chat_id)
+
+            # 🎯 缓存键包含重置时间戳
+            cache_key = (
+                f"user_activities:{chat_id}:{user_id}:{last_reset_at.timestamp()}"
+            )
+            cached = self._get_cached(cache_key)
+            if cached is not None:
+                return cached
 
             self._ensure_pool_initialized()
+
             async with self.pool.acquire() as conn:
+                # 🎯 关键修复：使用 created_at >= last_reset_at
                 rows = await conn.fetch(
                     """
-                    SELECT activity_name, activity_count, accumulated_time 
-                    FROM user_activities 
-                    WHERE chat_id = $1 AND user_id = $2 AND activity_date = $3
+                    SELECT
+                        activity_name,
+                        SUM(activity_count) AS total_count,
+                        SUM(accumulated_time) AS total_time
+                    FROM user_activities
+                    WHERE chat_id = $1
+                      AND user_id = $2
+                      AND created_at >= $3
+                    GROUP BY activity_name
                     """,
                     chat_id,
                     user_id,
-                    period_date,  # 🎯 关键：使用重置周期日期
+                    last_reset_at,
                 )
 
                 activities = {}
                 for row in rows:
                     activities[row["activity_name"]] = {
-                        "count": row["activity_count"],
-                        "time": row["accumulated_time"],
+                        "count": row["total_count"] or 0,
+                        "time": row["total_time"] or 0,
                     }
+
+                self._set_cached(cache_key, activities, 30)
                 return activities
 
         except Exception as e:
