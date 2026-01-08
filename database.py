@@ -1463,7 +1463,7 @@ class PostgreSQLDatabase:
     async def reset_user_daily_data(
         self, chat_id: int, user_id: int, target_date: Optional[date] = None
     ):
-        """纯粹的重置方法 - 移除活动处理逻辑"""
+        """彻底重置用户每日数据 - 修复版"""
         try:
             if target_date is None:
                 target_date = self.get_beijing_date()
@@ -1471,14 +1471,15 @@ class PostgreSQLDatabase:
             self._ensure_pool_initialized()
             async with self.pool.acquire() as conn:
                 async with conn.transaction():
-                    # 🎯 只做纯粹的数据重置
+                    # 🎯 修复1：删除该用户在 user_activities 表中的【所有】分项记录
+                    # 不再限制 activity_date = target_date，确保所有旧的、跨天的、残留的计数全部清空
                     await conn.execute(
-                        "DELETE FROM user_activities WHERE chat_id = $1 AND user_id = $2 AND activity_date = $3",
+                        "DELETE FROM user_activities WHERE chat_id = $1 AND user_id = $2",
                         chat_id,
                         user_id,
-                        target_date,
                     )
 
+                    # 🎯 修复2：重置 users 表中的所有统计字段
                     await conn.execute(
                         """
                         UPDATE users SET
@@ -1492,22 +1493,28 @@ class PostgreSQLDatabase:
                             last_updated = $3,
                             updated_at = CURRENT_TIMESTAMP
                         WHERE chat_id = $1 AND user_id = $2
-                    """,
+                        """,
                         chat_id,
                         user_id,
-                        target_date,
+                        target_date,  # 这里的 target_date 决定了下次重置检查的基础
                     )
 
-                # 清理缓存
-                cache_keys = [f"user:{chat_id}:{user_id}", f"group:{chat_id}"]
-                for key in cache_keys:
-                    self._cache.pop(key, None)
+            # 🎯 修复3：彻底清理缓存 (必须包含 user_all_activities)
+            cache_keys = [
+                f"user:{chat_id}:{user_id}",
+                f"user_all_activities:{chat_id}:{user_id}",  # 必须清理分项统计缓存
+                f"group:{chat_id}",
+            ]
+            for key in cache_keys:
+                self._cache.pop(key, None)
 
-                logger.info(f"用户数据重置完成: {chat_id}-{user_id}")
-                return True
+            logger.info(
+                f"✅ 用户数据彻底重置完成: {chat_id}-{user_id} (新周期日期: {target_date})"
+            )
+            return True
 
         except Exception as e:
-            logger.error(f"重置用户数据失败 {chat_id}-{user_id}: {e}")
+            logger.error(f"❌ 重置用户数据失败 {chat_id}-{user_id}: {e}")
             return False
 
     async def get_user_activity_count(
@@ -1517,13 +1524,14 @@ class PostgreSQLDatabase:
         activity: str,
         target_datetime: datetime = None,
     ) -> int:
-        """获取用户当前重置周期内的活动次数"""
+        """获取用户当前周期的活动次数"""
         try:
-            # 🎯 使用重置周期日期，而不是自然日
+            # 获取当前群组重置逻辑下的“业务日期”
             period_date = await self.get_reset_period_date(chat_id, target_datetime)
 
             self._ensure_pool_initialized()
             async with self.pool.acquire() as conn:
+                # 🎯 这里建议只查 period_date 的记录
                 row = await conn.fetchrow(
                     """
                     SELECT activity_count FROM user_activities 
@@ -1532,13 +1540,13 @@ class PostgreSQLDatabase:
                     """,
                     chat_id,
                     user_id,
-                    period_date,  # 🎯 关键：使用重置周期日期
+                    period_date,
                     activity,
                 )
                 return row["activity_count"] if row else 0
 
         except Exception as e:
-            logger.error(f"获取用户活动次数失败 {chat_id}-{user_id}: {e}")
+            logger.error(f"获取次数失败 {chat_id}-{user_id}: {e}")
             return 0
 
     async def get_user_all_activities(
