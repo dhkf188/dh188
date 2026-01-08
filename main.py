@@ -1086,10 +1086,16 @@ async def process_back(message: types.Message):
 
 
 async def _process_back_locked(message: types.Message, chat_id: int, uid: int):
-    """线程安全的回座逻辑 - 最终稳定生产版（数据正确 + 月报安全 + 显示稳定）"""
+    """
+    线程安全的回座逻辑 - 最终稳定生产版
+    1. 解决跨凌晨重置导致的时长计算错误
+    2. 解决相对导入产生的循环引用报错
+    3. 解决缓存未及时清理导致的显示计数错误
+    """
     start_time = time.time()
     lock_key = f"{chat_id}:{uid}"
 
+    # --- 1. 并发防抖锁 ---
     if active_back_processing.get(lock_key):
         await message.answer("⚠️ 您的回座请求正在处理中，请稍候。")
         return
@@ -1098,9 +1104,17 @@ async def _process_back_locked(message: types.Message, chat_id: int, uid: int):
     try:
         now = get_beijing_time()
 
-        # 1️⃣ 读取当前用户状态
+        # --- 2. 核心：优先处理跨天重置 ---
+        # 必须在读取 user_data 之前执行，确保拿到的 start_time 是重置后的状态
+        # 此函数在 main.py 本地定义，直接调用即可
+        await reset_daily_data_if_needed(chat_id, uid)
+
+        # --- 3. 读取用户实时状态 ---
+        # 此时 get_user_cached 内部已修复日期校验逻辑
         user_data = await db.get_user_cached(chat_id, uid)
+
         if not user_data or not user_data.get("current_activity"):
+            # 如果重置逻辑强行清空了活动，或者本身没活动
             await message.answer(
                 Config.MESSAGES["no_activity"],
                 reply_markup=await get_main_keyboard(
@@ -1113,23 +1127,19 @@ async def _process_back_locked(message: types.Message, chat_id: int, uid: int):
         activity_start_time_str = user_data["activity_start_time"]
         nickname = user_data.get("nickname", "未知用户")
 
-        # 2️⃣ 时间解析（完整兜底）
+        # --- 4. 时间解析（带异常处理和时区对齐） ---
         start_time_dt = None
-        try:
-            if activity_start_time_str:
-                clean_str = str(activity_start_time_str).strip()
-                if clean_str.endswith("Z"):
-                    clean_str = clean_str.replace("Z", "+00:00")
-
+        if activity_start_time_str:
+            try:
+                clean_str = str(activity_start_time_str).strip().replace("Z", "+00:00")
                 try:
                     start_time_dt = datetime.fromisoformat(clean_str)
                 except ValueError:
+                    # 尝试多种常用格式解析
                     for fmt in [
                         "%Y-%m-%d %H:%M:%S.%f",
                         "%Y-%m-%d %H:%M:%S",
-                        "%Y-%m-%d %H:%M",
                         "%m/%d %H:%M:%S",
-                        "%m/%d %H:%M",
                     ]:
                         try:
                             start_time_dt = datetime.strptime(clean_str, fmt)
@@ -1139,75 +1149,74 @@ async def _process_back_locked(message: types.Message, chat_id: int, uid: int):
                         except ValueError:
                             continue
 
+                # 强制对齐到北京时区
                 if start_time_dt and start_time_dt.tzinfo is None:
                     start_time_dt = beijing_tz.localize(start_time_dt)
+            except Exception as e:
+                logger.error(f"解析开始时间失败: {activity_start_time_str}, {e}")
 
-        except Exception as e:
-            logger.error(f"解析开始时间失败: {activity_start_time_str}, 错误: {e}")
-
+        # 兜底：如果解析彻底失败，使用当前时间（防止程序崩溃）
         if not start_time_dt:
-            logger.warning("时间解析失败，使用当前时间作为备用")
             start_time_dt = now
 
-        # 3️⃣ 计算耗时 & 罚款
+        # --- 5. 计算耗时、超时及罚款 ---
         elapsed = (now - start_time_dt).total_seconds()
+        time_limit_min = await db.get_activity_time_limit(act)
+        time_limit_sec = time_limit_min * 60
 
-        time_limit_minutes = await db.get_activity_time_limit(act)
-        time_limit_seconds = time_limit_minutes * 60
-        is_overtime = elapsed > time_limit_seconds
-        overtime_seconds = max(0, int(elapsed - time_limit_seconds))
-        overtime_minutes = overtime_seconds / 60
+        is_overtime = elapsed > time_limit_sec
+        overtime_sec = max(0, int(elapsed - time_limit_sec))
 
         fine_amount = 0
-        if is_overtime and overtime_seconds > 0:
-            fine_amount = await calculate_fine(act, overtime_minutes)
+        if is_overtime and overtime_sec > 0:
+            fine_amount = await calculate_fine(act, overtime_sec / 60)
 
-        # 4️⃣ 先处理跨天重置（必须在写入前）
-        await reset_daily_data_if_needed(chat_id, uid)
-
-        # 5️⃣ 写入本次活动
+        # --- 6. 写入数据库 & 清理缓存 ---
+        # complete_user_activity 内部会更新 users, user_activities, monthly_statistics 三张表
         await db.complete_user_activity(
             chat_id, uid, act, int(elapsed), fine_amount, is_overtime
         )
 
-        # 6️⃣ 强制清缓存（解决“第2次”的根因）
+        # 🎯 关键：手动清理缓存，强制下一步从 DB 读新鲜数据
         db._cache.pop(f"user:{chat_id}:{uid}", None)
         db._cache.pop(f"user_all_activities:{chat_id}:{uid}", None)
 
-        # 7️⃣ 并发拉取最新统计
+        # --- 7. 获取展示数据（并发拉取） ---
         user_data_task = asyncio.create_task(db.get_user_cached(chat_id, uid))
         user_activities_task = asyncio.create_task(
             db.get_user_all_activities(chat_id, uid)
         )
-        user_data, user_activities = await asyncio.gather(
+
+        # 确认获取到最新值
+        final_user_data, final_user_activities = await asyncio.gather(
             user_data_task, user_activities_task
         )
 
-        # 8️⃣ 取消计时器
+        # --- 8. 善后处理 (计时器 & 消息构建) ---
         await timer_manager.cancel_timer(f"{chat_id}-{uid}")
 
-        # 9️⃣ 构建回复消息
         activity_counts = {
-            a: info.get("count", 0) for a, info in user_activities.items()
+            a: info.get("count", 0) for a, info in final_user_activities.items()
         }
 
+        # 发送回座成功消息
         await message.answer(
             MessageFormatter.format_back_message(
                 user_id=uid,
-                user_name=user_data.get("nickname", nickname),
+                user_name=final_user_data.get("nickname", nickname),
                 activity=act,
                 time_str=now.strftime("%m/%d %H:%M:%S"),
                 elapsed_time=MessageFormatter.format_time(int(elapsed)),
                 total_activity_time=MessageFormatter.format_time(
-                    int(user_activities.get(act, {}).get("time", 0))
+                    int(final_user_activities.get(act, {}).get("time", 0))
                 ),
                 total_time=MessageFormatter.format_time(
-                    int(user_data.get("total_accumulated_time", 0))
+                    int(final_user_data.get("total_accumulated_time", 0))
                 ),
                 activity_counts=activity_counts,
-                total_count=user_data.get("total_activity_count", 0),
+                total_count=final_user_data.get("total_activity_count", 0),
                 is_overtime=is_overtime,
-                overtime_seconds=overtime_seconds,
+                overtime_seconds=overtime_sec,
                 fine_amount=fine_amount,
             ),
             reply_markup=await get_main_keyboard(
@@ -1216,27 +1225,28 @@ async def _process_back_locked(message: types.Message, chat_id: int, uid: int):
             parse_mode="HTML",
         )
 
-        # 🔔 超时通知
+        # --- 9. 异步发送超时通知 (不阻塞主回复) ---
         if is_overtime and fine_amount > 0:
-            notify_data = user_data.copy()
-            notify_data["activity_start_time"] = activity_start_time_str
-            notify_data["nickname"] = nickname
-
+            # 准备通知数据
+            notify_info = final_user_data.copy()
+            notify_info["activity_start_time"] = activity_start_time_str
             asyncio.create_task(
                 send_overtime_notification_async(
-                    chat_id, uid, notify_data, act, fine_amount, now
+                    chat_id, uid, notify_info, act, fine_amount, now
                 )
             )
 
     except Exception as e:
-        logger.error(f"回座处理异常: {e}")
+        logger.error(f"回座流程严重异常: {e}")
         traceback.print_exc()
-        await message.answer("❌ 回座失败，请稍后重试。")
+        await message.answer("❌ 回座处理失败，数据可能未正确保存。")
 
     finally:
+        # 释放锁
         active_back_processing.pop(lock_key, None)
-        duration = round(time.time() - start_time, 2)
-        logger.info(f"回座结束 chat_id={chat_id}, uid={uid}，耗时 {duration}s")
+        logger.info(
+            f"回座完成: {chat_id}-{uid}, 耗时: {round(time.time() - start_time, 2)}s"
+        )
 
 
 # 🎯 【新增】异步发送超时通知函数
