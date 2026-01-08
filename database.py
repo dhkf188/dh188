@@ -986,38 +986,30 @@ class PostgreSQLDatabase:
 
     async def get_user_cached(self, chat_id: int, user_id: int) -> Optional[Dict]:
         """
-        带缓存的获取用户数据 - 修复版
-        新增：读取前校验重置状态，确保数据的日期一致性
+        带缓存的获取用户数据 - 纯净版
+        不再依赖外部 reset 函数，解决循环引用和相对导入报错
         """
-
-        # 🎯 关键修改 1：在获取任何数据前，先检查并执行每日重置
-        # 这样可以保证不管是查询还是更新，拿到的永远是当天（重置后）的正确日期数据
-        from .utils import reset_daily_data_if_needed  # 确保能引用到重置逻辑
-
-        await reset_daily_data_if_needed(chat_id, user_id)
-
         cache_key = f"user:{chat_id}:{user_id}"
         cached = self._get_cached(cache_key)
-        if cached is not None:
-            return cached
 
-        # 只查询需要的字段，避免 SELECT *
+        # 即使命中缓存，也要检查缓存里的数据日期是否还是今天
+        if cached is not None:
+            current_date = self.get_beijing_date()
+            # 这里的 last_updated 是我们在 complete_user_activity 里存入的 period_date
+            if cached.get("last_updated") == current_date:
+                return cached
+            else:
+                # 缓存日期已过，清理它并重新读库
+                self._cache.pop(cache_key, None)
+
+        # 从数据库读取
         row = await self.fetchrow_with_retry(
             "获取用户数据",
             """
-            SELECT 
-                user_id,
-                nickname,
-                current_activity,
-                activity_start_time,
-                total_accumulated_time,
-                total_activity_count,
-                total_fines,
-                overtime_count,
-                total_overtime_time,
-                last_updated
-            FROM users 
-            WHERE chat_id = $1 AND user_id = $2
+            SELECT user_id, nickname, current_activity, activity_start_time, 
+                total_accumulated_time, total_activity_count, total_fines,
+                overtime_count, total_overtime_time, last_updated
+            FROM users WHERE chat_id = $1 AND user_id = $2
             """,
             chat_id,
             user_id,
@@ -1025,12 +1017,16 @@ class PostgreSQLDatabase:
 
         if row:
             result = dict(row)
-
-            # 🎯 关键修改 2：如果数据库里的 last_updated 不是今天，
-            # 即使上面的 reset 没触发（可能重置逻辑有条件），这里也强制认为数据已过期
             current_date = self.get_beijing_date()
-            if result.get("last_updated") != current_date:
-                # 虽然 reset 理论上已经处理过，但这里是“最后一道保险”
+            db_date = result.get("last_updated")
+
+            # 日期类型转换确保比对成功
+            if hasattr(db_date, "date"):
+                db_date = db_date.date()
+
+            # 🎯 核心逻辑：如果在读取时发现数据库日期不是今天
+            # 说明该用户今天还没产生过任何交互，逻辑上他的数据应该是 0
+            if db_date != current_date:
                 result.update(
                     {
                         "total_accumulated_time": 0,
@@ -1038,12 +1034,14 @@ class PostgreSQLDatabase:
                         "total_fines": 0,
                         "overtime_count": 0,
                         "total_overtime_time": 0,
+                        "current_activity": None,
+                        "activity_start_time": None,
+                        "last_updated": current_date,  # 修正内存中的日期
                     }
                 )
 
-            self._set_cached(cache_key, result, 30)  # 30 秒缓存
+            self._set_cached(cache_key, result, 30)
             return result
-
         return None
 
     async def update_user_activity(
