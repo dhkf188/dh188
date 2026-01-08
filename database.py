@@ -10,6 +10,15 @@ from asyncpg.pool import Pool
 logger = logging.getLogger("GroupCheckInBot")
 
 
+def ensure_aware(dt: datetime) -> datetime:
+    """确保 datetime 为带时区（北京时区）"""
+    if dt is None:
+        return None
+    if dt.tzinfo is None:
+        return dt.replace(tzinfo=beijing_tz)
+    return dt.astimezone(beijing_tz)
+
+
 class PostgreSQLDatabase:
     """PostgreSQL数据库管理器"""
 
@@ -308,39 +317,66 @@ class PostgreSQLDatabase:
         return self.get_beijing_time().date()
 
     # ========= 统一时间 =========
+    # async def get_reset_period_date(
+    #     self, chat_id: int, target_datetime: datetime = None
+    # ) -> date:
+    #     """根据群组重置时间获取重置周期日期"""
+    #     if target_datetime is None:
+    #         target_datetime = self.get_beijing_time()
+
+    #     try:
+    #         group_data = await self.get_group_cached(chat_id)
+    #         if not group_data:
+    #             await self.init_group(chat_id)
+    #             group_data = await self.get_group_cached(chat_id)
+
+    #         reset_hour = group_data.get("reset_hour", Config.DAILY_RESET_HOUR)
+    #         reset_minute = group_data.get("reset_minute", Config.DAILY_RESET_MINUTE)
+
+    #         # 计算今天的重置时间点
+    #         reset_time_today = target_datetime.replace(
+    #             hour=reset_hour, minute=reset_minute, second=0, microsecond=0
+    #         )
+
+    #         # 判断当前时间与重置时间的关系
+    #         if target_datetime < reset_time_today:
+    #             # 当前时间在今天重置时间之前，属于昨天的周期
+    #             return (reset_time_today - timedelta(days=1)).date()
+    #         else:
+    #             # 当前时间在今天重置时间之后，属于今天的周期
+    #             return reset_time_today.date()
+
+    #     except Exception as e:
+    #         logger.error(f"计算重置周期日期失败 {chat_id}: {e}")
+    #         # 出错时返回自然日
+    #         return target_datetime.date()
+
     async def get_reset_period_date(
-        self, chat_id: int, target_datetime: datetime = None
+        self,
+        chat_id: int,
+        target_datetime: datetime,
     ) -> date:
-        """根据群组重置时间获取重置周期日期"""
-        if target_datetime is None:
-            target_datetime = self.get_beijing_time()
+        target_datetime = ensure_aware(target_datetime)
 
-        try:
-            group_data = await self.get_group_cached(chat_id)
-            if not group_data:
-                await self.init_group(chat_id)
-                group_data = await self.get_group_cached(chat_id)
+        row = await self.fetchrow(
+            "SELECT last_reset_time FROM group_settings WHERE chat_id=$1",
+            chat_id,
+        )
 
-            reset_hour = group_data.get("reset_hour", Config.DAILY_RESET_HOUR)
-            reset_minute = group_data.get("reset_minute", Config.DAILY_RESET_MINUTE)
+        last_reset = row["last_reset_time"] if row else None
+        last_reset = ensure_aware(last_reset)
 
-            # 计算今天的重置时间点
-            reset_time_today = target_datetime.replace(
-                hour=reset_hour, minute=reset_minute, second=0, microsecond=0
-            )
-
-            # 判断当前时间与重置时间的关系
-            if target_datetime < reset_time_today:
-                # 当前时间在今天重置时间之前，属于昨天的周期
-                return (reset_time_today - timedelta(days=1)).date()
-            else:
-                # 当前时间在今天重置时间之后，属于今天的周期
-                return reset_time_today.date()
-
-        except Exception as e:
-            logger.error(f"计算重置周期日期失败 {chat_id}: {e}")
-            # 出错时返回自然日
+        if last_reset is None:
             return target_datetime.date()
+
+        # 🧯 现在两个都是 aware，可以安全计算
+        delta = target_datetime - last_reset
+
+        if delta.total_seconds() >= 86400:
+            return target_datetime.date()
+        else:
+            return last_reset.date()
+
 
     async def has_work_record_in_period(
         self, chat_id: int, user_id: int, checkin_type: str, target_datetime: datetime
@@ -987,30 +1023,40 @@ class PostgreSQLDatabase:
         nickname: str = None,
         target_datetime: datetime = None,
     ):
-        """初始化用户 - 使用重置周期日期"""
+        """初始化用户 - 使用重置周期日期（完整修复版）"""
+
         if target_datetime is None:
-            target_datetime = self.get_beijing_time()
+            target_datetime = get_beijing_time()
+
+        # 🧯 强制统一时区
+        target_datetime = ensure_aware(target_datetime)
 
         # 🎯 使用重置周期日期
         period_date = await self.get_reset_period_date(chat_id, target_datetime)
 
         await self.execute_with_retry(
-            "初始化用户",
             """
-            INSERT INTO users (chat_id, user_id, nickname, last_updated) 
-            VALUES ($1, $2, $3, $4) 
-            ON CONFLICT (chat_id, user_id) 
-            DO UPDATE SET 
+            INSERT INTO users (
+                chat_id,
+                user_id,
+                nickname,
+                register_time,
+                last_active_time,
+                period_date
+            )
+            VALUES ($1, $2, $3, $4, $4, $5)
+            ON CONFLICT (chat_id, user_id) DO UPDATE
+            SET
+                last_active_time = $4,
                 nickname = COALESCE($3, users.nickname),
-                last_updated = $4,
-                updated_at = CURRENT_TIMESTAMP
+                period_date = $5
             """,
             chat_id,
             user_id,
             nickname,
-            period_date,  # 🎯 使用重置周期日期
+            target_datetime,
+            period_date,
         )
-        self._cache.pop(f"user:{chat_id}:{user_id}", None)
 
     async def update_user_last_updated(
         self, chat_id: int, user_id: int, update_date: date
