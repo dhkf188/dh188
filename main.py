@@ -584,7 +584,7 @@ async def reset_daily_data_if_needed(
         last_updated_str = user_data.get("last_updated")
         if not last_updated_str:
             await db.reset_user_daily_data(chat_id, uid, current_period_date)
-            # await db.update_user_last_updated(chat_id, uid, current_period_date) # ❌ 删除冗余更新
+            
             return
 
         # 解析最后更新时间
@@ -613,10 +613,6 @@ async def reset_daily_data_if_needed(
             # 注意：reset_user_daily_data 数据库操作内部应负责更新 last_updated 字段
             await db.reset_user_daily_data(chat_id, uid, current_period_date)
 
-            # ❌ 删除这行：不要在这里手动更新时间。
-            # 如果 reset_user_daily_data 失败（抛出异常），这行也不会执行；
-            # 如果 reset 成功，它内部应该已经更新了时间。
-            # await db.update_user_last_updated(chat_id, uid, current_period_date)
 
     except Exception as e:
         logger.error(f"重置检查失败 {chat_id}-{uid}: {e}")
