@@ -554,24 +554,25 @@ async def recover_expired_activities():
 
 
 # ========== 每日重置逻辑 =========
-# ========== 每日重置逻辑（生产级最终版） =========
 async def reset_daily_data_if_needed(
     chat_id: int, uid: int, current_time: datetime | None = None
 ):
-    """生产级每日数据重置 - 精确按管理员设置重置周期"""
+    """生产级每日数据重置 - 终极修复版"""
+    from datetime import datetime, date, timedelta
+    from config import beijing_tz
+
     if current_time is None:
         current_time = get_beijing_time()
 
+    logger.debug(
+        f"🔍 重置检查开始: {chat_id}-{uid}, 时间: {current_time.strftime('%Y-%m-%d %H:%M:%S')}"
+    )
+
     try:
-        # ===== 获取当前重置周期日期 =====
+        # ===== 1. 获取当前重置周期日期 =====
         period_date = await db.get_reset_period_date(chat_id, current_time)
 
-        # 转换为带时区的datetime（用于数据库操作）
-        period_datetime = datetime.combine(period_date, datetime.min.time()).replace(
-            tzinfo=beijing_tz
-        )
-
-        # ===== 获取群组重置时间用于日志显示 =====
+        # ===== 2. 获取群组重置时间用于日志显示 =====
         group_data = await db.get_group_cached(chat_id)
         reset_hour = group_data.get("reset_hour", Config.DAILY_RESET_HOUR)
         reset_minute = group_data.get("reset_minute", Config.DAILY_RESET_MINUTE)
@@ -583,16 +584,16 @@ async def reset_daily_data_if_needed(
             f"重置时间: {reset_hour:02d}:{reset_minute:02d}"
         )
 
-        # ===== 获取用户数据 =====
+        # ===== 3. 获取用户数据 =====
         user_data = await db.get_user_cached(chat_id, uid, current_time)
         if not user_data:
             logger.info(f"用户不存在，初始化: {chat_id}-{uid}")
             await db.init_user(chat_id, uid, "用户", current_time)
             return
 
-        # ===== 解析最后更新时间 =====
+        # ===== 4. 解析最后更新时间 =====
         last_updated_raw = user_data.get("last_updated")
-        last_updated_date: date | None = None
+        last_updated_date = None
 
         if last_updated_raw is None:
             logger.info(f"用户最后更新时间为空，重置数据: {chat_id}-{uid}")
@@ -600,52 +601,86 @@ async def reset_daily_data_if_needed(
         elif isinstance(last_updated_raw, date):
             last_updated_date = last_updated_raw
         elif isinstance(last_updated_raw, datetime):
-            # 🎯 核心优化：处理 naive datetime → 北京时间
             last_updated = last_updated_raw
             if last_updated.tzinfo is None:
                 last_updated = beijing_tz.localize(last_updated)
-            last_updated_date = last_updated.astimezone(beijing_tz).date()
+            last_updated_date = last_updated.date()
         elif isinstance(last_updated_raw, str):
             try:
-                # 尝试解析 ISO 格式
-                last_updated_dt = datetime.fromisoformat(
-                    last_updated_raw.replace("Z", "+00:00")
+                # 尝试解析各种格式
+                for fmt in ["%Y-%m-%d", "%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M:%S.%f"]:
+                    try:
+                        dt = datetime.strptime(last_updated_raw, fmt)
+                        last_updated_date = dt.date()
+                        break
+                    except ValueError:
+                        continue
+                if last_updated_date is None:
+                    # 尝试ISO格式
+                    dt = datetime.fromisoformat(last_updated_raw.replace("Z", "+00:00"))
+                    last_updated_date = dt.date()
+            except Exception as parse_error:
+                logger.warning(
+                    f"解析最后更新时间失败: {last_updated_raw}, 错误: {parse_error}"
                 )
-                last_updated_date = last_updated_dt.astimezone(beijing_tz).date()
-            except ValueError:
-                try:
-                    # 尝试解析日期格式 YYYY-MM-DD
-                    last_updated_dt = datetime.strptime(last_updated_raw, "%Y-%m-%d")
-                    last_updated_date = beijing_tz.localize(last_updated_dt).date()
-                except ValueError:
-                    logger.warning(
-                        f"无法解析最后更新时间: {last_updated_raw}, "
-                        f"使用当前周期日期 {period_date}"
-                    )
-                    last_updated_date = period_date
+                last_updated_date = period_date  # 使用当前周期作为默认值
         else:
             logger.warning(
-                f"未知的最后更新时间类型: {type(last_updated_raw)}, "
-                f"使用当前周期日期 {period_date}"
+                f"未知的最后更新时间类型: {type(last_updated_raw)}, 使用当前周期"
             )
             last_updated_date = period_date
 
-        # ===== 核心判断：是否需要重置 =====
-        if last_updated_date is None or last_updated_date < period_date:
+        # ===== 5. 核心修复：更精确的重置判断 =====
+        should_reset = False
+        reset_reason = ""
+
+        if last_updated_date is None:
+            should_reset = True
+            reset_reason = "last_updated_date is None"
+        else:
+            # 🎯 关键修复：使用 period_date 进行比较
+            if last_updated_date < period_date:
+                should_reset = True
+                reset_reason = f"last_updated_date ({last_updated_date}) < period_date ({period_date})"
+            elif last_updated_date > period_date:
+                # 这种情况不应该发生，但如果有，也重置
+                should_reset = True
+                reset_reason = f"last_updated_date ({last_updated_date}) > period_date ({period_date})"
+            else:
+                # last_updated_date == period_date，不需要重置
+                should_reset = False
+                reset_reason = f"last_updated_date ({last_updated_date}) == period_date ({period_date})"
+
+        # ===== 6. 执行重置 =====
+        if should_reset:
             logger.info(
-                f"重置用户数据: {chat_id}-{uid}\n"
+                f"🔄 执行用户数据重置: {chat_id}-{uid}\n"
+                f"  • 原因: {reset_reason}\n"
                 f"  • 上次更新: {last_updated_date}\n"
                 f"  • 当前周期: {period_date}\n"
                 f"  • 重置时间: {reset_hour:02d}:{reset_minute:02d}"
             )
 
-            # 执行重置（传递正确的datetime类型）
-            success = await db.reset_user_daily_data(
-                chat_id, uid, period_datetime  # 使用带时区的datetime
+            # 创建带时区的datetime用于数据库
+            period_datetime = beijing_tz.localize(
+                datetime.combine(period_date, datetime.min.time())
             )
 
+            # 执行重置（传递正确的datetime类型）
+            success = await db.reset_user_daily_data(chat_id, uid, period_datetime)
+
             if success:
+                # 更新最后更新时间
                 await db.update_user_last_updated(chat_id, uid, period_date)
+
+                # 🎯 关键：彻底清理缓存
+                cache_keys = [
+                    f"user:{chat_id}:{uid}",
+                    f"user_all_activities:{chat_id}:{uid}",
+                ]
+                for key in cache_keys:
+                    db._cache.pop(key, None)
+
                 logger.info(f"✅ 重置完成: {chat_id}-{uid}")
             else:
                 logger.error(f"❌ 重置失败: {chat_id}-{uid}")
@@ -664,7 +699,7 @@ async def reset_daily_data_if_needed(
         # ===== 出错兜底：尝试初始化用户 =====
         try:
             # 使用当前周期日期
-            current_period_date = current_time.date()
+            current_period_date = await db.get_reset_period_date(chat_id, current_time)
             await db.init_user(chat_id, uid, "用户", current_time)
             await db.update_user_last_updated(chat_id, uid, current_period_date)
             logger.info(f"⚠️ 出错兜底：初始化用户成功 {chat_id}-{uid}")
