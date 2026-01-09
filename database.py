@@ -1624,13 +1624,13 @@ class PostgreSQLDatabase:
             for key in cache_keys:
                 self._cache.pop(key, None)
 
-            self.logger.info(
+            logger.info(
                 f"✅ 数据重置完成并已归档月报: {chat_id}-{user_id}, 周期={period_date}"
             )
             return True
 
         except Exception as e:
-            self.logger.error(f"❌ 重置失败: {e}")
+            logger.error(f"❌ 重置失败: {e}")
             return False
 
     async def get_user_activity_count(
