@@ -984,32 +984,54 @@ class PostgreSQLDatabase:
             return result
         return None
 
-    async def get_user_cached(self, chat_id: int, user_id: int) -> Optional[Dict]:
+    async def get_user_cached(
+        self, chat_id: int, user_id: int, target_datetime: datetime = None
+    ) -> Optional[Dict]:
         """
-        带缓存的获取用户数据 - 纯净版
-        不再依赖外部 reset 函数，解决循环引用和相对导入报错
+        带缓存的获取用户数据 - 修复版：使用重置周期日期
         """
+
+        if target_datetime is None:
+            target_datetime = self.get_beijing_time()
+
         cache_key = f"user:{chat_id}:{user_id}"
         cached = self._get_cached(cache_key)
 
-        # 即使命中缓存，也要检查缓存里的数据日期是否还是今天
+        # 🎯 获取当前重置周期日期（而不是自然日）
+        current_period_date = await self.get_reset_period_date(chat_id, target_datetime)
+
+        # --- 🎯 缓存命中但必须校验周期 ---
         if cached is not None:
-            current_date = self.get_beijing_date()
-            # 这里的 last_updated 是我们在 complete_user_activity 里存入的 period_date
-            if cached.get("last_updated") == current_date:
+            db_date = cached.get("last_updated")
+
+            # 日期类型转换，确保可比较
+            if hasattr(db_date, "date"):
+                db_date = db_date.date()
+
+            # 🎯 只有在同一重置周期内，缓存才有效
+            if db_date == current_period_date:
                 return cached
             else:
-                # 缓存日期已过，清理它并重新读库
+                # 缓存跨周期，立即清理
                 self._cache.pop(cache_key, None)
 
-        # 从数据库读取
+        # --- 🎯 从数据库读取 ---
         row = await self.fetchrow_with_retry(
             "获取用户数据",
             """
-            SELECT user_id, nickname, current_activity, activity_start_time, 
-                total_accumulated_time, total_activity_count, total_fines,
-                overtime_count, total_overtime_time, last_updated
-            FROM users WHERE chat_id = $1 AND user_id = $2
+            SELECT 
+                user_id,
+                nickname,
+                current_activity,
+                activity_start_time,
+                total_accumulated_time,
+                total_activity_count,
+                total_fines,
+                overtime_count,
+                total_overtime_time,
+                last_updated
+            FROM users 
+            WHERE chat_id = $1 AND user_id = $2
             """,
             chat_id,
             user_id,
@@ -1017,16 +1039,14 @@ class PostgreSQLDatabase:
 
         if row:
             result = dict(row)
-            current_date = self.get_beijing_date()
             db_date = result.get("last_updated")
 
-            # 日期类型转换确保比对成功
+            # 日期类型转换
             if hasattr(db_date, "date"):
                 db_date = db_date.date()
 
-            # 🎯 核心逻辑：如果在读取时发现数据库日期不是今天
-            # 说明该用户今天还没产生过任何交互，逻辑上他的数据应该是 0
-            if db_date != current_date:
+            # 🎯 核心兜底：数据库日期不在当前重置周期
+            if db_date != current_period_date:
                 result.update(
                     {
                         "total_accumulated_time": 0,
@@ -1036,12 +1056,14 @@ class PostgreSQLDatabase:
                         "total_overtime_time": 0,
                         "current_activity": None,
                         "activity_start_time": None,
-                        "last_updated": current_date,  # 修正内存中的日期
+                        # 仅修正内存数据，不写库
+                        "last_updated": current_period_date,
                     }
                 )
 
-            self._set_cached(cache_key, result, 30)
+            self._set_cached(cache_key, result, 30)  # 30 秒缓存
             return result
+
         return None
 
     async def update_user_activity(
@@ -1496,20 +1518,27 @@ class PostgreSQLDatabase:
         self,
         chat_id: int,
         user_id: int,
-        target_date: Optional[date] = None,
+        target_datetime: Optional[datetime] = None,
     ) -> bool:
-        """彻底重置用户每日数据：修复归零失败 + 保护月报统计"""
+        """彻底重置用户每日数据：使用重置周期日期 + 保护月报统计 + 数据安全"""
 
         try:
-            if target_date is None:
-                target_date = self.get_beijing_date()
+            # 🎯 1. 统一时间入口
+            if target_datetime is None:
+                target_datetime = self.get_beijing_time()
+
+            # 🎯 2. 获取业务重置周期日期
+            period_date = await self.get_reset_period_date(chat_id, target_datetime)
+
+            # 🎯 3. 确保用户存在且 last_updated 对齐周期
+            await self.init_user(chat_id, user_id, None, target_datetime)
 
             self._ensure_pool_initialized()
 
             async with self.pool.acquire() as conn:
                 async with conn.transaction():
 
-                    # --- 🎯 步骤 A: 归档数据到月报表 ---
+                    # --- 🧾 A: 归档数据到月报表 ---
                     await conn.execute(
                         """
                         INSERT INTO monthly_statistics (
@@ -1538,10 +1567,10 @@ class PostgreSQLDatabase:
                         """,
                         chat_id,
                         user_id,
-                        target_date,
+                        period_date,  # 🎯 使用周期日期
                     )
 
-                    # --- 🎯 步骤 B: 删除当日流水 ---
+                    # --- 🧹 B: 删除当期流水 ---
                     await conn.execute(
                         """
                         DELETE FROM user_activities
@@ -1551,10 +1580,10 @@ class PostgreSQLDatabase:
                         """,
                         chat_id,
                         user_id,
-                        target_date,
+                        period_date,  # 🎯 使用周期日期
                     )
 
-                    # --- 🎯 步骤 C: 主表彻底归零 ---
+                    # --- 🧮 C: 主表彻底归零 ---
                     await conn.execute(
                         """
                         UPDATE users SET
@@ -1572,10 +1601,10 @@ class PostgreSQLDatabase:
                         """,
                         chat_id,
                         user_id,
-                        target_date,
+                        period_date,  # 🎯 使用周期日期
                     )
 
-            # --- 🎯 步骤 D: 缓存清理 ---
+            # --- 🧽 D: 缓存清理 ---
             cache_keys = [
                 f"user:{chat_id}:{user_id}",
                 f"user_all_activities:{chat_id}:{user_id}",
@@ -1585,7 +1614,9 @@ class PostgreSQLDatabase:
             for key in cache_keys:
                 self._cache.pop(key, None)
 
-            self.logger.info(f"✅ 数据重置完成并已归档月报: {chat_id}-{user_id}")
+            self.logger.info(
+                f"✅ 数据重置完成并已归档月报: {chat_id}-{user_id}, 周期={period_date}"
+            )
             return True
 
         except Exception as e:
@@ -2142,15 +2173,28 @@ class PostgreSQLDatabase:
             rows = await conn.fetch("SELECT chat_id FROM groups")
             return [row["chat_id"] for row in rows]
 
-    async def get_group_members(self, chat_id: int) -> List[Dict]:
-        """获取群组成员"""
-        today = self.get_beijing_date()
+    async def get_group_members(
+        self, chat_id: int, target_datetime: datetime = None
+    ) -> List[Dict]:
+        """获取群组成员 - 根据重置周期"""
+        if target_datetime is None:
+            target_datetime = self.get_beijing_time()
+
+        # 🎯 获取当前重置周期日期
+        period_date = await self.get_reset_period_date(chat_id, target_datetime)
+
         self._ensure_pool_initialized()
         async with self.pool.acquire() as conn:
             rows = await conn.fetch(
-                "SELECT user_id, nickname, current_activity, activity_start_time, total_accumulated_time, total_activity_count, total_fines, overtime_count, total_overtime_time FROM users WHERE chat_id = $1 AND last_updated = $2",
+                """
+                SELECT user_id, nickname, current_activity, activity_start_time, 
+                    total_accumulated_time, total_activity_count, total_fines, 
+                    overtime_count, total_overtime_time, last_updated 
+                FROM users 
+                WHERE chat_id = $1 AND last_updated = $2
+                """,
                 chat_id,
-                today,
+                period_date,  # 🎯 使用重置周期日期
             )
             return [dict(row) for row in rows]
 
