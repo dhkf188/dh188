@@ -539,6 +539,7 @@ class PostgreSQLDatabase:
                     nickname TEXT,
                     current_activity TEXT,
                     activity_start_time TEXT,
+                    activity_period_date DATE,
                     total_accumulated_time INTEGER DEFAULT 0,
                     total_activity_count INTEGER DEFAULT 0,
                     total_fines INTEGER DEFAULT 0,
@@ -998,7 +999,7 @@ class PostgreSQLDatabase:
         self, chat_id: int, user_id: int, target_datetime: datetime = None
     ) -> Optional[Dict]:
         """
-        带缓存的获取用户数据 - 修复版：使用重置周期日期
+        带缓存的获取用户数据 - 修复版：包含周期字段
         """
 
         if target_datetime is None:
@@ -1025,7 +1026,7 @@ class PostgreSQLDatabase:
                 # 缓存跨周期，立即清理
                 self._cache.pop(cache_key, None)
 
-        # --- 🎯 从数据库读取 ---
+        # --- 🎯 从数据库读取（包含 activity_period_date 字段）---
         row = await self.fetchrow_with_retry(
             "获取用户数据",
             """
@@ -1034,6 +1035,7 @@ class PostgreSQLDatabase:
                 nickname,
                 current_activity,
                 activity_start_time,
+                activity_period_date,  -- 🆕 新增字段
                 total_accumulated_time,
                 total_activity_count,
                 total_fines,
@@ -1057,6 +1059,14 @@ class PostgreSQLDatabase:
 
             # 🎯 核心兜底：数据库日期不在当前重置周期
             if db_date != current_period_date:
+                # 🆕 新增：检查活动周期是否也需要重置
+                activity_period_date = result.get("activity_period_date")
+                if activity_period_date and activity_period_date != current_period_date:
+                    logger.warning(
+                        f"⚠️ 检测到跨周期活动数据: {chat_id}-{user_id}, "
+                        f"活动周期={activity_period_date}, 当前周期={current_period_date}"
+                    )
+
                 result.update(
                     {
                         "total_accumulated_time": 0,
@@ -1066,6 +1076,13 @@ class PostgreSQLDatabase:
                         "total_overtime_time": 0,
                         "current_activity": None,
                         "activity_start_time": None,
+                        # 🆕 如果活动周期与当前周期不符，也清除活动周期
+                        "activity_period_date": (
+                            None
+                            if activity_period_date
+                            and activity_period_date != current_period_date
+                            else activity_period_date
+                        ),
                         # 仅修正内存数据，不写库
                         "last_updated": current_period_date,
                     }
@@ -1173,164 +1190,165 @@ class PostgreSQLDatabase:
         fine_amount: int = 0,
         is_overtime: bool = False,
     ):
-        """完成用户活动 - 彻底修复版（同步更新所有表并物理清理多重缓存）"""
+        """完成用户活动 - 使用活动锁定周期版本"""
+        try:
+            # 1. 获取用户数据（包含锁定周期）
+            user_data = await self.get_user_cached(chat_id, user_id)
 
-        # 1. 获取准确的统计时间戳
-        current_time = self.get_beijing_time()
-        # 重置周期日期（用于判断属于哪一天的打卡）
-        period_date = await self.get_reset_period_date(chat_id, current_time)
-        # 月度统计日期（自然月首日）
-        statistic_date = current_time.date().replace(day=1)
+            # 🎯 第3步：结束活动时，使用锁定周期（封印点）
+            period_date = user_data.get("activity_period_date") if user_data else None
 
-        # 2. 计算超时秒数
-        overtime_seconds = 0
-        if is_overtime:
-            time_limit = await self.get_activity_time_limit(activity)
-            time_limit_seconds = time_limit * 60
-            overtime_seconds = max(0, elapsed_time - time_limit_seconds)
+            # 兜底（理论上不会发生）
+            if not period_date:
+                current_time = self.get_beijing_time()
+                period_date = await self.get_reset_period_date(chat_id, current_time)
+                logger.warning(f"⚠️ 使用兜底周期: {chat_id}-{user_id}, 活动={activity}")
 
-        self._ensure_pool_initialized()
-        async with self.pool.acquire() as conn:
-            async with conn.transaction():
-                # --- A. 基础用户信息更新 ---
-                await conn.execute(
-                    """
-                    INSERT INTO users (chat_id, user_id, last_updated) 
-                    VALUES ($1, $2, $3)
-                    ON CONFLICT (chat_id, user_id) 
-                    DO UPDATE SET last_updated = EXCLUDED.last_updated
-                    """,
-                    chat_id,
-                    user_id,
-                    current_time,
-                )
+            # 月度统计日期（自然月首日）
+            statistic_date = datetime.now(beijing_tz).date().replace(day=1)
 
-                # --- B. user_activities 表：更新当日分项流水 ---
-                await conn.execute(
-                    """
-                    INSERT INTO user_activities 
-                    (chat_id, user_id, activity_date, activity_name, activity_count, accumulated_time)
-                    VALUES ($1, $2, $3, $4, 1, $5)
-                    ON CONFLICT (chat_id, user_id, activity_date, activity_name) 
-                    DO UPDATE SET 
-                        activity_count = user_activities.activity_count + 1,
-                        accumulated_time = user_activities.accumulated_time + EXCLUDED.accumulated_time,
-                        updated_at = CURRENT_TIMESTAMP
-                    """,
-                    chat_id,
-                    user_id,
-                    period_date,
-                    activity,
-                    elapsed_time,
-                )
+            # 2. 计算超时秒数
+            overtime_seconds = 0
+            if is_overtime:
+                time_limit = await self.get_activity_time_limit(activity)
+                time_limit_seconds = time_limit * 60
+                overtime_seconds = max(0, elapsed_time - time_limit_seconds)
 
-                # --- C. monthly_statistics 表：更新月度分项累计 ---
-                await conn.execute(
-                    """
-                    INSERT INTO monthly_statistics 
-                    (chat_id, user_id, statistic_date, activity_name, activity_count, accumulated_time)
-                    VALUES ($1, $2, $3, $4, 1, $5)
-                    ON CONFLICT (chat_id, user_id, statistic_date, activity_name) 
-                    DO UPDATE SET 
-                        activity_count = monthly_statistics.activity_count + 1,
-                        accumulated_time = monthly_statistics.accumulated_time + EXCLUDED.accumulated_time,
-                        updated_at = CURRENT_TIMESTAMP
-                    """,
-                    chat_id,
-                    user_id,
-                    statistic_date,
-                    activity,
-                    elapsed_time,
-                )
+            self._ensure_pool_initialized()
+            async with self.pool.acquire() as conn:
+                async with conn.transaction():
+                    # --- A. 基础用户信息更新（同时清除活动周期）---
+                    update_fields = [
+                        "total_accumulated_time = total_accumulated_time + $1",
+                        "total_activity_count = total_activity_count + 1",
+                        "current_activity = NULL",
+                        "activity_start_time = NULL",
+                        "activity_period_date = NULL",  # 🆕 清除周期字段
+                        "last_updated = $2",
+                        "updated_at = CURRENT_TIMESTAMP",
+                    ]
+                    params = [
+                        elapsed_time,
+                        period_date,
+                    ]
 
-                # --- D. 处理超时相关的月度统计数据 ---
-                if is_overtime and overtime_seconds > 0:
-                    # 更新超时次数
+                    idx = 3
+                    if fine_amount > 0:
+                        update_fields.append(f"total_fines = total_fines + ${idx}")
+                        params.append(fine_amount)
+                        idx += 1
+
+                    if is_overtime:
+                        update_fields.append("overtime_count = overtime_count + 1")
+                        update_fields.append(
+                            f"total_overtime_time = total_overtime_time + ${idx}"
+                        )
+                        params.append(overtime_seconds)
+                        idx += 1
+
+                    params.extend([chat_id, user_id])
+                    query = (
+                        f"UPDATE users SET {', '.join(update_fields)} "
+                        f"WHERE chat_id = ${idx} AND user_id = ${idx+1}"
+                    )
+                    await conn.execute(query, *params)
+
+                    # --- B. user_activities 表：使用锁定周期 ---
                     await conn.execute(
                         """
-                        INSERT INTO monthly_statistics (chat_id, user_id, statistic_date, activity_name, activity_count)
-                        VALUES ($1, $2, $3, 'overtime_count', 1)
+                        INSERT INTO user_activities 
+                        (chat_id, user_id, activity_date, activity_name, activity_count, accumulated_time)
+                        VALUES ($1, $2, $3, $4, 1, $5)
+                        ON CONFLICT (chat_id, user_id, activity_date, activity_name) 
+                        DO UPDATE SET 
+                            activity_count = user_activities.activity_count + 1,
+                            accumulated_time = user_activities.accumulated_time + EXCLUDED.accumulated_time,
+                            updated_at = CURRENT_TIMESTAMP
+                        """,
+                        chat_id,
+                        user_id,
+                        period_date,  # 🎯 使用锁定周期
+                        activity,
+                        elapsed_time,
+                    )
+
+                    # --- C. monthly_statistics 表：更新月度分项累计 ---
+                    await conn.execute(
+                        """
+                        INSERT INTO monthly_statistics 
+                        (chat_id, user_id, statistic_date, activity_name, activity_count, accumulated_time)
+                        VALUES ($1, $2, $3, $4, 1, $5)
                         ON CONFLICT (chat_id, user_id, statistic_date, activity_name) 
-                        DO UPDATE SET activity_count = monthly_statistics.activity_count + 1
+                        DO UPDATE SET 
+                            activity_count = monthly_statistics.activity_count + 1,
+                            accumulated_time = monthly_statistics.accumulated_time + EXCLUDED.accumulated_time,
+                            updated_at = CURRENT_TIMESTAMP
                         """,
                         chat_id,
                         user_id,
                         statistic_date,
-                    )
-                    # 更新超时时长
-                    await conn.execute(
-                        """
-                        INSERT INTO monthly_statistics (chat_id, user_id, statistic_date, activity_name, accumulated_time)
-                        VALUES ($1, $2, $3, 'overtime_time', $4)
-                        ON CONFLICT (chat_id, user_id, statistic_date, activity_name) 
-                        DO UPDATE SET accumulated_time = monthly_statistics.accumulated_time + EXCLUDED.accumulated_time
-                        """,
-                        chat_id,
-                        user_id,
-                        statistic_date,
-                        overtime_seconds,
+                        activity,
+                        elapsed_time,
                     )
 
-                # --- E. 处理罚款的月度统计数据 ---
-                if fine_amount > 0:
-                    await conn.execute(
-                        """
-                        INSERT INTO monthly_statistics (chat_id, user_id, statistic_date, activity_name, accumulated_time)
-                        VALUES ($1, $2, $3, 'total_fines', $4)
-                        ON CONFLICT (chat_id, user_id, statistic_date, activity_name) 
-                        DO UPDATE SET accumulated_time = monthly_statistics.accumulated_time + EXCLUDED.accumulated_time
-                        """,
-                        chat_id,
-                        user_id,
-                        statistic_date,
-                        fine_amount,
-                    )
+                    # --- D. 处理超时相关的月度统计数据 ---
+                    if is_overtime and overtime_seconds > 0:
+                        # 更新超时次数
+                        await conn.execute(
+                            """
+                            INSERT INTO monthly_statistics (chat_id, user_id, statistic_date, activity_name, activity_count)
+                            VALUES ($1, $2, $3, 'overtime_count', 1)
+                            ON CONFLICT (chat_id, user_id, statistic_date, activity_name) 
+                            DO UPDATE SET activity_count = monthly_statistics.activity_count + 1
+                            """,
+                            chat_id,
+                            user_id,
+                            statistic_date,
+                        )
+                        # 更新超时时长
+                        await conn.execute(
+                            """
+                            INSERT INTO monthly_statistics (chat_id, user_id, statistic_date, activity_name, accumulated_time)
+                            VALUES ($1, $2, $3, 'overtime_time', $4)
+                            ON CONFLICT (chat_id, user_id, statistic_date, activity_name) 
+                            DO UPDATE SET accumulated_time = monthly_statistics.accumulated_time + EXCLUDED.accumulated_time
+                            """,
+                            chat_id,
+                            user_id,
+                            statistic_date,
+                            overtime_seconds,
+                        )
 
-                # --- F. 核心：更新 users 主表的实时累计数据（原子操作） ---
-                update_fields = [
-                    "total_accumulated_time = total_accumulated_time + $1",
-                    "total_activity_count = total_activity_count + 1",
-                    "current_activity = NULL",
-                    "activity_start_time = NULL",
-                    "last_updated = $2",
-                    "updated_at = CURRENT_TIMESTAMP",
-                ]
-                params = [
-                    elapsed_time,
-                    period_date,
-                ]  # 注意：last_updated 记录为统计日期
+                    # --- E. 处理罚款的月度统计数据 ---
+                    if fine_amount > 0:
+                        await conn.execute(
+                            """
+                            INSERT INTO monthly_statistics (chat_id, user_id, statistic_date, activity_name, accumulated_time)
+                            VALUES ($1, $2, $3, 'total_fines', $4)
+                            ON CONFLICT (chat_id, user_id, statistic_date, activity_name) 
+                            DO UPDATE SET accumulated_time = monthly_statistics.accumulated_time + EXCLUDED.accumulated_time
+                            """,
+                            chat_id,
+                            user_id,
+                            statistic_date,
+                            fine_amount,
+                        )
 
-                idx = 3
-                if fine_amount > 0:
-                    update_fields.append(f"total_fines = total_fines + ${idx}")
-                    params.append(fine_amount)
-                    idx += 1
+            # 🎯 核心修复步骤：双重清理缓存
+            cache_keys = [
+                f"user:{chat_id}:{user_id}",
+                f"user_all_activities:{chat_id}:{user_id}",
+            ]
+            for key in cache_keys:
+                self._cache.pop(key, None)
 
-                if is_overtime:
-                    update_fields.append("overtime_count = overtime_count + 1")
-                    update_fields.append(
-                        f"total_overtime_time = total_overtime_time + ${idx}"
-                    )
-                    params.append(overtime_seconds)
-                    idx += 1
+            logger.info(
+                f"✅ 用户 {user_id} 活动记录完成（使用锁定周期: {period_date}）"
+            )
 
-                params.extend([chat_id, user_id])
-                query = (
-                    f"UPDATE users SET {', '.join(update_fields)} "
-                    f"WHERE chat_id = ${idx} AND user_id = ${idx+1}"
-                )
-                await conn.execute(query, *params)
-
-        # 🎯 核心修复步骤：双重清理缓存
-        # 必须清理主表缓存 + 分项活动统计缓存，否则回座后显示的“总次数”会是旧的
-        cache_keys = [
-            f"user:{chat_id}:{user_id}",
-            f"user_all_activities:{chat_id}:{user_id}",
-        ]
-        for key in cache_keys:
-            self._cache.pop(key, None)
-
-        logger.info(f"✅ 用户 {user_id} 活动记录完成并清理缓存")
+        except Exception as e:
+            logger.error(f"❌ 完成用户活动失败 {chat_id}-{user_id}: {e}", exc_info=True)
+            raise
 
     # ========= 重置前批量完成所有未结束活动 =========
     async def complete_all_pending_activities_before_reset(
@@ -1565,7 +1583,7 @@ class PostgreSQLDatabase:
                             activity_date,
                             activity_name,
                             activity_count,
-                            activity_time
+                            accumulated_time
                         FROM user_activities
                         WHERE chat_id = $1
                           AND user_id = $2
@@ -1593,7 +1611,7 @@ class PostgreSQLDatabase:
                         period_date,  # 🎯 使用周期日期
                     )
 
-                    # --- 🧮 C: 主表彻底归零 ---
+                    # --- 🧮 C: 主表彻底归零（包含周期字段）---
                     await conn.execute(
                         """
                         UPDATE users SET
@@ -1604,6 +1622,7 @@ class PostgreSQLDatabase:
                             overtime_count = 0,
                             current_activity = NULL,
                             activity_start_time = NULL,
+                            activity_period_date = NULL,
                             last_updated = $3,
                             updated_at = CURRENT_TIMESTAMP
                         WHERE chat_id = $1
@@ -1630,7 +1649,7 @@ class PostgreSQLDatabase:
             return True
 
         except Exception as e:
-            logger.error(f"❌ 重置失败: {e}")
+            logger.error(f"❌ 重置失败: {e}", exc_info=True)
             return False
 
     async def get_user_activity_count(
