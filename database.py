@@ -6,8 +6,18 @@ from typing import Dict, Any, List, Optional, Union
 from config import Config, beijing_tz
 import asyncpg
 from asyncpg.pool import Pool
+from dataclasses import dataclass
 
 logger = logging.getLogger("GroupCheckInBot")
+
+
+@dataclass
+class ResetPeriod:
+    """重置周期对象"""
+
+    start: datetime  # 周期开始时间（精确到秒）
+    end: datetime  # 周期结束时间（精确到秒）
+    key: date  # 周期标识（用于比较和存储）
 
 
 class PostgreSQLDatabase:
