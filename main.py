@@ -557,7 +557,7 @@ async def recover_expired_activities():
 async def reset_daily_data_if_needed(
     chat_id: int, uid: int, current_time: datetime | None = None
 ):
-    """生产级每日数据重置 - 终极修复版"""
+    """生产级每日数据重置 - 终极修复版（含周期检查）"""
     from datetime import datetime, date, timedelta
     from config import beijing_tz
 
@@ -591,7 +591,68 @@ async def reset_daily_data_if_needed(
             await db.init_user(chat_id, uid, "用户", current_time)
             return
 
-        # ===== 4. 解析最后更新时间 =====
+        # ===== 4. 新增：检查活动周期是否需要清理（必须在重置判断前执行）=====
+        activity_period = user_data.get("activity_period_date")
+        current_activity = user_data.get("current_activity")
+
+        if current_activity and activity_period and activity_period != period_date:
+            logger.warning(
+                f"🔄 检测到跨周期活动，自动清理: {chat_id}-{uid}, "
+                f"活动={current_activity}, 活动周期={activity_period}, 当前周期={period_date}"
+            )
+            try:
+                # 先尝试正常结束活动（使用活动锁定的周期）
+                activity_start_time_str = user_data.get("activity_start_time")
+                if activity_start_time_str:
+                    try:
+                        start_time = datetime.fromisoformat(
+                            activity_start_time_str.replace("Z", "+00:00")
+                        )
+                        if start_time.tzinfo is None:
+                            start_time = beijing_tz.localize(start_time)
+
+                        elapsed = int((current_time - start_time).total_seconds())
+
+                        # 结束活动时使用活动锁定的周期
+                        await db.complete_user_activity(
+                            chat_id, uid, current_activity, elapsed, 0, False
+                        )
+                        logger.info(
+                            f"✅ 已正常结束跨周期活动: {chat_id}-{uid} -> {current_activity}"
+                        )
+
+                    except Exception as end_error:
+                        logger.error(f"结束跨周期活动失败: {end_error}")
+                        # 如果结束失败，直接清理活动状态
+                        await db.execute_with_retry(
+                            "清理跨周期活动状态",
+                            """
+                            UPDATE users
+                            SET
+                                current_activity = NULL,
+                                activity_start_time = NULL,
+                                activity_period_date = NULL,
+                                updated_at = CURRENT_TIMESTAMP
+                            WHERE chat_id = $1 AND user_id = $2
+                            """,
+                            chat_id,
+                            uid,
+                        )
+                        logger.info(f"✅ 已清理跨周期活动状态: {chat_id}-{uid}")
+
+                # 清理缓存
+                cache_keys = [
+                    f"user:{chat_id}:{uid}",
+                    f"user_all_activities:{chat_id}:{uid}",
+                ]
+                for key in cache_keys:
+                    db._cache.pop(key, None)
+
+            except Exception as e:
+                logger.error(f"❌ 处理跨周期活动失败: {e}")
+                # 继续执行，不阻断重置流程
+
+        # ===== 5. 解析最后更新时间 =====
         last_updated_raw = user_data.get("last_updated")
         last_updated_date = None
 
@@ -630,7 +691,7 @@ async def reset_daily_data_if_needed(
             )
             last_updated_date = period_date
 
-        # ===== 5. 核心修复：更精确的重置判断 =====
+        # ===== 6. 核心修复：更精确的重置判断 =====
         should_reset = False
         reset_reason = ""
 
@@ -651,7 +712,7 @@ async def reset_daily_data_if_needed(
                 should_reset = False
                 reset_reason = f"last_updated_date ({last_updated_date}) == period_date ({period_date})"
 
-        # ===== 6. 执行重置 =====
+        # ===== 7. 执行重置 =====
         if should_reset:
             logger.info(
                 f"🔄 执行用户数据重置: {chat_id}-{uid}\n"
@@ -702,6 +763,23 @@ async def reset_daily_data_if_needed(
             current_period_date = await db.get_reset_period_date(chat_id, current_time)
             await db.init_user(chat_id, uid, "用户", current_time)
             await db.update_user_last_updated(chat_id, uid, current_period_date)
+
+            # 🎯 新增：清理可能存在的活动状态
+            await db.execute_with_retry(
+                "出错兜底清理活动状态",
+                """
+                UPDATE users
+                SET
+                    current_activity = NULL,
+                    activity_start_time = NULL,
+                    activity_period_date = NULL,
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE chat_id = $1 AND user_id = $2
+                """,
+                chat_id,
+                uid,
+            )
+
             logger.info(f"⚠️ 出错兜底：初始化用户成功 {chat_id}-{uid}")
         except Exception as init_error:
             logger.error(f"❌ 用户初始化也失败: {init_error}")
@@ -727,7 +805,7 @@ async def check_activity_limit(
 async def has_active_activity(
     chat_id: int, uid: int, current_time: datetime = None
 ) -> tuple[bool, Optional[str]]:
-    """检查用户是否有活动正在进行 - 修复版"""
+    """检查用户是否有活动正在进行 - 检查周期一致性"""
     if current_time is None:
         current_time = get_beijing_time()
 
@@ -738,7 +816,21 @@ async def has_active_activity(
     # 🎯 获取用户数据（传入当前时间）
     user_data = await db.get_user_cached(chat_id, uid, current_time)  # ✅ 传入时间
 
-    return user_data["current_activity"] is not None, user_data["current_activity"]
+    if not user_data or user_data["current_activity"] is None:
+        return False, None
+
+    # 🎯 新增：检查活动周期是否有效
+    activity_period = user_data.get("activity_period_date")
+    if activity_period:
+        current_period = await db.get_reset_period_date(chat_id, current_time)
+        if activity_period != current_period:
+            # 周期不匹配，视为无效活动
+            logger.warning(
+                f"⚠️ 活动周期不匹配: {chat_id}-{uid}, 活动周期={activity_period}, 当前周期={current_period}"
+            )
+            return False, None
+
+    return True, user_data["current_activity"]
 
 
 async def can_perform_activities(
@@ -1110,7 +1202,7 @@ async def activity_timer(chat_id: int, uid: int, act: str, limit: int):
 
 # ========== 核心打卡功能 ==========
 async def start_activity(message: types.Message, act: str):
-    """开始活动"""
+    """开始活动 - 带周期锁定版本"""
     chat_id = message.chat.id
     uid = message.from_user.id
 
@@ -1119,6 +1211,36 @@ async def start_activity(message: types.Message, act: str):
 
     user_lock = user_lock_manager.get_lock(chat_id, uid)
     async with user_lock:
+        # 🎯 第4步：跨周期时强制清理旧活动
+        current_period = await db.get_reset_period_date(chat_id, now)
+        user_data = await db.get_user_cached(chat_id, uid, now)
+        last_period = user_data.get("activity_period_date") if user_data else None
+
+        # 🧹 如果周期已经变了，说明旧活动是"跨周期幽灵"
+        if last_period and last_period != current_period:
+            try:
+                await db.execute_with_retry(
+                    "清理跨周期活动",
+                    """
+                    UPDATE users
+                    SET
+                        current_activity = NULL,
+                        activity_start_time = NULL,
+                        activity_period_date = NULL
+                    WHERE chat_id = $1 AND user_id = $2
+                    """,
+                    chat_id,
+                    uid,
+                )
+                logger.info(
+                    f"🧹 清理跨周期活动: {chat_id}-{uid}, 旧周期={last_period}, 新周期={current_period}"
+                )
+
+                # 清理缓存
+                db._cache.pop(f"user:{chat_id}:{uid}", None)
+            except Exception as e:
+                logger.error(f"清理跨周期活动失败 {chat_id}-{uid}: {e}")
+                # 继续执行，不阻断主流程
 
         # 🧹 周期重置（只做一次）
         await reset_daily_data_if_needed(chat_id, uid, now)
@@ -1160,7 +1282,7 @@ async def start_activity(message: types.Message, act: str):
                 )
                 return
 
-        has_active, current_act = await has_active_activity(chat_id, uid)
+        has_active, current_act = await has_active_activity(chat_id, uid, now)
         if has_active:
             await message.answer(
                 Config.MESSAGES["has_activity"].format(current_act),
@@ -1179,7 +1301,41 @@ async def start_activity(message: types.Message, act: str):
             )
             return
 
-        await db.update_user_activity(chat_id, uid, act, str(now), name)
+        # 🎯 第2步：开始活动时，锁定周期（关键）
+        period_date = await db.get_reset_period_date(chat_id, now)
+
+        try:
+            await db.execute_with_retry(
+                "开始活动锁定周期",
+                """
+                UPDATE users
+                SET
+                    current_activity = $1,
+                    activity_start_time = $2,
+                    activity_period_date = $3,
+                    nickname = COALESCE($4, nickname),
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE chat_id = $5 AND user_id = $6
+                """,
+                act,
+                now.isoformat(),
+                period_date,
+                name,
+                chat_id,
+                uid,
+            )
+
+            # 清理缓存
+            db._cache.pop(f"user:{chat_id}:{uid}", None)
+
+            logger.info(
+                f"✅ 活动开始（周期锁定）: {chat_id}-{uid} -> {act}, 周期={period_date}"
+            )
+
+        except Exception as e:
+            logger.error(f"❌ 开始活动失败 {chat_id}-{uid}: {e}")
+            await message.answer("❌ 开始活动失败，请稍后重试")
+            return
 
         time_limit = await db.get_activity_time_limit(act)
         await timer_manager.start_timer(chat_id, uid, act, time_limit)
