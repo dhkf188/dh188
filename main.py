@@ -568,9 +568,11 @@ async def reset_daily_data_if_needed(
         reset_minute = group_data.get("reset_minute", Config.DAILY_RESET_MINUTE)
 
         # ===== 当前重置周期起点（时间点）=====
+        # 🎯 修复：确保使用带时区的时间
         reset_time_today = current_time.replace(
             hour=reset_hour, minute=reset_minute, second=0, microsecond=0
         )
+        
         if current_time < reset_time_today:
             current_period_start = reset_time_today - timedelta(days=1)
         else:
@@ -595,11 +597,20 @@ async def reset_daily_data_if_needed(
         # ===== 解析 last_updated =====
         if isinstance(last_updated_raw, datetime):
             last_updated = last_updated_raw
+            # 🎯 修复：如果没有时区，加上北京时间
+            if last_updated.tzinfo is None:
+                last_updated = beijing_tz.localize(last_updated)
         else:
             try:
                 last_updated = datetime.fromisoformat(
                     str(last_updated_raw).replace("Z", "+00:00")
                 )
+                # 🎯 修复：确保转换为北京时间
+                if last_updated.tzinfo is None:
+                    last_updated = beijing_tz.localize(last_updated)
+                elif last_updated.tzinfo != beijing_tz:
+                    # 如果是其他时区，转换为北京时间
+                    last_updated = last_updated.astimezone(beijing_tz)
             except Exception:
                 # 无法解析 → 视为需要重置
                 last_updated = None
