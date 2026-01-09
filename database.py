@@ -6,18 +6,8 @@ from typing import Dict, Any, List, Optional, Union
 from config import Config, beijing_tz
 import asyncpg
 from asyncpg.pool import Pool
-from dataclasses import dataclass
 
 logger = logging.getLogger("GroupCheckInBot")
-
-
-@dataclass
-class ResetPeriod:
-    """重置周期对象"""
-
-    start: datetime  # 周期开始时间（精确到秒）
-    end: datetime  # 周期结束时间（精确到秒）
-    key: date  # 周期标识（用于比较和存储）
 
 
 class PostgreSQLDatabase:
@@ -319,13 +309,26 @@ class PostgreSQLDatabase:
 
     # ========= 统一时间 =========
     async def get_reset_period_date(
-        self, chat_id: int, target_datetime: datetime = None
+        self, chat_id: int, target_datetime: datetime | date | None = None
     ) -> date:
-        """根据群组重置时间获取重置周期日期"""
-        if target_datetime is None:
-            target_datetime = self.get_beijing_time()
-
+        """根据群组重置时间获取重置周期日期（date / datetime 安全 & 语义纯净版）"""
         try:
+            # 1️⃣ 统一 target_datetime 为 datetime
+            if target_datetime is None:
+                target_datetime = self.get_beijing_time()
+            elif isinstance(target_datetime, date) and not isinstance(
+                target_datetime, datetime
+            ):
+                # 仅做“类型转换”，不引入业务假设
+                target_datetime = datetime.combine(
+                    target_datetime, datetime.min.time(), tzinfo=beijing_tz
+                )
+
+            # 2️⃣ 确保有时区
+            if target_datetime.tzinfo is None:
+                target_datetime = beijing_tz.localize(target_datetime)
+
+            # 3️⃣ 获取群组配置
             group_data = await self.get_group_cached(chat_id)
             if not group_data:
                 await self.init_group(chat_id)
@@ -334,23 +337,20 @@ class PostgreSQLDatabase:
             reset_hour = group_data.get("reset_hour", Config.DAILY_RESET_HOUR)
             reset_minute = group_data.get("reset_minute", Config.DAILY_RESET_MINUTE)
 
-            # 计算今天的重置时间点
+            # 4️⃣ 计算当天重置时间
             reset_time_today = target_datetime.replace(
                 hour=reset_hour, minute=reset_minute, second=0, microsecond=0
             )
 
-            # 判断当前时间与重置时间的关系
+            # 5️⃣ 判断周期
             if target_datetime < reset_time_today:
-                # 当前时间在今天重置时间之前，属于昨天的周期
                 return (reset_time_today - timedelta(days=1)).date()
             else:
-                # 当前时间在今天重置时间之后，属于今天的周期
                 return reset_time_today.date()
 
         except Exception as e:
-            logger.error(f"计算重置周期日期失败 {chat_id}: {e}")
-            # 出错时返回自然日
-            return target_datetime.date()
+            logger.error(f"计算重置周期日期失败 {chat_id}: {e}", exc_info=True)
+            return self.get_beijing_time().date()
 
     async def has_work_record_in_period(
         self, chat_id: int, user_id: int, checkin_type: str, target_datetime: datetime
