@@ -1211,45 +1211,62 @@ class PostgreSQLDatabase:
         target_datetime: datetime = None,
     ) -> int:
         """
-        原子性更新用户活动状态并返回更新后的计数
+        原子性更新用户活动状态并返回更新后的计数 - 加强版
+        添加更多调试日志和验证
         """
         try:
-
-            # 🎯 统一时间入口
+            # 1️⃣ 统一时间入口
             if target_datetime is None:
                 target_datetime = self.get_beijing_time()
 
-            # 🎯 获取业务周期日期
+            # 2️⃣ 获取业务周期日期
             period_date = await self.get_reset_period_date(chat_id, target_datetime)
 
-            # 🎯 标准化 start_time
-            original_type = type(start_time).__name__
+            # 🎯 调试日志：记录周期信息
+            logger.debug(
+                f"🔍 update_user_activity: {chat_id}-{user_id}-{activity}, "
+                f"周期日期: {period_date}, 目标时间: {target_datetime.strftime('%Y-%m-%d %H:%M:%S')}"
+            )
 
+            # 3️⃣ 标准化 start_time
             if hasattr(start_time, "isoformat"):
-                # datetime 对象
                 if start_time.tzinfo is None:
                     start_time = beijing_tz.localize(start_time)
                 start_time_str = start_time.isoformat()
-
             elif isinstance(start_time, str):
-                # 字符串类型
                 start_time_str = self._normalize_time_string(
                     start_time, target_datetime
                 )
             else:
-                # 其他类型转换为字符串
                 start_time_str = str(start_time)
-                logger.debug(f"🔄 转换类型: {original_type} -> {start_time_str}")
 
             self._ensure_pool_initialized()
             async with self.pool.acquire() as conn:
                 async with conn.transaction():
-                    # 1️⃣ 原子性更新 user_activities 表
+                    # 🎯 调试：检查当前是否有记录
+                    existing_record = await conn.fetchrow(
+                        """
+                        SELECT activity_count FROM user_activities 
+                        WHERE chat_id = $1 AND user_id = $2 
+                        AND activity_date = $3 AND activity_name = $4
+                        """,
+                        chat_id,
+                        user_id,
+                        period_date,
+                        activity,
+                    )
+
+                    logger.debug(
+                        f"📊 更新前检查: {chat_id}-{user_id}-{activity}, "
+                        f"现有记录: {'有' if existing_record else '无'}, "
+                        f"现有次数: {existing_record['activity_count'] if existing_record else 0}"
+                    )
+
+                    # 4️⃣ 原子性更新 user_activities 并返回最新计数
                     row = await conn.fetchrow(
                         """
                         INSERT INTO user_activities
-                            (chat_id, user_id, activity_date, activity_name, 
-                             activity_count, accumulated_time)
+                            (chat_id, user_id, activity_date, activity_name, activity_count, accumulated_time)
                         VALUES ($1, $2, $3, $4, 1, 0)
                         ON CONFLICT (chat_id, user_id, activity_date, activity_name)
                         DO UPDATE SET
@@ -1264,7 +1281,7 @@ class PostgreSQLDatabase:
                     )
                     updated_count = row["activity_count"] if row else 1
 
-                    # 2️⃣ 更新 users 表
+                    # 5️⃣ 更新 users 表（支持 nickname）
                     update_query = """
                         UPDATE users
                         SET current_activity = $1,
@@ -1288,24 +1305,38 @@ class PostgreSQLDatabase:
                         update_params.append(nickname)
 
                     update_query += " WHERE chat_id = $4 AND user_id = $5"
-
                     await conn.execute(update_query, *update_params)
 
-                    # 3️⃣ 验证更新
-                    verify = await conn.fetchrow(
-                        "SELECT 1 FROM users WHERE chat_id = $1 AND user_id = $2 "
-                        "AND current_activity = $3",
+                    # 🎯 验证更新
+                    verify_row = await conn.fetchrow(
+                        "SELECT activity_count FROM user_activities WHERE chat_id = $1 AND user_id = $2 AND activity_date = $3 AND activity_name = $4",
                         chat_id,
                         user_id,
+                        period_date,
                         activity,
                     )
-                    if not verify:
-                        logger.warning(f"⚠️ 用户活动状态验证异常: {chat_id}-{user_id}")
 
-            # 4️⃣ 清理缓存（在事务外执行）
-            self._cache.pop(f"user:{chat_id}:{user_id}", None)
-            self._cache.pop(f"user_all_activities:{chat_id}:{user_id}", None)
-            logger.debug(f"🧹 已清理用户缓存: {chat_id}-{user_id}")
+                    if verify_row and verify_row["activity_count"] != updated_count:
+                        logger.error(
+                            f"⚠️ 验证失败: 期望{updated_count}, 实际{verify_row['activity_count']}"
+                        )
+
+            # 6️⃣ 缓存清理（事务外执行）
+            cache_keys_to_remove = [
+                f"user:{chat_id}:{user_id}",
+                f"user_all_activities:{chat_id}:{user_id}",
+                f"activity_count:{chat_id}:{user_id}:{activity}:{period_date}",
+            ]
+
+            # 清理所有活动计数相关的缓存
+            pattern = f"activity_count:{chat_id}:{user_id}:"
+            for cache_key in list(self._cache.keys()):
+                if cache_key.startswith(pattern):
+                    cache_keys_to_remove.append(cache_key)
+
+            for key in set(cache_keys_to_remove):  # 去重
+                self._cache.pop(key, None)
+                self._cache_ttl.pop(key, None)
 
             logger.info(
                 f"✅ 用户活动更新: {chat_id}-{user_id}, 活动: {activity}, "
@@ -1743,6 +1774,13 @@ class PostgreSQLDatabase:
             # 🎯 2. 获取业务重置周期日期
             period_date = await self.get_reset_period_date(chat_id, target_datetime)
 
+            # 🎯 调试：记录重置开始
+            logger.info(
+                f"🔄 开始重置用户数据: {chat_id}-{user_id}, "
+                f"周期日期: {period_date}, "
+                f"目标时间: {target_datetime.strftime('%Y-%m-%d %H:%M:%S')}"
+            )
+
             # 🎯 3. 确保用户存在且 last_updated 对齐周期
             await self.init_user(chat_id, user_id, None, target_datetime)
 
@@ -1750,9 +1788,31 @@ class PostgreSQLDatabase:
 
             async with self.pool.acquire() as conn:
                 async with conn.transaction():
+                    # 🎯 调试：重置前检查数据
+                    pre_reset_check = await conn.fetchrow(
+                        """
+                        SELECT 
+                            (SELECT COUNT(*) FROM user_activities 
+                             WHERE chat_id = $1 AND user_id = $2 AND activity_date = $3) as activity_count,
+                            (SELECT COUNT(*) FROM work_records 
+                             WHERE chat_id = $1 AND user_id = $2 AND record_date = $3) as work_record_count,
+                            (SELECT total_activity_count FROM users 
+                             WHERE chat_id = $1 AND user_id = $2) as user_total_count
+                        """,
+                        chat_id,
+                        user_id,
+                        period_date,
+                    )
+
+                    logger.debug(
+                        f"📊 重置前数据状态: "
+                        f"活动记录数={pre_reset_check['activity_count']}, "
+                        f"工作记录数={pre_reset_check['work_record_count']}, "
+                        f"用户总次数={pre_reset_check['user_total_count']}"
+                    )
 
                     # --- 🧹 A: 删除当期活动流水 ---
-                    await conn.execute(
+                    delete_result = await conn.execute(
                         """
                         DELETE FROM user_activities
                         WHERE chat_id = $1
@@ -1763,9 +1823,10 @@ class PostgreSQLDatabase:
                         user_id,
                         period_date,
                     )
+                    logger.debug(f"删除活动记录结果: {delete_result}")
 
-                    # --- 🧹 B: 删除当期上下班记录 --- 🎯 新增！
-                    await conn.execute(
+                    # --- 🧹 B: 删除当期上下班记录 ---
+                    delete_work_result = await conn.execute(
                         """
                         DELETE FROM work_records
                         WHERE chat_id = $1
@@ -1776,9 +1837,10 @@ class PostgreSQLDatabase:
                         user_id,
                         period_date,
                     )
+                    logger.debug(f"删除工作记录结果: {delete_work_result}")
 
                     # --- 🧮 C: 主表彻底归零 ---
-                    await conn.execute(
+                    update_result = await conn.execute(
                         """
                         UPDATE users SET
                             total_activity_count = 0,
@@ -1797,24 +1859,108 @@ class PostgreSQLDatabase:
                         user_id,
                         period_date,
                     )
+                    logger.debug(f"更新用户表结果: {update_result}")
+
+                    # 🎯 验证重置效果
+                    post_reset_check = await conn.fetchrow(
+                        """
+                        SELECT 
+                            (SELECT COUNT(*) FROM user_activities 
+                             WHERE chat_id = $1 AND user_id = $2 AND activity_date = $3) as activity_count,
+                            (SELECT total_activity_count FROM users 
+                             WHERE chat_id = $1 AND user_id = $2) as user_total_count
+                        """,
+                        chat_id,
+                        user_id,
+                        period_date,
+                    )
+
+                    if (
+                        post_reset_check["activity_count"] > 0
+                        or post_reset_check["user_total_count"] > 0
+                    ):
+                        logger.warning(
+                            f"⚠️ 重置后数据非零: "
+                            f"活动记录数={post_reset_check['activity_count']}, "
+                            f"用户总次数={post_reset_check['user_total_count']}"
+                        )
+
+                # 🎯 提交事务后，确保用户数据被正确更新
+                await conn.execute(
+                    """
+                    UPDATE users SET last_updated = $3 
+                    WHERE chat_id = $1 AND user_id = $2
+                    """,
+                    chat_id,
+                    user_id,
+                    period_date,
+                )
 
             # --- 🧽 D: 缓存清理 ---
-            cache_keys = [
+            cache_keys_to_remove = set()
+
+            # 1. 固定要清理的键
+            fixed_keys = [
                 f"user:{chat_id}:{user_id}",
                 f"user_all_activities:{chat_id}:{user_id}",
                 f"group:{chat_id}",
             ]
+            cache_keys_to_remove.update(fixed_keys)
 
-            for key in cache_keys:
-                self._cache.pop(key, None)
+            # 2. 动态匹配要清理的键
+            all_cache_keys = list(self._cache.keys())
+            for cache_key in all_cache_keys:
+                if f"activity_count:{chat_id}:{user_id}:" in cache_key:
+                    cache_keys_to_remove.add(cache_key)
+                if f"activity_limit:" in cache_key:
+                    cache_keys_to_remove.add(cache_key)
 
-            self.logger.info(
-                f"✅ 数据重置完成: {chat_id}-{user_id}, 周期={period_date}"
-            )
+            # 3. 执行清理
+            cleaned_count = 0
+            for key in cache_keys_to_remove:
+                if key in self._cache:
+                    self._cache.pop(key, None)
+                    cleaned_count += 1
+                if key in self._cache_ttl:
+                    self._cache_ttl.pop(key, None)
+
+            logger.info(f"🧹 缓存清理: 清理了 {cleaned_count} 个缓存项")
+
+            # 🎯 重置后立即验证
+            try:
+                async with self.pool.acquire() as conn:
+                    verify_row = await conn.fetchrow(
+                        """
+                        SELECT activity_count FROM user_activities 
+                        WHERE chat_id = $1 AND user_id = $2 
+                        AND activity_date = $3 AND activity_name = $4
+                        """,
+                        chat_id,
+                        user_id,
+                        period_date,
+                        "小厕",  # 示例活动，可按实际调整
+                    )
+                    verify_count = verify_row["activity_count"] if verify_row else 0
+
+                    if verify_count == 0:
+                        logger.info(
+                            f"✅ 重置验证通过: {chat_id}-{user_id}, 活动计数={verify_count}"
+                        )
+                    else:
+                        logger.warning(
+                            f"⚠️ 重置验证异常: {chat_id}-{user_id}, 活动计数={verify_count} (应该是0)"
+                        )
+            except Exception as verify_error:
+                logger.error(f"❌ 重置验证失败: {verify_error}")
+
+            logger.info(f"✅ 数据重置完成: {chat_id}-{user_id}, 周期={period_date}")
             return True
 
         except Exception as e:
-            self.logger.error(f"❌ 重置失败: {e}")
+            logger.error(f"❌ 重置失败 {chat_id}-{user_id}: {e}")
+            import traceback
+
+            logger.error(f"详细错误: {traceback.format_exc()}")
             return False
 
     async def get_user_activity_count(
@@ -1823,30 +1969,72 @@ class PostgreSQLDatabase:
         user_id: int,
         activity: str,
         target_datetime: datetime = None,
+        cache_ttl: int = 3,  # 短期缓存秒数，可调整
     ) -> int:
-        """获取用户当前周期的活动次数"""
+
         try:
-            # 获取当前群组重置逻辑下的“业务日期”
+            # 1️⃣ 统一时间入口
+            if target_datetime is None:
+                target_datetime = self.get_beijing_time()
+
+            # 2️⃣ 获取业务周期日期
             period_date = await self.get_reset_period_date(chat_id, target_datetime)
 
+            # 3️⃣ 构造缓存 key（与 update_user_activity 保持一致）
+            cache_key = f"activity_count:{chat_id}:{user_id}:{activity}:{period_date}"
+
+            # 🎯 调试日志：记录关键信息
+            logger.debug(
+                f"🔍 get_user_activity_count: {cache_key}, "
+                f"周期: {period_date}, 时间: {target_datetime.strftime('%Y-%m-%d %H:%M:%S')}"
+            )
+
+            current_time = time.time()
+
+            # 4️⃣ 检查缓存有效性
+            if cache_key in self._cache_ttl:
+                if current_time < self._cache_ttl[cache_key]:
+                    cached_value = self._cache.get(cache_key)
+                    if cached_value is not None:
+                        logger.debug(f"✅ 缓存命中: {cache_key} = {cached_value}")
+                        return cached_value
+                else:
+                    # TTL 过期，清理缓存
+                    logger.debug(f"🔄 缓存过期: {cache_key}")
+                    self._cache.pop(cache_key, None)
+                    self._cache_ttl.pop(cache_key, None)
+
+            # 5️⃣ 查询数据库
             self._ensure_pool_initialized()
             async with self.pool.acquire() as conn:
-                # 🎯 这里建议只查 period_date 的记录
                 row = await conn.fetchrow(
                     """
-                    SELECT activity_count FROM user_activities 
-                    WHERE chat_id = $1 AND user_id = $2 
-                    AND activity_date = $3 AND activity_name = $4
+                    SELECT activity_count 
+                    FROM user_activities 
+                    WHERE chat_id = $1 
+                      AND user_id = $2 
+                      AND activity_date = $3 
+                      AND activity_name = $4
                     """,
                     chat_id,
                     user_id,
                     period_date,
                     activity,
                 )
-                return row["activity_count"] if row else 0
+                count = row["activity_count"] if row else 0
+
+            # 6️⃣ 设置短期缓存
+            self._cache[cache_key] = count
+            self._cache_ttl[cache_key] = current_time + cache_ttl
+
+            logger.debug(f"📊 数据库查询: {cache_key} = {count}")
+            return count
 
         except Exception as e:
-            logger.error(f"获取次数失败 {chat_id}-{user_id}: {e}")
+            logger.error(f"❌ 获取用户活动次数失败 {chat_id}-{user_id}-{activity}: {e}")
+            import traceback
+
+            logger.error(f"堆栈跟踪: {traceback.format_exc()}")
             return 0
 
     async def get_user_all_activities(
