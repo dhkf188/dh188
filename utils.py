@@ -99,22 +99,22 @@ class MessageFormatter:
         user_name: str,
         activity: str,
         time_str: str,
-        count: int,
+        count: int,  # 🎯 这个 count 应该是数据库中的实际计数
         max_times: int,
         time_limit: int,
     ) -> str:
-        """格式化打卡消息"""
         first_line = f"👤 用户：{MessageFormatter.format_user_link(user_id, user_name)}"
 
+        # 🎯 修复：消息文本去掉"第 X 次"中的计算逻辑
         message = (
             f"{first_line}\n"
             f"✅ 打卡成功：{MessageFormatter.format_copyable_text(activity)} - {MessageFormatter.format_copyable_text(time_str)}\n"
-            f"⚠️ 注意：这是您第 {MessageFormatter.format_copyable_text(str(count))} 次{MessageFormatter.format_copyable_text(activity)}（今日上限：{MessageFormatter.format_copyable_text(str(max_times))}次）\n"
+            f"⚠️ 注意：您今日已进行 {MessageFormatter.format_copyable_text(str(count))} 次{MessageFormatter.format_copyable_text(activity)}（今日上限：{MessageFormatter.format_copyable_text(str(max_times))}次）\n"
             f"⏰ 本次活动时间限制：{MessageFormatter.format_copyable_text(str(time_limit))} 分钟"
         )
 
         if count >= max_times:
-            message += f"\n🚨 警告：本次结束后，您今日的{MessageFormatter.format_copyable_text(activity)}次数将达到上限，请留意！"
+            message += f"\n🚨 警告：您今日的{MessageFormatter.format_copyable_text(activity)}次数已达到上限，请明日再来！"
 
         message += f"\n💡提示：活动完成后请及时点击'✅ 回座'按钮"
 
