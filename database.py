@@ -344,8 +344,10 @@ class PostgreSQLDatabase:
 
     async def has_reset_executed_today(
         self, chat_id: int, target_datetime: datetime = None
-    ) -> bool:
-        """检查今天是否已经执行过重置（使用groups表字段）"""
+    ) -> tuple[bool, str]:
+        """
+        返回：(是否执行过, 原因)
+        """
         if target_datetime is None:
             target_datetime = self.get_beijing_time()
 
@@ -353,15 +355,34 @@ class PostgreSQLDatabase:
 
         self._ensure_pool_initialized()
         async with self.pool.acquire() as conn:
+            # 获取当前配置和最后记录
             row = await conn.fetchrow(
                 """
-                SELECT 1 FROM groups 
-                WHERE chat_id = $1 AND last_reset_date = $2
+                SELECT 
+                    g.reset_hour,
+                    g.reset_minute,
+                    g.last_reset_date,
+                    g.last_reset_config
+                FROM groups g
+                WHERE g.chat_id = $1
                 """,
                 chat_id,
-                today,
             )
-            return row is not None
+
+            if not row or not row["last_reset_date"]:
+                return False, "从未重置过"
+
+            last_date = row["last_reset_date"]
+            last_config = row["last_reset_config"] or ""
+            current_config = f"{row['reset_hour']}:{row['reset_minute']}"
+
+            if last_date != today:
+                return False, "今天未重置过"
+
+            if last_config != current_config:
+                return False, "重置配置已变更"
+
+            return True, "今天已按相同配置重置过"
 
     async def get_last_reset_info(self, chat_id: int) -> Optional[Dict]:
         """获取群组最后一次重置的信息"""
