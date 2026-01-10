@@ -1075,7 +1075,7 @@ async def activity_timer(chat_id: int, uid: int, act: str, limit: int):
 
 # ========== 核心打卡功能 ==========
 async def start_activity(message: types.Message, act: str):
-    """开始活动"""
+    """开始活动 - 适配新版 update_user_activity"""
     chat_id = message.chat.id
     uid = message.from_user.id
 
@@ -1144,18 +1144,32 @@ async def start_activity(message: types.Message, act: str):
             )
             return
 
-        await db.update_user_activity(chat_id, uid, act, str(now), name)
+        # 🎯 关键修改：使用新版 update_user_activity 获取更新后的计数
+        updated_count = await db.update_user_activity(
+            chat_id=chat_id,
+            user_id=uid,
+            activity=act,
+            start_time=now,  # 传入 datetime 对象
+            nickname=name,
+            target_datetime=now,  # 用于周期计算
+        )
+
+        # 检查更新是否成功
+        if updated_count == 0:
+            await message.answer("❌ 打卡失败，请重试")
+            return
 
         time_limit = await db.get_activity_time_limit(act)
         await timer_manager.start_timer(chat_id, uid, act, time_limit)
 
+        # 🎯 使用数据库返回的准确计数
         await message.answer(
             MessageFormatter.format_activity_message(
                 uid,
                 name,
                 act,
                 now.strftime("%m/%d %H:%M:%S"),
-                current_count + 1,
+                updated_count,  # 🎯 使用数据库返回的计数
                 max_times,
                 time_limit,
             ),
