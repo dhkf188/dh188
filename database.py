@@ -1634,7 +1634,7 @@ class PostgreSQLDatabase:
         user_id: int,
         target_datetime: Optional[datetime] = None,
     ) -> bool:
-        """彻底重置用户每日数据：使用重置周期日期 + 保护月报统计 + 数据安全"""
+        """彻底重置用户每日数据：使用重置周期日期 + 数据安全"""
 
         try:
             # 🎯 1. 统一时间入口
@@ -1652,39 +1652,7 @@ class PostgreSQLDatabase:
             async with self.pool.acquire() as conn:
                 async with conn.transaction():
 
-                    # --- 🧾 A: 归档数据到月报表 ---
-                    await conn.execute(
-                        """
-                        INSERT INTO monthly_statistics (
-                            chat_id,
-                            user_id,
-                            statistic_date,
-                            activity_name,
-                            activity_count,
-                            accumulated_time
-                        )
-                        SELECT
-                            chat_id,
-                            user_id,
-                            activity_date,
-                            activity_name,
-                            activity_count,
-                            activity_time
-                        FROM user_activities
-                        WHERE chat_id = $1
-                          AND user_id = $2
-                          AND activity_date = $3
-                        ON CONFLICT (chat_id, user_id, statistic_date, activity_name)
-                        DO UPDATE SET
-                            activity_count = monthly_statistics.activity_count + EXCLUDED.activity_count,
-                            accumulated_time = monthly_statistics.accumulated_time + EXCLUDED.accumulated_time
-                        """,
-                        chat_id,
-                        user_id,
-                        period_date,  # 🎯 使用周期日期
-                    )
-
-                    # --- 🧹 B: 删除当期流水 ---
+                    # --- 🧹 A: 删除当期活动流水 ---
                     await conn.execute(
                         """
                         DELETE FROM user_activities
@@ -1694,7 +1662,20 @@ class PostgreSQLDatabase:
                         """,
                         chat_id,
                         user_id,
-                        period_date,  # 🎯 使用周期日期
+                        period_date,
+                    )
+
+                    # --- 🧹 B: 删除当期上下班记录 --- 🎯 新增！
+                    await conn.execute(
+                        """
+                        DELETE FROM work_records
+                        WHERE chat_id = $1
+                          AND user_id = $2
+                          AND record_date = $3
+                        """,
+                        chat_id,
+                        user_id,
+                        period_date,
                     )
 
                     # --- 🧮 C: 主表彻底归零 ---
@@ -1715,7 +1696,7 @@ class PostgreSQLDatabase:
                         """,
                         chat_id,
                         user_id,
-                        period_date,  # 🎯 使用周期日期
+                        period_date,
                     )
 
             # --- 🧽 D: 缓存清理 ---
@@ -1729,7 +1710,7 @@ class PostgreSQLDatabase:
                 self._cache.pop(key, None)
 
             self.logger.info(
-                f"✅ 数据重置完成并已归档月报: {chat_id}-{user_id}, 周期={period_date}"
+                f"✅ 数据重置完成: {chat_id}-{user_id}, 周期={period_date}"
             )
             return True
 
