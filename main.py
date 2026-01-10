@@ -3938,7 +3938,7 @@ async def export_and_push_csv(
 # ========== 定时任务 ==========
 async def daily_reset_task():
     """
-    完整版每日重置任务 - 使用groups表字段记录状态
+    完整版每日重置任务 - 修复重置时间变更问题
     包含：重置前导出、结束活动、取消定时器、数据重置
     """
     # 简单内存锁，防止同一分钟内重复执行
@@ -3973,29 +3973,40 @@ async def daily_reset_task():
                 if now.hour != reset_hour or now.minute != reset_minute:
                     continue
 
-                # 🎯 核心检查：今天是否已执行过
-                has_executed = await db.has_reset_executed_today(chat_id, now)
-                if has_executed:
-                    # 检查配置是否相同
-                    last_reset = await db.get_last_reset_info(chat_id)
-                    if last_reset:
-                        last_config = last_reset.get("reset_config", "")
-                        current_config = f"{reset_hour}:{reset_minute}"
+                # 🎯 修复的核心检查逻辑开始
+                should_execute = True
+                skip_reason = ""
 
+                # 获取最后重置信息
+                last_reset = await db.get_last_reset_info(chat_id)
+                if last_reset:
+                    last_date = last_reset.get("reset_date")
+                    last_config = last_reset.get("reset_config", "")
+                    current_config = f"{reset_hour}:{reset_minute}"
+
+                    # 检查今天是否已重置过
+                    if last_date == today:
+                        # 检查配置是否相同
                         if last_config == current_config:
-                            logger.debug(
-                                f"群组 {chat_id} 今天已执行过相同配置的重置，跳过"
-                            )
-                            continue
+                            should_execute = False
+                            skip_reason = "今天已按相同配置重置过"
                         else:
-                            logger.info(
-                                f"群组 {chat_id} 重置配置已变更 ({last_config} -> {current_config})，允许执行"
+                            skip_reason = (
+                                f"重置配置已变更 ({last_config} -> {current_config})"
                             )
+                            # 配置变更，应该执行重置
+                    else:
+                        skip_reason = "今天未重置过"
+                else:
+                    skip_reason = "从未重置过"
 
-                # 🎯 开始执行重置
-                logger.info(
-                    f"🚀 开始重置群组 {chat_id} (重置时间: {reset_hour:02d}:{reset_minute:02d})"
-                )
+                if not should_execute:
+                    logger.debug(f"群组 {chat_id} {skip_reason}，跳过重置")
+                    continue
+
+                logger.info(f"群组 {chat_id} {skip_reason}，开始重置...")
+                # 🎯 修复的核心检查逻辑结束
+
                 executing_groups.add(chat_id)
 
                 try:
