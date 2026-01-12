@@ -3696,6 +3696,7 @@ async def handle_my_record(message: types.Message):
 
     user_lock = get_user_lock(chat_id, uid)
     async with user_lock:
+        await reset_daily_data_if_needed(chat_id, uid)
         await show_history(message)
 
 
@@ -3709,6 +3710,9 @@ async def handle_rank(message: types.Message):
 
     user_lock = get_user_lock(chat_id, uid)
     async with user_lock:
+        # 🆕 修复：查看排行榜时也顺便检查该用户的重置状态
+        await reset_daily_data_if_needed(chat_id, uid)
+        
         await show_rank(message)
 
 
