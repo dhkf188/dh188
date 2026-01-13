@@ -748,7 +748,7 @@ def get_admin_keyboard() -> ReplyKeyboardMarkup:
 
 # ========== 活动定时提醒 ==========
 async def activity_timer(chat_id: int, uid: int, act: str, limit: int):
-    """最终无遗漏可用版活动定时器（含引用回复 + 每10分钟超时提醒 + 2小时强制回座）"""
+    """最终可用版活动定时器（含引用回复 + 自动重试 + 每10分钟超时提醒 + 2小时强制回座）"""
     try:
         # ===== 状态标记 =====
         one_minute_warning_sent = False
@@ -760,10 +760,10 @@ async def activity_timer(chat_id: int, uid: int, act: str, limit: int):
         # 获取原打卡消息 ID
         checkin_message_id = await db.get_user_checkin_message_id(chat_id, uid)
 
-        # ===== 群消息发送封装（引用 + 降级） =====
+        # ===== 群消息发送封装（引用 + 自动重试） =====
         async def send_group_message(text: str, kb=None):
-            try:
-                if checkin_message_id:
+            if checkin_message_id:
+                try:
                     return await bot.send_message(
                         chat_id=chat_id,
                         text=text,
@@ -771,15 +771,27 @@ async def activity_timer(chat_id: int, uid: int, act: str, limit: int):
                         reply_markup=kb,
                         reply_to_message_id=checkin_message_id,
                     )
-                else:
-                    return await bot.send_message(
-                        chat_id=chat_id,
-                        text=text,
-                        parse_mode="HTML",
-                        reply_markup=kb,
-                    )
-            except Exception as e:
-                logger.warning(f"⚠️ 引用发送失败，降级普通发送: {e}")
+                except Exception as e:
+                    logger.warning(f"⚠️ 引用发送失败，重试一次: {e}")
+                    # 重试一次
+                    await asyncio.sleep(1)
+                    try:
+                        return await bot.send_message(
+                            chat_id=chat_id,
+                            text=text,
+                            parse_mode="HTML",
+                            reply_markup=kb,
+                            reply_to_message_id=checkin_message_id,
+                        )
+                    except Exception as e2:
+                        logger.warning(f"⚠️ 引用发送重试失败，降级普通发送: {e2}")
+                        return await bot.send_message(
+                            chat_id=chat_id,
+                            text=text,
+                            parse_mode="HTML",
+                            reply_markup=kb,
+                        )
+            else:
                 return await bot.send_message(
                     chat_id=chat_id,
                     text=text,
@@ -890,7 +902,7 @@ async def activity_timer(chat_id: int, uid: int, act: str, limit: int):
                 msg = (
                     f"⏳ <b>即将超时警告</b>\n"
                     f"👤 {MessageFormatter.format_user_link(uid, nickname)}\n"
-                    f"🕓 本次 {MessageFormatter.format_copyable_text(act)} 还有 <code>1</code> 分钟！"
+                    f"🕓 本次 {MessageFormatter.format_copyable_text(act)} 还有 <code>1</code> 分钟！\n"
                     f"💡 请及时回座，避免超时罚款"
                 )
                 await send_group_message(msg, build_quick_back_kb())
@@ -906,7 +918,7 @@ async def activity_timer(chat_id: int, uid: int, act: str, limit: int):
                     timeout_immediate_sent = True
                     msg = (
                         f"⚠️ <b>超时警告</b>\n"
-                        f"👤 {MessageFormatter.format_user_link(uid, nickname)} 已超时！"
+                        f"👤 {MessageFormatter.format_user_link(uid, nickname)} 已超时！\n"
                         f"🏃‍♂️ 请立即回座，避免产生罚款！"
                     )
                     last_reminder_minute = 0
@@ -916,7 +928,7 @@ async def activity_timer(chat_id: int, uid: int, act: str, limit: int):
                     timeout_5min_sent = True
                     msg = (
                         f"🔔 <b>超时警告</b>\n"
-                        f"👤 {MessageFormatter.format_user_link(uid, nickname)} 已超时 <code>5</code> 分钟！"
+                        f"👤 {MessageFormatter.format_user_link(uid, nickname)} 已超时 <code>5</code> 分钟！\n"
                         f"😤 罚款正在累积，请立即回座！"
                     )
                     last_reminder_minute = 5
@@ -926,7 +938,7 @@ async def activity_timer(chat_id: int, uid: int, act: str, limit: int):
                     last_reminder_minute = overtime_minutes
                     msg = (
                         f"🚨 <b>超时警告</b>\n"
-                        f"👤 {MessageFormatter.format_user_link(uid, nickname)} 已超时 <code>{overtime_minutes}</code> 分钟！"
+                        f"👤 {MessageFormatter.format_user_link(uid, nickname)} 已超时 <code>{overtime_minutes}</code> 分钟！\n"
                         f"💢 请立刻回座，系统将持续记录超时！"
                     )
 
