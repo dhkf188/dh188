@@ -748,7 +748,7 @@ def get_admin_keyboard() -> ReplyKeyboardMarkup:
 
 # ========== 活动定时提醒 ==========
 async def activity_timer(chat_id: int, uid: int, act: str, limit: int):
-    """活动定时提醒任务 - 强制回座时支持引用回复，并安全清理打卡消息ID"""
+    """活动定时提醒任务 - 所有超时消息和强制回座都引用原打卡消息"""
     try:
         one_minute_warning_sent = False
         timeout_immediate_sent = False
@@ -756,11 +756,16 @@ async def activity_timer(chat_id: int, uid: int, act: str, limit: int):
         last_reminder_minute = 0
         force_back_sent = False  # 防止重复强制回座
 
+        # 🎯 获取原打卡消息ID
+        checkin_message_id = await db.get_user_checkin_message_id(chat_id, uid)
+        logger.info(f"⏰ 定时器启动: {chat_id}-{uid} - {act}，原消息ID: {checkin_message_id}")
+
         while True:
             user_lock = user_lock_manager.get_lock(chat_id, uid)
             async with user_lock:
                 user_data = await db.get_user_cached(chat_id, uid)
                 if not user_data or user_data["current_activity"] != act:
+                    logger.info(f"定时器 {chat_id}-{uid} 活动已结束，停止监控")
                     break
 
                 start_time = datetime.fromisoformat(user_data["activity_start_time"])
@@ -784,7 +789,25 @@ async def activity_timer(chat_id: int, uid: int, act: str, limit: int):
                         )
                     ]]
                 )
-                await bot.send_message(chat_id, warning_msg, parse_mode="HTML", reply_markup=back_keyboard)
+
+                # 🎯 引用原打卡消息发送
+                try:
+                    if checkin_message_id:
+                        await bot.send_message(
+                            chat_id,
+                            warning_msg,
+                            parse_mode="HTML",
+                            reply_markup=back_keyboard,
+                            reply_to_message_id=checkin_message_id
+                        )
+                        logger.info(f"✅ 1分钟预警已发送，引用消息 {checkin_message_id}")
+                    else:
+                        await bot.send_message(chat_id, warning_msg, parse_mode="HTML", reply_markup=back_keyboard)
+                        logger.warning("⚠️ 1分钟预警没有原消息引用")
+                except Exception as e:
+                    logger.error(f"❌ 发送1分钟预警失败: {e}")
+                    await bot.send_message(chat_id, warning_msg, parse_mode="HTML", reply_markup=back_keyboard)
+
                 one_minute_warning_sent = True
 
             # ===== 超时提醒 =====
@@ -801,7 +824,6 @@ async def activity_timer(chat_id: int, uid: int, act: str, limit: int):
                         f"❌ 您的 {MessageFormatter.format_copyable_text(act)} 已经<code>超时</code>！\n"
                         f"🏃‍♂️ 请立即回座，避免产生更多罚款！"
                     )
-
                 elif overtime_minutes == 5 and not timeout_5min_sent:
                     timeout_5min_sent = True
                     last_reminder_minute = 5
@@ -811,7 +833,6 @@ async def activity_timer(chat_id: int, uid: int, act: str, limit: int):
                         f"❌ 您的 {MessageFormatter.format_copyable_text(act)} 已经超时 <code>5</code> 分钟！\n"
                         f"😤 请立即回座，避免罚款增加！"
                     )
-
                 elif overtime_minutes >= 10 and overtime_minutes % 10 == 0 and overtime_minutes > last_reminder_minute:
                     last_reminder_minute = overtime_minutes
                     msg = (
@@ -830,7 +851,22 @@ async def activity_timer(chat_id: int, uid: int, act: str, limit: int):
                             )
                         ]]
                     )
-                    await bot.send_message(chat_id, msg, parse_mode="HTML", reply_markup=back_keyboard)
+                    # 🎯 引用原打卡消息发送
+                    try:
+                        if checkin_message_id:
+                            await bot.send_message(
+                                chat_id,
+                                msg,
+                                parse_mode="HTML",
+                                reply_markup=back_keyboard,
+                                reply_to_message_id=checkin_message_id
+                            )
+                            logger.info(f"✅ 超时警告已发送，引用消息 {checkin_message_id}")
+                        else:
+                            await bot.send_message(chat_id, msg, parse_mode="HTML", reply_markup=back_keyboard)
+                    except Exception as e:
+                        logger.error(f"❌ 发送超时警告失败: {e}")
+                        await bot.send_message(chat_id, msg, parse_mode="HTML", reply_markup=back_keyboard)
 
             # ===== 2 小时强制回座 =====
             user_lock = user_lock_manager.get_lock(chat_id, uid)
@@ -840,12 +876,13 @@ async def activity_timer(chat_id: int, uid: int, act: str, limit: int):
                     if remaining <= -120 * 60 and not force_back_sent:
                         force_back_sent = True
 
-                        # 🆕 获取打卡消息ID
-                        checkin_message_id = await db.get_user_checkin_message_id(chat_id, uid)
+                        # 🎯 再次获取打卡消息ID（以防变化）
+                        current_checkin_message_id = await db.get_user_checkin_message_id(chat_id, uid)
+                        if not current_checkin_message_id and checkin_message_id:
+                            current_checkin_message_id = checkin_message_id
 
                         overtime_minutes = 120
                         fine_amount = await calculate_fine(act, overtime_minutes)
-
                         elapsed = (get_beijing_time() - datetime.fromisoformat(user_data["activity_start_time"])).total_seconds()
 
                         await db.complete_user_activity(chat_id, uid, act, int(elapsed), fine_amount, True)
@@ -860,18 +897,19 @@ async def activity_timer(chat_id: int, uid: int, act: str, limit: int):
                             f"💢 请检查是否忘记回座！"
                         )
 
-                        # 🆕 尝试引用回复打卡消息
+                        # 🎯 引用原打卡消息发送
                         try:
-                            if checkin_message_id:
+                            if current_checkin_message_id:
                                 await bot.send_message(
                                     chat_id,
                                     auto_back_msg,
-                                    reply_to_message_id=checkin_message_id,
+                                    reply_to_message_id=current_checkin_message_id,
                                     parse_mode="HTML",
                                 )
-                                logger.info(f"✅ 强制回座引用回复成功: {checkin_message_id}")
+                                logger.info(f"✅ 强制回座引用回复成功: {current_checkin_message_id}")
                             else:
                                 await bot.send_message(chat_id, auto_back_msg, parse_mode="HTML")
+                                logger.warning("⚠️ 强制回座没有原消息引用")
                         except Exception as e:
                             logger.warning(f"⚠️ 强制回座引用失败，降级普通发送: {e}")
                             await bot.send_message(chat_id, auto_back_msg, parse_mode="HTML")
@@ -925,10 +963,8 @@ async def activity_timer(chat_id: int, uid: int, act: str, limit: int):
 
     except asyncio.CancelledError:
         logger.info(f"定时器 {chat_id}-{uid} 被取消")
-      
     except Exception as e:
         logger.error(f"定时器错误: {e}")
-      
     finally:
         # 🧹 finally 再兜底一次
         try:
@@ -936,6 +972,7 @@ async def activity_timer(chat_id: int, uid: int, act: str, limit: int):
             logger.info(f"🧹 finally 兜底清理用户 {uid} 的打卡消息ID")
         except Exception as e:
             logger.warning(f"⚠️ finally 兜底清理失败 chat_id={chat_id}, uid={uid}: {e}")
+
 
 
 
@@ -1086,7 +1123,7 @@ async def _process_back_locked(message: types.Message, chat_id: int, uid: int):
 
         # 获取用户数据
         user_data = await db.get_user_cached(chat_id, uid)
-        logger.info(f"🔍 用户数据: {user_data}")
+        logger.debug(f"🔍 用户数据: {user_data}")
 
         if not user_data or not user_data.get("current_activity"):
             await message.answer(
@@ -1109,7 +1146,7 @@ async def _process_back_locked(message: types.Message, chat_id: int, uid: int):
         # fallback 从缓存/数据库字段获取
         if not checkin_message_id and user_data.get("checkin_message_id"):
             checkin_message_id = user_data.get("checkin_message_id")
-            logger.info(f"📝 从user_data获取消息ID: {checkin_message_id}")
+            logger.debug(f"📝 从user_data获取消息ID: {checkin_message_id}")
 
         if not checkin_message_id:
             logger.warning(f"⚠️ 用户 {uid} 没有找到打卡消息ID")
