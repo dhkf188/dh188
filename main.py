@@ -762,19 +762,45 @@ async def activity_timer(chat_id: int, uid: int, act: str, limit: int):
         # 获取原打卡消息 ID
         checkin_message_id = await db.get_user_checkin_message_id(chat_id, uid)
 
-        # ===== 群消息发送封装（引用+降级） =====
+        # ===== 群消息发送封装（引用 + 降级） =====
         async def send_group_message(text: str, kb=None):
             try:
                 if checkin_message_id:
                     return await bot.send_message(
-                        chat_id, text, parse_mode="HTML", reply_markup=kb,
-                        reply_to_message_id=checkin_message_id
+                        chat_id=chat_id,
+                        text=text,
+                        parse_mode="HTML",
+                        reply_markup=kb,
+                        reply_to_message_id=checkin_message_id,
                     )
                 else:
-                    return await bot.send_message(chat_id, text, parse_mode="HTML", reply_markup=kb)
+                    return await bot.send_message(
+                        chat_id=chat_id,
+                        text=text,
+                        parse_mode="HTML",
+                        reply_markup=kb,
+                    )
             except Exception as e:
                 logger.warning(f"⚠️ 引用发送失败，降级普通发送: {e}")
-                return await bot.send_message(chat_id, text, parse_mode="HTML", reply_markup=kb)
+                return await bot.send_message(
+                    chat_id=chat_id,
+                    text=text,
+                    parse_mode="HTML",
+                    reply_markup=kb,
+                )
+
+        # ===== 快速回座按钮（aiogram v3 安全写法） =====
+        def build_quick_back_kb():
+            return InlineKeyboardMarkup(
+                inline_keyboard=[
+                    [
+                        InlineKeyboardButton(
+                            text="👉 点击✅立即回座 👈",
+                            callback_data=f"quick_back:{chat_id}:{uid}",
+                        )
+                    ]
+                ]
+            )
 
         # ===== 强制回座通知封装 =====
         async def push_force_back_notification(nickname, elapsed, fine_amount):
@@ -783,7 +809,8 @@ async def activity_timer(chat_id: int, uid: int, act: str, limit: int):
                 try:
                     info = await bot.get_chat(chat_id)
                     chat_title = info.title or chat_title
-                except: pass
+                except:
+                    pass
 
                 notification_text = (
                     f"🚨 <b>超时强制回座通知</b>\n"
@@ -802,7 +829,11 @@ async def activity_timer(chat_id: int, uid: int, act: str, limit: int):
                 if not notification_service.bot and bot:
                     notification_service.bot = bot
 
-                await notification_service.send_notification(chat_id, notification_text, notification_type="channel")
+                await notification_service.send_notification(
+                    chat_id,
+                    notification_text,
+                    notification_type="channel",
+                )
                 logger.info(f"✅ 强制回座通知推送成功: chat={chat_id}, uid={uid}")
                 return True
             except Exception as e:
@@ -830,7 +861,9 @@ async def activity_timer(chat_id: int, uid: int, act: str, limit: int):
                 if elapsed >= 120 * 60 and not force_back_sent:
                     force_back_sent = True
                     fine_amount = await calculate_fine(act, 120)
-                    await db.complete_user_activity(chat_id, uid, act, elapsed, fine_amount, True)
+                    await db.complete_user_activity(
+                        chat_id, uid, act, elapsed, fine_amount, True
+                    )
                     break_force = True
 
             # ===== 锁外处理 =====
@@ -844,11 +877,15 @@ async def activity_timer(chat_id: int, uid: int, act: str, limit: int):
                 )
                 await send_group_message(auto_back_msg)
 
-                # 通知推送
+                # 通知推送（最多 3 次）
                 for attempt in range(3):
-                    if await push_force_back_notification(nickname, elapsed, fine_amount):
+                    if await push_force_back_notification(
+                        nickname, elapsed, fine_amount
+                    ):
                         break
-                    logger.warning(f"⚠️ 强制回座通知发送失败，重试 {attempt+1}/3")
+                    logger.warning(
+                        f"⚠️ 强制回座通知发送失败，重试 {attempt + 1}/3"
+                    )
                     await asyncio.sleep(2)
 
                 await db.clear_user_checkin_message(chat_id, uid)
@@ -857,21 +894,30 @@ async def activity_timer(chat_id: int, uid: int, act: str, limit: int):
 
             # ===== 准备超时提示 =====
             if limit >= 15 and remaining_minutes == 10 and not ten_minute_warning_sent:
-                msg = f"⏰ <b>准备超时提示</b>\n👤 {MessageFormatter.format_user_link(uid, nickname)}\n🕓 本次 {MessageFormatter.format_copyable_text(act)} 还有 <code>10</code> 分钟！"
-                kb = InlineKeyboardMarkup([[InlineKeyboardButton("👉 点击✅立即回座 👈", callback_data=f"quick_back:{chat_id}:{uid}")]])
-                await send_group_message(msg, kb)
+                msg = (
+                    f"⏰ <b>准备超时提示</b>\n"
+                    f"👤 {MessageFormatter.format_user_link(uid, nickname)}\n"
+                    f"🕓 本次 {MessageFormatter.format_copyable_text(act)} 还有 <code>10</code> 分钟！"
+                )
+                await send_group_message(msg, build_quick_back_kb())
                 ten_minute_warning_sent = True
 
             elif remaining_minutes == 5 and not five_minute_warning_sent:
-                msg = f"⏰ <b>准备超时提示</b>\n👤 {MessageFormatter.format_user_link(uid, nickname)}\n🕓 本次 {MessageFormatter.format_copyable_text(act)} 还有 <code>5</code> 分钟！"
-                kb = InlineKeyboardMarkup([[InlineKeyboardButton("👉 点击✅立即回座 👈", callback_data=f"quick_back:{chat_id}:{uid}")]])
-                await send_group_message(msg, kb)
+                msg = (
+                    f"⏰ <b>准备超时提示</b>\n"
+                    f"👤 {MessageFormatter.format_user_link(uid, nickname)}\n"
+                    f"🕓 本次 {MessageFormatter.format_copyable_text(act)} 还有 <code>5</code> 分钟！"
+                )
+                await send_group_message(msg, build_quick_back_kb())
                 five_minute_warning_sent = True
 
             elif 0 < remaining <= 60 and not one_minute_warning_sent:
-                msg = f"⏳ <b>即将超时警告</b>\n👤 {MessageFormatter.format_user_link(uid, nickname)}\n🕓 本次 {MessageFormatter.format_copyable_text(act)} 还有 <code>1</code> 分钟！"
-                kb = InlineKeyboardMarkup([[InlineKeyboardButton("👉 点击✅立即回座 👈", callback_data=f"quick_back:{chat_id}:{uid}")]])
-                await send_group_message(msg, kb)
+                msg = (
+                    f"⏳ <b>即将超时警告</b>\n"
+                    f"👤 {MessageFormatter.format_user_link(uid, nickname)}\n"
+                    f"🕓 本次 {MessageFormatter.format_copyable_text(act)} 还有 <code>1</code> 分钟！"
+                )
+                await send_group_message(msg, build_quick_back_kb())
                 one_minute_warning_sent = True
 
             # ===== 超时提醒 =====
@@ -882,20 +928,28 @@ async def activity_timer(chat_id: int, uid: int, act: str, limit: int):
                 if overtime_minutes == 0 and not timeout_immediate_sent:
                     timeout_immediate_sent = True
                     last_reminder_minute = 0
-                    msg = f"⚠️ <b>超时警告</b>\n👤 {MessageFormatter.format_user_link(uid, nickname)} 已超时！"
+                    msg = (
+                        f"⚠️ <b>超时警告</b>\n"
+                        f"👤 {MessageFormatter.format_user_link(uid, nickname)} 已超时！"
+                    )
 
                 elif overtime_minutes == 5 and not timeout_5min_sent:
                     timeout_5min_sent = True
                     last_reminder_minute = 5
-                    msg = f"🔔 <b>超时警告</b>\n👤 {MessageFormatter.format_user_link(uid, nickname)} 已超时 <code>5</code> 分钟！"
+                    msg = (
+                        f"🔔 <b>超时警告</b>\n"
+                        f"👤 {MessageFormatter.format_user_link(uid, nickname)} 已超时 <code>5</code> 分钟！"
+                    )
 
                 elif overtime_minutes >= 10 and overtime_minutes > last_reminder_minute:
                     last_reminder_minute = overtime_minutes
-                    msg = f"🚨 <b>超时警告</b>\n👤 {MessageFormatter.format_user_link(uid, nickname)} 已超时 <code>{overtime_minutes}</code> 分钟！"
+                    msg = (
+                        f"🚨 <b>超时警告</b>\n"
+                        f"👤 {MessageFormatter.format_user_link(uid, nickname)} 已超时 <code>{overtime_minutes}</code> 分钟！"
+                    )
 
                 if msg:
-                    kb = InlineKeyboardMarkup([[InlineKeyboardButton("👉 点击✅立即回座 👈", callback_data=f"quick_back:{chat_id}:{uid}")]])
-                    await send_group_message(msg, kb)
+                    await send_group_message(msg, build_quick_back_kb())
 
             await asyncio.sleep(30)
 
@@ -906,7 +960,8 @@ async def activity_timer(chat_id: int, uid: int, act: str, limit: int):
     finally:
         try:
             await db.clear_user_checkin_message(chat_id, uid)
-        except: pass
+        except:
+            pass
 
 
 
