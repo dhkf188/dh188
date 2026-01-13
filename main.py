@@ -749,11 +749,12 @@ def get_admin_keyboard() -> ReplyKeyboardMarkup:
 # ========== 活动定时提醒 ==========
 async def activity_timer(chat_id: int, uid: int, act: str, limit: int):
     """
-    活动定时提醒任务（100%生产稳定版）
+    活动定时提醒任务（增强版 2 小时强制回座推送）
     - 锁内完成关键 DB 操作（强制回座）
     - 锁外统一发送群消息 / 通知
     - 支持：1 分钟预警、超时提醒、10 分钟循环提醒、2 小时强制回座
     - CancelledError + finally 兜底清理
+    - 2 小时强制回座消息必发（失败重试）
     """
     try:
         one_minute_warning_sent = False
@@ -845,13 +846,30 @@ async def activity_timer(chat_id: int, uid: int, act: str, limit: int):
                     f"⚠️ 超时超过2小时，系统已自动回座\n"
                     f"💰 本次罚款：<code>{fine_amount}</code> 元"
                 )
-                await send_group_message(auto_back_msg)
 
-                # 推送通知
-                ok = await push_force_back_notification(nickname, elapsed, fine_amount)
-                if not ok:
+                # 发送群消息（失败重试一次）
+                for attempt in range(2):
+                    try:
+                        await send_group_message(auto_back_msg)
+                        logger.info(f"✅ 2小时强制回座群消息发送成功: chat={chat_id}, uid={uid}")
+                        break
+                    except Exception as e:
+                        logger.warning(f"⚠️ 发送群消息失败，重试: {e}")
+                        await asyncio.sleep(1)
+                else:
+                    logger.error(f"❌ 2小时强制回座群消息发送失败，请手动检查: chat={chat_id}, uid={uid}")
+
+                # 推送通知（失败重试三次）
+                for attempt in range(3):
+                    ok = await push_force_back_notification(nickname, elapsed, fine_amount)
+                    if ok:
+                        break
+                    logger.warning(f"⚠️ 强制回座通知发送失败，重试 {attempt+1}/3")
+                    await asyncio.sleep(2)
+                else:
                     await bot.send_message(chat_id, "⚠️ 管理端强制回座通知发送失败，请检查日志")
 
+                # 清理打卡消息 ID & 取消定时器
                 await db.clear_user_checkin_message(chat_id, uid)
                 await timer_manager.cancel_timer(f"{chat_id}-{uid}")
                 break
