@@ -749,9 +749,9 @@ def get_admin_keyboard() -> ReplyKeyboardMarkup:
 # ========== 活动定时提醒 ==========
 async def activity_timer(chat_id: int, uid: int, act: str, limit: int):
     """
-    最终无遗漏版活动定时器
-    - 1 分钟预警
-    - 超时提醒（立即、5 分钟、>=10 分钟循环）
+    真正无遗漏版活动定时器
+    - 准备超时提醒
+    - 超时立即 / 5 分钟 / >=10 分钟循环提醒
     - 2 小时强制回座
     - 群消息 + 通知推送
     - 消息引用 / 降级发送
@@ -778,9 +778,7 @@ async def activity_timer(chat_id: int, uid: int, act: str, limit: int):
                         reply_to_message_id=checkin_message_id
                     )
                 else:
-                    return await bot.send_message(
-                        chat_id, text, parse_mode="HTML", reply_markup=kb
-                    )
+                    return await bot.send_message(chat_id, text, parse_mode="HTML", reply_markup=kb)
             except Exception as e:
                 logger.warning(f"⚠️ 引用发送失败，降级普通发送: {e}")
                 return await bot.send_message(chat_id, text, parse_mode="HTML", reply_markup=kb)
@@ -832,7 +830,7 @@ async def activity_timer(chat_id: int, uid: int, act: str, limit: int):
                 remaining = limit * 60 - elapsed
                 nickname = user_data.get("nickname", str(uid))
 
-                # ===== 强制回座（锁内 DB） =====
+                # ===== 2 小时强制回座（锁内 DB） =====
                 break_force = False
                 if elapsed >= 120 * 60 and not force_back_sent:
                     force_back_sent = True
@@ -889,29 +887,42 @@ async def activity_timer(chat_id: int, uid: int, act: str, limit: int):
                 overtime_minutes = int((-remaining) // 60)
                 msg = None
 
-                # 超时立即提醒（0 分钟）
+                # 立即超时提醒（0分钟）
                 if overtime_minutes == 0 and not timeout_immediate_sent:
                     timeout_immediate_sent = True
                     last_reminder_minute = 0
-                    msg = f"⚠️ <b>超时警告</b>\n👤 {MessageFormatter.format_user_link(uid, nickname)} 已超时！"
+                    msg = (
+                        f"⚠️ <b>超时警告</b>\n"
+                        f"👤 用户：{MessageFormatter.format_user_link(uid, nickname)}\n"
+                        f"❌ 您的 {MessageFormatter.format_copyable_text(act)} 已经<code>超时</code>！\n"
+                        f"🏃‍♂️ 请立即回座，避免产生更多罚款！"
+                    )
 
                 # 超时 5 分钟提醒
                 elif overtime_minutes == 5 and not timeout_5min_sent:
                     timeout_5min_sent = True
                     last_reminder_minute = 5
-                    msg = f"🔔 <b>超时警告</b>\n👤 {MessageFormatter.format_user_link(uid, nickname)} 已超时 <code>5</code> 分钟！"
+                    msg = (
+                        f"🔔 <b>超时警告</b>\n"
+                        f"👤 用户：{MessageFormatter.format_user_link(uid, nickname)}\n"
+                        f"❌ 您的 {MessageFormatter.format_copyable_text(act)} 已经超时 <code>5</code> 分钟！\n"
+                        f"😤 请立即回座，避免罚款增加！"
+                    )
 
-                # 超时 >=10 分钟循环提醒（每分钟检查一次）
+                # 超时 >=10 分钟循环提醒（每分钟检查一次，保证不漏）
                 elif overtime_minutes >= 10 and overtime_minutes > last_reminder_minute:
                     last_reminder_minute = overtime_minutes
-                    msg = f"🚨 <b>超时警告</b>\n👤 {MessageFormatter.format_user_link(uid, nickname)} 已超时 <code>{overtime_minutes}</code> 分钟！"
+                    msg = (
+                        f"🚨 <b>超时警告</b>\n"
+                        f"👤 用户：{MessageFormatter.format_user_link(uid, nickname)}\n"
+                        f"❌ 您的 {MessageFormatter.format_copyable_text(act)} 已经超时 <code>{overtime_minutes}</code> 分钟！\n"
+                        f"💢 请立即回座！"
+                    )
 
-                # 发送超时消息
                 if msg:
                     kb = InlineKeyboardMarkup([[InlineKeyboardButton("👉 点击✅立即回座 👈", callback_data=f"quick_back:{chat_id}:{uid}")]])
                     await send_group_message(msg, kb)
 
-            # ===== 每 30 秒检查一次 =====
             await asyncio.sleep(30)
 
     except asyncio.CancelledError:
@@ -925,6 +936,7 @@ async def activity_timer(chat_id: int, uid: int, act: str, limit: int):
         try:
             await db.clear_user_checkin_message(chat_id, uid)
         except: pass
+
 
 
 
