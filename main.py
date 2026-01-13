@@ -1068,38 +1068,53 @@ async def process_back(message: types.Message):
 
 
 async def _process_back_locked(message: types.Message, chat_id: int, uid: int):
-    """线程安全的回座逻辑 - 修复时间计算顺序 + 添加引用回复功能 + 清理打卡消息ID"""
+    """线程安全的回座逻辑 - 带引用回复优先 + 调试日志"""
     start_time = time.time()
     key = f"{chat_id}:{uid}"
 
     # 防重入检测
     if active_back_processing.get(key):
-        await message.answer("⚠️ 您的回座请求正在处理中，请稍候。",reply_to_message_id=message.message_id)
+        await message.answer(
+            "⚠️ 您的回座请求正在处理中，请稍候。",
+            reply_to_message_id=message.message_id
+        )
         return
     active_back_processing[key] = True
 
     try:
         now = get_beijing_time()
 
+        # 获取用户数据
         user_data = await db.get_user_cached(chat_id, uid)
+        logger.info(f"🔍 用户数据: {user_data}")
+
         if not user_data or not user_data.get("current_activity"):
             await message.answer(
                 Config.MESSAGES["no_activity"],
                 reply_markup=await get_main_keyboard(
                     chat_id=chat_id, show_admin=await is_admin(uid)
                 ),
+                reply_to_message_id=message.message_id
             )
             return
 
         act = user_data["current_activity"]
-        activity_start_time_str = user_data["activity_start_time"]  # 🎯 先保存
+        activity_start_time_str = user_data["activity_start_time"]
         nickname = user_data.get("nickname", "未知用户")
 
-        # 🆕 获取用户的打卡消息ID
+        # 获取打卡消息ID
         checkin_message_id = await db.get_user_checkin_message_id(chat_id, uid)
         logger.info(f"📝 回座: 用户 {uid}，原打卡消息ID: {checkin_message_id}")
 
-        # 🎯 解析活动开始时间
+        # fallback 从缓存/数据库字段获取
+        if not checkin_message_id and user_data.get("checkin_message_id"):
+            checkin_message_id = user_data.get("checkin_message_id")
+            logger.info(f"📝 从user_data获取消息ID: {checkin_message_id}")
+
+        if not checkin_message_id:
+            logger.warning(f"⚠️ 用户 {uid} 没有找到打卡消息ID")
+
+        # 解析活动开始时间
         start_time_dt = None
         try:
             if activity_start_time_str:
@@ -1135,10 +1150,10 @@ async def _process_back_locked(message: types.Message, chat_id: int, uid: int):
             logger.warning("时间解析失败，使用当前时间作为备用")
             start_time_dt = now
 
-        # 🎯 计算经过时间
+        # 计算经过时间
         elapsed = (now - start_time_dt).total_seconds()
 
-        # 🎯 并行获取时间限制
+        # 并行获取时间限制
         time_limit_task = asyncio.create_task(db.get_activity_time_limit(act))
         time_limit_minutes = await time_limit_task
         time_limit_seconds = time_limit_minutes * 60
@@ -1151,33 +1166,28 @@ async def _process_back_locked(message: types.Message, chat_id: int, uid: int):
         if is_overtime and overtime_seconds > 0:
             fine_amount = await calculate_fine(act, overtime_minutes)
 
-        # 🎯 消息数据准备
+        # 准备消息数据
         elapsed_time_str = MessageFormatter.format_time(int(elapsed))
         time_str = now.strftime("%m/%d %H:%M:%S")
         activity_start_time_for_notification = activity_start_time_str
 
-        # ✅ 完成活动
+        # 完成活动
         await db.complete_user_activity(
             chat_id, uid, act, int(elapsed), fine_amount, is_overtime
         )
 
-        # ✅ 取消计时器
+        # 取消计时器
         await timer_manager.cancel_timer(f"{chat_id}-{uid}")
 
-        # 🎯 获取最新数据
+        # 获取最新数据
         user_data_task = asyncio.create_task(db.get_user_cached(chat_id, uid))
-        user_activities_task = asyncio.create_task(
-            db.get_user_all_activities(chat_id, uid)
-        )
-
+        user_activities_task = asyncio.create_task(db.get_user_all_activities(chat_id, uid))
         user_data = await user_data_task
         user_activities = await user_activities_task
 
-        activity_counts = {
-            a: info.get("count", 0) for a, info in user_activities.items()
-        }
+        activity_counts = {a: info.get("count", 0) for a, info in user_activities.items()}
 
-        # 🎯 构建回座消息
+        # 构建回座消息
         back_message = MessageFormatter.format_back_message(
             user_id=uid,
             user_name=user_data.get("nickname", nickname),
@@ -1197,7 +1207,7 @@ async def _process_back_locked(message: types.Message, chat_id: int, uid: int):
             fine_amount=fine_amount,
         )
 
-        # 🆕 优先尝试引用回复
+        # 优先尝试引用回复
         send_success = False
         if checkin_message_id:
             try:
@@ -1213,18 +1223,13 @@ async def _process_back_locked(message: types.Message, chat_id: int, uid: int):
                 logger.info(f"✅ 成功引用回复到消息 {checkin_message_id}")
             except Exception as e:
                 error_msg = str(e).lower()
-                if any(
-                    keyword in error_msg
-                    for keyword in [
-                        "message to reply not found",
-                        "message can't be replied",
-                        "message not found",
-                        "bad request: replied message not found",
-                    ]
-                ):
-                    logger.warning(
-                        f"⚠️ 打卡消息 {checkin_message_id} 不可用，降级普通回复"
-                    )
+                if any(k in error_msg for k in [
+                    "message to reply not found",
+                    "message can't be replied",
+                    "message not found",
+                    "bad request: replied message not found",
+                ]):
+                    logger.warning(f"⚠️ 打卡消息 {checkin_message_id} 不可用，降级普通回复")
                 else:
                     logger.error(f"❌ 引用回复未知错误: {e}")
                     raise
@@ -1236,16 +1241,15 @@ async def _process_back_locked(message: types.Message, chat_id: int, uid: int):
                     chat_id=chat_id, show_admin=await is_admin(uid)
                 ),
                 parse_mode="HTML",
+                reply_to_message_id=message.message_id  # fallback引用用户最新消息
             )
+            logger.info(f"ℹ️ 降级发送回座消息，没有引用打卡消息")
 
-        # 🎯 异步发送超时通知
+        # 异步发送超时通知
         if is_overtime and fine_amount > 0:
             notification_user_data = user_data.copy() if user_data else {}
-            notification_user_data["activity_start_time"] = (
-                activity_start_time_for_notification
-            )
+            notification_user_data["activity_start_time"] = activity_start_time_for_notification
             notification_user_data["nickname"] = nickname
-
             asyncio.create_task(
                 send_overtime_notification_async(
                     chat_id, uid, notification_user_data, act, fine_amount, now
@@ -1254,23 +1258,24 @@ async def _process_back_locked(message: types.Message, chat_id: int, uid: int):
 
     except Exception as e:
         logger.error(f"回座处理异常: {e}")
-        await message.answer("❌ 回座失败，请稍后重试。",reply_to_message_id=message.message_id)
-        
+        await message.answer(
+            "❌ 回座失败，请稍后重试。",
+            reply_to_message_id=message.message_id
+        )
 
     finally:
-        # 🧹 finally 兜底清理打卡消息ID
+        # finally 清理打卡消息ID
         try:
             await db.clear_user_checkin_message(chat_id, uid)
             logger.info(f"🧹 finally 兜底清理用户 {uid} 的打卡消息ID")
         except Exception as e:
-            logger.warning(
-                f"⚠️ finally 兜底清理失败 chat_id={chat_id}, uid={uid}: {e}"
-            )
+            logger.warning(f"⚠️ finally 兜底清理失败 chat_id={chat_id}, uid={uid}: {e}")
 
         # 释放锁
         active_back_processing.pop(key, None)
         duration = round(time.time() - start_time, 2)
         logger.info(f"回座结束 chat_id={chat_id}, uid={uid}，耗时 {duration}s")
+
 
 
 
