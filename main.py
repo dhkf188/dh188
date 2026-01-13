@@ -749,24 +749,27 @@ def get_admin_keyboard() -> ReplyKeyboardMarkup:
 # ========== 活动定时提醒 ==========
 async def activity_timer(chat_id: int, uid: int, act: str, limit: int):
     """
-    活动定时提醒任务（增强版 2 小时强制回座推送）
-    - 锁内完成关键 DB 操作（强制回座）
-    - 锁外统一发送群消息 / 通知
-    - 支持：1 分钟预警、超时提醒、10 分钟循环提醒、2 小时强制回座
-    - CancelledError + finally 兜底清理
-    - 2 小时强制回座消息必发（失败重试）
+    最终无遗漏版活动定时器
+    - 1 分钟预警
+    - 超时提醒（立即、5 分钟、>=10 分钟循环）
+    - 2 小时强制回座
+    - 群消息 + 通知推送
+    - 消息引用 / 降级发送
+    - 锁内 DB / 锁外消息分离
+    - CancelledError + finally 清理
     """
     try:
+        # 状态标记
         one_minute_warning_sent = False
         timeout_immediate_sent = False
         timeout_5min_sent = False
         last_reminder_minute = 0
         force_back_sent = False
 
-        # 🎯 原打卡消息 ID
+        # 原打卡消息 ID
         checkin_message_id = await db.get_user_checkin_message_id(chat_id, uid)
 
-        # ===== 群消息统一封装 =====
+        # ===== 群消息发送封装 =====
         async def send_group_message(text: str, kb=None, force_plain=False):
             try:
                 if checkin_message_id and not force_plain:
@@ -815,6 +818,7 @@ async def activity_timer(chat_id: int, uid: int, act: str, limit: int):
                 logger.error(f"❌ 强制回座通知推送失败: {e}")
                 return False
 
+        # ===== 主循环 =====
         while True:
             user_lock = user_lock_manager.get_lock(chat_id, uid)
             async with user_lock:
@@ -828,14 +832,13 @@ async def activity_timer(chat_id: int, uid: int, act: str, limit: int):
                 remaining = limit * 60 - elapsed
                 nickname = user_data.get("nickname", str(uid))
 
-                # ===== 强制回座（锁内 DB 安全） =====
+                # ===== 强制回座（锁内 DB） =====
+                break_force = False
                 if elapsed >= 120 * 60 and not force_back_sent:
                     force_back_sent = True
                     fine_amount = await calculate_fine(act, 120)
                     await db.complete_user_activity(chat_id, uid, act, elapsed, fine_amount, True)
                     break_force = True
-                else:
-                    break_force = False
 
             # ===== 锁外消息处理 =====
             if break_force:
@@ -846,30 +849,26 @@ async def activity_timer(chat_id: int, uid: int, act: str, limit: int):
                     f"⚠️ 超时超过2小时，系统已自动回座\n"
                     f"💰 本次罚款：<code>{fine_amount}</code> 元"
                 )
-
-                # 发送群消息（失败重试一次）
+                # 群消息重试
                 for attempt in range(2):
                     try:
                         await send_group_message(auto_back_msg)
-                        logger.info(f"✅ 2小时强制回座群消息发送成功: chat={chat_id}, uid={uid}")
+                        logger.info(f"✅ 2小时强制回座群消息发送成功")
                         break
                     except Exception as e:
                         logger.warning(f"⚠️ 发送群消息失败，重试: {e}")
                         await asyncio.sleep(1)
-                else:
-                    logger.error(f"❌ 2小时强制回座群消息发送失败，请手动检查: chat={chat_id}, uid={uid}")
 
-                # 推送通知（失败重试三次）
+                # 推送通知重试
                 for attempt in range(3):
-                    ok = await push_force_back_notification(nickname, elapsed, fine_amount)
-                    if ok:
+                    if await push_force_back_notification(nickname, elapsed, fine_amount):
                         break
                     logger.warning(f"⚠️ 强制回座通知发送失败，重试 {attempt+1}/3")
                     await asyncio.sleep(2)
                 else:
                     await bot.send_message(chat_id, "⚠️ 管理端强制回座通知发送失败，请检查日志")
 
-                # 清理打卡消息 ID & 取消定时器
+                # 清理打卡消息 & 取消定时器
                 await db.clear_user_checkin_message(chat_id, uid)
                 await timer_manager.cancel_timer(f"{chat_id}-{uid}")
                 break
@@ -885,26 +884,34 @@ async def activity_timer(chat_id: int, uid: int, act: str, limit: int):
                 await send_group_message(msg, kb)
                 one_minute_warning_sent = True
 
-            # ===== 超时提醒 =====
+            # ===== 超时提醒（完整每分钟覆盖） =====
             if remaining <= 0:
-                overtime = int(-remaining // 60)
+                overtime_minutes = int((-remaining) // 60)
                 msg = None
-                if overtime == 0 and not timeout_immediate_sent:
+
+                # 超时立即提醒（0 分钟）
+                if overtime_minutes == 0 and not timeout_immediate_sent:
                     timeout_immediate_sent = True
                     last_reminder_minute = 0
                     msg = f"⚠️ <b>超时警告</b>\n👤 {MessageFormatter.format_user_link(uid, nickname)} 已超时！"
-                elif overtime == 5 and not timeout_5min_sent:
+
+                # 超时 5 分钟提醒
+                elif overtime_minutes == 5 and not timeout_5min_sent:
                     timeout_5min_sent = True
                     last_reminder_minute = 5
                     msg = f"🔔 <b>超时警告</b>\n👤 {MessageFormatter.format_user_link(uid, nickname)} 已超时 <code>5</code> 分钟！"
-                elif overtime >= 10 and overtime % 10 == 0 and overtime > last_reminder_minute:
-                    last_reminder_minute = overtime
-                    msg = f"🚨 <b>超时警告</b>\n👤 {MessageFormatter.format_user_link(uid, nickname)} 已超时 <code>{overtime}</code> 分钟！"
 
+                # 超时 >=10 分钟循环提醒（每分钟检查一次）
+                elif overtime_minutes >= 10 and overtime_minutes > last_reminder_minute:
+                    last_reminder_minute = overtime_minutes
+                    msg = f"🚨 <b>超时警告</b>\n👤 {MessageFormatter.format_user_link(uid, nickname)} 已超时 <code>{overtime_minutes}</code> 分钟！"
+
+                # 发送超时消息
                 if msg:
                     kb = InlineKeyboardMarkup([[InlineKeyboardButton("👉 点击✅立即回座 👈", callback_data=f"quick_back:{chat_id}:{uid}")]])
                     await send_group_message(msg, kb)
 
+            # ===== 每 30 秒检查一次 =====
             await asyncio.sleep(30)
 
     except asyncio.CancelledError:
