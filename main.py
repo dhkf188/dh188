@@ -748,7 +748,9 @@ def get_admin_keyboard() -> ReplyKeyboardMarkup:
 
 # ========== 活动定时提醒 ==========
 async def activity_timer(chat_id: int, uid: int, act: str, limit: int):
-    """最终可用版活动定时器（含引用回复 + 自动重试 + 每10分钟超时提醒 + 2小时强制回座）"""
+    """最终无遗漏 + 稳健可用版活动定时器
+    (引用回复 + 自动降级 + 自动重试 + 每10分钟超时提醒 + 2小时强制回座)
+    """
     try:
         # ===== 状态标记 =====
         one_minute_warning_sent = False
@@ -757,11 +759,9 @@ async def activity_timer(chat_id: int, uid: int, act: str, limit: int):
         last_reminder_minute = 0
         force_back_sent = False  # 防止重复强制回座
 
-        # 获取原打卡消息 ID
-        checkin_message_id = await db.get_user_checkin_message_id(chat_id, uid)
-
-        # ===== 群消息发送封装（引用 + 自动重试） =====
+        # ===== 群消息发送封装（引用 + 自动降级 + 自动重试） =====
         async def send_group_message(text: str, kb=None):
+            checkin_message_id = await db.get_user_checkin_message_id(chat_id, uid)
             if checkin_message_id:
                 try:
                     return await bot.send_message(
@@ -773,7 +773,6 @@ async def activity_timer(chat_id: int, uid: int, act: str, limit: int):
                     )
                 except Exception as e:
                     logger.warning(f"⚠️ 引用发送失败，重试一次: {e}")
-                    # 重试一次
                     await asyncio.sleep(1)
                     try:
                         return await bot.send_message(
@@ -785,31 +784,23 @@ async def activity_timer(chat_id: int, uid: int, act: str, limit: int):
                         )
                     except Exception as e2:
                         logger.warning(f"⚠️ 引用发送重试失败，降级普通发送: {e2}")
-                        return await bot.send_message(
-                            chat_id=chat_id,
-                            text=text,
-                            parse_mode="HTML",
-                            reply_markup=kb,
-                        )
-            else:
-                return await bot.send_message(
-                    chat_id=chat_id,
-                    text=text,
-                    parse_mode="HTML",
-                    reply_markup=kb,
-                )
+            # 没有 message_id 或引用失败则普通发送
+            return await bot.send_message(
+                chat_id=chat_id,
+                text=text,
+                parse_mode="HTML",
+                reply_markup=kb,
+            )
 
-        # ===== 快速回座按钮（aiogram v3 安全写法） =====
+        # ===== 快速回座按钮 =====
         def build_quick_back_kb():
             return InlineKeyboardMarkup(
-                inline_keyboard=[
-                    [
-                        InlineKeyboardButton(
-                            text="👉 点击✅立即回座 👈",
-                            callback_data=f"quick_back:{chat_id}:{uid}",
-                        )
-                    ]
-                ]
+                inline_keyboard=[[
+                    InlineKeyboardButton(
+                        text="👉 点击✅立即回座 👈",
+                        callback_data=f"quick_back:{chat_id}:{uid}"
+                    )
+                ]]
             )
 
         # ===== 强制回座通知封装 =====
@@ -877,16 +868,16 @@ async def activity_timer(chat_id: int, uid: int, act: str, limit: int):
 
             # ===== 锁外处理 =====
             if break_force:
-                auto_back_msg = (
+                msg = (
                     f"🛑 <b>自动安全回座</b>\n"
                     f"👤 用户：{MessageFormatter.format_user_link(uid, nickname)}\n"
                     f"📝 活动：<code>{act}</code>\n"
                     f"⚠️ 超时超过2小时，系统已自动回座\n"
                     f"💰 本次罚款：<code>{fine_amount}</code> 元"
                 )
-                await send_group_message(auto_back_msg)
+                await send_group_message(msg)
 
-                # 通知推送（最多 3 次）
+                # 推送通知（最多3次重试）
                 for attempt in range(3):
                     if await push_force_back_notification(nickname, elapsed, fine_amount):
                         break
@@ -933,7 +924,7 @@ async def activity_timer(chat_id: int, uid: int, act: str, limit: int):
                     )
                     last_reminder_minute = 5
 
-                # >=10 分钟，每 10 分钟提醒一次
+                # >=10 分钟，每10分钟提醒一次
                 elif overtime_minutes >= 10 and overtime_minutes % 10 == 0 and overtime_minutes != last_reminder_minute:
                     last_reminder_minute = overtime_minutes
                     msg = (
