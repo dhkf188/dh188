@@ -953,7 +953,7 @@ async def start_activity(message: types.Message, act: str):
 
         # 快速检查活动是否存在
         if not await db.activity_exists(act):
-            await message.answer(f"❌ 活动 '{act}' 不存在")
+            await message.answer(f"❌ 活动 '{act}' 不存在",reply_to_message_id=message.message_id)
             return
 
         # 检查活动限制（如被封禁等）
@@ -982,6 +982,7 @@ async def start_activity(message: types.Message, act: str):
                         chat_id=chat_id,
                         show_admin=await is_admin(uid),
                     ),
+                    reply_to_message_id=message.message_id,
                     parse_mode="HTML",
                 )
                 return
@@ -995,6 +996,7 @@ async def start_activity(message: types.Message, act: str):
                     chat_id=chat_id,
                     show_admin=await is_admin(uid),
                 ),
+                reply_to_message_id=message.message_id
             )
             return
 
@@ -1012,6 +1014,7 @@ async def start_activity(message: types.Message, act: str):
                     chat_id=chat_id,
                     show_admin=await is_admin(uid),
                 ),
+                reply_to_message_id=message.message_id
             )
             return
 
@@ -1039,6 +1042,7 @@ async def start_activity(message: types.Message, act: str):
                 chat_id=chat_id,
                 show_admin=await is_admin(uid),
             ),
+            reply_to_message_id=message.message_id,
             parse_mode="HTML",
         )
 
@@ -1071,7 +1075,7 @@ async def _process_back_locked(message: types.Message, chat_id: int, uid: int):
 
     # 防重入检测
     if active_back_processing.get(key):
-        await message.answer("⚠️ 您的回座请求正在处理中，请稍候。")
+        await message.answer("⚠️ 您的回座请求正在处理中，请稍候。",reply_to_message_id=message.message_id)
         return
     active_back_processing[key] = True
 
@@ -1251,7 +1255,8 @@ async def _process_back_locked(message: types.Message, chat_id: int, uid: int):
 
     except Exception as e:
         logger.error(f"回座处理异常: {e}")
-        await message.answer("❌ 回座失败，请稍后重试。")
+        await message.answer("❌ 回座失败，请稍后重试。",reply_to_message_id=message.message_id)
+        
 
     finally:
         # 🧹 finally 兜底清理打卡消息ID
@@ -1411,7 +1416,8 @@ async def process_work_checkin(message: types.Message, checkin_type: str):
             user_data = await db.get_user_cached(chat_id, uid)
         except Exception as e:
             logger.error(f"[{trace_id}] ❌ 初始化用户/群组失败: {e}")
-            await message.answer("⚠️ 数据初始化失败，请稍后再试。")
+            await message.answer("⚠️ 数据初始化失败，请稍后再试。",reply_to_message_id=message.message_id
+)
             return
 
         # ✅ 检查是否重复打卡（基于业务日期）
@@ -1440,6 +1446,7 @@ async def process_work_checkin(message: types.Message, checkin_type: str):
                 reply_markup=await get_main_keyboard(
                     chat_id=chat_id, show_admin=await is_admin(uid)
                 ),
+                reply_to_message_id=message.message_id,
                 parse_mode="HTML",
             )
             logger.info(f"[{trace_id}] 🔁 检测到重复{action_text}打卡，终止处理。")
@@ -1461,6 +1468,7 @@ async def process_work_checkin(message: types.Message, checkin_type: str):
                     reply_markup=await get_main_keyboard(
                         chat_id=chat_id, show_admin=await is_admin(uid)
                     ),
+                    reply_to_message_id=message.message_id,
                     parse_mode="HTML",
                 )
                 logger.info(f"[{trace_id}] 🔁 检测到异常：下班后再次上班打卡")
@@ -1478,6 +1486,7 @@ async def process_work_checkin(message: types.Message, checkin_type: str):
                     reply_markup=await get_main_keyboard(
                         chat_id=chat_id, show_admin=await is_admin(uid)
                     ),
+                    reply_to_message_id=message.message_id,
                     parse_mode="HTML",
                 )
                 logger.warning(f"[{trace_id}] ⚠️ 用户试图下班打卡但未上班")
@@ -1508,6 +1517,7 @@ async def process_work_checkin(message: types.Message, checkin_type: str):
                 reply_markup=await get_main_keyboard(
                     chat_id=chat_id, show_admin=await is_admin(uid)
                 ),
+                reply_to_message_id=message.message_id,
                 parse_mode="HTML",
             )
             logger.info(
@@ -1588,6 +1598,7 @@ async def process_work_checkin(message: types.Message, checkin_type: str):
                         reply_markup=await get_main_keyboard(
                             chat_id=chat_id, show_admin=await is_admin(uid)
                         ),
+                        reply_to_message_id=message.message_id
                     )
                     return
                 await asyncio.sleep(0.5)
@@ -1612,6 +1623,7 @@ async def process_work_checkin(message: types.Message, checkin_type: str):
             reply_markup=await get_main_keyboard(
                 chat_id=chat_id, show_admin=await is_admin(uid)
             ),
+            reply_to_message_id=message.message_id,
             parse_mode="HTML",
         )
 
@@ -1678,6 +1690,7 @@ async def cmd_start(message: types.Message):
     await message.answer(
         Config.MESSAGES["welcome"],
         reply_markup=await get_main_keyboard(message.chat.id, is_admin_user),
+        reply_to_message_id=message.message_id,
     )
 
 
@@ -1690,6 +1703,7 @@ async def cmd_menu(message: types.Message):
         reply_markup=await get_main_keyboard(
             chat_id=message.chat.id, show_admin=await is_admin(uid)
         ),
+        reply_to_message_id=message.message_id,
     )
 
 
@@ -1726,6 +1740,7 @@ async def cmd_help(message: types.Message):
         reply_markup=await get_main_keyboard(
             chat_id=message.chat.id, show_admin=await is_admin(uid)
         ),
+        reply_to_message_id=message.message_id,
         parse_mode="HTML",
     )
 
@@ -1743,6 +1758,7 @@ async def cmd_ci(message: types.Message):
             reply_markup=await get_main_keyboard(
                 chat_id=message.chat.id, show_admin=await is_admin(message.from_user.id)
             ),
+            reply_to_message_id=message.message_id,
         )
         return
 
@@ -1753,6 +1769,7 @@ async def cmd_ci(message: types.Message):
             reply_markup=await get_main_keyboard(
                 chat_id=message.chat.id, show_admin=await is_admin(message.from_user.id)
             ),
+            reply_to_message_id=message.message_id,
             parse_mode="HTML",
         )
         return
@@ -1792,7 +1809,7 @@ async def cmd_workend(message: types.Message):
 @rate_limit(rate=5, per=60)
 async def cmd_admin(message: types.Message):
     """管理员命令"""
-    await message.answer("👑 管理员面板", reply_markup=get_admin_keyboard())
+    await message.answer("👑 管理员面板", reply_markup=get_admin_keyboard(),reply_to_message_id=message.message_id)
 
 
 # ========== 修复消息引用 ==========
@@ -1870,6 +1887,7 @@ async def cmd_cleanup_monthly(message: types.Message):
             "此操作不可恢复！\n\n"
             "请输入 <code>/cleanup_monthly confirm_all</code> 确认执行",
             parse_mode="HTML",
+            reply_to_message_id=message.message_id
         )
         return
     elif len(args) == 2 and args[1].lower() == "confirm_all":
@@ -1888,14 +1906,15 @@ async def cmd_cleanup_monthly(message: types.Message):
                 f"删除记录: <code>{deleted_count}</code> 条\n\n"
                 f"⚠️ 所有月度统计已被清空，月度报告将无法生成历史数据",
                 parse_mode="HTML",
+                reply_to_message_id=message.message_id
             )
             logger.warning(f"👑 管理员 {message.from_user.id} 清理了所有月度统计数据")
             return
         except Exception as e:
-            await message.answer(f"❌ 清理所有数据失败: {e}")
+            await message.answer(f"❌ 清理所有数据失败: {e}",reply_to_message_id=message.message_id)
             return
 
-    await message.answer("⏳ 正在清理月度统计数据...")
+    await message.answer("⏳ 正在清理月度统计数据...",reply_to_message_id=message.message_id)
 
     try:
         if target_date:
@@ -1909,6 +1928,7 @@ async def cmd_cleanup_monthly(message: types.Message):
                 f"📅 清理月份: <code>{date_str}</code>\n"
                 f"🗑️ 删除记录: <code>{deleted_count}</code> 条",
                 parse_mode="HTML",
+                reply_to_message_id=message.message_id
             )
         else:
             # 默认清理3个月前的数据
@@ -1923,138 +1943,154 @@ async def cmd_cleanup_monthly(message: types.Message):
                 f"🗑️ 删除记录: <code>{deleted_count}</code> 条\n\n"
                 f"💡 保留了最近3个月的月度统计数据",
                 parse_mode="HTML",
+                reply_to_message_id=message.message_id
             )
 
     except Exception as e:
         logger.error(f"❌ 清理月度数据失败: {e}")
-        await message.answer(f"❌ 清理月度数据失败: {e}")
+        await message.answer(f"❌ 清理月度数据失败: {e}",reply_to_message_id=message.message_id)
 
 
 @admin_required
 @rate_limit(rate=5, per=60)
 async def cmd_monthly_stats_status(message: types.Message):
-    """查看月度统计数据状态"""
+    """查看月度统计数据状态 - 高精度版"""
     chat_id = message.chat.id
 
     try:
         async with db.pool.acquire() as conn:
-            # 获取月度统计的日期范围
-            date_range = await conn.fetch(
-                "SELECT MIN(statistic_date) as earliest, MAX(statistic_date) as latest, COUNT(*) as total FROM monthly_statistics WHERE chat_id = $1",
+            # 查询每个月的总记录数、活跃用户数和活动类型数
+            monthly_rows = await conn.fetch(
+                """
+                SELECT
+                    DATE_TRUNC('month', statistic_date) AS month,
+                    COUNT(*) AS total_records,
+                    COUNT(DISTINCT user_id) AS monthly_users,
+                    COUNT(DISTINCT activity_name) AS monthly_activities
+                FROM monthly_statistics
+                WHERE chat_id = $1
+                GROUP BY month
+                ORDER BY month DESC
+                """,
                 chat_id,
             )
 
-            # 获取各月份数据量
-            monthly_counts = await conn.fetch(
-                "SELECT statistic_date, COUNT(*) as count FROM monthly_statistics WHERE chat_id = $1 GROUP BY statistic_date ORDER BY statistic_date DESC",
+            # 总计信息
+            total_records = await conn.fetchval(
+                "SELECT COUNT(*) FROM monthly_statistics WHERE chat_id = $1",
                 chat_id,
             )
-
-            # 获取总用户数
-            user_count = await conn.fetchval(
+            total_users = await conn.fetchval(
                 "SELECT COUNT(DISTINCT user_id) FROM monthly_statistics WHERE chat_id = $1",
                 chat_id,
             )
-
-            # 获取活动类型数量
-            activity_count = await conn.fetchval(
+            total_activities = await conn.fetchval(
                 "SELECT COUNT(DISTINCT activity_name) FROM monthly_statistics WHERE chat_id = $1",
                 chat_id,
             )
 
-        if not date_range or not date_range[0]["earliest"]:
+        if not monthly_rows:
             await message.answer(
-                "📊 <b>月度统计数据状态</b>\n\n" "暂无月度统计数据", parse_mode="HTML"
+                "📊 <b>月度统计数据状态</b>\n\n暂无月度统计数据",
+                parse_mode="HTML",
+                reply_to_message_id=message.message_id,
             )
             return
 
-        earliest = date_range[0]["earliest"]
-        latest = date_range[0]["latest"]
-        total_records = date_range[0]["total"]
+        earliest = min(row["month"] for row in monthly_rows)
+        latest = max(row["month"] for row in monthly_rows)
 
         status_text = (
             f"📊 <b>月度统计数据状态</b>\n\n"
             f"📅 数据范围: <code>{earliest.strftime('%Y年%m月')}</code> - <code>{latest.strftime('%Y年%m月')}</code>\n"
-            f"👥 统计用户: <code>{user_count}</code> 人\n"
-            f"📝 活动类型: <code>{activity_count}</code> 种\n"
+            f"👥 总用户数: <code>{total_users}</code> 人\n"
+            f"📝 活动类型总数: <code>{total_activities}</code> 种\n"
             f"💾 总记录数: <code>{total_records}</code> 条\n\n"
-            f"<b>各月份数据量:</b>\n"
+            f"<b>最近12个月数据量:</b>\n"
         )
 
-        for row in monthly_counts[:12]:  # 显示最近12个月
-            month_str = row["statistic_date"].strftime("%Y年%m月")
-            count = row["count"]
-            status_text += f"• {month_str}: <code>{count}</code> 条\n"
+        for row in monthly_rows[:12]:
+            month_str = row["month"].strftime("%Y年%m月")
+            total = row["total_records"]
+            users = row["monthly_users"]
+            acts = row["monthly_activities"]
+            status_text += f"• {month_str}: <code>{total}</code> 条, 用户 <code>{users}</code> 人, 活动类型 <code>{acts}</code> 种\n"
 
-        if len(monthly_counts) > 12:
-            status_text += f"• ... 还有 {len(monthly_counts) - 12} 个月份\n"
+        if len(monthly_rows) > 12:
+            status_text += f"• ... 还有 {len(monthly_rows) - 12} 个月份\n"
 
         status_text += (
-            f"\n💡 <b>可用命令:</b>\n"
-            f"• <code>/cleanup_monthly</code> - 自动清理（保留3个月）\n"
-            f"• <code>/cleanup_monthly 2024 1</code> - 清理指定月份\n"
-            f"• <code>/cleanup_monthly all</code> - 清理所有数据（危险）"
+            "\n💡 <b>可用命令:</b>\n"
+            "• <code>/cleanup_monthly</code> - 自动清理（保留最近3个月）\n"
+            "• <code>/cleanup_monthly 年 月</code> - 清理指定月份\n"
+            "• <code>/cleanup_monthly all</code> - 清理所有数据（危险）"
         )
 
-        await message.answer(status_text, parse_mode="HTML")
+        await message.answer(
+            status_text,
+            parse_mode="HTML",
+            reply_to_message_id=message.message_id,
+        )
 
     except Exception as e:
         logger.error(f"❌ 查看月度统计状态失败: {e}")
-        await message.answer(f"❌ 查看月度统计状态失败: {e}")
+        await message.answer(
+            "❌ 查看月度统计状态失败，请稍后重试",
+            reply_to_message_id=message.message_id,
+        )
+
 
 
 @admin_required
+@rate_limit(rate=1, per=60)
 async def cmd_cleanup_inactive(message: types.Message):
     """清理长期未活动的用户数据"""
     args = message.text.split()
+    days = 30  # 默认30天未活动
 
-    # 默认清理 30 天未活动的用户
-    days = 30
-
-    # 如果用户手动传入天数
+    # 用户指定天数
     if len(args) > 1:
         try:
             days = int(args[1])
             if days < 7:
-                await message.answer("❌ 天数不能少于7天，避免误删活跃用户")
+                await message.answer(
+                    "❌ 天数不能少于7天，避免误删活跃用户",
+                    reply_to_message_id=message.message_id
+                )
                 return
         except ValueError:
-            await message.answer("❌ 天数必须是数字，例如：/cleanup_inactive 60")
+            await message.answer(
+                "❌ 天数必须是数字，例如：/cleanup_inactive 60",
+                reply_to_message_id=message.message_id
+            )
             return
 
-    await message.answer(f"⏳ 正在清理 {days} 天未活动的用户，请稍候...")
+    await message.answer(
+        f"⏳ 正在清理 {days} 天未活动的用户，请稍候...",
+        reply_to_message_id=message.message_id
+    )
+
+    cutoff_date = (get_beijing_time() - timedelta(days=days)).date()
 
     try:
-        cutoff_date = (get_beijing_time() - timedelta(days=days)).date()
-
         async with db.pool.acquire() as conn:
-            # 删除长期未活动的用户
-            result = await conn.execute(
+            # 删除用户
+            result_users = await conn.execute(
                 "DELETE FROM users WHERE last_updated < $1", cutoff_date
             )
-            deleted_users = (
-                int(result.split()[-1]) if result and result.startswith("DELETE") else 0
-            )
+            deleted_users = int(result_users.split()[-1]) if result_users.startswith("DELETE") else 0
 
-            # 删除对应的活动记录
-            result2 = await conn.execute(
+            # 删除活动记录
+            result_activities = await conn.execute(
                 "DELETE FROM user_activities WHERE activity_date < $1", cutoff_date
             )
-            deleted_activities = (
-                int(result2.split()[-1])
-                if result2 and result2.startswith("DELETE")
-                else 0
-            )
+            deleted_activities = int(result_activities.split()[-1]) if result_activities.startswith("DELETE") else 0
 
-            # 删除对应的工作记录
-            result3 = await conn.execute(
+            # 删除工作记录
+            result_work = await conn.execute(
                 "DELETE FROM work_records WHERE record_date < $1", cutoff_date
             )
-            deleted_work_records = (
-                int(result3.split()[-1])
-                if result3 and result3.startswith("DELETE")
-                else 0
-            )
+            deleted_work_records = int(result_work.split()[-1]) if result_work.startswith("DELETE") else 0
 
         total_deleted = deleted_users + deleted_activities + deleted_work_records
 
@@ -2064,13 +2100,24 @@ async def cmd_cleanup_inactive(message: types.Message):
             f"🗑️ 删除用户: <code>{deleted_users}</code> 个\n"
             f"🗑️ 删除活动记录: <code>{deleted_activities}</code> 条\n"
             f"🗑️ 删除工作记录: <code>{deleted_work_records}</code> 条\n\n"
-            f"📊 总计删除: <code>{total_deleted}</code> 条记录",
+            f"📊 总计删除: <code>{total_deleted}</code> 条记录\n"
+            f"⚠️ 此操作不可撤销",
             parse_mode="HTML",
+            reply_to_message_id=message.message_id
+        )
+
+        logger.info(
+            f"👑 管理员 {message.from_user.id} 清理 {days} 天未活动用户: "
+            f"{deleted_users} 用户, {deleted_activities} 活动, {deleted_work_records} 工作记录"
         )
 
     except Exception as e:
-        logger.error(f"❌ 清理未活动用户失败: {e}")
-        await message.answer(f"❌ 清理未活动用户失败: {e}")
+        logger.exception("❌ 清理未活动用户失败")
+        await message.answer(
+            f"❌ 清理未活动用户失败: {e}",
+            reply_to_message_id=message.message_id
+        )
+
 
 
 # ========== 重置用户命令 ==========
@@ -2079,20 +2126,30 @@ async def cmd_cleanup_inactive(message: types.Message):
 async def cmd_reset_user(message: types.Message):
     """重置指定用户的今日数据"""
     args = message.text.split()
-    if len(args) != 2:
+    if len(args) < 2:
         await message.answer(
-            "❌ 用法：/resetuser <用户ID>\n" "💡 示例：/resetuser 123456789",
-            reply_markup=await get_main_keyboard(
-                chat_id=message.chat.id, show_admin=True
-            ),
+            "❌ 用法：/resetuser <用户ID> [confirm]\n"
+            "💡 示例：/resetuser 123456789 confirm",
+            reply_markup=await get_main_keyboard(chat_id=message.chat.id, show_admin=True),
+            reply_to_message_id=message.message_id
         )
         return
 
     try:
         chat_id = message.chat.id
         target_user_id = int(args[1])
+        confirm = len(args) == 3 and args[2].lower() == "confirm"
 
-        await message.answer(f"⏳ 正在重置用户 {target_user_id} 的今日数据...")
+        if not confirm:
+            await message.answer(
+                f"⚠️ 确认重置用户 <code>{target_user_id}</code> 的今日数据？\n"
+                f"请输入 <code>/resetuser {target_user_id} confirm</code> 执行",
+                parse_mode="HTML",
+                reply_to_message_id=message.message_id
+            )
+            return
+
+        await message.answer(f"⏳ 正在重置用户 {target_user_id} 的今日数据...", reply_to_message_id=message.message_id)
 
         # 执行重置
         success = await db.reset_user_daily_data(chat_id, target_user_id)
@@ -2100,42 +2157,33 @@ async def cmd_reset_user(message: types.Message):
         if success:
             await message.answer(
                 f"✅ 已重置用户 <code>{target_user_id}</code> 的今日数据\n\n"
-                f"🗑️ 已清除：\n"
-                f"• 今日活动记录\n"
-                f"• 今日统计计数\n"
-                f"• 当前活动状态\n"
-                f"• 罚款计数（保留总罚款）",
+                f"🗑️ 已清除：今日活动记录 | 今日统计计数 | 当前活动状态 | 罚款计数（保留总罚款）",
                 parse_mode="HTML",
-                reply_markup=await get_main_keyboard(
-                    chat_id=message.chat.id, show_admin=True
-                ),
+                reply_markup=await get_main_keyboard(chat_id=chat_id, show_admin=True),
+                reply_to_message_id=message.message_id
             )
-            logger.info(
-                f"👑 管理员 {message.from_user.id} 重置了用户 {target_user_id} 的数据"
-            )
+            logger.info(f"👑 管理员 {message.from_user.id} 在群 {chat_id} 重置了用户 {target_user_id} 的今日数据")
         else:
             await message.answer(
                 f"❌ 重置用户 {target_user_id} 数据失败",
-                reply_markup=await get_main_keyboard(
-                    chat_id=message.chat.id, show_admin=True
-                ),
+                reply_markup=await get_main_keyboard(chat_id=chat_id, show_admin=True),
+                reply_to_message_id=message.message_id
             )
 
     except ValueError:
         await message.answer(
             "❌ 用户ID必须是数字",
-            reply_markup=await get_main_keyboard(
-                chat_id=message.chat.id, show_admin=True
-            ),
+            reply_markup=await get_main_keyboard(chat_id=message.chat.id, show_admin=True),
+            reply_to_message_id=message.message_id
         )
     except Exception as e:
-        logger.error(f"重置用户数据失败: {e}")
+        logger.exception(f"重置用户数据失败")
         await message.answer(
             f"❌ 重置失败：{e}",
-            reply_markup=await get_main_keyboard(
-                chat_id=message.chat.id, show_admin=True
-            ),
+            reply_markup=await get_main_keyboard(chat_id=message.chat.id, show_admin=True),
+            reply_to_message_id=message.message_id
         )
+
 
 # ========== 设置软重置时间命令 ==========
 @admin_required
@@ -2151,68 +2199,67 @@ async def cmd_setsoftresettime(message: types.Message):
             "• 只重置打卡次数和'我的记录'显示\n"
             "• 不影响每日数据导出和月度统计\n"
             "• 设为 0 0 可禁用软重置",
-            reply_markup=await get_main_keyboard(
-                chat_id=message.chat.id, show_admin=True
-            ),
+            reply_markup=await get_main_keyboard(chat_id=message.chat.id, show_admin=True),
+            reply_to_message_id=message.message_id
         )
         return
-    
+
     try:
         hour = int(args[1])
         minute = int(args[2])
-        
-        if (0 <= hour <= 23 and 0 <= minute <= 59) or (hour == 0 and minute == 0):
-            chat_id = message.chat.id
-            await db.init_group(chat_id)
-            await db.update_group_soft_reset_time(chat_id, hour, minute)
-            
-            if hour == 0 and minute == 0:
-                await message.answer(
-                    "✅ 软重置功能已禁用\n\n"
-                    "💡 软重置功能已关闭，不会再执行二次重置",
-                    reply_markup=await get_main_keyboard(
-                        chat_id=message.chat.id, show_admin=True
-                    ),
-                    parse_mode="HTML",
-                )
-            else:
-                await message.answer(
-                    f"✅ 软重置时间已设置为：<code>{hour:02d}:{minute:02d}</code>\n\n"
-                    f"💡 软重置特点：\n"
-                    f"• 每天此时会重置打卡次数和'我的记录'显示\n"
-                    f"• 不影响每日数据导出和月度统计\n"
-                    f"• 用户可以重新开始打卡，但历史数据已保存",
-                    reply_markup=await get_main_keyboard(
-                        chat_id=message.chat.id, show_admin=True
-                    ),
-                    parse_mode="HTML",
-                )
-            logger.info(f"软重置时间设置成功: 群组 {chat_id} -> {hour:02d}:{minute:02d}")
-        else:
+        keyboard = await get_main_keyboard(chat_id=message.chat.id, show_admin=True)
+
+        if not (0 <= hour <= 23 and 0 <= minute <= 59):
             await message.answer(
                 "❌ 小时必须在0-23之间，分钟必须在0-59之间！\n"
                 "💡 示例：/setsoftresettime 12 0 (中午12点软重置)\n"
                 "      /setsoftresettime 0 0 (禁用软重置)",
-                reply_markup=await get_main_keyboard(
-                    chat_id=message.chat.id, show_admin=True
-                ),
+                reply_markup=keyboard,
+                reply_to_message_id=message.message_id
             )
+            return
+
+        chat_id = message.chat.id
+        await db.init_group(chat_id)
+        await db.update_group_soft_reset_time(chat_id, hour, minute)
+
+        if hour == 0 and minute == 0:
+            await message.answer(
+                "✅ 软重置功能已禁用\n\n"
+                "💡 软重置功能已关闭，不会再执行二次重置",
+                reply_markup=keyboard,
+                parse_mode="HTML",
+                reply_to_message_id=message.message_id
+            )
+            logger.info(f"软重置功能已禁用: 群组 {chat_id}")
+        else:
+            await message.answer(
+                f"✅ 软重置时间已设置为：<code>{hour:02d}:{minute:02d}</code>\n\n"
+                f"💡 软重置特点：\n"
+                f"• 每天此时会重置打卡次数和'我的记录'显示\n"
+                f"• 不影响每日数据导出和月度统计\n"
+                f"• 用户可以重新开始打卡，但历史数据已保存",
+                reply_markup=keyboard,
+                parse_mode="HTML",
+                reply_to_message_id=message.message_id
+            )
+            logger.info(f"软重置时间设置成功: 群组 {chat_id} -> {hour:02d}:{minute:02d}")
+
     except ValueError:
         await message.answer(
             "❌ 请输入有效的数字！\n"
             "💡 示例：/setsoftresettime 12 0 (中午12点)",
-            reply_markup=await get_main_keyboard(
-                chat_id=message.chat.id, show_admin=True
-            ),
+            reply_markup=await get_main_keyboard(chat_id=message.chat.id, show_admin=True),
+            reply_to_message_id=message.message_id
         )
     except Exception as e:
         logger.error(f"设置软重置时间失败: {e}")
         await message.answer(
             f"❌ 设置失败：{e}",
-            reply_markup=await get_main_keyboard(
-                chat_id=message.chat.id, show_admin=True
-            ),
+            reply_markup=await get_main_keyboard(chat_id=message.chat.id, show_admin=True),
+            reply_to_message_id=message.message_id
         )
+
 
 @admin_required
 @rate_limit(rate=5, per=60)
@@ -2220,33 +2267,39 @@ async def cmd_softresettime(message: types.Message):
     """查看当前软重置时间"""
     chat_id = message.chat.id
     try:
+        keyboard = await get_main_keyboard(chat_id=chat_id, show_admin=True)
         soft_reset_hour, soft_reset_minute = await db.get_group_soft_reset_time(chat_id)
         
         if soft_reset_hour == 0 and soft_reset_minute == 0:
             status_text = "🔴 未启用"
         else:
-            status_text = f"🟢 {soft_reset_hour:02d}:{soft_reset_minute:02d}"
+            status_text = f"🟢 <code>{soft_reset_hour:02d}:{soft_reset_minute:02d}</code>"
         
         await message.answer(
             f"⏰ 当前重置时间设置\n\n"
             f"🔄 <b>硬重置（日常重置）</b>\n"
             f"• 重置所有数据（活动、上下班、记录、排行榜）\n"
-            f"• 时间：根据 /resettime 设置\n\n"
+            f"• 时间：根据 /setresettime 设置\n\n"
             f"🔄 <b>软重置（二次重置）</b>\n"
             f"• 只重置打卡次数和'我的记录'显示\n"
             f"• 不影响数据导出和月度统计\n"
-            f"• 状态：{status_text}\n"
-            f"• 时间：{f'<code>{soft_reset_hour:02d}:{soft_reset_minute:02d}</code>' if soft_reset_hour > 0 or soft_reset_minute > 0 else '未设置'}\n\n"
-            f"💡 使用以下命令管理：\n"
+            f"• 状态：{status_text}\n\n"
+            f"💡 管理命令：\n"
             f"• /setresettime <小时> <分钟> - 设置硬重置时间\n"
             f"• /setsoftresettime <小时> <分钟> - 设置软重置时间\n"
             f"• /setsoftresettime 0 0 - 禁用软重置",
-            reply_markup=await get_main_keyboard(chat_id=chat_id, show_admin=True),
+            reply_markup=keyboard,
             parse_mode="HTML",
+            reply_to_message_id=message.message_id
         )
     except Exception as e:
         logger.error(f"查看软重置时间失败: {e}")
-        await message.answer(f"❌ 获取重置时间失败：{e}")
+        await message.answer(
+            f"❌ 获取重置时间失败：{e}",
+            reply_markup=await get_main_keyboard(chat_id=chat_id, show_admin=True),
+            reply_to_message_id=message.message_id
+        )
+
 
 
 # ========== 导出每日数据命令 ==========
@@ -2256,12 +2309,12 @@ async def cmd_softresettime(message: types.Message):
 async def cmd_export(message: types.Message):
     """导出数据"""
     chat_id = message.chat.id
-    await message.answer("⏳ 正在导出数据，请稍候...")
+    await message.answer("⏳ 正在导出数据，请稍候...",reply_to_message_id=message.message_id)
     try:
         await export_and_push_csv(chat_id)
-        await message.answer("✅ 数据已导出并推送！")
+        await message.answer("✅ 数据已导出并推送！",reply_to_message_id=message.message_id)
     except Exception as e:
-        await message.answer(f"❌ 导出失败：{e}")
+        await message.answer(f"❌ 导出失败：{e}",reply_to_message_id=message.message_id)
 
 
 # ========== 月度报告函数 ==========
@@ -2394,29 +2447,29 @@ async def cmd_monthlyreport(message: types.Message):
             year = int(args[1])
             month = int(args[2])
             if month < 1 or month > 12:
-                await message.answer("❌ 月份必须在1-12之间")
+                await message.answer("❌ 月份必须在1-12之间",reply_to_message_id=message.message_id)
                 return
         except ValueError:
-            await message.answer("❌ 请输入有效的年份和月份")
+            await message.answer("❌ 请输入有效的年份和月份",reply_to_message_id=message.message_id)
             return
 
-    await message.answer("⏳ 正在生成月度报告，请稍候...")
+    await message.answer("⏳ 正在生成月度报告，请稍候...",reply_to_message_id=message.message_id)
 
     try:
         # 生成报告
         report = await generate_monthly_report(chat_id, year, month)
         if report:
-            await message.answer(report, parse_mode="HTML")
+            await message.answer(report, parse_mode="HTML",reply_to_message_id=message.message_id)
 
             # 导出CSV
             await export_monthly_csv(chat_id, year, month)
-            await message.answer("✅ 月度数据已导出并推送！")
+            await message.answer("✅ 月度数据已导出并推送！",reply_to_message_id=message.message_id)
         else:
             time_desc = f"{year}年{month}月" if year and month else "最近一个月"
-            await message.answer(f"⚠️ {time_desc}没有数据需要报告")
+            await message.answer(f"⚠️ {time_desc}没有数据需要报告",reply_to_message_id=message.message_id)
 
     except Exception as e:
-        await message.answer(f"❌ 生成月度报告失败：{e}")
+        await message.answer(f"❌ 生成月度报告失败：{e}",reply_to_message_id=message.message_id)
 
 
 @admin_required
@@ -2461,6 +2514,7 @@ async def cmd_addactivity(message: types.Message):
             reply_markup=await get_main_keyboard(
                 chat_id=message.chat.id, show_admin=True
             ),
+            reply_to_message_id=message.message_id
         )
         return
 
@@ -2476,6 +2530,7 @@ async def cmd_addactivity(message: types.Message):
                 reply_markup=await get_main_keyboard(
                     chat_id=message.chat.id, show_admin=True
                 ),
+                reply_to_message_id=message.message_id,
                 parse_mode="HTML",
             )
         else:
@@ -2484,10 +2539,11 @@ async def cmd_addactivity(message: types.Message):
                 reply_markup=await get_main_keyboard(
                     chat_id=message.chat.id, show_admin=True
                 ),
+                reply_to_message_id=message.message_id,
                 parse_mode="HTML",
             )
     except Exception as e:
-        await message.answer(f"❌ 添加/修改活动失败：{e}")
+        await message.answer(f"❌ 添加/修改活动失败：{e}",reply_to_message_id=message.message_id)
 
 
 @admin_required
@@ -2501,6 +2557,7 @@ async def cmd_delactivity(message: types.Message):
             reply_markup=await get_main_keyboard(
                 chat_id=message.chat.id, show_admin=True
             ),
+            reply_to_message_id=message.message_id
         )
         return
     act = args[1]
@@ -2510,6 +2567,7 @@ async def cmd_delactivity(message: types.Message):
             reply_markup=await get_main_keyboard(
                 chat_id=message.chat.id, show_admin=True
             ),
+            reply_to_message_id=message.message_id,
             parse_mode="HTML",
         )
         return
@@ -2520,6 +2578,7 @@ async def cmd_delactivity(message: types.Message):
     await message.answer(
         f"✅ 活动 <code>{act}</code> 已删除",
         reply_markup=await get_main_keyboard(chat_id=message.chat.id, show_admin=True),
+        reply_to_message_id=message.message_id,
         parse_mode="HTML",
     )
     logger.info(f"删除活动: {act}")
@@ -2539,6 +2598,7 @@ async def cmd_setworktime(message: types.Message):
             reply_markup=await get_main_keyboard(
                 chat_id=message.chat.id, show_admin=True
             ),
+            reply_to_message_id=message.message_id
         )
         return
 
@@ -2558,6 +2618,7 @@ async def cmd_setworktime(message: types.Message):
                 reply_markup=await get_main_keyboard(
                     chat_id=message.chat.id, show_admin=True
                 ),
+                reply_to_message_id=message.message_id
             )
             return
 
@@ -2573,6 +2634,7 @@ async def cmd_setworktime(message: types.Message):
             reply_markup=await get_main_keyboard(
                 chat_id=message.chat.id, show_admin=True
             ),
+            reply_to_message_id=message.message_id,
             parse_mode="HTML",
         )
 
@@ -2583,6 +2645,7 @@ async def cmd_setworktime(message: types.Message):
             reply_markup=await get_main_keyboard(
                 chat_id=message.chat.id, show_admin=True
             ),
+            reply_to_message_id=message.message_id,
         )
 
 
@@ -2598,6 +2661,7 @@ async def cmd_setresettime(message: types.Message):
             reply_markup=await get_main_keyboard(
                 chat_id=message.chat.id, show_admin=True
             ),
+            reply_to_message_id=message.message_id
         )
         return
 
@@ -2615,6 +2679,7 @@ async def cmd_setresettime(message: types.Message):
                 reply_markup=await get_main_keyboard(
                     chat_id=message.chat.id, show_admin=True
                 ),
+                reply_to_message_id=message.message_id,
                 parse_mode="HTML",
             )
             logger.info(f"重置时间设置成功: 群组 {chat_id} -> {hour:02d}:{minute:02d}")
@@ -2625,6 +2690,7 @@ async def cmd_setresettime(message: types.Message):
                 reply_markup=await get_main_keyboard(
                     chat_id=message.chat.id, show_admin=True
                 ),
+                reply_to_message_id=message.message_id
             )
     except ValueError:
         await message.answer(
@@ -2632,6 +2698,7 @@ async def cmd_setresettime(message: types.Message):
             reply_markup=await get_main_keyboard(
                 chat_id=message.chat.id, show_admin=True
             ),
+            reply_to_message_id=message.message_id
         )
     except Exception as e:
         logger.error(f"设置重置时间失败: {e}")
@@ -2640,6 +2707,7 @@ async def cmd_setresettime(message: types.Message):
             reply_markup=await get_main_keyboard(
                 chat_id=message.chat.id, show_admin=True
             ),
+            reply_to_message_id=message.message_id
         )
 
 
@@ -2660,10 +2728,11 @@ async def cmd_resettime(message: types.Message):
             f"💡 使用 /setresettime <小时> <分钟> 修改",
             reply_markup=await get_main_keyboard(chat_id=chat_id, show_admin=True),
             parse_mode="HTML",
+            reply_to_message_id=message.message_id,
         )
     except Exception as e:
         logger.error(f"查看重置时间失败: {e}")
-        await message.answer(f"❌ 获取重置时间失败：{e}")
+        await message.answer(f"❌ 获取重置时间失败：{e}",reply_to_message_id=message.message_id)
 
 
 @admin_required
@@ -2677,6 +2746,7 @@ async def cmd_delwork_clear(message: types.Message):
         await message.answer(
             "❌ 当前群组没有设置上下班功能",
             reply_markup=await get_main_keyboard(chat_id=chat_id, show_admin=True),
+            reply_to_message_id=message.message_id
         )
         return
 
@@ -2739,6 +2809,7 @@ async def cmd_delwork_clear(message: types.Message):
             success_msg,
             reply_markup=await get_main_keyboard(chat_id=chat_id, show_admin=True),
             parse_mode="HTML",
+            reply_to_message_id=message.message_id
         )
 
         logger.info(
@@ -2750,6 +2821,7 @@ async def cmd_delwork_clear(message: types.Message):
         await message.answer(
             f"❌ 移除失败：{e}",
             reply_markup=await get_main_keyboard(chat_id=chat_id, show_admin=True),
+            reply_to_message_id=message.message_id
         )
 
 
@@ -2767,6 +2839,7 @@ async def cmd_setchannel(message: types.Message):
             reply_markup=await get_main_keyboard(
                 chat_id=message.chat.id, show_admin=True
             ),
+            reply_to_message_id=message.message_id
         )
         return
 
@@ -2780,6 +2853,7 @@ async def cmd_setchannel(message: types.Message):
                 reply_markup=await get_main_keyboard(
                     chat_id=message.chat.id, show_admin=True
                 ),
+                reply_to_message_id=message.message_id
             )
             return
 
@@ -2796,6 +2870,7 @@ async def cmd_setchannel(message: types.Message):
             reply_markup=await get_main_keyboard(
                 chat_id=message.chat.id, show_admin=True
             ),
+            reply_to_message_id=message.message_id,
             parse_mode="HTML",
         )
 
@@ -2807,6 +2882,7 @@ async def cmd_setchannel(message: types.Message):
             reply_markup=await get_main_keyboard(
                 chat_id=message.chat.id, show_admin=True
             ),
+            reply_to_message_id=message.message_id
         )
     except Exception as e:
         logger.error(f"设置频道失败: {e}")
@@ -2815,6 +2891,7 @@ async def cmd_setchannel(message: types.Message):
             reply_markup=await get_main_keyboard(
                 chat_id=message.chat.id, show_admin=True
             ),
+            reply_to_message_id=message.message_id
         )
 
 
@@ -2831,6 +2908,7 @@ async def cmd_setgroup(message: types.Message):
             reply_markup=await get_main_keyboard(
                 chat_id=message.chat.id, show_admin=True
             ),
+            reply_to_message_id=message.message_id
         )
         return
 
@@ -2845,6 +2923,7 @@ async def cmd_setgroup(message: types.Message):
             reply_markup=await get_main_keyboard(
                 chat_id=message.chat.id, show_admin=True
             ),
+            reply_to_message_id=message.message_id,
             parse_mode="HTML",
         )
 
@@ -2856,6 +2935,7 @@ async def cmd_setgroup(message: types.Message):
             reply_markup=await get_main_keyboard(
                 chat_id=message.chat.id, show_admin=True
             ),
+            reply_to_message_id=message.message_id
         )
     except Exception as e:
         logger.error(f"设置群组失败: {e}")
@@ -2864,6 +2944,7 @@ async def cmd_setgroup(message: types.Message):
             reply_markup=await get_main_keyboard(
                 chat_id=message.chat.id, show_admin=True
             ),
+            reply_to_message_id=message.message_id
         )
 
 
@@ -2881,6 +2962,7 @@ async def cmd_actnum(message: types.Message):
             reply_markup=await get_main_keyboard(
                 chat_id=message.chat.id, show_admin=True
             ),
+            reply_to_message_id=message.message_id
         )
         return
 
@@ -2895,6 +2977,7 @@ async def cmd_actnum(message: types.Message):
                 reply_markup=await get_main_keyboard(
                     chat_id=message.chat.id, show_admin=True
                 ),
+                reply_to_message_id=message.message_id,
                 parse_mode="HTML",
             )
             return
@@ -2917,6 +3000,7 @@ async def cmd_actnum(message: types.Message):
                 f"✅ 已取消活动 '<code>{activity}</code>' 的人数限制",
                 reply_markup=await get_main_keyboard(chat_id=chat_id, show_admin=True),
                 parse_mode="HTML",
+                reply_to_message_id=message.message_id
             )
             logger.info(f"取消活动人数限制: {activity}")
         else:
@@ -2934,6 +3018,7 @@ async def cmd_actnum(message: types.Message):
                 f"• 剩余名额：<code>{max_users - current_users}</code> 人",
                 reply_markup=await get_main_keyboard(chat_id=chat_id, show_admin=True),
                 parse_mode="HTML",
+                reply_to_message_id=message.message_id
             )
             logger.info(f"设置活动人数限制: {activity} -> {max_users}人")
 
@@ -2943,6 +3028,7 @@ async def cmd_actnum(message: types.Message):
             reply_markup=await get_main_keyboard(
                 chat_id=message.chat.id, show_admin=True
             ),
+            reply_to_message_id=message.message_id
         )
     except Exception as e:
         logger.error(f"设置活动人数限制失败: {e}")
@@ -2951,6 +3037,7 @@ async def cmd_actnum(message: types.Message):
             reply_markup=await get_main_keyboard(
                 chat_id=message.chat.id, show_admin=True
             ),
+            reply_to_message_id=message.message_id
         )
 
 
@@ -2961,7 +3048,6 @@ async def cmd_actstatus(message: types.Message):
     chat_id = message.chat.id
 
     try:
-        # 获取所有活动限制
         activity_limits = await db.get_all_activity_limits()
 
         if not activity_limits:
@@ -2969,6 +3055,7 @@ async def cmd_actstatus(message: types.Message):
                 "📊 当前没有设置任何活动人数限制\n"
                 "💡 使用 /actnum <活动名> <人数> 来设置限制",
                 reply_markup=await get_main_keyboard(chat_id=chat_id, show_admin=True),
+                reply_to_message_id=message.message_id
             )
             return
 
@@ -2976,13 +3063,14 @@ async def cmd_actstatus(message: types.Message):
 
         for activity, max_users in activity_limits.items():
             current_users = await db.get_current_activity_users(chat_id, activity)
-            remaining = max_users - current_users
+            remaining = max(0, max_users - current_users) if max_users > 0 else "无限制"
 
-            status_icon = "🟢" if remaining > 0 else "🔴"
+            status_icon = "🟢" if remaining == "无限制" or remaining > 0 else "🔴"
+            limit_display = f"{max_users}" if max_users > 0 else "无限制"
 
             status_text += (
                 f"{status_icon} <code>{activity}</code>\n"
-                f"   • 限制：<code>{max_users}</code> 人\n"
+                f"   • 限制：<code>{limit_display}</code>\n"
                 f"   • 当前：<code>{current_users}</code> 人\n"
                 f"   • 剩余：<code>{remaining}</code> 人\n\n"
             )
@@ -2993,6 +3081,7 @@ async def cmd_actstatus(message: types.Message):
             status_text,
             reply_markup=await get_main_keyboard(chat_id=chat_id, show_admin=True),
             parse_mode="HTML",
+            reply_to_message_id=message.message_id
         )
 
         logger.info(f"查看活动状态: {chat_id}")
@@ -3002,6 +3091,7 @@ async def cmd_actstatus(message: types.Message):
         await message.answer(
             f"❌ 获取状态失败：{e}",
             reply_markup=await get_main_keyboard(chat_id=chat_id, show_admin=True),
+            reply_to_message_id=message.message_id
         )
 
 
@@ -3014,9 +3104,8 @@ async def cmd_setfines_all(message: types.Message):
     if len(args) < 3 or (len(args) - 1) % 2 != 0:
         await message.answer(
             Config.MESSAGES["setfines_all_usage"],
-            reply_markup=await get_main_keyboard(
-                chat_id=message.chat.id, show_admin=True
-            ),
+            reply_markup=await get_main_keyboard(chat_id=message.chat.id, show_admin=True),
+            reply_to_message_id=message.message_id
         )
         return
 
@@ -3029,35 +3118,49 @@ async def cmd_setfines_all(message: types.Message):
             if t <= 0 or f < 0:
                 await message.answer(
                     "❌ 时间段必须为正整数，罚款金额不能为负数",
-                    reply_markup=await get_main_keyboard(
-                        chat_id=message.chat.id, show_admin=True
-                    ),
+                    reply_markup=await get_main_keyboard(chat_id=message.chat.id, show_admin=True),
+                    reply_to_message_id=message.message_id
                 )
                 return
-            segments[str(t)] = f
+            segments[t] = f
 
         activity_limits = await db.get_activity_limits_cached()
+        if not activity_limits:
+            await message.answer(
+                "⚠️ 当前没有活动，无法设置罚款",
+                reply_markup=await get_main_keyboard(chat_id=message.chat.id, show_admin=True),
+                reply_to_message_id=message.message_id
+            )
+            return
+
         for act in activity_limits.keys():
             for time_segment, amount in segments.items():
-                await db.update_fine_config(act, time_segment, amount)
+                await db.update_fine_config(act, str(time_segment), amount)
 
-        segments_text = " ".join(
-            [f"<code>{t}</code>:<code>{f}</code>" for t, f in segments.items()]
-        )
+        segments_text = " ".join([f"<code>{t}</code>:<code>{f}</code>" for t, f in segments.items()])
         await message.answer(
             f"✅ 已为所有活动设置分段罚款：{segments_text}",
-            reply_markup=await get_main_keyboard(
-                chat_id=message.chat.id, show_admin=True
-            ),
+            reply_markup=await get_main_keyboard(chat_id=message.chat.id, show_admin=True),
+            reply_to_message_id=message.message_id,
             parse_mode="HTML",
         )
+
+        logger.info(f"群 {message.chat.id} 已统一设置所有活动罚款: {segments_text}")
+
+    except ValueError:
+        await message.answer(
+            "❌ 时间段和金额必须是数字！",
+            reply_markup=await get_main_keyboard(chat_id=message.chat.id, show_admin=True),
+            reply_to_message_id=message.message_id
+        )
     except Exception as e:
+        logger.error(f"设置所有活动罚款失败: {e}")
         await message.answer(
             f"❌ 设置失败：{e}",
-            reply_markup=await get_main_keyboard(
-                chat_id=message.chat.id, show_admin=True
-            ),
+            reply_markup=await get_main_keyboard(chat_id=message.chat.id, show_admin=True),
+            reply_to_message_id=message.message_id
         )
+
 
 
 @admin_required
@@ -3068,69 +3171,67 @@ async def cmd_setfine(message: types.Message):
     if len(args) != 4:
         await message.answer(
             Config.MESSAGES["setfine_usage"],
-            reply_markup=await get_main_keyboard(
-                chat_id=message.chat.id, show_admin=True
-            ),
+            reply_markup=await get_main_keyboard(chat_id=message.chat.id, show_admin=True),
+            reply_to_message_id=message.message_id
         )
         return
 
     try:
         activity = args[1]
-        time_segment = args[2]
+        time_segment = int(args[2])
         amount = int(args[3])
 
-        # 检查活动是否存在
         if not await db.activity_exists(activity):
             await message.answer(
                 f"❌ 活动 '<code>{activity}</code>' 不存在！",
-                reply_markup=await get_main_keyboard(
-                    chat_id=message.chat.id, show_admin=True
-                ),
+                reply_markup=await get_main_keyboard(chat_id=message.chat.id, show_admin=True),
+                reply_to_message_id=message.message_id,
                 parse_mode="HTML",
             )
             return
 
-        if amount < 0:
+        if time_segment <= 0 or amount < 0:
             await message.answer(
-                "❌ 罚款金额不能为负数！",
-                reply_markup=await get_main_keyboard(
-                    chat_id=message.chat.id, show_admin=True
-                ),
+                "❌ 时间段必须为正整数，罚款金额不能为负数",
+                reply_markup=await get_main_keyboard(chat_id=message.chat.id, show_admin=True),
+                reply_to_message_id=message.message_id
             )
             return
 
-        await db.update_fine_config(activity, time_segment, amount)
+        await db.update_fine_config(activity, str(time_segment), amount)
 
         await message.answer(
             f"✅ 已设置活动 '<code>{activity}</code>' 的罚款：\n"
             f"⏱️ 时间段：<code>{time_segment}</code>\n"
             f"💰 金额：<code>{amount}</code> 元",
-            reply_markup=await get_main_keyboard(
-                chat_id=message.chat.id, show_admin=True
-            ),
+            reply_markup=await get_main_keyboard(chat_id=message.chat.id, show_admin=True),
+            reply_to_message_id=message.message_id,
             parse_mode="HTML",
         )
 
+        logger.info(f"群 {message.chat.id} 已设置活动罚款: {activity} {time_segment} -> {amount}元")
+
     except ValueError:
         await message.answer(
-            "❌ 金额必须是数字！",
-            reply_markup=await get_main_keyboard(
-                chat_id=message.chat.id, show_admin=True
-            ),
+            "❌ 时间段和金额必须是数字！",
+            reply_markup=await get_main_keyboard(chat_id=message.chat.id, show_admin=True),
+            reply_to_message_id=message.message_id
         )
     except Exception as e:
+        logger.error(f"设置单个活动罚款失败: {e}")
         await message.answer(
             f"❌ 设置失败：{e}",
-            reply_markup=await get_main_keyboard(
-                chat_id=message.chat.id, show_admin=True
-            ),
+            reply_markup=await get_main_keyboard(chat_id=message.chat.id, show_admin=True),
+            reply_to_message_id=message.message_id
         )
+
 
 
 @admin_required
 @rate_limit(rate=5, per=60)
 async def cmd_finesstatus(message: types.Message):
     """查看所有活动的罚款设置状态"""
+    chat_id = message.chat.id
     try:
         # 获取所有活动和罚款配置
         activity_limits = await db.get_activity_limits_cached()
@@ -3139,9 +3240,8 @@ async def cmd_finesstatus(message: types.Message):
         if not activity_limits:
             await message.answer(
                 "⚠️ 当前没有配置任何活动",
-                reply_markup=await get_main_keyboard(
-                    chat_id=message.chat.id, show_admin=True
-                ),
+                reply_markup=await get_main_keyboard(chat_id=chat_id, show_admin=True),
+                reply_to_message_id=message.message_id
             )
             return
 
@@ -3152,35 +3252,35 @@ async def cmd_finesstatus(message: types.Message):
             status_text += f"🔹 <code>{activity}</code>\n"
 
             if activity_fines:
-                for time_seg, amount in sorted(
-                    activity_fines.items(), key=lambda x: int(x[0].replace("min", ""))
-                ):
-                    status_text += f"   • {time_seg}: <code>{amount}</code>元\n"
+                # 按时间段排序
+                for time_seg, amount in sorted(activity_fines.items(), key=lambda x: int(x[0])):
+                    status_text += f"   • 时间段 <code>{time_seg}</code> 分钟：<code>{amount}</code> 元\n"
             else:
                 status_text += f"   • 未设置罚款\n"
 
             status_text += "\n"
 
-        status_text += "💡 使用以下命令设置：\n"
+        status_text += "💡 设置命令：\n"
         status_text += "• /setfine <活动> <时间> <金额> - 设置单个活动\n"
         status_text += "• /setfines_all <t1> <f1> [t2 f2...] - 统一设置所有活动"
 
         await message.answer(
             status_text,
-            reply_markup=await get_main_keyboard(
-                chat_id=message.chat.id, show_admin=True
-            ),
+            reply_markup=await get_main_keyboard(chat_id=chat_id, show_admin=True),
+            reply_to_message_id=message.message_id,
             parse_mode="HTML",
         )
+
+        logger.info(f"群 {chat_id} 查看了活动罚款状态")
 
     except Exception as e:
         logger.error(f"查看罚款状态失败: {e}")
         await message.answer(
             f"❌ 获取罚款状态失败：{e}",
-            reply_markup=await get_main_keyboard(
-                chat_id=message.chat.id, show_admin=True
-            ),
+            reply_markup=await get_main_keyboard(chat_id=chat_id, show_admin=True),
+            reply_to_message_id=message.message_id
         )
+
 
 
 # =========== 上下班罚款指令 ===========
@@ -3197,10 +3297,11 @@ async def cmd_setworkfine(message: types.Message):
         迟到30分钟以上罚500
     """
     args = message.text.split()
-    if len(args) < 4 or len(args) % 2 != 0:
+    if len(args) < 4 or (len(args) - 2) % 2 != 0:
         await message.answer(
             "❌ 用法错误\n正确格式：/setworkfine <work_start|work_end> <分钟1> <罚款1> [分钟2 罚款2 ...]",
-            reply_markup=get_admin_keyboard(),
+            reply_markup=await get_admin_keyboard(),
+            reply_to_message_id=message.message_id
         )
         return
 
@@ -3208,7 +3309,8 @@ async def cmd_setworkfine(message: types.Message):
     if checkin_type not in ["work_start", "work_end"]:
         await message.answer(
             "❌ 类型必须是 work_start 或 work_end",
-            reply_markup=get_admin_keyboard(),
+            reply_markup=await get_admin_keyboard(),
+            reply_to_message_id=message.message_id
         )
         return
 
@@ -3218,6 +3320,13 @@ async def cmd_setworkfine(message: types.Message):
         for i in range(2, len(args), 2):
             minute = int(args[i])
             amount = int(args[i + 1])
+            if minute <= 0 or amount < 0:
+                await message.answer(
+                    "❌ 分钟必须大于0，罚款金额不能为负数",
+                    reply_markup=await get_admin_keyboard(),
+                    reply_to_message_id=message.message_id
+                )
+                return
             fine_segments[str(minute)] = amount
 
         # 更新数据库配置（重写整个罚款配置）
@@ -3226,14 +3335,16 @@ async def cmd_setworkfine(message: types.Message):
             await db.update_work_fine_rate(checkin_type, minute_str, fine_amount)
 
         segments_text = "\n".join(
-            [f"⏰ 超过 {m} 分钟 → 💰 {a} 元" for m, a in fine_segments.items()]
+            [f"⏰ 超过 {m} 分钟 → 💰 {a} 元"
+             for m, a in sorted(fine_segments.items(), key=lambda x: int(x[0]))]
         )
 
         type_text = "上班迟到" if checkin_type == "work_start" else "下班早退"
 
         await message.answer(
             f"✅ 已设置{type_text}罚款规则：\n{segments_text}",
-            reply_markup=get_admin_keyboard(),
+            reply_markup=await get_admin_keyboard(),
+            reply_to_message_id=message.message_id
         )
 
         logger.info(f"设置上下班罚款: {checkin_type} -> {fine_segments}")
@@ -3241,14 +3352,17 @@ async def cmd_setworkfine(message: types.Message):
     except ValueError:
         await message.answer(
             "❌ 分钟和罚款必须是数字",
-            reply_markup=get_admin_keyboard(),
+            reply_markup=await get_admin_keyboard(),
+            reply_to_message_id=message.message_id
         )
     except Exception as e:
         logger.error(f"设置上下班罚款失败: {e}")
         await message.answer(
             f"❌ 设置失败：{e}",
-            reply_markup=get_admin_keyboard(),
+            reply_markup=await get_admin_keyboard(),
+            reply_to_message_id=message.message_id
         )
+
 
 
 @admin_required
@@ -3257,70 +3371,71 @@ async def cmd_showsettings(message: types.Message):
     """显示目前的设置 - 优化版本"""
     chat_id = message.chat.id
     await db.init_group(chat_id)
-    group_data = await db.get_group_cached(chat_id)
-
-    if group_data and not isinstance(group_data, dict):
-        group_data = dict(group_data)
+    group_data = await db.get_group_cached(chat_id) or {}
 
     activity_limits = await db.get_activity_limits_cached()
     fine_rates = await db.get_fine_rates()
     work_fine_rates = await db.get_work_fine_rates()
 
     # 生成输出文本
-    text = f"🔧 当前群设置（当前群ID {chat_id}）\n\n"
+    text = f"🔧 当前群设置（群ID {chat_id}）\n\n"
 
     # 基本设置
     text += "📋 基本设置：\n"
     text += f"• 绑定频道ID: <code>{group_data.get('channel_id', '未设置')}</code>\n"
     text += f"• 通知群组ID: <code>{group_data.get('notification_group_id', '未设置')}</code>\n\n"
-    text += "⏰ 重置设置：\n"
-    text += f"• 每日重置时间: <code>{group_data.get('reset_hour', 0):02d}:{group_data.get('reset_minute', 0):02d}</code>\n"
+    
+    # 重置与上下班时间
+    text += "⏰ 重置与工作时间：\n"
+    text += f"• 每日重置时间: <code>{group_data.get('reset_hour', Config.DAILY_RESET_HOUR):02d}:{group_data.get('reset_minute', Config.DAILY_RESET_MINUTE):02d}</code>\n"
     text += f"• 上班时间: <code>{group_data.get('work_start_time', '09:00')}</code>\n"
     text += f"• 下班时间: <code>{group_data.get('work_end_time', '18:00')}</code>\n\n"
 
     # 活动设置
     text += "🎯 活动设置：\n"
-    for act, v in activity_limits.items():
-        text += f"• <code>{act}</code>：次数上限 <code>{v['max_times']}</code>，时间限制 <code>{v['time_limit']}</code> 分钟\n"
+    if activity_limits:
+        for act, v in activity_limits.items():
+            text += f"• <code>{act}</code>：次数上限 <code>{v['max_times']}</code>，时间限制 <code>{v['time_limit']}</code> 分钟\n"
+    else:
+        text += "• 暂无活动设置\n"
 
     # 活动罚款设置
     text += "\n💰 活动罚款分段：\n"
-    has_fine_settings = False
-    for act, fr in fine_rates.items():
-        if fr:
-            has_fine_settings = True
-            sorted_fines = sorted(
-                fr.items(), key=lambda x: int(x[0].replace("min", ""))
-            )
-            fines_text = " | ".join([f"{k}:{v}元" for k, v in sorted_fines])
-            text += f"• <code>{act}</code>：{fines_text}\n"
-
-    if not has_fine_settings:
+    if fine_rates:
+        for act, fr in fine_rates.items():
+            if fr:
+                try:
+                    sorted_fines = sorted(fr.items(), key=lambda x: int(x[0].replace("min", "")))
+                    fines_text = " | ".join([f"{k}:{v}元" for k, v in sorted_fines])
+                    text += f"• <code>{act}</code>：{fines_text}\n"
+                except Exception:
+                    text += f"• <code>{act}</code>：配置异常\n"
+            else:
+                text += f"• <code>{act}</code>：未设置\n"
+    else:
         text += "• 暂无活动罚款设置\n"
 
-    # 上下班罚款设置
+    # 上下班罚款
     text += "\n⏰ 上下班罚款设置：\n"
-    start_fines = work_fine_rates.get("work_start", {})
-    if start_fines:
-        sorted_start = sorted(start_fines.items(), key=lambda x: int(x[0]))
-        start_text = " | ".join([f"{k}分:{v}元" for k, v in sorted_start])
-        text += f"• 上班迟到：{start_text}\n"
-    else:
-        text += "• 上班迟到：未设置\n"
-
-    end_fines = work_fine_rates.get("work_end", {})
-    if end_fines:
-        sorted_end = sorted(end_fines.items(), key=lambda x: int(x[0]))
-        end_text = " | ".join([f"{k}分:{v}元" for k, v in sorted_end])
-        text += f"• 下班早退：{end_text}\n"
-    else:
-        text += "• 下班早退：未设置\n"
+    for key, label in [("work_start", "上班迟到"), ("work_end", "下班早退")]:
+        wf = work_fine_rates.get(key, {})
+        if wf:
+            try:
+                sorted_wf = sorted(wf.items(), key=lambda x: int(x[0]))
+                wf_text = " | ".join([f"{k}分:{v}元" for k, v in sorted_wf])
+                text += f"• {label}：{wf_text}\n"
+            except Exception:
+                text += f"• {label}：配置异常\n"
+        else:
+            text += f"• {label}：未设置\n"
 
     await message.answer(
         text,
         reply_markup=await get_main_keyboard(chat_id=chat_id, show_admin=True),
         parse_mode="HTML",
+        reply_to_message_id=message.message_id
     )
+
 
 
 # ========== 查看工作时间命令 =========
@@ -3330,30 +3445,31 @@ async def cmd_worktime(message: types.Message):
     """查看当前工作时间设置"""
     chat_id = message.chat.id
     try:
-        work_hours = await db.get_group_work_time(chat_id)
+        work_hours = await db.get_group_work_time(chat_id) or {}
         has_enabled = await db.has_work_hours_enabled(chat_id)
 
+        work_start = work_hours.get('work_start', '09:00')
+        work_end = work_hours.get('work_end', '18:00')
         status = "🟢 已启用" if has_enabled else "🔴 未启用（使用默认时间）"
 
         await message.answer(
             f"🕒 当前工作时间设置\n\n"
             f"📊 状态：{status}\n"
-            f"🟢 上班时间：<code>{work_hours['work_start']}</code>\n"
-            f"🔴 下班时间：<code>{work_hours['work_end']}</code>\n\n"
+            f"🟢 上班时间：<code>{work_start}</code>\n"
+            f"🔴 下班时间：<code>{work_end}</code>\n\n"
             f"💡 使用 /setworktime 09:00 18:00 来修改",
-            reply_markup=await get_main_keyboard(
-                chat_id=message.chat.id, show_admin=True
-            ),
+            reply_markup=await get_main_keyboard(chat_id=chat_id, show_admin=True),
+            reply_to_message_id=message.message_id,
             parse_mode="HTML",
         )
     except Exception as e:
         logger.error(f"查看工作时间失败: {e}")
         await message.answer(
-            f"❌ 获取工作时间失败：{e}",
-            reply_markup=await get_main_keyboard(
-                chat_id=message.chat.id, show_admin=True
-            ),
+            "❌ 获取工作时间失败，请稍后重试",
+            reply_markup=await get_main_keyboard(chat_id=chat_id, show_admin=True),
+            reply_to_message_id=message.message_id
         )
+
 
 
 # ========== 按钮处理 ==========
@@ -3379,12 +3495,12 @@ async def handle_work_buttons(message: types.Message):
 async def handle_export_button(message: types.Message):
     """处理导出数据按钮"""
     chat_id = message.chat.id
-    await message.answer("⏳ 正在导出数据，请稍候...")
+    await message.answer("⏳ 正在导出数据，请稍候...",reply_to_message_id=message.message_id)
     try:
         await export_and_push_csv(chat_id)
-        await message.answer("✅ 数据已导出并推送！")
+        await message.answer("✅ 数据已导出并推送！",reply_to_message_id=message.message_id)
     except Exception as e:
-        await message.answer(f"❌ 导出失败：{e}")
+        await message.answer(f"❌ 导出失败：{e}",reply_to_message_id=message.message_id)
 
 
 @rate_limit(rate=10, per=60)
@@ -3420,6 +3536,7 @@ async def handle_admin_panel_button(message: types.Message):
             reply_markup=await get_main_keyboard(
                 chat_id=message.chat.id, show_admin=False
             ),
+            reply_to_message_id=message.message_id
         )
         return
 
@@ -3459,7 +3576,7 @@ async def handle_admin_panel_button(message: types.Message):
         "💾 数据显示：\n"
         "• /showsettings - 显示所有当前设置\n\n"
     )
-    await message.answer(admin_text, reply_markup=get_admin_keyboard())
+    await message.answer(admin_text, reply_markup=get_admin_keyboard(),reply_to_message_id=message.message_id)
 
 
 # ========== 返回主菜单按钮处理 ==========
@@ -3476,6 +3593,7 @@ async def handle_back_to_main_menu(message: types.Message):
         reply_markup=await get_main_keyboard(
             chat_id=chat_id, show_admin=await is_admin(uid)
         ),
+        reply_to_message_id=message.message_id
     )
     logger.info(f"已为用户 {uid} 返回主菜单")
 
@@ -3514,6 +3632,7 @@ async def handle_all_text_messages(message: types.Message):
         reply_markup=await get_main_keyboard(
             chat_id=chat_id, show_admin=await is_admin(uid)
         ),
+        reply_to_message_id=message.message_id,
         parse_mode="HTML",
     )
 
@@ -3545,6 +3664,7 @@ async def show_history(message: types.Message):
             reply_markup=await get_main_keyboard(
                 chat_id=chat_id, show_admin=await is_admin(uid)
             ),
+            reply_to_message_id=message.message_id,
         )
         return
 
@@ -3621,6 +3741,7 @@ async def show_history(message: types.Message):
         reply_markup=await get_main_keyboard(
             chat_id=chat_id, show_admin=await is_admin(uid)
         ),
+        reply_to_message_id=message.message_id,
         parse_mode="HTML",
     )
 
@@ -3635,7 +3756,7 @@ async def show_rank(message: types.Message):
     activity_limits = await db.get_activity_limits_cached()
 
     if not activity_limits:
-        await message.answer("⚠️ 当前没有配置任何活动，无法生成排行榜。")
+        await message.answer("⚠️ 当前没有配置任何活动，无法生成排行榜。",reply_to_message_id=message.message_id)
         return
 
     # 🧠 获取业务日期
@@ -3717,6 +3838,7 @@ async def show_rank(message: types.Message):
         rank_text,
         reply_markup=await get_main_keyboard(chat_id, await is_admin(uid)),
         parse_mode="HTML",
+        reply_to_message_id=message.message_id
     )
 
 
