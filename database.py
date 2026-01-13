@@ -909,7 +909,7 @@ class PostgreSQLDatabase:
             SELECT user_id, nickname, current_activity, activity_start_time, 
                 total_accumulated_time, total_activity_count, total_fines,
                 overtime_count, total_overtime_time, last_updated,
-                checkin_message_id  -- 🆕 新增字段（必须放在最后，保持兼容性）
+                checkin_message_id  
             FROM users WHERE chat_id = $1 AND user_id = $2
             """,
             chat_id,
@@ -957,7 +957,7 @@ class PostgreSQLDatabase:
             """
             SELECT user_id, nickname, current_activity, activity_start_time, 
                 total_accumulated_time, total_activity_count, total_fines,
-                overtime_count, total_overtime_time, last_updated
+                overtime_count, total_overtime_time, last_updated,checkin_message_id
             FROM users WHERE chat_id = $1 AND user_id = $2
             """,
             chat_id,
@@ -1074,7 +1074,11 @@ class PostgreSQLDatabase:
                 chat_id,
                 user_id,
             )
-        self._cache.pop(f"user:{chat_id}:{user_id}", None)
+        # ✅ 强制清除缓存，确保下次读取能获取最新数据
+        cache_key = f"user:{chat_id}:{user_id}"
+        self._cache.pop(cache_key, None)
+        self._cache_ttl.pop(cache_key, None)
+        logger.info(f"✅ 已更新用户 {user_id} 的打卡消息ID为 {message_id}，并清除缓存")
 
     async def get_user_checkin_message_id(self, chat_id: int, user_id: int) -> Optional[int]:
         """获取用户的打卡消息ID"""
