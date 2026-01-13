@@ -748,11 +748,9 @@ def get_admin_keyboard() -> ReplyKeyboardMarkup:
 
 # ========== 活动定时提醒 ==========
 async def activity_timer(chat_id: int, uid: int, act: str, limit: int):
-    """最终无遗漏可用版活动定时器（含引用回复）"""
+    """最终无遗漏可用版活动定时器（含引用回复 + 每10分钟超时提醒 + 2小时强制回座）"""
     try:
         # ===== 状态标记 =====
-        ten_minute_warning_sent = False
-        five_minute_warning_sent = False
         one_minute_warning_sent = False
         timeout_immediate_sent = False
         timeout_5min_sent = False
@@ -853,10 +851,9 @@ async def activity_timer(chat_id: int, uid: int, act: str, limit: int):
                 now = get_beijing_time()
                 elapsed = int((now - start_time).total_seconds())
                 remaining = limit * 60 - elapsed
-                remaining_minutes = int(remaining // 60)
                 nickname = user_data.get("nickname", str(uid))
 
-                # ===== 强制回座 =====
+                # ===== 强制回座 2 小时 =====
                 break_force = False
                 if elapsed >= 120 * 60 and not force_back_sent:
                     force_back_sent = True
@@ -879,21 +876,16 @@ async def activity_timer(chat_id: int, uid: int, act: str, limit: int):
 
                 # 通知推送（最多 3 次）
                 for attempt in range(3):
-                    if await push_force_back_notification(
-                        nickname, elapsed, fine_amount
-                    ):
+                    if await push_force_back_notification(nickname, elapsed, fine_amount):
                         break
-                    logger.warning(
-                        f"⚠️ 强制回座通知发送失败，重试 {attempt + 1}/3"
-                    )
+                    logger.warning(f"⚠️ 强制回座通知发送失败，重试 {attempt + 1}/3")
                     await asyncio.sleep(2)
 
                 await db.clear_user_checkin_message(chat_id, uid)
                 await timer_manager.cancel_timer(f"{chat_id}-{uid}")
                 break
 
-            # ===== 准备超时提示 =====
-         
+            # ===== 即将超时 1 分钟提醒 =====
             if 0 < remaining <= 60 and not one_minute_warning_sent:
                 msg = (
                     f"⏳ <b>即将超时警告</b>\n"
@@ -909,26 +901,28 @@ async def activity_timer(chat_id: int, uid: int, act: str, limit: int):
                 overtime_minutes = int(-remaining // 60)
                 msg = None
 
+                # 0 分钟超时
                 if overtime_minutes == 0 and not timeout_immediate_sent:
                     timeout_immediate_sent = True
-                    last_reminder_minute = 0
                     msg = (
                         f"⚠️ <b>超时警告</b>\n"
                         f"👤 {MessageFormatter.format_user_link(uid, nickname)} 已超时！"
                         f"🏃‍♂️ 请立即回座，避免产生罚款！"
-                        
                     )
+                    last_reminder_minute = 0
 
+                # 5 分钟超时
                 elif overtime_minutes == 5 and not timeout_5min_sent:
                     timeout_5min_sent = True
-                    last_reminder_minute = 5
                     msg = (
                         f"🔔 <b>超时警告</b>\n"
                         f"👤 {MessageFormatter.format_user_link(uid, nickname)} 已超时 <code>5</code> 分钟！"
                         f"😤 罚款正在累积，请立即回座！"
                     )
+                    last_reminder_minute = 5
 
-                elif overtime_minutes >= 10 and overtime_minutes > last_reminder_minute:
+                # >=10 分钟，每 10 分钟提醒一次
+                elif overtime_minutes >= 10 and overtime_minutes % 10 == 0 and overtime_minutes != last_reminder_minute:
                     last_reminder_minute = overtime_minutes
                     msg = (
                         f"🚨 <b>超时警告</b>\n"
@@ -950,6 +944,7 @@ async def activity_timer(chat_id: int, uid: int, act: str, limit: int):
             await db.clear_user_checkin_message(chat_id, uid)
         except:
             pass
+
 
 
 # ========== 核心打卡功能 ==========
