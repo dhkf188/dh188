@@ -331,10 +331,12 @@ class PostgreSQLDatabase:
         )
 
         # 如果当前时间小于重置时间，说明还在上一天的业务周期内
-        if current_dt < reset_time_today:
-            return (current_dt - timedelta(days=1)).date()
-        else:
-            return current_dt.date()
+        business_date = (current_dt - timedelta(days=1)).date() if current_dt < reset_time_today else current_dt.date()
+
+        logger.debug(f"📅 业务日期计算: chat_id={chat_id}, 当前时间={current_dt}, "
+                 f"重置时间={reset_time_today}, 业务日期={business_date}")
+        
+        return business_date
 
     # ========== 初始化方法 ==========
     async def initialize(self):
@@ -1133,8 +1135,8 @@ class PostgreSQLDatabase:
         fine_amount: int = 0,
         is_overtime: bool = False,
     ):
-        """完成用户活动 - 实时四表同步写入版本"""
-
+        """完成用户活动 - 完整修复版本，确保四表同步写入"""
+        
         today = await self.get_business_date(chat_id)
         statistic_date = today.replace(day=1)
 
@@ -1147,8 +1149,23 @@ class PostgreSQLDatabase:
 
         async with self.pool.acquire() as conn:
             async with conn.transaction():
+                # ========== 1. 获取当前的 is_soft_reset 状态 ==========
+                current_soft_reset = False
+                soft_reset_row = await conn.fetchrow(
+                    """
+                    SELECT is_soft_reset FROM daily_statistics 
+                    WHERE chat_id = $1 AND user_id = $2 AND record_date = $3 
+                    LIMIT 1
+                    """, 
+                    chat_id, user_id, today
+                )
+                
+                if soft_reset_row:
+                    current_soft_reset = soft_reset_row["is_soft_reset"]
+                
+                logger.debug(f"软重置状态: {current_soft_reset}")
 
-                # ========== 1. users 表 ==========
+                # ========== 2. users 表 ==========
                 await conn.execute(
                     """
                     INSERT INTO users (chat_id, user_id, last_updated)
@@ -1159,7 +1176,7 @@ class PostgreSQLDatabase:
                     chat_id, user_id, today
                 )
 
-                # ========== 2. user_activities 表 ==========
+                # ========== 3. user_activities 表 ==========
                 await conn.execute(
                     """
                     INSERT INTO user_activities
@@ -1174,36 +1191,7 @@ class PostgreSQLDatabase:
                     chat_id, user_id, today, activity, elapsed_time
                 )
 
-                # ========== 3. monthly_statistics 活动数据 ==========
-                await conn.execute(
-                    """
-                    INSERT INTO monthly_statistics
-                    (chat_id, user_id, statistic_date, activity_name, activity_count, accumulated_time)
-                    VALUES ($1, $2, $3, $4, 1, $5)
-                    ON CONFLICT (chat_id, user_id, statistic_date, activity_name)
-                    DO UPDATE SET
-                        activity_count = monthly_statistics.activity_count + 1,
-                        accumulated_time = monthly_statistics.accumulated_time + EXCLUDED.accumulated_time,
-                        updated_at = CURRENT_TIMESTAMP
-                    """,
-                    chat_id, user_id, statistic_date, activity, elapsed_time
-                )
-
-                # ========== 4. daily_statistics 表（新增） ==========
-                # 获取当前的 is_soft_reset 状态
-                current_soft_reset = False
-                soft_reset_row = await conn.fetchrow(
-                    """
-                    SELECT is_soft_reset FROM daily_statistics 
-                    WHERE chat_id = $1 AND user_id = $2 AND record_date = $3 
-                    LIMIT 1
-                    """, 
-                    chat_id, user_id, today
-                )
-                
-                if soft_reset_row:
-                    current_soft_reset = soft_reset_row["is_soft_reset"]
-                
+                # ========== 4. daily_statistics 表 ==========
                 # 4.1 活动数据到 daily_statistics
                 await conn.execute(
                     """
@@ -1220,13 +1208,60 @@ class PostgreSQLDatabase:
                     chat_id, user_id, today, activity, elapsed_time, current_soft_reset
                 )
 
-                # 4.2 超时统计到 monthly_statistics 表
+                # 4.2 总活动时间统计（新增汇总）
+                await conn.execute(
+                    """
+                    INSERT INTO daily_statistics 
+                    (chat_id, user_id, record_date, activity_name, 
+                     accumulated_time, is_soft_reset)
+                    VALUES ($1, $2, $3, 'total_time', $4, $5)
+                    ON CONFLICT (chat_id, user_id, record_date, activity_name, is_soft_reset)
+                    DO UPDATE SET
+                        accumulated_time = daily_statistics.accumulated_time + EXCLUDED.accumulated_time,
+                        updated_at = CURRENT_TIMESTAMP
+                    """,
+                    chat_id, user_id, today, elapsed_time, current_soft_reset
+                )
+
+                # 4.3 总活动次数统计（新增汇总）
+                await conn.execute(
+                    """
+                    INSERT INTO daily_statistics 
+                    (chat_id, user_id, record_date, activity_name, 
+                     activity_count, is_soft_reset)
+                    VALUES ($1, $2, $3, 'total_count', 1, $4)
+                    ON CONFLICT (chat_id, user_id, record_date, activity_name, is_soft_reset)
+                    DO UPDATE SET
+                        activity_count = daily_statistics.activity_count + EXCLUDED.activity_count,
+                        updated_at = CURRENT_TIMESTAMP
+                    """,
+                    chat_id, user_id, today, current_soft_reset
+                )
+
+                # ========== 5. monthly_statistics 表 ==========
+                # 5.1 活动数据（保持原第一个代码的功能）
+                await conn.execute(
+                    """
+                    INSERT INTO monthly_statistics
+                    (chat_id, user_id, statistic_date, activity_name, activity_count, accumulated_time)
+                    VALUES ($1, $2, $3, $4, 1, $5)
+                    ON CONFLICT (chat_id, user_id, statistic_date, activity_name)
+                    DO UPDATE SET
+                        activity_count = monthly_statistics.activity_count + 1,
+                        accumulated_time = monthly_statistics.accumulated_time + EXCLUDED.accumulated_time,
+                        updated_at = CURRENT_TIMESTAMP
+                    """,
+                    chat_id, user_id, statistic_date, activity, elapsed_time
+                )
+
+                # 5.2 超时统计到 monthly_statistics 表
                 if is_overtime and overtime_seconds > 0:
+                    # 超时次数统计
                     await conn.execute(
                         """
                         INSERT INTO monthly_statistics
-                        (chat_id, user_id, statistic_date, activity_name, activity_count, accumulated_time)
-                        VALUES ($1, $2, $3, 'overtime_count', 1, 0)
+                        (chat_id, user_id, statistic_date, activity_name, activity_count)
+                        VALUES ($1, $2, $3, 'overtime_count', 1)
                         ON CONFLICT (chat_id, user_id, statistic_date, activity_name)
                         DO UPDATE SET
                             activity_count = monthly_statistics.activity_count + 1,
@@ -1235,11 +1270,12 @@ class PostgreSQLDatabase:
                         chat_id, user_id, statistic_date
                     )
 
+                    # 超时时间统计
                     await conn.execute(
                         """
                         INSERT INTO monthly_statistics
-                        (chat_id, user_id, statistic_date, activity_name, accumulated_time, activity_count)
-                        VALUES ($1, $2, $3, 'overtime_time', $4, 0)
+                        (chat_id, user_id, statistic_date, activity_name, accumulated_time)
+                        VALUES ($1, $2, $3, 'overtime_time', $4)
                         ON CONFLICT (chat_id, user_id, statistic_date, activity_name)
                         DO UPDATE SET
                             accumulated_time = monthly_statistics.accumulated_time + EXCLUDED.accumulated_time,
@@ -1248,7 +1284,8 @@ class PostgreSQLDatabase:
                         chat_id, user_id, statistic_date, overtime_seconds
                     )
                     
-                    # 超时统计到 daily_statistics
+                    # 5.3 daily_statistics 中的超时统计
+                    # 超时次数
                     await conn.execute(
                         """
                         INSERT INTO daily_statistics 
@@ -1263,6 +1300,7 @@ class PostgreSQLDatabase:
                         chat_id, user_id, today, current_soft_reset
                     )
 
+                    # 超时时间
                     await conn.execute(
                         """
                         INSERT INTO daily_statistics 
@@ -1277,7 +1315,7 @@ class PostgreSQLDatabase:
                         chat_id, user_id, today, overtime_seconds, current_soft_reset
                     )
 
-                # 4.3 罚款统计到 monthly_statistics 表
+                # 5.4 罚款统计到 monthly_statistics 表
                 if fine_amount > 0:
                     await conn.execute(
                         """
@@ -1292,7 +1330,7 @@ class PostgreSQLDatabase:
                         chat_id, user_id, statistic_date, fine_amount
                     )
                     
-                    # 罚款统计到 daily_statistics
+                    # daily_statistics 中的罚款统计
                     await conn.execute(
                         """
                         INSERT INTO daily_statistics 
@@ -1307,12 +1345,13 @@ class PostgreSQLDatabase:
                         chat_id, user_id, today, fine_amount, current_soft_reset
                     )
 
-                # ========== 5. users 汇总更新（最终） ==========
+                # ========== 6. users 汇总更新（最终） ==========
                 update_fields = [
                     "total_accumulated_time = total_accumulated_time + $1",
                     "total_activity_count = total_activity_count + 1",
                     "current_activity = NULL",
                     "activity_start_time = NULL",
+                    "checkin_message_id = NULL",  # 新增：清空签到消息ID
                     "last_updated = $2",
                 ]
                 params = [elapsed_time, today]
@@ -1335,12 +1374,12 @@ class PostgreSQLDatabase:
                 """
                 await conn.execute(query, *params)
 
-        # ========== 6. 清理缓存 ==========
+        # ========== 7. 清理缓存 ==========
         self._cache.pop(f"user:{chat_id}:{user_id}", None)
         
-        logger.debug(f"✅ 四表同步写入完成: {chat_id}-{user_id} - {activity} "
-                     f"(时长: {elapsed_time}秒, 罚款: {fine_amount}元, "
-                     f"软重置状态: {current_soft_reset})")
+        logger.info(f"✅ 四表同步写入完成: {chat_id}-{user_id} - {activity} "
+                    f"(时长: {elapsed_time}秒, 罚款: {fine_amount}元, "
+                    f"超时: {is_overtime}, 软重置状态: {current_soft_reset})")
 
     # ========= 重置前批量完成所有未结束活动 =========
     async def complete_all_pending_activities_before_reset(
@@ -2467,15 +2506,17 @@ class PostgreSQLDatabase:
 
     # ========== 统计和导出相关 ==========
     async def get_group_statistics(
-        self, chat_id: int, target_date: Optional[date] = None
+        self, 
+        chat_id: int, 
+        target_date: Optional[date] = None  # ✅ 修复：添加默认值
     ) -> List[Dict]:
-        """获取群组统计信息 - 从 daily_statistics 获取完整一天数据"""
+        """获取群组统计信息 - 完整版从 daily_statistics 获取完整一天数据"""
         if target_date is None:
             target_date = await self.get_business_date(chat_id)
 
         self._ensure_pool_initialized()
         async with self.pool.acquire() as conn:
-            # 🎯 从 daily_statistics 获取完整一天数据（不区分软硬重置）
+            # 从 daily_statistics 获取完整一天数据
             rows = await conn.fetch(
                 """
                 WITH user_activities AS (
@@ -2517,7 +2558,7 @@ class PostgreSQLDatabase:
                         MAX(ua.overtime_count) as overtime_count,
                         MAX(ua.overtime_time) as total_overtime_time,
                         
-                        -- 工作统计（新增）
+                        -- 工作统计
                         MAX(ua.work_days) as work_days,
                         MAX(ua.work_hours) as work_hours
                         
@@ -2549,7 +2590,7 @@ class PostgreSQLDatabase:
                     COALESCE(ad.activities, '{}'::jsonb) AS activities
                 FROM user_totals ut
                 LEFT JOIN activity_details ad ON ut.user_id = ad.user_id
-                -- 保持与第一个代码一致的筛选条件：有活动记录的用户
+                -- 筛选有活动记录的用户
                 WHERE EXISTS (
                     SELECT 1 FROM daily_statistics ds2
                     WHERE ds2.chat_id = $1 AND ds2.record_date = $2 
@@ -2593,7 +2634,20 @@ class PostgreSQLDatabase:
         self._ensure_pool_initialized()
         async with self.pool.acquire() as conn:
             rows = await conn.fetch(
-                "SELECT user_id, nickname, current_activity, activity_start_time, total_accumulated_time, total_activity_count, total_fines, overtime_count, total_overtime_time FROM users WHERE chat_id = $1 AND last_updated = $2",
+                """
+                SELECT 
+                    user_id, 
+                    nickname, 
+                    current_activity, 
+                    activity_start_time, 
+                    total_accumulated_time, 
+                    total_activity_count, 
+                    total_fines, 
+                    overtime_count, 
+                    total_overtime_time 
+                FROM users 
+                WHERE chat_id = $1 AND last_updated = $2
+                """,
                 chat_id,
                 today,
             )
