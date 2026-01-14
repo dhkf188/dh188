@@ -481,8 +481,6 @@ class PostgreSQLDatabase:
                     overtime_count INTEGER DEFAULT 0,
                     total_overtime_time INTEGER DEFAULT 0,
                     last_updated DATE,
-                    last_soft_reset TIMESTAMP DEFAULT NULL,
-                    display_data_cleared BOOLEAN DEFAULT FALSE,
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                     UNIQUE(chat_id, user_id)
@@ -584,34 +582,6 @@ class PostgreSQLDatabase:
                     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 )
                 """,
-                """
-                CREATE TABLE IF NOT EXISTS user_activities_display(
-                    id SERIAL PRIMARY KEY,
-                    chat_id BIGINT,
-                    user_id BIGINT,
-                    activity_date DATE,
-                    activity_name TEXT,
-                    activity_count INTEGER DEFAULT 0,
-                    accumulated_time INTEGER DEFAULT 0,
-                    is_soft_reset_applied BOOLEAN DEFAULT FALSE,
-                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                    UNIQUE(chat_id, user_id, activity_date, activity_name)
-                )
-                """,
-                """
-                CREATE TABLE IF NOT EXISTS soft_reset_events(
-                    id SERIAL PRIMARY KEY,
-                    chat_id BIGINT,
-                    user_id BIGINT,
-                    reset_time TIMESTAMP,
-                    reset_type TEXT,
-                    activity_date DATE,
-                    notes TEXT,
-                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-                )
-                """,
-
             ]
 
             for table_sql in tables:
@@ -1131,7 +1101,7 @@ class PostgreSQLDatabase:
         self._cache.pop(f"user:{chat_id}:{user_id}", None)
 
 
-    # ---------------- 核心方法 ----------------
+    # ====== 核心业务方法 ======
     async def complete_user_activity(
         self,
         chat_id: int,
@@ -1140,26 +1110,23 @@ class PostgreSQLDatabase:
         elapsed_time: int,
         fine_amount: int = 0,
         is_overtime: bool = False,
-    ) -> bool:
-       
+    ):
+        """完成用户活动 - 业务日期统一版本"""
+
         today = await self.get_business_date(chat_id)
         statistic_date = today.replace(day=1)
-        current_time = self.get_beijing_time()
 
-        # ─────────────── 超时计算 ───────────────
         overtime_seconds = 0
         if is_overtime:
             time_limit = await self.get_activity_time_limit(activity)
             overtime_seconds = max(0, elapsed_time - time_limit * 60)
 
-        # 确保连接池已初始化
-        if not self._ensure_pool_initialized():
-            logger.error(f"数据库连接池未初始化: chat_id={chat_id}, user_id={user_id}")
-            return False
+        self._ensure_pool_initialized()
 
         async with self.pool.acquire() as conn:
             async with conn.transaction():
-                # ─────────────── ① 确保 users 行存在 ───────────────
+
+                # users 表
                 await conn.execute(
                     """
                     INSERT INTO users (chat_id, user_id, last_updated)
@@ -1167,94 +1134,10 @@ class PostgreSQLDatabase:
                     ON CONFLICT (chat_id, user_id)
                     DO UPDATE SET last_updated = EXCLUDED.last_updated
                     """,
-                    chat_id,
-                    user_id,
-                    today,
+                    chat_id, user_id, today
                 )
 
-                # ─────────────── ② 读取用户状态（软重置 + 当前活动） ───────────────
-                user_row = await conn.fetchrow(
-                    """
-                    SELECT last_soft_reset, current_activity, activity_start_time, display_data_cleared
-                    FROM users
-                    WHERE chat_id = $1 AND user_id = $2
-                    """,
-                    chat_id,
-                    user_id,
-                )
-
-                last_soft_reset = user_row["last_soft_reset"] if user_row else None
-                current_activity = user_row["current_activity"] if user_row else None
-                activity_start_str = user_row["activity_start_time"] if user_row else None
-                display_data_cleared = user_row["display_data_cleared"] if user_row else False
-
-                # ─────────────── ③ 跨天结算（仅当活动一致） ───────────────
-                if current_activity and activity_start_str and current_activity == activity:
-                    try:
-                        start_time = datetime.fromisoformat(activity_start_str)
-                        elapsed_cross = int((current_time - start_time).total_seconds())
-
-                        # 分段罚款逻辑
-                        limit_min = await self.get_activity_time_limit(activity)
-                        limit_sec = limit_min * 60
-                        overtime_sec_cross = max(0, elapsed_cross - limit_sec)
-                        fine_cross = 0
-                        if overtime_sec_cross > 0:
-                            rates = await self.get_fine_rates_for_activity(activity)
-                            if rates:
-                                segments = []
-                                for k in rates:
-                                    try:
-                                        v = int(str(k).lower().replace("min", ""))
-                                        segments.append(v)
-                                    except:
-                                        pass
-                                segments.sort()
-                                for s in segments:
-                                    if overtime_sec_cross / 60 <= s:
-                                        fine_cross = rates.get(str(s), rates.get(f"{s}min", 0))
-                                        break
-                                if fine_cross == 0 and segments:
-                                    m = segments[-1]
-                                    fine_cross = rates.get(str(m), rates.get(f"{m}min", 0))
-
-                        # 月度统计
-                        month_date = start_time.date().replace(day=1)
-                        await conn.execute(
-                            """
-                            INSERT INTO monthly_statistics 
-                            (chat_id, user_id, statistic_date, activity_name, activity_count, accumulated_time)
-                            VALUES ($1, $2, $3, $4, 1, $5)
-                            ON CONFLICT (chat_id, user_id, statistic_date, activity_name)
-                            DO UPDATE SET
-                                activity_count = monthly_statistics.activity_count + 1,
-                                accumulated_time = monthly_statistics.accumulated_time + EXCLUDED.accumulated_time,
-                                updated_at = CURRENT_TIMESTAMP
-                            """,
-                            chat_id, user_id, month_date, activity, elapsed_cross,
-                        )
-
-                        if fine_cross > 0:
-                            await conn.execute(
-                                "UPDATE users SET total_fines = total_fines + $1 WHERE chat_id = $2 AND user_id = $3",
-                                fine_cross, chat_id, user_id
-                            )
-
-                        if overtime_sec_cross > 0:
-                            await conn.execute(
-                                """
-                                UPDATE users SET
-                                    overtime_count = overtime_count + 1,
-                                    total_overtime_time = total_overtime_time + $1
-                                WHERE chat_id = $2 AND user_id = $3
-                                """,
-                                overtime_sec_cross, chat_id, user_id
-                            )
-
-                    except Exception as e:
-                        logger.error(f"❌ 跨天结算失败: {e}")
-
-                # ─────────────── ④ 原始流水表（权威账本） ───────────────
+                # user_activities 表
                 await conn.execute(
                     """
                     INSERT INTO user_activities
@@ -1266,26 +1149,10 @@ class PostgreSQLDatabase:
                         accumulated_time = user_activities.accumulated_time + EXCLUDED.accumulated_time,
                         updated_at = CURRENT_TIMESTAMP
                     """,
-                    chat_id, user_id, today, activity, elapsed_time,
+                    chat_id, user_id, today, activity, elapsed_time
                 )
 
-                # ─────────────── ⑤ 显示表写入（仅在 display_data_cleared = FALSE 时写入） ───────────────
-                if not display_data_cleared:
-                    await conn.execute(
-                        """
-                        INSERT INTO user_activities_display
-                        (chat_id, user_id, activity_date, activity_name, activity_count, accumulated_time)
-                        VALUES ($1, $2, $3, $4, 1, $5)
-                        ON CONFLICT (chat_id, user_id, activity_date, activity_name)
-                        DO UPDATE SET
-                            activity_count = user_activities_display.activity_count + 1,
-                            accumulated_time = user_activities_display.accumulated_time + EXCLUDED.accumulated_time,
-                            updated_at = CURRENT_TIMESTAMP
-                        """,
-                        chat_id, user_id, today, activity, elapsed_time,
-                    )
-
-                # ─────────────── ⑥ 月度统计（活动本身） ───────────────
+                # monthly_statistics 活动数据
                 await conn.execute(
                     """
                     INSERT INTO monthly_statistics
@@ -1297,37 +1164,39 @@ class PostgreSQLDatabase:
                         accumulated_time = monthly_statistics.accumulated_time + EXCLUDED.accumulated_time,
                         updated_at = CURRENT_TIMESTAMP
                     """,
-                    chat_id, user_id, statistic_date, activity, elapsed_time,
+                    chat_id, user_id, statistic_date, activity, elapsed_time
                 )
 
-                # ─────────────── ⑦ 超时统计 ───────────────
+                # 超时统计
                 if is_overtime and overtime_seconds > 0:
+
                     await conn.execute(
                         """
                         INSERT INTO monthly_statistics
-                        (chat_id, user_id, statistic_date, activity_name, activity_count)
-                        VALUES ($1, $2, $3, 'overtime_count', 1)
+                        (chat_id, user_id, statistic_date, activity_name, activity_count, accumulated_time)
+                        VALUES ($1, $2, $3, 'overtime_count', 1, 0)
                         ON CONFLICT (chat_id, user_id, statistic_date, activity_name)
                         DO UPDATE SET
                             activity_count = monthly_statistics.activity_count + 1,
                             updated_at = CURRENT_TIMESTAMP
                         """,
-                        chat_id, user_id, statistic_date,
+                        chat_id, user_id, statistic_date
                     )
+
                     await conn.execute(
                         """
                         INSERT INTO monthly_statistics
-                        (chat_id, user_id, statistic_date, activity_name, accumulated_time)
-                        VALUES ($1, $2, $3, 'overtime_time', $4)
+                        (chat_id, user_id, statistic_date, activity_name, accumulated_time, activity_count)
+                        VALUES ($1, $2, $3, 'overtime_time', $4, 0)
                         ON CONFLICT (chat_id, user_id, statistic_date, activity_name)
                         DO UPDATE SET
                             accumulated_time = monthly_statistics.accumulated_time + EXCLUDED.accumulated_time,
                             updated_at = CURRENT_TIMESTAMP
                         """,
-                        chat_id, user_id, statistic_date, overtime_seconds,
+                        chat_id, user_id, statistic_date, overtime_seconds
                     )
 
-                # ─────────────── ⑧ 罚款统计 ───────────────
+                # 罚款统计
                 if fine_amount > 0:
                     await conn.execute(
                         """
@@ -1339,80 +1208,38 @@ class PostgreSQLDatabase:
                             accumulated_time = monthly_statistics.accumulated_time + EXCLUDED.accumulated_time,
                             updated_at = CURRENT_TIMESTAMP
                         """,
-                        chat_id, user_id, statistic_date, fine_amount,
+                        chat_id, user_id, statistic_date, fine_amount
                     )
 
-                # ─────────────── ⑨ users 汇总字段更新 ───────────────
-                fields = [
+                # users 汇总更新
+                update_fields = [
                     "total_accumulated_time = total_accumulated_time + $1",
                     "total_activity_count = total_activity_count + 1",
                     "current_activity = NULL",
                     "activity_start_time = NULL",
-                    "checkin_message_id = NULL",
                     "last_updated = $2",
-                    "updated_at = CURRENT_TIMESTAMP",
                 ]
                 params = [elapsed_time, today]
 
                 if fine_amount > 0:
-                    fields.append("total_fines = total_fines + $3")
+                    update_fields.append("total_fines = total_fines + $3")
                     params.append(fine_amount)
 
-                if is_overtime and overtime_seconds > 0:
-                    fields.append("overtime_count = overtime_count + 1")
-                    fields.append("total_overtime_time = total_overtime_time + $4")
+                if is_overtime:
+                    update_fields.append("overtime_count = overtime_count + 1")
+                    update_fields.append("total_overtime_time = total_overtime_time + $4")
                     params.append(overtime_seconds)
 
+                update_fields.append("updated_at = CURRENT_TIMESTAMP")
                 params.extend([chat_id, user_id])
 
                 query = f"""
-                    UPDATE users SET {', '.join(fields)}
+                    UPDATE users SET {", ".join(update_fields)}
                     WHERE chat_id = ${len(params)-1} AND user_id = ${len(params)}
                 """
                 await conn.execute(query, *params)
 
-        # ─────────────── ⑩ 缓存清理 ───────────────
-        for key in (f"user:{chat_id}:{user_id}", f"group:{chat_id}", "activity_limits"):
-            self._cache.pop(key, None)
-            self._cache_ttl.pop(key, None)
-
-        # ─────────────── ⑪ 日志记录 ───────────────
-        logger.info(
-            f"✅ [完成活动] 群:{chat_id} 用户:{user_id} 活动:{activity}\n"
-            f"📊 时长:{elapsed_time}s 罚款:{fine_amount}元 超时:{'是' if is_overtime else '否'}\n"
-            f"🔄 软重置时间:{last_soft_reset if last_soft_reset else '未重置'}"
-        )
-
-        return True
-
-
-    # 需要实现的依赖方法（根据你的实际类结构实现这些方法）
-    
-    async def get_business_date(self, chat_id: int):
-        """获取业务日期"""
-        # 需要实现
-        pass
-    
-    def get_beijing_time(self) -> datetime:
-        """获取北京时间"""
-        # 需要实现
-        pass
-    
-    async def get_activity_time_limit(self, activity: str) -> int:
-        """获取活动时间限制（分钟）"""
-        # 需要实现
-        pass
-    
-    def _ensure_pool_initialized(self) -> bool:
-        """确保数据库连接池已初始化"""
-        # 需要实现
-        pass
-    
-    async def get_fine_rates_for_activity(self, activity: str) -> dict:
-        """获取活动的罚款费率"""
-        # 需要实现
-        pass
-
+        self._cache.pop(f"user:{chat_id}:{user_id}", None)
 
     # ========= 重置前批量完成所有未结束活动 =========
     async def complete_all_pending_activities_before_reset(
@@ -1606,20 +1433,14 @@ class PostgreSQLDatabase:
                 overtime_seconds,
             )
 
-    # ------------------- 重置方法 -------------------
-    
-    async def reset_user_daily_data(
-        self,
-        chat_id: int,
-        user_id: int,
-        target_date: date | None = None,
-        hard_reset: bool = False
-    ) -> bool:
-   
+
+    async def reset_user_daily_data(self, chat_id: int, user_id: int, target_date: date | None = None):
+        """
+        🧬 终极融合稳定版：
+        自动结算跨天活动 → 精确罚款 → 月度统计 → 硬删除当日流水 → 清空用户状态 → 完整缓存清理
+        """
         try:
-            # ─────────────── ① 日期校验 ───────────────
-            current_time = self.get_beijing_time()
-            
+            # ────────────────── ① 日期校验 ──────────────────
             if target_date is None:
                 target_date = await self.get_business_date(chat_id)
             elif not isinstance(target_date, date):
@@ -1627,189 +1448,146 @@ class PostgreSQLDatabase:
 
             user_before = await self.get_user(chat_id, user_id)
             activities_before = await self.get_user_all_activities(chat_id, user_id)
+
             cross_day = {"activity": None, "duration": 0, "fine": 0}
+
+            new_date = max(target_date, await self.get_business_date(chat_id))
 
             async with self.pool.acquire() as conn:
                 async with conn.transaction():
-                    if hard_reset:
-                        # ─────────────── ② 硬重置前跨天结算 ───────────────
-                        if user_before and user_before.get("current_activity"):
-                            act = user_before["current_activity"]
-                            start_str = user_before.get("activity_start_time")
-                            if start_str:
-                                try:
-                                    start = datetime.fromisoformat(start_str)
-                                    elapsed = int((current_time - start).total_seconds())
 
-                                    # 计算超时罚款
-                                    limit_min = await self.get_activity_time_limit(act)
-                                    limit_sec = limit_min * 60
-                                    overtime_sec = max(0, elapsed - limit_sec)
-                                    overtime_min = overtime_sec / 60
-                                    fine = 0
-                                    
-                                    if overtime_sec > 0:
-                                        fine_rates = await self.get_fine_rates_for_activity(act)
-                                        if fine_rates:
-                                            # 查找适用的罚款段
-                                            segments = []
-                                            for time_key in fine_rates.keys():
-                                                try:
-                                                    if isinstance(time_key, str) and "min" in time_key.lower():
-                                                        time_value = int(time_key.lower().replace("min", "").strip())
-                                                    else:
-                                                        time_value = int(time_key)
-                                                    segments.append(time_value)
-                                                except (ValueError, TypeError):
-                                                    continue
-                                            
-                                            segments.sort()
-                                            for segment in segments:
-                                                if overtime_min <= segment:
-                                                    original_key = str(segment)
-                                                    if original_key not in fine_rates:
-                                                        original_key = f"{segment}min"
-                                                    fine = fine_rates.get(original_key, 0)
-                                                    break
-                                            
-                                            if fine == 0 and segments:
-                                                max_segment = segments[-1]
-                                                original_key = str(max_segment)
-                                                if original_key not in fine_rates:
-                                                    original_key = f"{max_segment}min"
-                                                fine = fine_rates.get(original_key, 0)
+                    # ─────────────── ② 跨天结算与月度统计 ───────────────
+                    if user_before and user_before.get("current_activity"):
+                        act = user_before["current_activity"]
+                        start_str = user_before.get("activity_start_time")
 
-                                    # 更新月度统计
-                                    activity_month = start.date().replace(day=1)
+                        if start_str:
+                            try:
+                                start = datetime.fromisoformat(start_str)
+                                now = self.get_beijing_time()
+                                elapsed = int((now - start).total_seconds())
+
+                                limit_min = await self.get_activity_time_limit(act)
+                                limit_sec = limit_min * 60
+
+                                overtime_sec = max(0, elapsed - limit_sec)
+                                overtime_min = overtime_sec / 60
+
+                                fine = 0
+                                if overtime_sec > 0:
+                                    rates = await self.get_fine_rates_for_activity(act)
+                                    if rates:
+                                        segments = []
+                                        for k in rates:
+                                            try:
+                                                v = int(str(k).lower().replace("min", ""))
+                                                segments.append(v)
+                                            except:
+                                                pass
+                                        segments.sort()
+                                        for s in segments:
+                                            if overtime_min <= s:
+                                                fine = rates.get(str(s), rates.get(f"{s}min", 0))
+                                                break
+                                        if fine == 0 and segments:
+                                            m = segments[-1]
+                                            fine = rates.get(str(m), rates.get(f"{m}min", 0))
+
+                                activity_month = start.date().replace(day=1)
+
+                                await conn.execute("""
+                                    INSERT INTO monthly_statistics 
+                                    (chat_id, user_id, statistic_date, activity_name, activity_count, accumulated_time)
+                                    VALUES ($1, $2, $3, $4, 1, $5)
+                                    ON CONFLICT (chat_id, user_id, statistic_date, activity_name)
+                                    DO UPDATE SET
+                                        activity_count = monthly_statistics.activity_count + 1,
+                                        accumulated_time = monthly_statistics.accumulated_time + EXCLUDED.accumulated_time,
+                                        updated_at = CURRENT_TIMESTAMP
+                                """, chat_id, user_id, activity_month, act, elapsed)
+
+                                if fine > 0:
                                     await conn.execute("""
-                                        INSERT INTO monthly_statistics 
-                                        (chat_id, user_id, statistic_date, activity_name, activity_count, accumulated_time)
-                                        VALUES ($1, $2, $3, $4, 1, $5)
-                                        ON CONFLICT (chat_id, user_id, statistic_date, activity_name)
-                                        DO UPDATE SET
-                                            activity_count = monthly_statistics.activity_count + 1,
-                                            accumulated_time = monthly_statistics.accumulated_time + EXCLUDED.accumulated_time,
-                                            updated_at = CURRENT_TIMESTAMP
-                                    """, chat_id, user_id, activity_month, act, elapsed)
+                                        UPDATE users SET total_fines = total_fines + $1
+                                        WHERE chat_id = $2 AND user_id = $3
+                                    """, fine, chat_id, user_id)
 
-                                    # 更新用户罚款与超时
-                                    if fine > 0:
-                                        await conn.execute("""
-                                            UPDATE users SET total_fines = total_fines + $1
-                                            WHERE chat_id = $2 AND user_id = $3
-                                        """, fine, chat_id, user_id)
+                                if overtime_sec > 0:
+                                    await conn.execute("""
+                                        UPDATE users SET
+                                            overtime_count = overtime_count + 1,
+                                            total_overtime_time = total_overtime_time + $1
+                                        WHERE chat_id = $2 AND user_id = $3
+                                    """, overtime_sec, chat_id, user_id)
 
-                                    if overtime_sec > 0:
-                                        await conn.execute("""
-                                            UPDATE users SET
-                                                overtime_count = overtime_count + 1,
-                                                total_overtime_time = total_overtime_time + $1
-                                            WHERE chat_id = $2 AND user_id = $3
-                                        """, overtime_sec, chat_id, user_id)
+                                cross_day.update({"activity": act, "duration": elapsed, "fine": fine})
 
-                                    cross_day.update({"activity": act, "duration": elapsed, "fine": fine})
+                            except Exception as e:
+                                logger.error(f"❌ 跨天结算失败: {e}")
 
-                                except Exception as e:
-                                    logger.error(f"❌ 跨天结算失败: {e}")
+                    # ─────────────── ③ 硬删除当日流水 ───────────────
+                    activities_deleted = await conn.execute("""
+                        DELETE FROM user_activities
+                        WHERE chat_id = $1 AND user_id = $2 AND activity_date = $3
+                    """, chat_id, user_id, new_date)
 
-                        # ─────────────── ③ 硬重置流水表 ───────────────
-                        await conn.execute("""
-                            DELETE FROM user_activities_display
-                            WHERE chat_id = $1 AND user_id = $2 AND activity_date = $3
-                        """, chat_id, user_id, target_date)
-
-                        await conn.execute("""
-                            DELETE FROM user_activities
-                            WHERE chat_id = $1 AND user_id = $2 AND activity_date = $3
-                        """, chat_id, user_id, target_date)
-
-                        # ─────────────── ④ 重置用户状态字段 ───────────────
-                        await conn.execute("""
-                            UPDATE users SET
-                                total_activity_count = 0,
-                                total_accumulated_time = 0,
-                                total_fines = 0,
-                                total_overtime_time = 0,
-                                overtime_count = 0,
-                                current_activity = NULL,
-                                activity_start_time = NULL,
-                                checkin_message_id = NULL,
-                                last_soft_reset = NULL,
-                                display_data_cleared = FALSE,
-                                last_updated = $3,
-                                updated_at = CURRENT_TIMESTAMP
-                            WHERE chat_id = $1 AND user_id = $2
-                        """, chat_id, user_id, target_date)
-
-                        # 记录硬重置事件
-                        await conn.execute("""
-                            INSERT INTO soft_reset_events
-                            (chat_id, user_id, reset_time, reset_type, activity_date, notes)
-                            VALUES ($1, $2, $3, 'hard', $4, '每日硬重置')
-                        """, chat_id, user_id, current_time, target_date)
-
-                    else:
-                        # ─────────────── ② 软重置 ───────────────
-                        # 使用当前业务日期清理显示表
-                        today = await self.get_business_date(chat_id)
-                        
-                        # 更新软重置标记
-                        await conn.execute("""
-                            UPDATE users SET
-                                last_soft_reset = $3,
-                                display_data_cleared = TRUE,
-                                updated_at = CURRENT_TIMESTAMP
-                            WHERE chat_id = $1 AND user_id = $2
-                        """, chat_id, user_id, current_time)
-
-                        # 清空显示表（视觉清零）- 使用当前业务日期
-                        await conn.execute("""
-                            DELETE FROM user_activities_display
-                            WHERE chat_id = $1 AND user_id = $2 AND activity_date = $3
-                        """, chat_id, user_id, today)
-                        
-                        # 🆕 关键：重置用户的显示字段（否则"我的记录"会显示旧数据）
-                        await conn.execute("""
-                            UPDATE users SET
-                                total_activity_count = 0,
-                                total_accumulated_time = 0,
-                                total_fines = 0,
-                                total_overtime_time = 0,
-                                overtime_count = 0,
-                                current_activity = NULL,
-                                activity_start_time = NULL,
-                                checkin_message_id = NULL,
-                                updated_at = CURRENT_TIMESTAMP
-                            WHERE chat_id = $1 AND user_id = $2
-                        """, chat_id, user_id)
-
-                        # 记录软重置事件
-                        await conn.execute("""
-                            INSERT INTO soft_reset_events
-                            (chat_id, user_id, reset_time, reset_type, activity_date, notes)
-                            VALUES ($1, $2, $3, 'soft', $4, '每日软重置（显示清零）')
-                        """, chat_id, user_id, current_time, today)
+                    # ─────────────── ④ 清空用户状态 ───────────────
+                    users_updated = await conn.execute("""
+                        UPDATE users SET
+                            total_activity_count = 0,
+                            total_accumulated_time = 0,
+                            total_fines = 0,
+                            total_overtime_time = 0,
+                            overtime_count = 0,
+                            current_activity = NULL,
+                            activity_start_time = NULL,
+                            checkin_message_id = NULL,                          
+                            last_updated = $3,
+                            updated_at = CURRENT_TIMESTAMP
+                        WHERE chat_id = $1 AND user_id = $2
+                        AND (
+                            total_activity_count > 0 OR
+                            total_accumulated_time > 0 OR
+                            total_fines > 0 OR
+                            overtime_count > 0 OR
+                            current_activity IS NOT NULL OR
+                            checkin_message_id IS NOT NULL                           
+                        )
+                    """, chat_id, user_id, new_date)
 
             # ─────────────── ⑤ 缓存全清 ───────────────
             for key in (f"user:{chat_id}:{user_id}", f"group:{chat_id}", "activity_limits"):
                 self._cache.pop(key, None)
                 self._cache_ttl.pop(key, None)
 
-            # ─────────────── ⑥ 日志记录 ───────────────
-            if hard_reset:
-                log = (
-                    f"✅ [硬重置完成] 用户:{user_id} 群:{chat_id} 日期:{target_date}\n"
-                    f"💾 月度统计已更新 | 🗑️ 流水表已清空"
-                )
-                if cross_day["activity"]:
-                    log += f" 🌙 跨天:{cross_day['activity']} {self.format_seconds_to_hms(cross_day['duration'])}"
-                    if cross_day["fine"] > 0:
-                        log += f" 💰罚款:{cross_day['fine']}元"
-            else:
-                log = (
-                    f"🔄 [软重置完成] 用户:{user_id} 群:{chat_id}\n"
-                    f"📊 显示字段已清零 | 📝 原始数据保留"
-                )
+            # ─────────────── ⑥ SQL 返回安全解析 ───────────────
+            def parse_count(result):
+                if not result:
+                    return 0
+                parts = result.split()
+                return int(parts[-1]) if len(parts) > 1 and parts[0] in ("DELETE", "UPDATE") else 0
+
+            del_count = parse_count(activities_deleted)
+            upd_count = parse_count(users_updated)
+
+            # ─────────────── ⑦ 生产级日志 ───────────────
+            log = (
+                f"✅ [终极重置完成] 用户:{user_id} 群:{chat_id}\n"
+                f"📅 日期:{new_date} 🗑 删除:{del_count} 🔄 更新:{upd_count}\n"
+                f"💾 月度统计: 已安全持久化\n"
+            )
+            if cross_day["activity"]:
+                log += f"🌙 跨天:{cross_day['activity']} {self.format_seconds_to_hms(cross_day['duration'])}"
+                if cross_day["fine"] > 0:
+                    log += f" 💰罚款:{cross_day['fine']}元"
+            log += (
+                f"\n📊 重置前状态: 次数{user_before.get('total_activity_count', 0) if user_before else 0} "
+                f"时长{user_before.get('total_accumulated_time', 0) if user_before else 0}s "
+                f"罚款{user_before.get('total_fines', 0) if user_before else 0} "
+                f"超时{user_before.get('overtime_count', 0) if user_before else 0} "
+                f"当前:{user_before.get('current_activity', '无') if user_before else '无'} "
+                f"活动种类:{len(activities_before)}"
+            )
 
             logger.info(log)
             return True
@@ -1817,44 +1595,7 @@ class PostgreSQLDatabase:
         except Exception as e:
             logger.error(f"❌ 重置失败 {chat_id}-{user_id}: {e}")
             return False
-
-    # 需要实现的依赖方法
-    
-    def get_beijing_time(self) -> datetime:
-        """获取北京时间"""
-        # 需要实现
-        pass
-    
-    async def get_business_date(self, chat_id: int) -> date:
-        """获取业务日期"""
-        # 需要实现
-        pass
-    
-    async def get_user(self, chat_id: int, user_id: int) -> Optional[Dict[str, Any]]:
-        """获取用户信息"""
-        # 需要实现
-        pass
-    
-    async def get_user_all_activities(self, chat_id: int, user_id: int) -> list:
-        """获取用户所有活动"""
-        # 需要实现
-        pass
-    
-    async def get_activity_time_limit(self, activity: str) -> int:
-        """获取活动时间限制（分钟）"""
-        # 需要实现
-        pass
-    
-    async def get_fine_rates_for_activity(self, activity: str) -> Dict[str, int]:
-        """获取活动的罚款费率"""
-        # 需要实现
-        pass
-    
-    def format_seconds_to_hms(self, seconds: int) -> str:
-        """格式化秒数为时分秒"""
-        # 需要实现
-        pass
-
+        
 
 
     # ───────────────────────── 软重置时间配置 ─────────────────────────
@@ -1884,84 +1625,101 @@ class PostgreSQLDatabase:
         return hour, minute
 
 
+    # ========= 软重置(二次重置) =========
+    async def reset_user_soft_daily_data(self, chat_id: int, user_id: int):
+        """
+        🧽 软重置用户数据
+        仅重置 users 表的展示/累计字段
+        保留 user_activities 表中的所有历史记录
+        """
+        try:
+            today = await self.get_business_date(chat_id)
+
+            async with self.pool.acquire() as conn:
+                async with conn.transaction():
+
+                    users_updated = await conn.execute("""
+                        UPDATE users SET
+                            total_activity_count = 0,
+                            total_accumulated_time = 0,
+                            total_fines = 0,
+                            total_overtime_time = 0,
+                            overtime_count = 0,
+                            current_activity = NULL,
+                            activity_start_time = NULL,
+                            last_updated = $3,
+                            updated_at = CURRENT_TIMESTAMP
+                        WHERE chat_id = $1 AND user_id = $2
+                        AND (
+                            total_activity_count > 0 OR
+                            total_accumulated_time > 0 OR
+                            total_fines > 0 OR
+                            overtime_count > 0 OR
+                            current_activity IS NOT NULL
+                        )
+                    """, chat_id, user_id, today)
+
+            # 🧹 完整缓存清理（与硬重置一致）
+            for key in (f"user:{chat_id}:{user_id}", f"group:{chat_id}", "activity_limits"):
+                self._cache.pop(key, None)
+                self._cache_ttl.pop(key, None)
+
+            # 🧾 SQL 返回安全解析
+            def parse_count(result):
+                if not result:
+                    return 0
+                parts = result.split()
+                return int(parts[-1]) if len(parts) > 1 and parts[0] == "UPDATE" else 0
+
+            updated_count = parse_count(users_updated)
+
+            logger.info(
+                f"🧽 [软重置完成] 用户:{user_id} 群:{chat_id} | "
+                f"清空字段记录:{updated_count} | 历史流水:完整保留"
+            )
+            return True
+
+        except Exception as e:
+            logger.error(f"❌ 软重置失败 {chat_id}-{user_id}: {e}")
+            return False
+
+
     async def get_user_activity_count(
         self, chat_id: int, user_id: int, activity: str
     ) -> int:
-        """获取用户今日活动次数 - 考虑软重置"""
+        """获取用户今日活动次数"""
         today = await self.get_business_date(chat_id)
-
-        # 检查是否已应用软重置
-        user_data = await self.get_user_cached(chat_id, user_id)
-        display_data_cleared = user_data.get("display_data_cleared", False) if user_data else False
-
-        if not self._ensure_pool_initialized():
-            raise RuntimeError(f"数据库连接池未初始化: chat_id={chat_id}, user_id={user_id}")
-
+        self._ensure_pool_initialized()
         async with self.pool.acquire() as conn:
-            if display_data_cleared:
-                # 软重置后：从显示表读取
-                row = await conn.fetchrow("""
-                    SELECT activity_count FROM user_activities_display 
-                    WHERE chat_id = $1 AND user_id = $2 AND activity_date = $3 AND activity_name = $4
-                """, chat_id, user_id, today, activity)
-            else:
-                # 未软重置：从原始表读取
-                row = await conn.fetchrow("""
-                    SELECT activity_count FROM user_activities 
-                    WHERE chat_id = $1 AND user_id = $2 AND activity_date = $3 AND activity_name = $4
-                """, chat_id, user_id, today, activity)
-
+            row = await conn.fetchrow(
+                "SELECT activity_count FROM user_activities WHERE chat_id = $1 AND user_id = $2 AND activity_date = $3 AND activity_name = $4",
+                chat_id,
+                user_id,
+                today,
+                activity,
+            )
             return row["activity_count"] if row else 0
-
-
-    # ------------------- 获取用户数据,软重置 -------------------
 
     async def get_user_all_activities(
         self, chat_id: int, user_id: int
     ) -> Dict[str, Dict]:
-        """获取用户所有活动数据 - 考虑软重置"""
+        """获取用户所有活动数据"""
         today = await self.get_business_date(chat_id)
-
-        # 🆕 检查是否已应用软重置
-        user_data = await self.get_user_cached(chat_id, user_id)
-        display_data_cleared = (
-            user_data.get("display_data_cleared", False) if user_data else False
-        )
-
         self._ensure_pool_initialized()
         async with self.pool.acquire() as conn:
-            if display_data_cleared:
-                # 软重置后：从显示表读取
-                rows = await conn.fetch(
-                    """
-                    SELECT activity_name, activity_count, accumulated_time
-                    FROM user_activities_display
-                    WHERE chat_id = $1 AND user_id = $2 AND activity_date = $3
-                    """,
-                    chat_id,
-                    user_id,
-                    today,
-                )
-            else:
-                # 未软重置：从原始表读取
-                rows = await conn.fetch(
-                    """
-                    SELECT activity_name, activity_count, accumulated_time
-                    FROM user_activities
-                    WHERE chat_id = $1 AND user_id = $2 AND activity_date = $3
-                    """,
-                    chat_id,
-                    user_id,
-                    today,
-                )
+            rows = await conn.fetch(
+                "SELECT activity_name, activity_count, accumulated_time FROM user_activities WHERE chat_id = $1 AND user_id = $2 AND activity_date = $3",
+                chat_id,
+                user_id,
+                today,
+            )
 
-            activities: Dict[str, Dict] = {}
+            activities = {}
             for row in rows:
                 activities[row["activity_name"]] = {
                     "count": row["activity_count"],
                     "time": row["accumulated_time"],
                 }
-
             return activities
 
     # ========== 上下班记录操作 ==========
