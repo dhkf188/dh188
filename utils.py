@@ -103,20 +103,25 @@ class MessageFormatter:
         max_times: int,
         time_limit: int,
     ) -> str:
-        """格式化打卡消息"""
+        """格式化打卡消息 - 改为新模板"""
         first_line = f"👤 用户：{MessageFormatter.format_user_link(user_id, user_name)}"
-
+        dashed_line = MessageFormatter.create_dashed_line()
+        
         message = (
             f"{first_line}\n"
             f"✅ 打卡成功：{MessageFormatter.format_copyable_text(activity)} - {MessageFormatter.format_copyable_text(time_str)}\n"
-            f"⚠️ 注意：这是您第 {MessageFormatter.format_copyable_text(str(count))} 次{MessageFormatter.format_copyable_text(activity)}（今日上限：{MessageFormatter.format_copyable_text(str(max_times))}次）\n"
-            f"⏰ 本次活动时间限制：{MessageFormatter.format_copyable_text(str(time_limit))} 分钟"
+            f"{dashed_line}\n"
+            f"📋 活动须知\n"
+            f"▫️ 本次活动类型：{MessageFormatter.format_copyable_text(activity)}\n"
+            f"▫️ 单次时长限制：{MessageFormatter.format_copyable_text(str(time_limit))}分钟 ⏱️\n"
+            f"▫️ 今日{MessageFormatter.format_copyable_text(activity)}次数：第 {MessageFormatter.format_copyable_text(str(count))} 次（上限 {MessageFormatter.format_copyable_text(str(max_times))} 次）📈\n"
+            f"{dashed_line}\n"
+            f"💡 操作提示\n"
+            f"完成后请及时点击 👉【✅ 回座打卡】👈按钮。"
         )
 
         if count >= max_times:
             message += f"\n🚨 警告：本次结束后，您今日的{MessageFormatter.format_copyable_text(activity)}次数将达到上限，请留意！"
-
-        message += f"\n💡提示：活动完成后请及时点击'✅ 回座'按钮"
 
         return message
 
@@ -135,33 +140,46 @@ class MessageFormatter:
         overtime_seconds: int = 0,
         fine_amount: int = 0,
     ) -> str:
-        """格式化回座消息"""
+        """格式化回座消息 - 改为新模板"""
         first_line = f"👤 用户：{MessageFormatter.format_user_link(user_id, user_name)}"
-
+        dashed_line = MessageFormatter.create_dashed_line()
+        
+        # 今日次数从activity_counts中获取
+        today_count = activity_counts.get(activity, 0)
+        
+        # 构建消息
         message = (
             f"{first_line}\n"
-            f"✅ {MessageFormatter.format_copyable_text(time_str)} 回座打卡成功\n"
-            f"📝 活动：{MessageFormatter.format_copyable_text(activity)}\n"
-            f"⏰ 本次活动耗时：{MessageFormatter.format_copyable_text(elapsed_time)}\n"
-            f"📈 今日累计{MessageFormatter.format_copyable_text(activity)}时间：{MessageFormatter.format_copyable_text(total_activity_time)}\n"
-            f"📊 今日总计时：{MessageFormatter.format_copyable_text(total_time)}\n"
+            f"✅ 回座打卡：{MessageFormatter.format_copyable_text(time_str)}\n"
+            f"{dashed_line}\n"
+            f"📍 活动记录\n"
+            f"▫️ 活动类型：{MessageFormatter.format_copyable_text(activity)}\n"
+            f"▫️ 本次耗时：{MessageFormatter.format_copyable_text(elapsed_time)} ⏰\n"
+            f"▫️ 累计时长：{MessageFormatter.format_copyable_text(total_activity_time)}\n"
+            f"▫️ 今日次数：{MessageFormatter.format_copyable_text(str(today_count))}次\n"
         )
-
+        
+        # 超时罚款部分 - 改为新模板格式
         if is_overtime:
             overtime_time = MessageFormatter.format_time(int(overtime_seconds))
-            message += f"⚠️ 警告：您本次的活动已超时！\n🚨 超时时间：{MessageFormatter.format_copyable_text(overtime_time)}\n"
+            message += f"\n⚠️ 超时提醒\n"
+            message += f"▫️ 超时时长：{MessageFormatter.format_copyable_text(overtime_time)} 🚨\n"
             if fine_amount > 0:
-                message += f"💸 罚款：{MessageFormatter.format_copyable_text(str(fine_amount))} 元\n"
-
-        dashed_line = MessageFormatter.create_dashed_line()
+                message += f"▫️ 罚款金额：{MessageFormatter.format_copyable_text(str(fine_amount))}元 💸\n"
+        
+        # 今日总计
         message += f"{dashed_line}\n"
-
+        message += f"📊 今日总计\n"
+        message += f"▫️ 活动详情\n"
+        
+        # 添加活动详情 - 改为新模板格式
         for act, count in activity_counts.items():
             if count > 0:
-                message += f"🔹 今日{MessageFormatter.format_copyable_text(act)}次数：{MessageFormatter.format_copyable_text(str(count))} 次\n"
-
-        message += f"\n📊 今日总活动次数：{MessageFormatter.format_copyable_text(str(total_count))} 次"
-
+                message += f"   ➤ {MessageFormatter.format_copyable_text(act)}：{MessageFormatter.format_copyable_text(str(count))} 次 📝\n"
+        
+        message += f"▫️ 总活动次数：{MessageFormatter.format_copyable_text(str(total_count))}次\n"
+        message += f"▫️ 总计时长：{MessageFormatter.format_copyable_text(total_time)}"
+        
         return message
 
     @staticmethod
