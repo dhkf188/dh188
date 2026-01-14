@@ -3762,28 +3762,28 @@ async def show_history(message: types.Message):
 
 
 async def show_rank(message: types.Message):
-    """显示排行榜 - 业务日期统一版本"""
-
+    """显示排行榜 - 从 daily_statistics 表获取数据"""
     chat_id = message.chat.id
     uid = message.from_user.id
-
+    
     await db.init_group(chat_id)
     activity_limits = await db.get_activity_limits_cached()
-
+    
     if not activity_limits:
-        await message.answer("⚠️ 当前没有配置任何活动，无法生成排行榜。",reply_to_message_id=message.message_id)
+        await message.answer("⚠️ 当前没有配置任何活动，无法生成排行榜。",
+                           reply_to_message_id=message.message_id)
         return
-
+    
     # 🧠 获取业务日期
     business_date = await db.get_business_date(chat_id)
-
+    
     # 读取重置配置
     group_data = await db.get_group_cached(chat_id)
     reset_hour = group_data.get("reset_hour", Config.DAILY_RESET_HOUR)
     reset_minute = group_data.get("reset_minute", Config.DAILY_RESET_MINUTE)
 
     rank_text = (
-        f"🏆 当前周期活动排行榜\n"
+        f"🏆 当前周期活动排行榜\n"  # 保持第一个代码的标题
         f"📅 统计周期：<code>{business_date.strftime('%Y-%m-%d')}</code>\n"
         f"⏰ 重置时间：<code>{reset_hour:02d}:{reset_minute:02d}</code>\n\n"
     )
@@ -3792,22 +3792,28 @@ async def show_rank(message: types.Message):
 
     for act in activity_limits.keys():
         try:
+            # 🎯 从 daily_statistics 表获取数据，按用户聚合
             rows = await db.fetch_with_retry(
                 "获取活动排行榜",
                 """
                 SELECT 
-                    ua.user_id,
+                    ds.user_id,
                     u.nickname,
-                    ua.accumulated_time as total_time,
-                    ua.activity_count as total_count,
-                    CASE WHEN u.current_activity = $1 THEN TRUE ELSE FALSE END as is_active
-                FROM user_activities ua
-                LEFT JOIN users u ON ua.chat_id = u.chat_id AND ua.user_id = u.user_id
-                WHERE ua.chat_id = $2 
-                AND ua.activity_date = $3 
-                AND ua.activity_name = $4
-                AND (ua.accumulated_time > 0 OR u.current_activity = $1)
-                ORDER BY ua.accumulated_time DESC
+                    SUM(ds.accumulated_time) as total_time,
+                    SUM(ds.activity_count) as total_count,
+                    CASE 
+                        WHEN u.current_activity = $1 
+                        THEN TRUE 
+                        ELSE FALSE 
+                    END as is_active
+                FROM daily_statistics ds
+                LEFT JOIN users u ON ds.chat_id = u.chat_id AND ds.user_id = u.user_id
+                WHERE ds.chat_id = $2 
+                AND ds.record_date = $3 
+                AND ds.activity_name = $4
+                GROUP BY ds.user_id, u.nickname, u.current_activity
+                HAVING SUM(ds.accumulated_time) > 0 OR u.current_activity = $1
+                ORDER BY total_time DESC
                 LIMIT 10
                 """,
                 act,
@@ -3823,8 +3829,8 @@ async def show_rank(message: types.Message):
                 for i, row in enumerate(rows, 1):
                     user_id = row["user_id"]
                     nickname = row["nickname"]
-                    total_time = row["total_time"]
-                    count = row["total_count"]
+                    total_time = row["total_time"] or 0
+                    count = row["total_count"] or 0
                     is_active = row["is_active"]
 
                     if is_active:
@@ -3855,7 +3861,6 @@ async def show_rank(message: types.Message):
         parse_mode="HTML",
         reply_to_message_id=message.message_id
     )
-
 
 # ========== 快速回座回调 ==========
 async def handle_quick_back(callback_query: types.CallbackQuery):
@@ -3971,7 +3976,7 @@ async def export_and_push_csv(
     file_name: str = None,
     target_date=None,
 ):
-    """导出群组数据为 CSV 并推送 - 支持从月度表恢复数据"""
+    """导出群组数据为 CSV 并推送 - 基于 daily_statistics 表（完整版）"""
     await db.init_group(chat_id)
 
     # 规范 target_date
@@ -3989,25 +3994,26 @@ async def export_and_push_csv(
     writer = csv.writer(csv_buffer)
 
     activity_limits = await db.get_activity_limits_cached()
-    headers = ["用户ID", "用户昵称"]
+    
+    # 🎯 修改表头，添加重置类型列
+    headers = ["用户ID", "用户昵称", "重置类型"]
     for act in activity_limits.keys():
         headers.extend([f"{act}次数", f"{act}总时长"])
-    headers.extend(
-        [
-            "活动次数总计",
-            "活动用时总计",
-            "罚款总金额",
-            "超时次数",
-            "总超时时间",
-            "工作天数",  # 🆕 新增工作天数
-            "工作时长",  # 🆕 新增工作时长
-        ]
-    )
+    headers.extend([
+        "活动次数总计",
+        "活动用时总计",
+        "罚款总金额",
+        "超时次数",
+        "总超时时间",
+        "工作天数",
+        "工作时长",
+    ])
     writer.writerow(headers)
 
+    # ✅ 保留第一个代码的数据存在性检查
     has_data = False
 
-    # ✅ 修改：直接调用 get_group_statistics，不再判断是否为重置后导出
+    # 🎯 直接从 daily_statistics 获取数据
     group_stats = await db.get_group_statistics(chat_id, target_date)
 
     # 处理每个用户的数据
@@ -4021,12 +4027,42 @@ async def export_and_push_csv(
         if not isinstance(user_activities, dict):
             user_activities = {}
 
+        # ✅ 保留第一个代码的 has_data 检查逻辑
         total_count = user_data.get("total_activity_count", 0)
         total_time = user_data.get("total_accumulated_time", 0)
         if total_count > 0 or total_time > 0:
             has_data = True
 
-        row = [user_data.get("user_id", "未知"), user_data.get("nickname", "未知用户")]
+        # 🎯 第二个代码的改进：添加重置类型列
+        # 但 user_data 中可能没有 reset_type 字段，需要处理
+        reset_type = "硬重置"
+        # 可以从数据库中查询软重置状态
+        if target_date:
+            try:
+                # 检查是否有软重置标记
+                soft_reset_exists = await db.execute_with_retry(
+                    "检查软重置",
+                    """
+                    SELECT 1 FROM daily_statistics 
+                    WHERE chat_id = $1 AND user_id = $2 AND record_date = $3 
+                    AND activity_name = 'soft_reset_flag' AND is_soft_reset = TRUE
+                    LIMIT 1
+                    """,
+                    chat_id,
+                    user_data.get("user_id"),
+                    target_date,
+                    fetchval=True
+                )
+                if soft_reset_exists:
+                    reset_type = "软重置"
+            except Exception as e:
+                logger.debug(f"检查软重置状态失败: {e}")
+
+        row = [
+            user_data.get("user_id", "未知"),
+            user_data.get("nickname", "未知用户"),
+            reset_type  # 🎯 新增重置类型列
+        ]
 
         for act in activity_limits.keys():
             activity_info = user_activities.get(act, {})
@@ -4051,19 +4087,18 @@ async def export_and_push_csv(
         work_hours = int(user_data.get("work_hours", 0) or 0)
         work_hours_str = MessageFormatter.format_time_for_csv(work_hours)
 
-        row.extend(
-            [
-                total_count,
-                total_time_str,
-                user_data.get("total_fines", 0),
-                user_data.get("overtime_count", 0),
-                overtime_str,
-                work_days,  # 🆕 工作天数
-                work_hours_str,  # 🆕 工作时长
-            ]
-        )
+        row.extend([
+            total_count,  # ✅ 使用已经检查过的 total_count
+            total_time_str,
+            user_data.get("total_fines", 0),
+            user_data.get("overtime_count", 0),
+            overtime_str,
+            work_days,  # 🆕 工作天数
+            work_hours_str,  # 🆕 工作时长
+        ])
         writer.writerow(row)
 
+    # ✅ 保留第一个代码的 no data 检查
     if not has_data:
         await bot.send_message(chat_id, "⚠️ 当前群组没有数据需要导出")
         return
@@ -4083,14 +4118,17 @@ async def export_and_push_csv(
         except:
             pass
 
+        # 🎯 改进描述
         caption = (
             f"📊 群组：<b>{chat_title}</b>\n"
             f"📅 统计日期：<code>{(target_date.strftime('%Y-%m-%d') if target_date else get_beijing_time().strftime('%Y-%m-%d'))}</code>\n"
             f"⏰ 导出时间：<code>{get_beijing_time().strftime('%Y-%m-%d %H:%M:%S')}</code>\n"
             f"{MessageFormatter.create_dashed_line()}\n"
-            f"💾 包含每个用户的每日活动统计"
+            f"💾 包含软重置前后数据（重置类型列）\n"
+            f"📈 数据来源：daily_statistics 表"
         )
 
+        # ✅ 保留第一个代码的发送逻辑
         # 先把文件发回到当前 chat（可选）
         try:
             csv_input_file = FSInputFile(temp_file, filename=file_name)
@@ -4100,10 +4138,12 @@ async def export_and_push_csv(
         except Exception as e:
             logger.warning(f"发送到当前聊天失败: {e}")
 
-        # 使用统一的 NotificationService 推送到绑定的频道/群组/管理员
-        await notification_service.send_document(
-            chat_id, FSInputFile(temp_file, filename=file_name), caption=caption
-        )
+        # ✅ 处理 to_admin_if_no_group 参数
+        if to_admin_if_no_group:
+            # 使用统一的 NotificationService 推送到绑定的频道/群组/管理员
+            await notification_service.send_document(
+                chat_id, FSInputFile(temp_file, filename=file_name), caption=caption
+            )
 
         logger.info(f"✅ 数据导出并推送完成: {file_name}")
 
