@@ -111,12 +111,12 @@ class MessageFormatter:
             f"{first_line}\n"
             f"✅ 打卡成功：{MessageFormatter.format_copyable_text(activity)} - {MessageFormatter.format_copyable_text(time_str)}\n"
             f"{dashed_line}\n"
-            f"📋 活动须知\n"
+            f"📋 活动详情\n"
             f"▫️ 本次活动类型：{MessageFormatter.format_copyable_text(activity)}\n"
             f"▫️ 单次时长限制：{MessageFormatter.format_copyable_text(str(time_limit))}分钟 ⏱️\n"
             f"▫️ 今日{MessageFormatter.format_copyable_text(activity)}次数：第 {MessageFormatter.format_copyable_text(str(count))} 次（上限 {MessageFormatter.format_copyable_text(str(max_times))} 次）📈\n"
             f"{dashed_line}\n"
-            f"💡 操作提示\n"
+            f"💡 提示\n"
             f"完成后请及时点击 👉【✅ 回座打卡】👈按钮。"
         )
 
@@ -1074,3 +1074,4 @@ timer_manager = ActivityTimerManager()
 performance_optimizer = EnhancedPerformanceOptimizer()
 heartbeat_manager = HeartbeatManager()
 notification_service = NotificationService()
+
