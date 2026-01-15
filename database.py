@@ -569,6 +569,9 @@ class PostgreSQLDatabase:
                     activity_name TEXT,
                     activity_count INTEGER DEFAULT 0,
                     accumulated_time INTEGER DEFAULT 0,
+                    ine_amount INTEGER DEFAULT 0, 
+                    overtime_count INTEGER DEFAULT 0,
+                    overtime_time INTEGER DEFAULT 0,
                     work_days INTEGER DEFAULT 0,
                     work_hours INTEGER DEFAULT 0,
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
@@ -624,11 +627,31 @@ class PostgreSQLDatabase:
         """创建性能索引"""
         async with self.pool.acquire() as conn:
             indexes = [
-                "CREATE INDEX IF NOT EXISTS idx_user_activities_main ON user_activities (chat_id, user_id, activity_date)",
-                "CREATE INDEX IF NOT EXISTS idx_work_records_main ON work_records (chat_id, user_id, record_date)",
+                # 核心组合索引（最重要的3个）
+                "CREATE INDEX IF NOT EXISTS idx_daily_stats_composite ON daily_statistics (chat_id, user_id, record_date, activity_name, is_soft_reset)",
+                "CREATE INDEX IF NOT EXISTS idx_monthly_stats_composite ON monthly_statistics (chat_id, user_id, statistic_date, activity_name)",
+                "CREATE INDEX IF NOT EXISTS idx_user_activities_composite ON user_activities (chat_id, user_id, activity_date, activity_name)",
+    
+                # 其他必要的索引
+                "CREATE INDEX IF NOT EXISTS idx_work_records_composite ON work_records (chat_id, user_id, record_date, checkin_type)",
                 "CREATE INDEX IF NOT EXISTS idx_users_main ON users (chat_id, user_id)",
-                "CREATE INDEX IF NOT EXISTS idx_monthly_stats_main ON monthly_statistics (chat_id, user_id, statistic_date)",
-                "CREATE INDEX IF NOT EXISTS idx_daily_stats_main ON daily_statistics (chat_id, user_id, record_date, is_soft_reset)",
+                "CREATE INDEX IF NOT EXISTS idx_work_records_status ON work_records (status)",
+    
+                # groups表索引
+                "CREATE INDEX IF NOT EXISTS idx_groups_reset_time ON groups (reset_hour, reset_minute)",
+                "CREATE INDEX IF NOT EXISTS idx_groups_soft_reset ON groups (soft_reset_hour, soft_reset_minute)",
+    
+                # 配置表索引
+                "CREATE INDEX IF NOT EXISTS idx_activity_configs_name ON activity_configs (activity_name)",
+                "CREATE INDEX IF NOT EXISTS idx_fine_configs_composite ON fine_configs (activity_name, time_segment)",
+                "CREATE INDEX IF NOT EXISTS idx_work_fine_configs_composite ON work_fine_configs (checkin_type, time_segment)",
+                "CREATE INDEX IF NOT EXISTS idx_push_settings_key ON push_settings (setting_key)",
+                "CREATE INDEX IF NOT EXISTS idx_activity_user_limits_name ON activity_user_limits (activity_name)",
+    
+                # 日期范围查询索引
+                "CREATE INDEX IF NOT EXISTS idx_daily_statistics_date ON daily_statistics (record_date DESC)",
+                "CREATE INDEX IF NOT EXISTS idx_monthly_statistics_date ON monthly_statistics (statistic_date DESC)",
+                "CREATE INDEX IF NOT EXISTS idx_user_activities_date ON user_activities (activity_date DESC)",
             ]
 
             for index_sql in indexes:
@@ -1127,7 +1150,6 @@ class PostgreSQLDatabase:
 
 
     # ====== 核心业务方法 ======
-
     async def complete_user_activity(
         self,
         chat_id: int,
@@ -1137,72 +1159,74 @@ class PostgreSQLDatabase:
         fine_amount: int = 0,
         is_overtime: bool = False,
     ):
-        """完成用户活动 - 真正完整最终终极版"""
-        
+        """
+        完成用户活动 - 最终完整安全版
+
+        功能：
+        1️⃣ 四表同步：users、user_activities、daily_statistics、monthly_statistics
+        2️⃣ 日/月总统计行（activity_name='user_total'）累加
+        3️⃣ 支持软重置插入
+        4️⃣ 累加字段：activity_count, accumulated_time, fine_amount, overtime_count, overtime_time
+        5️⃣ users总账更新
+        6️⃣ 缓存清理 + 日志
+        """
         today = await self.get_business_date(chat_id)
         statistic_date = today.replace(day=1)
         now = self.get_beijing_time()
 
+        # 计算超时秒数
         overtime_seconds = 0
         if is_overtime:
             time_limit = await self.get_activity_time_limit(activity)
             overtime_seconds = max(0, elapsed_time - time_limit * 60)
 
-        self._ensure_pool_initialized()
+        if self.pool is None:
+            raise RuntimeError("数据库连接池未初始化")
 
         async with self.pool.acquire() as conn:
             async with conn.transaction():
-                # ===== 1. 软重置状态判断 =====
-                has_soft_reset_record = await conn.fetchval(
+
+                # ===== 1. 检查软重置 =====
+                has_soft_reset = await conn.fetchval(
                     """
-                    SELECT EXISTS (
+                    SELECT EXISTS(
                         SELECT 1 FROM daily_statistics 
-                        WHERE chat_id = $1 AND user_id = $2 AND record_date = $3 
-                        AND is_soft_reset = TRUE
+                        WHERE chat_id=$1 AND user_id=$2 AND record_date=$3 AND is_soft_reset=TRUE
                     )
                     """,
                     chat_id, user_id, today
                 )
 
-                should_be_soft_reset = False
-                if not has_soft_reset_record:
-                    soft_reset_hour, soft_reset_minute = await self.get_group_soft_reset_time(chat_id)
-                    if soft_reset_hour > 0 or soft_reset_minute > 0:
-                        reset_time = now.replace(
-                            hour=soft_reset_hour,
-                            minute=soft_reset_minute,
-                            second=0,
-                            microsecond=0
-                        )
+                should_soft_reset = False
+                if not has_soft_reset:
+                    soft_hour, soft_minute = await self.get_group_soft_reset_time(chat_id)
+                    if soft_hour > 0 or soft_minute > 0:
+                        reset_time = now.replace(hour=soft_hour, minute=soft_minute, second=0, microsecond=0)
                         if now >= reset_time:
-                            should_be_soft_reset = True
+                            should_soft_reset = True
 
-                current_soft_reset = bool(has_soft_reset_record or should_be_soft_reset)
+                current_soft_reset = bool(has_soft_reset or should_soft_reset)
 
-                # 自动插入软重置记录，如果当前应为软重置但还没有记录
-                if should_be_soft_reset:
+                if should_soft_reset:
                     await self.execute_with_retry(
                         conn,
                         """
                         INSERT INTO daily_statistics
-                        (chat_id, user_id, record_date, activity_name, activity_count, accumulated_time, is_soft_reset)
-                        VALUES ($1, $2, $3, 'soft_reset', 0, 0, TRUE)
-                        ON CONFLICT (chat_id, user_id, record_date, activity_name, is_soft_reset)
-                        DO NOTHING
+                        (chat_id,user_id,record_date,activity_name,activity_count,accumulated_time,is_soft_reset)
+                        VALUES ($1,$2,$3,'soft_reset',0,0,TRUE)
+                        ON CONFLICT(chat_id,user_id,record_date,activity_name,is_soft_reset) DO NOTHING
                         """,
                         chat_id, user_id, today
                     )
-
-                logger.debug(f"软重置状态: {current_soft_reset}")
 
                 # ===== 2. users 表 =====
                 await self.execute_with_retry(
                     conn,
                     """
-                    INSERT INTO users (chat_id, user_id, last_updated)
-                    VALUES ($1, $2, $3)
-                    ON CONFLICT (chat_id, user_id)
-                    DO UPDATE SET last_updated = EXCLUDED.last_updated
+                    INSERT INTO users (chat_id,user_id,last_updated)
+                    VALUES ($1,$2,$3)
+                    ON CONFLICT(chat_id,user_id)
+                    DO UPDATE SET last_updated=EXCLUDED.last_updated
                     """,
                     chat_id, user_id, today
                 )
@@ -1212,9 +1236,9 @@ class PostgreSQLDatabase:
                     conn,
                     """
                     INSERT INTO user_activities
-                    (chat_id, user_id, activity_date, activity_name, activity_count, accumulated_time)
-                    VALUES ($1, $2, $3, $4, 1, $5)
-                    ON CONFLICT (chat_id, user_id, activity_date, activity_name)
+                    (chat_id,user_id,activity_date,activity_name,activity_count,accumulated_time)
+                    VALUES ($1,$2,$3,$4,1,$5)
+                    ON CONFLICT(chat_id,user_id,activity_date,activity_name)
                     DO UPDATE SET
                         activity_count = user_activities.activity_count + 1,
                         accumulated_time = user_activities.accumulated_time + EXCLUDED.accumulated_time,
@@ -1223,15 +1247,14 @@ class PostgreSQLDatabase:
                     chat_id, user_id, today, activity, elapsed_time
                 )
 
-                # ===== 4. daily_statistics 表 =====
-                # 主活动记录
+                # ===== 4. daily_statistics 普通活动 =====
                 await self.execute_with_retry(
                     conn,
                     """
                     INSERT INTO daily_statistics
-                    (chat_id, user_id, record_date, activity_name, activity_count, accumulated_time, is_soft_reset)
-                    VALUES ($1, $2, $3, $4, 1, $5, $6)
-                    ON CONFLICT (chat_id, user_id, record_date, activity_name, is_soft_reset)
+                    (chat_id,user_id,record_date,activity_name,activity_count,accumulated_time,is_soft_reset)
+                    VALUES ($1,$2,$3,$4,1,$5,$6)
+                    ON CONFLICT(chat_id,user_id,record_date,activity_name,is_soft_reset)
                     DO UPDATE SET
                         activity_count = daily_statistics.activity_count + EXCLUDED.activity_count,
                         accumulated_time = daily_statistics.accumulated_time + EXCLUDED.accumulated_time,
@@ -1240,59 +1263,47 @@ class PostgreSQLDatabase:
                     chat_id, user_id, today, activity, elapsed_time, current_soft_reset
                 )
 
-                # 超时次数 & 时间
+                # ===== 4b. daily_statistics 用户总统计行 =====
+                daily_total_values = [
+                    chat_id, user_id, today, 'user_total', 1, elapsed_time,
+                    1 if is_overtime else 0,
+                    overtime_seconds if is_overtime else 0,
+                    fine_amount if fine_amount > 0 else 0,
+                    current_soft_reset
+                ]
+                daily_total_update_fields = [
+                    "activity_count = activity_count + 1",
+                    "accumulated_time = accumulated_time + EXCLUDED.accumulated_time"
+                ]
                 if is_overtime:
-                    await self.execute_with_retry(
-                        conn,
-                        """
-                        INSERT INTO daily_statistics
-                        (chat_id, user_id, record_date, activity_name, activity_count, is_soft_reset)
-                        VALUES ($1, $2, $3, 'overtime_count', 1, $4)
-                        ON CONFLICT (chat_id, user_id, record_date, activity_name, is_soft_reset)
-                        DO UPDATE SET
-                            activity_count = daily_statistics.activity_count + 1,
-                            updated_at = CURRENT_TIMESTAMP
-                        """,
-                        chat_id, user_id, today, current_soft_reset
-                    )
-                    await self.execute_with_retry(
-                        conn,
-                        """
-                        INSERT INTO daily_statistics
-                        (chat_id, user_id, record_date, activity_name, accumulated_time, is_soft_reset)
-                        VALUES ($1, $2, $3, 'overtime_time', $4, $5)
-                        ON CONFLICT (chat_id, user_id, record_date, activity_name, is_soft_reset)
-                        DO UPDATE SET
-                            accumulated_time = daily_statistics.accumulated_time + EXCLUDED.accumulated_time,
-                            updated_at = CURRENT_TIMESTAMP
-                        """,
-                        chat_id, user_id, today, overtime_seconds, current_soft_reset
-                    )
-
-                # 罚款统计
+                    daily_total_update_fields += [
+                        "overtime_count = overtime_count + EXCLUDED.overtime_count",
+                        "overtime_time = overtime_time + EXCLUDED.overtime_time"
+                    ]
                 if fine_amount > 0:
-                    await self.execute_with_retry(
-                        conn,
-                        """
-                        INSERT INTO daily_statistics
-                        (chat_id, user_id, record_date, activity_name, accumulated_time, is_soft_reset)
-                        VALUES ($1, $2, $3, 'total_fines', $4, $5)
-                        ON CONFLICT (chat_id, user_id, record_date, activity_name, is_soft_reset)
-                        DO UPDATE SET
-                            accumulated_time = daily_statistics.accumulated_time + EXCLUDED.accumulated_time,
-                            updated_at = CURRENT_TIMESTAMP
-                        """,
-                        chat_id, user_id, today, fine_amount, current_soft_reset
-                    )
+                    daily_total_update_fields.append("fine_amount = fine_amount + EXCLUDED.fine_amount")
 
-                # ===== 5. monthly_statistics 表 =====
+                await self.execute_with_retry(
+                    conn,
+                    f"""
+                    INSERT INTO daily_statistics
+                    (chat_id,user_id,record_date,activity_name,activity_count,accumulated_time,
+                     overtime_count,overtime_time,fine_amount,is_soft_reset)
+                    VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)
+                    ON CONFLICT(chat_id,user_id,record_date,activity_name,is_soft_reset)
+                    DO UPDATE SET {', '.join(daily_total_update_fields)}, updated_at=CURRENT_TIMESTAMP
+                    """,
+                    *daily_total_values
+                )
+
+                # ===== 5. monthly_statistics 普通活动 =====
                 await self.execute_with_retry(
                     conn,
                     """
                     INSERT INTO monthly_statistics
-                    (chat_id, user_id, statistic_date, activity_name, activity_count, accumulated_time)
-                    VALUES ($1, $2, $3, $4, 1, $5)
-                    ON CONFLICT (chat_id, user_id, statistic_date, activity_name)
+                    (chat_id,user_id,statistic_date,activity_name,activity_count,accumulated_time)
+                    VALUES ($1,$2,$3,$4,1,$5)
+                    ON CONFLICT(chat_id,user_id,statistic_date,activity_name)
                     DO UPDATE SET
                         activity_count = monthly_statistics.activity_count + 1,
                         accumulated_time = monthly_statistics.accumulated_time + EXCLUDED.accumulated_time,
@@ -1301,77 +1312,64 @@ class PostgreSQLDatabase:
                     chat_id, user_id, statistic_date, activity, elapsed_time
                 )
 
+                # ===== 5b. monthly_statistics 用户总统计行 =====
+                month_total_values = [
+                    chat_id, user_id, statistic_date, 'user_total', 1, elapsed_time,
+                    1 if is_overtime else 0,
+                    overtime_seconds if is_overtime else 0,
+                    fine_amount if fine_amount > 0 else 0
+                ]
+                month_total_update_fields = [
+                    "activity_count = activity_count + 1",
+                    "accumulated_time = accumulated_time + EXCLUDED.accumulated_time"
+                ]
+                if is_overtime:
+                    month_total_update_fields += [
+                        "overtime_count = overtime_count + EXCLUDED.overtime_count",
+                        "overtime_time = overtime_time + EXCLUDED.overtime_time"
+                    ]
                 if fine_amount > 0:
-                    await self.execute_with_retry(
-                        conn,
-                        """
-                        INSERT INTO monthly_statistics
-                        (chat_id, user_id, statistic_date, activity_name, accumulated_time)
-                        VALUES ($1, $2, $3, 'total_fines', $4)
-                        ON CONFLICT (chat_id, user_id, statistic_date, activity_name)
-                        DO UPDATE SET
-                            accumulated_time = monthly_statistics.accumulated_time + EXCLUDED.accumulated_time,
-                            updated_at = CURRENT_TIMESTAMP
-                        """,
-                        chat_id, user_id, statistic_date, fine_amount
-                    )
+                    month_total_update_fields.append("fine_amount = fine_amount + EXCLUDED.fine_amount")
 
-                if is_overtime and overtime_seconds > 0:
-                    await self.execute_with_retry(
-                        conn,
-                        """
-                        INSERT INTO monthly_statistics
-                        (chat_id, user_id, statistic_date, activity_name, activity_count)
-                        VALUES ($1, $2, $3, 'overtime_count', 1)
-                        ON CONFLICT (chat_id, user_id, statistic_date, activity_name)
-                        DO UPDATE SET
-                            activity_count = monthly_statistics.activity_count + 1,
-                            updated_at = CURRENT_TIMESTAMP
-                        """,
-                        chat_id, user_id, statistic_date
-                    )
-                    await self.execute_with_retry(
-                        conn,
-                        """
-                        INSERT INTO monthly_statistics
-                        (chat_id, user_id, statistic_date, activity_name, accumulated_time)
-                        VALUES ($1, $2, $3, 'overtime_time', $4)
-                        ON CONFLICT (chat_id, user_id, statistic_date, activity_name)
-                        DO UPDATE SET
-                            accumulated_time = monthly_statistics.accumulated_time + EXCLUDED.accumulated_time,
-                            updated_at = CURRENT_TIMESTAMP
-                        """,
-                        chat_id, user_id, statistic_date, overtime_seconds
-                    )
+                await self.execute_with_retry(
+                    conn,
+                    f"""
+                    INSERT INTO monthly_statistics
+                    (chat_id,user_id,statistic_date,activity_name,activity_count,accumulated_time,
+                     overtime_count,overtime_time,fine_amount)
+                    VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)
+                    ON CONFLICT(chat_id,user_id,statistic_date,activity_name)
+                    DO UPDATE SET {', '.join(month_total_update_fields)}, updated_at=CURRENT_TIMESTAMP
+                    """,
+                    *month_total_values
+                )
 
                 # ===== 6. users 总账更新 =====
-                update_fields = [
+                user_update_fields = [
                     "total_accumulated_time = total_accumulated_time + $1",
                     "total_activity_count = total_activity_count + 1",
                     "current_activity = NULL",
                     "activity_start_time = NULL",
                     "checkin_message_id = NULL",
                     "last_updated = $2",
+                    "updated_at = CURRENT_TIMESTAMP"
                 ]
-                params = [elapsed_time, today]
+                user_update_values = [elapsed_time, today]
 
                 if fine_amount > 0:
-                    update_fields.append("total_fines = total_fines + $3")
-                    params.append(fine_amount)
-
+                    user_update_fields.append("total_fines = total_fines + $3")
+                    user_update_values.append(fine_amount)
                 if is_overtime:
-                    update_fields.append("overtime_count = overtime_count + 1")
-                    update_fields.append("total_overtime_time = total_overtime_time + $4")
-                    params.append(overtime_seconds)
+                    user_update_fields.append("overtime_count = overtime_count + 1")
+                    user_update_fields.append("total_overtime_time = total_overtime_time + $4")
+                    user_update_values.append(overtime_seconds)
 
-                update_fields.append("updated_at = CURRENT_TIMESTAMP")
-                params.extend([chat_id, user_id])
-
+                user_update_values.extend([chat_id, user_id])
                 query = f"""
-                    UPDATE users SET {", ".join(update_fields)}
-                    WHERE chat_id = ${len(params)-1} AND user_id = ${len(params)}
+                    UPDATE users SET {', '.join(user_update_fields)}
+                    WHERE chat_id=${len(user_update_values)-1} AND user_id=${len(user_update_values)}
                 """
-                await self.execute_with_retry(conn, query, *params)
+                await self.execute_with_retry(conn, query, *user_update_values)
 
         # ===== 7. 清理缓存 =====
         self._cache.pop(f"user:{chat_id}:{user_id}", None)
@@ -1382,7 +1380,6 @@ class PostgreSQLDatabase:
             f"(时长: {elapsed_time}s, 罚款: {fine_amount}, "
             f"超时: {is_overtime} {overtime_seconds}s, 软重置: {current_soft_reset})"
         )
-
 
 
     # ========= 重置前批量完成所有未结束活动 =========
