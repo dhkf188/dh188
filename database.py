@@ -1192,7 +1192,6 @@ class PostgreSQLDatabase:
                 )
 
                 # ========== 4. daily_statistics 表 ==========
-                # 4.1 活动数据到 daily_statistics
                 await conn.execute(
                     """
                     INSERT INTO daily_statistics 
@@ -1208,38 +1207,8 @@ class PostgreSQLDatabase:
                     chat_id, user_id, today, activity, elapsed_time, current_soft_reset
                 )
 
-                # 4.2 总活动时间统计（新增汇总）
-                await conn.execute(
-                    """
-                    INSERT INTO daily_statistics 
-                    (chat_id, user_id, record_date, activity_name, 
-                     accumulated_time, is_soft_reset)
-                    VALUES ($1, $2, $3, 'total_time', $4, $5)
-                    ON CONFLICT (chat_id, user_id, record_date, activity_name, is_soft_reset)
-                    DO UPDATE SET
-                        accumulated_time = daily_statistics.accumulated_time + EXCLUDED.accumulated_time,
-                        updated_at = CURRENT_TIMESTAMP
-                    """,
-                    chat_id, user_id, today, elapsed_time, current_soft_reset
-                )
-
-                # 4.3 总活动次数统计（新增汇总）
-                await conn.execute(
-                    """
-                    INSERT INTO daily_statistics 
-                    (chat_id, user_id, record_date, activity_name, 
-                     activity_count, is_soft_reset)
-                    VALUES ($1, $2, $3, 'total_count', 1, $4)
-                    ON CONFLICT (chat_id, user_id, record_date, activity_name, is_soft_reset)
-                    DO UPDATE SET
-                        activity_count = daily_statistics.activity_count + EXCLUDED.activity_count,
-                        updated_at = CURRENT_TIMESTAMP
-                    """,
-                    chat_id, user_id, today, current_soft_reset
-                )
-
+              
                 # ========== 5. monthly_statistics 表 ==========
-                # 5.1 活动数据（保持原第一个代码的功能）
                 await conn.execute(
                     """
                     INSERT INTO monthly_statistics
@@ -2508,98 +2477,91 @@ class PostgreSQLDatabase:
     async def get_group_statistics(
         self, 
         chat_id: int, 
-        target_date: Optional[date] = None  # ✅ 修复：添加默认值
+        target_date: Optional[date] = None
     ) -> List[Dict]:
-        """获取群组统计信息 - 完整版从 daily_statistics 获取完整一天数据"""
+        """获取群组统计信息 - 修复版，不再依赖 total_time/total_count"""
         if target_date is None:
             target_date = await self.get_business_date(chat_id)
 
         self._ensure_pool_initialized()
         async with self.pool.acquire() as conn:
-            # 从 daily_statistics 获取完整一天数据
+            # 简化的查询，直接从活动数据计算汇总
             rows = await conn.fetch(
                 """
-                WITH user_activities AS (
+                WITH user_stats AS (
+                    -- 统计每个用户的活动数据
                     SELECT 
+                        ds.user_id,
+                        u.nickname,
+                        -- 活动统计
+                        SUM(ds.activity_count) as total_activity_count,
+                        SUM(ds.accumulated_time) as total_accumulated_time,
+                        SUM(ds.fine_amount) as total_fines,
+                        -- 超时统计
+                        SUM(CASE WHEN ds.overtime_count > 0 THEN 1 ELSE 0 END) as overtime_count,
+                        SUM(ds.overtime_time) as total_overtime_time,
+                        -- 工作统计（从其他行获取）
+                        MAX(CASE WHEN ds.activity_name = 'work_days' THEN ds.activity_count ELSE 0 END) as work_days,
+                        MAX(CASE WHEN ds.activity_name = 'work_hours' THEN ds.accumulated_time ELSE 0 END) as work_hours
+                    FROM daily_statistics ds
+                    LEFT JOIN users u ON ds.chat_id = u.chat_id AND ds.user_id = u.user_id
+                    WHERE ds.chat_id = $1 
+                    AND ds.record_date = $2
+                    -- ❌ 不再需要排除 total_time/total_count
+                    AND ds.activity_name NOT IN (
+                        'work_days', 'work_hours', 'work_fines', 
+                        'work_start_fines', 'work_end_fines'
+                    )
+                    GROUP BY ds.user_id, u.nickname
+                ),
+                activity_details AS (
+                    -- 获取详细活动数据
+                    SELECT
                         ds.user_id,
                         ds.activity_name,
                         SUM(ds.activity_count) as total_count,
-                        SUM(ds.accumulated_time) as total_time,
-                        SUM(CASE WHEN ds.activity_name IN 
-                            ('total_fines', 'work_fines', 'work_start_fines', 'work_end_fines')
-                            THEN ds.accumulated_time ELSE 0 END) as total_fine,
-                        SUM(CASE WHEN ds.activity_name = 'overtime_count' THEN ds.activity_count ELSE 0 END) as overtime_count,
-                        SUM(CASE WHEN ds.activity_name = 'overtime_time' THEN ds.accumulated_time ELSE 0 END) as overtime_time,
-                        SUM(CASE WHEN ds.activity_name = 'work_days' THEN ds.activity_count ELSE 0 END) as work_days,
-                        SUM(CASE WHEN ds.activity_name = 'work_hours' THEN ds.accumulated_time ELSE 0 END) as work_hours
+                        SUM(ds.accumulated_time) as total_time
                     FROM daily_statistics ds
-                    WHERE ds.chat_id = $1 AND ds.record_date = $2
+                    WHERE ds.chat_id = $1 
+                    AND ds.record_date = $2
+                    AND ds.activity_name NOT IN (
+                        'work_days', 'work_hours', 'work_fines', 
+                        'work_start_fines', 'work_end_fines'
+                    )
                     GROUP BY ds.user_id, ds.activity_name
                 ),
-                user_totals AS (
-                    SELECT 
-                        ua.user_id,
-                        COALESCE(u.nickname, '用户' || ua.user_id::text) as nickname,
-                        -- 活动统计
-                        SUM(CASE WHEN ua.activity_name NOT IN 
-                            ('total_fines', 'overtime_count', 'overtime_time', 'work_days', 'work_hours', 
-                             'work_fines', 'work_start_fines', 'work_end_fines')
-                            THEN ua.total_count ELSE 0 END) as total_activity_count,
-                        
-                        SUM(CASE WHEN ua.activity_name NOT IN 
-                            ('total_fines', 'overtime_count', 'overtime_time', 'work_days', 'work_hours',
-                             'work_fines', 'work_start_fines', 'work_end_fines')
-                            THEN ua.total_time ELSE 0 END) as total_accumulated_time,
-                        
-                        -- 罚款统计
-                        SUM(ua.total_fine) as total_fines,
-                        
-                        -- 超时统计
-                        MAX(ua.overtime_count) as overtime_count,
-                        MAX(ua.overtime_time) as total_overtime_time,
-                        
-                        -- 工作统计
-                        MAX(ua.work_days) as work_days,
-                        MAX(ua.work_hours) as work_hours
-                        
-                    FROM user_activities ua
-                    LEFT JOIN users u ON u.chat_id = $1 AND u.user_id = ua.user_id
-                    GROUP BY ua.user_id, u.nickname
-                ),
-                activity_details AS (
+                work_stats AS (
+                    -- 专门获取工作相关统计
                     SELECT
-                        ua.user_id,
-                        jsonb_object_agg(
-                            ua.activity_name, 
-                            jsonb_build_object(
-                                'count', ua.total_count,
-                                'time', ua.total_time
-                            )
-                        ) FILTER (WHERE ua.activity_name NOT IN 
-                            ('total_fines', 'overtime_count', 'overtime_time', 'work_days', 'work_hours',
-                             'work_fines', 'work_start_fines', 'work_end_fines')
-                        ) AS activities
-                    FROM user_activities ua
-                    WHERE ua.activity_name NOT IN 
-                        ('total_fines', 'overtime_count', 'overtime_time', 'work_days', 'work_hours',
-                         'work_fines', 'work_start_fines', 'work_end_fines')
-                    GROUP BY ua.user_id
+                        ds.user_id,
+                        MAX(CASE WHEN ds.activity_name = 'work_days' THEN ds.activity_count ELSE 0 END) as work_days,
+                        MAX(CASE WHEN ds.activity_name = 'work_hours' THEN ds.accumulated_time ELSE 0 END) as work_hours,
+                        MAX(CASE WHEN ds.activity_name = 'work_fines' THEN ds.accumulated_time ELSE 0 END) as work_fines
+                    FROM daily_statistics ds
+                    WHERE ds.chat_id = $1 
+                    AND ds.record_date = $2
+                    AND ds.activity_name IN ('work_days', 'work_hours', 'work_fines')
+                    GROUP BY ds.user_id
                 )
                 SELECT 
-                    ut.*,
-                    COALESCE(ad.activities, '{}'::jsonb) AS activities
-                FROM user_totals ut
-                LEFT JOIN activity_details ad ON ut.user_id = ad.user_id
-                -- 筛选有活动记录的用户
-                WHERE EXISTS (
-                    SELECT 1 FROM daily_statistics ds2
-                    WHERE ds2.chat_id = $1 AND ds2.record_date = $2 
-                    AND ds2.user_id = ut.user_id
-                    AND ds2.activity_name NOT IN 
-                        ('total_fines', 'overtime_count', 'overtime_time', 'work_days', 'work_hours',
-                         'work_fines', 'work_start_fines', 'work_end_fines')
-                )
-                ORDER BY ut.total_accumulated_time DESC
+                    us.*,
+                    COALESCE(ws.work_days, 0) as final_work_days,
+                    COALESCE(ws.work_hours, 0) as final_work_hours,
+                    jsonb_object_agg(
+                        ad.activity_name, 
+                        jsonb_build_object(
+                            'count', ad.total_count,
+                            'time', ad.total_time
+                        )
+                    ) FILTER (WHERE ad.activity_name IS NOT NULL) AS activities
+                FROM user_stats us
+                LEFT JOIN activity_details ad ON us.user_id = ad.user_id
+                LEFT JOIN work_stats ws ON us.user_id = ws.user_id
+                GROUP BY us.user_id, us.nickname, us.total_activity_count, 
+                         us.total_accumulated_time, us.total_fines, us.overtime_count,
+                         us.total_overtime_time, us.work_days, us.work_hours,
+                         ws.work_days, ws.work_hours
+                ORDER BY us.total_accumulated_time DESC
                 """, 
                 chat_id, 
                 target_date
@@ -2610,12 +2572,20 @@ class PostgreSQLDatabase:
             for row in rows:
                 data = dict(row)
                 
+                # 使用正确的工作统计
+                data["work_days"] = data.get("final_work_days", 0)
+                data["work_hours"] = data.get("final_work_hours", 0)
+                
                 # 确保activities是字典格式
                 activities = data.get("activities", {})
                 if hasattr(activities, "copy"):  # 如果是jsonb类型
                     data["activities"] = dict(activities)
                 else:
                     data["activities"] = activities or {}
+                
+                # 清理临时字段
+                data.pop("final_work_days", None)
+                data.pop("final_work_hours", None)
                 
                 result.append(data)
             
