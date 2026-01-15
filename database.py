@@ -2751,16 +2751,23 @@ class PostgreSQLDatabase:
             result = []
             for row in rows:
                 data = dict(row)
-
-                # 确保activities是字典格式
-                activities = data.get("activities", {})
-                if hasattr(activities, "copy"):  # 如果是jsonb类型
-                    data["activities"] = dict(activities)
-                else:
-                    data["activities"] = activities or {}
-
+                
+                # 🛠️ 统一稳定的 JSON 解析
+                raw_activities = data.get("activities")
+                parsed_activities = {}
+                
+                if raw_activities:
+                    if isinstance(raw_activities, str):
+                        try:
+                            parsed_activities = json.loads(raw_activities)
+                        except Exception as e:
+                            logger.error(f"JSON解析失败: {e}")
+                elif isinstance(raw_activities, dict):
+                    parsed_activities = raw_activities
+                    
+                data["activities"] = parsed_activities
                 result.append(data)
-
+            
             return result
 
     async def get_monthly_work_statistics(
