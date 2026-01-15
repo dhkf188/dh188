@@ -1,6 +1,7 @@
 import logging
 import asyncio
 import time
+import json
 from datetime import datetime, timedelta, date
 from typing import Dict, Any, List, Optional, Union
 from config import Config, beijing_tz
@@ -2479,39 +2480,44 @@ class PostgreSQLDatabase:
         chat_id: int, 
         target_date: Optional[date] = None
     ) -> List[Dict]:
-        """获取群组统计信息 - 修复版，不再依赖 total_time/total_count"""
+        """获取群组统计信息 - 修复版：修复JSON解析和工作用户丢失问题"""
         if target_date is None:
             target_date = await self.get_business_date(chat_id)
 
         self._ensure_pool_initialized()
         async with self.pool.acquire() as conn:
-            # 简化的查询，直接从活动数据计算汇总
+            # 修复逻辑：
+            # 1. user_stats: 统计该日所有有记录的用户（不再排除只有工作记录的用户）
+            # 2. activity_details: 获取具体的活动详情JSON
+            # 3. Python层: 增加 json.loads 解析
             rows = await conn.fetch(
                 """
                 WITH user_stats AS (
-                    -- 统计每个用户的活动数据
+                    -- 统计每个用户的活动数据 (包含所有用户)
                     SELECT 
                         ds.user_id,
                         u.nickname,
-                        -- 活动统计
-                        SUM(ds.activity_count) as total_activity_count,
-                        SUM(ds.accumulated_time) as total_accumulated_time,
+                        -- 活动统计 (排除工作相关)
+                        SUM(CASE WHEN ds.activity_name NOT IN (
+                            'work_days', 'work_hours', 'work_fines', 
+                            'work_start_fines', 'work_end_fines'
+                        ) THEN ds.activity_count ELSE 0 END) as total_activity_count,
+                        
+                        SUM(CASE WHEN ds.activity_name NOT IN (
+                            'work_days', 'work_hours', 'work_fines', 
+                            'work_start_fines', 'work_end_fines'
+                        ) THEN ds.accumulated_time ELSE 0 END) as total_accumulated_time,
+                        
                         SUM(ds.fine_amount) as total_fines,
+                        
                         -- 超时统计
                         SUM(CASE WHEN ds.overtime_count > 0 THEN 1 ELSE 0 END) as overtime_count,
-                        SUM(ds.overtime_time) as total_overtime_time,
-                        -- 工作统计（从其他行获取）
-                        MAX(CASE WHEN ds.activity_name = 'work_days' THEN ds.activity_count ELSE 0 END) as work_days,
-                        MAX(CASE WHEN ds.activity_name = 'work_hours' THEN ds.accumulated_time ELSE 0 END) as work_hours
+                        SUM(ds.overtime_time) as total_overtime_time
+                        
                     FROM daily_statistics ds
                     LEFT JOIN users u ON ds.chat_id = u.chat_id AND ds.user_id = u.user_id
                     WHERE ds.chat_id = $1 
                     AND ds.record_date = $2
-                    -- ❌ 不再需要排除 total_time/total_count
-                    AND ds.activity_name NOT IN (
-                        'work_days', 'work_hours', 'work_fines', 
-                        'work_start_fines', 'work_end_fines'
-                    )
                     GROUP BY ds.user_id, u.nickname
                 ),
                 activity_details AS (
@@ -2535,12 +2541,11 @@ class PostgreSQLDatabase:
                     SELECT
                         ds.user_id,
                         MAX(CASE WHEN ds.activity_name = 'work_days' THEN ds.activity_count ELSE 0 END) as work_days,
-                        MAX(CASE WHEN ds.activity_name = 'work_hours' THEN ds.accumulated_time ELSE 0 END) as work_hours,
-                        MAX(CASE WHEN ds.activity_name = 'work_fines' THEN ds.accumulated_time ELSE 0 END) as work_fines
+                        MAX(CASE WHEN ds.activity_name = 'work_hours' THEN ds.accumulated_time ELSE 0 END) as work_hours
                     FROM daily_statistics ds
                     WHERE ds.chat_id = $1 
                     AND ds.record_date = $2
-                    AND ds.activity_name IN ('work_days', 'work_hours', 'work_fines')
+                    AND ds.activity_name IN ('work_days', 'work_hours')
                     GROUP BY ds.user_id
                 )
                 SELECT 
@@ -2559,7 +2564,7 @@ class PostgreSQLDatabase:
                 LEFT JOIN work_stats ws ON us.user_id = ws.user_id
                 GROUP BY us.user_id, us.nickname, us.total_activity_count, 
                          us.total_accumulated_time, us.total_fines, us.overtime_count,
-                         us.total_overtime_time, us.work_days, us.work_hours,
+                         us.total_overtime_time, 
                          ws.work_days, ws.work_hours
                 ORDER BY us.total_accumulated_time DESC
                 """, 
@@ -2576,12 +2581,20 @@ class PostgreSQLDatabase:
                 data["work_days"] = data.get("final_work_days", 0)
                 data["work_hours"] = data.get("final_work_hours", 0)
                 
-                # 确保activities是字典格式
-                activities = data.get("activities", {})
-                if hasattr(activities, "copy"):  # 如果是jsonb类型
-                    data["activities"] = dict(activities)
-                else:
-                    data["activities"] = activities or {}
+                # 🛠️ 关键修复：正确处理 activities JSON 解析
+                raw_activities = data.get("activities")
+                parsed_activities = {}
+                
+                if raw_activities:
+                    if isinstance(raw_activities, str):
+                        try:
+                            parsed_activities = json.loads(raw_activities)
+                        except Exception as e:
+                            logger.error(f"JSON解析失败: {e}")
+                    elif isinstance(raw_activities, dict):
+                        parsed_activities = raw_activities
+                
+                data["activities"] = parsed_activities
                 
                 # 清理临时字段
                 data.pop("final_work_days", None)
