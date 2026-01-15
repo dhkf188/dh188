@@ -3976,26 +3976,26 @@ async def export_and_push_csv(
     file_name: str = None,
     target_date=None,
 ):
-    """导出群组数据为 CSV 并推送 - 基于 daily_statistics 表（完整版）"""
+    """导出群组数据为 CSV 并推送 - 日常统计最终稳定版"""
+
     await db.init_group(chat_id)
 
-    # 规范 target_date
     if target_date is not None and hasattr(target_date, "date"):
         target_date = target_date.date()
 
     if not file_name:
-        if target_date is not None:
-            date_str = target_date.strftime("%Y%m%d")
-        else:
-            date_str = get_beijing_time().strftime("%Y%m%d_%H%M%S")
+        date_str = (
+            target_date.strftime("%Y%m%d")
+            if target_date
+            else get_beijing_time().strftime("%Y%m%d_%H%M%S")
+        )
         file_name = f"group_{chat_id}_statistics_{date_str}.csv"
 
     csv_buffer = StringIO()
     writer = csv.writer(csv_buffer)
 
     activity_limits = await db.get_activity_limits_cached()
-    
-    # 🎯 修改表头，添加重置类型列
+
     headers = ["用户ID", "用户昵称", "重置类型"]
     for act in activity_limits.keys():
         headers.extend([f"{act}次数", f"{act}总时长"])
@@ -4010,42 +4010,47 @@ async def export_and_push_csv(
     ])
     writer.writerow(headers)
 
-    # ✅ 保留第一个代码的数据存在性检查
     has_data = False
 
-    # 🎯 直接从 daily_statistics 获取数据
     group_stats = await db.get_group_statistics(chat_id, target_date)
 
-    # 处理每个用户的数据
     for user_data in group_stats:
-        # 🆕 最小修复：只在需要的地方添加保护
         if not isinstance(user_data, dict):
             continue
 
-        # 安全处理 activities 字段
-        user_activities = user_data.get("activities", {})
-        if not isinstance(user_activities, dict):
-            user_activities = {}
+        activities = user_data.get("activities") or {}
+        if not isinstance(activities, dict):
+            activities = {}
 
-        # ✅ 保留第一个代码的 has_data 检查逻辑
-        total_count = user_data.get("total_activity_count", 0)
-        total_time = user_data.get("total_accumulated_time", 0)
-        if total_count > 0 or total_time > 0:
+        total_count = int(user_data.get("total_activity_count") or 0)
+        total_time = int(user_data.get("total_accumulated_time") or 0)
+
+        total_fines = int(user_data.get("total_fines") or 0)
+        overtime_count = int(user_data.get("overtime_count") or 0)
+        overtime_time = int(user_data.get("total_overtime_time") or 0)
+
+        work_days = int(user_data.get("work_days") or 0)
+        work_hours = int(user_data.get("work_hours") or 0)
+
+        # ✅ 新 has_data 判断（只要任一字段有值）
+        if (
+            total_count > 0
+            or total_time > 0
+            or total_fines > 0
+            or overtime_count > 0
+            or work_days > 0
+        ):
             has_data = True
 
-        # 🎯 第二个代码的改进：添加重置类型列
-        # 但 user_data 中可能没有 reset_type 字段，需要处理
         reset_type = "硬重置"
-        # 可以从数据库中查询软重置状态
         if target_date:
             try:
-                # 检查是否有软重置标记
                 soft_reset_exists = await db.execute_with_retry(
                     "检查软重置",
                     """
-                    SELECT 1 FROM daily_statistics 
-                    WHERE chat_id = $1 AND user_id = $2 AND record_date = $3 
-                    AND activity_name = 'soft_reset_flag' AND is_soft_reset = TRUE
+                    SELECT 1 FROM daily_statistics
+                    WHERE chat_id = $1 AND user_id = $2 AND record_date = $3
+                    AND is_soft_reset = TRUE
                     LIMIT 1
                     """,
                     chat_id,
@@ -4055,50 +4060,34 @@ async def export_and_push_csv(
                 )
                 if soft_reset_exists:
                     reset_type = "软重置"
-            except Exception as e:
-                logger.debug(f"检查软重置状态失败: {e}")
+            except Exception:
+                pass
 
         row = [
             user_data.get("user_id", "未知"),
             user_data.get("nickname", "未知用户"),
-            reset_type  # 🎯 新增重置类型列
+            reset_type,
         ]
 
         for act in activity_limits.keys():
-            activity_info = user_activities.get(act, {})
-            # 🆕 安全获取活动数据
-            if not isinstance(activity_info, dict):
-                activity_info = {}
-
-            count = activity_info.get("count", 0)
-            total_seconds = int(activity_info.get("time", 0))
-            time_str = MessageFormatter.format_time_for_csv(total_seconds)
+            info = activities.get(act) or {}
+            count = int(info.get("count") or 0)
+            seconds = int(info.get("time") or 0)
             row.append(count)
-            row.append(time_str)
-
-        total_seconds_all = int(user_data.get("total_accumulated_time", 0) or 0)
-        total_time_str = MessageFormatter.format_time_for_csv(total_seconds_all)
-
-        overtime_seconds = int(user_data.get("total_overtime_time", 0) or 0)
-        overtime_str = MessageFormatter.format_time_for_csv(overtime_seconds)
-
-        # 🆕 安全获取工作相关字段
-        work_days = user_data.get("work_days", 0)
-        work_hours = int(user_data.get("work_hours", 0) or 0)
-        work_hours_str = MessageFormatter.format_time_for_csv(work_hours)
+            row.append(MessageFormatter.format_time_for_csv(seconds))
 
         row.extend([
-            total_count,  # ✅ 使用已经检查过的 total_count
-            total_time_str,
-            user_data.get("total_fines", 0),
-            user_data.get("overtime_count", 0),
-            overtime_str,
-            work_days,  # 🆕 工作天数
-            work_hours_str,  # 🆕 工作时长
+            total_count,
+            MessageFormatter.format_time_for_csv(total_time),
+            total_fines,
+            overtime_count,
+            MessageFormatter.format_time_for_csv(overtime_time),
+            work_days,
+            MessageFormatter.format_time_for_csv(work_hours),
         ])
+
         writer.writerow(row)
 
-    # ✅ 保留第一个代码的 no data 检查
     if not has_data:
         await bot.send_message(chat_id, "⚠️ 当前群组没有数据需要导出")
         return
@@ -4107,6 +4096,7 @@ async def export_and_push_csv(
     csv_buffer.close()
 
     temp_file = f"temp_{file_name}"
+
     try:
         async with aiofiles.open(temp_file, "w", encoding="utf-8-sig") as f:
             await f.write(csv_content)
@@ -4118,44 +4108,31 @@ async def export_and_push_csv(
         except:
             pass
 
-        # 🎯 改进描述
         caption = (
             f"📊 群组：<b>{chat_title}</b>\n"
             f"📅 统计日期：<code>{(target_date.strftime('%Y-%m-%d') if target_date else get_beijing_time().strftime('%Y-%m-%d'))}</code>\n"
             f"⏰ 导出时间：<code>{get_beijing_time().strftime('%Y-%m-%d %H:%M:%S')}</code>\n"
             f"{MessageFormatter.create_dashed_line()}\n"
-            f"💾 包含每个用户每日的活动统计）\n"
-         
+            f"💾 每日活动统计数据\n"
         )
 
-        # ✅ 保留第一个代码的发送逻辑
-        # 先把文件发回到当前 chat（可选）
-        try:
-            csv_input_file = FSInputFile(temp_file, filename=file_name)
-            await bot.send_document(
-                chat_id, csv_input_file, caption=caption, parse_mode="HTML"
-            )
-        except Exception as e:
-            logger.warning(f"发送到当前聊天失败: {e}")
+        csv_input_file = FSInputFile(temp_file, filename=file_name)
+        await bot.send_document(chat_id, csv_input_file, caption=caption, parse_mode="HTML")
 
-        # ✅ 处理 to_admin_if_no_group 参数
         if to_admin_if_no_group:
-            # 使用统一的 NotificationService 推送到绑定的频道/群组/管理员
             await notification_service.send_document(
-                chat_id, FSInputFile(temp_file, filename=file_name), caption=caption
+                chat_id,
+                FSInputFile(temp_file, filename=file_name),
+                caption=caption
             )
-
-        logger.info(f"✅ 数据导出并推送完成: {file_name}")
 
     except Exception as e:
-        logger.error(f"❌ 导出过程出错: {e}")
+        logger.error(f"❌ 导出失败: {e}")
         await bot.send_message(chat_id, f"❌ 导出失败：{e}")
     finally:
-        try:
-            if os.path.exists(temp_file):
-                os.remove(temp_file)
-        except:
-            pass
+        if os.path.exists(temp_file):
+            os.remove(temp_file)
+
 
 
 # ========== 定时任务 ==========
@@ -4783,4 +4760,3 @@ if __name__ == "__main__":
         logger.info("机器人已被用户中断")
     except Exception as e:
         logger.error(f"机器人运行异常: {e}")
-
