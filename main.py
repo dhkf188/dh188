@@ -4124,8 +4124,8 @@ async def export_and_push_csv(
             f"📅 统计日期：<code>{(target_date.strftime('%Y-%m-%d') if target_date else get_beijing_time().strftime('%Y-%m-%d'))}</code>\n"
             f"⏰ 导出时间：<code>{get_beijing_time().strftime('%Y-%m-%d %H:%M:%S')}</code>\n"
             f"{MessageFormatter.create_dashed_line()}\n"
-            f"💾 包含软重置前后数据（重置类型列）\n"
-            f"📈 数据来源：daily_statistics 表"
+            f"💾 包含每个用户每日的活动统计）\n"
+         
         )
 
         # ✅ 保留第一个代码的发送逻辑
@@ -4783,3 +4783,4 @@ if __name__ == "__main__":
         logger.info("机器人已被用户中断")
     except Exception as e:
         logger.error(f"机器人运行异常: {e}")
+
