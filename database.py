@@ -2514,7 +2514,7 @@ class PostgreSQLDatabase:
         chat_id: int, 
         target_date: Optional[date] = None
     ) -> List[Dict]:
-        """获取群组统计信息 - 稳定终版：修复活动口径 + JSON解析 + 用户完整性"""
+        """获取群组统计信息 - 稳定终版：修复罚款统计口径 + 完整数据逻辑"""
 
         if target_date is None:
             target_date = await self.get_business_date(chat_id)
@@ -2528,21 +2528,30 @@ class PostgreSQLDatabase:
                         ds.user_id,
                         u.nickname,
 
-                        -- 活动统计（只统计真实活动）
+                        -- 1. 活动统计（排除特殊统计行和软重置标记）
                         SUM(CASE WHEN ds.activity_name NOT IN (
                             'work_days','work_hours',
                             'work_fines','work_start_fines','work_end_fines',
-                            'overtime_count','overtime_time','total_fines'
+                            'overtime_count','overtime_time','total_fines',
+                            'soft_reset'
                         ) THEN ds.activity_count ELSE 0 END) AS total_activity_count,
 
                         SUM(CASE WHEN ds.activity_name NOT IN (
                             'work_days','work_hours',
                             'work_fines','work_start_fines','work_end_fines',
-                            'overtime_count','overtime_time','total_fines'
+                            'overtime_count','overtime_time','total_fines',
+                            'soft_reset'
                         ) THEN ds.accumulated_time ELSE 0 END) AS total_accumulated_time,
 
-                        -- 罚款与超时
-                        SUM(ds.fine_amount) AS total_fines,
+                        -- 2. 修复：罚款统计 (从 accumulated_time 获取特定行的值，而非 fine_amount 列)
+                        SUM(CASE WHEN ds.activity_name IN (
+                            'total_fines', 
+                            'work_fines', 
+                            'work_start_fines', 
+                            'work_end_fines'
+                        ) THEN ds.accumulated_time ELSE 0 END) AS total_fines,
+
+                        -- 3. 超时统计
                         SUM(CASE WHEN ds.activity_name = 'overtime_count' THEN ds.activity_count ELSE 0 END) AS overtime_count,
                         SUM(CASE WHEN ds.activity_name = 'overtime_time' THEN ds.accumulated_time ELSE 0 END) AS total_overtime_time
 
@@ -2567,7 +2576,8 @@ class PostgreSQLDatabase:
                       AND ds.activity_name NOT IN (
                             'work_days','work_hours',
                             'work_fines','work_start_fines','work_end_fines',
-                            'overtime_count','overtime_time','total_fines'
+                            'overtime_count','overtime_time','total_fines',
+                            'soft_reset'
                       )
                     GROUP BY ds.user_id, ds.activity_name
                 ),
