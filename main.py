@@ -1727,28 +1727,41 @@ async def cmd_help(message: types.Message):
     uid = message.from_user.id
 
     help_text = (
-        "📋 打卡机器人使用帮助\n\n"
-        "🟢 开始活动打卡：\n"
-        "• 直接输入活动名称\n"
-        "• 或使用命令：/ci 活动名\n"
-        "• 或点击下方活动按钮\n\n"
-        "🔴 结束活动回座：\n"
-        "• 直接输入：回座\n"
-        "• 或使用命令：/at\n"
-        "• 或点击下方 ✅ 回座 按钮\n\n"
-        "🕒 上下班打卡：\n"
-        "• /workstart - 上班打卡\n"
-        "• /workend - 下班打卡\n"
-        "• 或点击 🟢 上班 和 🔴 下班 按钮\n\n"
-        "📊 查看记录：\n"
-        "• 点击 📊 我的记录 查看个人统计\n"
-        "• 点击 🏆 排行榜 查看群内排名\n\n"
-        "🔧 其他命令：\n"
-        "• /start - 开始使用机器人\n"
-        "• /menu - 显示主菜单\n"
-        "• /help - 显示此帮助信息"
+        "┌──────────────────────────────────────────┐\n"
+        "│          📋 打卡机器人使用帮助\n"
+        "├──────────────────────────────────────────┤\n\n"
+        
+        "🟢 <b>开始活动打卡</b>\n"
+        "├─ 📝 直接输入活动名称\n"
+        "├─ ⌨️ 使用命令：/ci 活动名\n"
+        "└─ 📱 点击下方活动按钮\n\n"
+        
+        "🔴 <b>结束活动回座</b>\n"
+        "├─ 📝 直接输入：回座\n"
+        "├─ ⌨️ 使用命令：/at\n"
+        "└─ 📱 点击下方 ✅ 回座 按钮\n\n"
+        
+        "🕒 <b>上下班打卡</b>\n"
+        "├─ 🟢 /workstart - 上班打卡\n"
+        "├─ 🔴 /workend - 下班打卡\n"
+        "└─ 📱 点击上下班按钮\n\n"
+        
+        "📊 <b>查看记录</b>\n"
+        "├─ 📈 点击 📊 我的记录 查看个人统计\n"
+        "└─ 🏆 点击 🏆 排行榜 查看群内排名\n\n"
+        
+        "🔧 <b>其他命令</b>\n"
+        "├─ 🚀 /start - 开始使用机器人\n"
+        "├─ 🏠 /menu - 显示主菜单\n"
+        "└─ ❓ /help - 显示此帮助信息\n\n"
+        
+        "────────────────────────────────────────────\n"
+        "💡 <b>提示：</b>\n"
+        "• 活动名称区分大小写\n"
+        "• 打卡后请记得回座\n"
+        "• 每天数据会定时重置"
     )
-
+    
     await message.answer(
         help_text,
         reply_markup=await get_main_keyboard(
@@ -1757,7 +1770,6 @@ async def cmd_help(message: types.Message):
         reply_to_message_id=message.message_id,
         parse_mode="HTML",
     )
-
 
 @rate_limit(rate=10, per=60)
 @message_deduplicate
@@ -3555,44 +3567,62 @@ async def handle_admin_panel_button(message: types.Message):
         return
 
     admin_text = (
-        "👑 管理员面板\n\n"
-        "📢 频道与推送管理：\n"
-        "• /setchannel <频道ID> - 绑定提醒频道\n"
-        "• /setgroup <群组ID> - 绑定通知群组\n"
-        "• /setpush <channel|group|admin> <on|off> - 设置推送开关\n"
-        "• /showpush - 显示推送设置状态\n\n"
-        "🎯 活动管理：\n"
-        "• /addactivity <活动名> <次数> <分钟> - 添加或修改活动\n"
-        "• /delactivity <活动名> - 删除活动\n"
-        "• /actnum <活动名> <人数> - 设置活动人数限制\n"
-        "• /actstatus - 查看活动人数状态\n\n"
-        "💰 罚款管理：\n"
-        "• /setfine <活动名> <时间段> <金额> - 设置单个活动罚款\n"
-        "• /setfines_all <t1> <f1> [t2 f2...] - 统一设置所有活动罚款\n"
-        "• /setworkfine <work_start|work_end> <分钟1> <罚款1> [分钟2 罚款2...] - 设置上下班罚款\n"
-        "• /finesstatus - 查看罚款设置状态\n\n"
-        "🔄 重置设置：：\n"
-        "• /setresettime <小时> <分钟> - 设置每日重置时间\n"
-        "• //setsoftresettime <小时> <分钟> - 设置每日二次重置时间\n"
-        "• /reset <用户ID> - 重置用户数据\n"
-        "• /resettime - 查看当前重置时间\n\n"
-        "⏰ 上下班管理：\n"
-        "• /setworktime <上班时间> <下班时间> - 设置上下班时间\n"
-        "• /worktime - 查看当前工作时间设置\n"
-        "• /delwork - 移除功能(保留记录)\n"
-        "• /delwork_clear - 移除功能(不保留记录)\n\n"
-        "📊 数据管理：\n"
-        "• /export - 导出当前数据\n"
-        "• /exportmonthly [年份] [月份] - 导出月度数据\n"
-        "• /monthlyreport [年份] [月份] - 生成月度报告\n"
-        "• /cleanup_monthly [年份] [月份] - 清理月度数据\n"
-        "• /monthly_stats_status - 查看月度统计状态\n"
-        "• /cleanup_inactive [天数] - 清理未活动用户\n\n"
-        "💾 数据显示：\n"
-        "• /showsettings - 显示所有当前设置\n\n"
+        "┌──────────────────────────────────────────┐\n"
+        "│          👑 管理员面板\n"
+        "├──────────────────────────────────────────┤\n\n"
+        
+        "📢 频道与推送管理\n"
+        "├─ 🔗 /setchannel <频道ID>\n"
+        "├─ 👥 /setgroup <群组ID>\n"
+        "├─ ⚙️ /setpush <目标> <开关>\n"
+        "│   (目标: channel|group|admin)\n"
+        "│   (开关: on|off)\n"
+        "└─ 👀 /showpush\n\n"
+        
+        "🎯 活动管理\n"
+        "├─ ➕ /addactivity <活动名> <次数> <分钟>\n"
+        "├─ 🗑️ /delactivity <活动名>\n"
+        "├─ 👥 /actnum <活动名> <人数>\n"
+        "└─ 📊 /actstatus\n\n"
+        
+        "💰 罚款管理\n"
+        "├─ 💸 /setfine <活动名> <时间段> <金额>\n"
+        "├─ 📋 /setfines_all <t1> <f1> [t2 f2...]\n"
+        "├─ ⏰ /setworkfine <类型> <分钟1> <罚款1>\n"
+        "│   (类型: work_start|work_end)\n"
+        "└─ 📈 /finesstatus\n\n"
+        
+        "🔄 重置设置\n"
+        "├─ 🕐 /setresettime <小时> <分钟>\n"
+        "├─ 🕑 /setsoftresettime <小时> <分钟>\n"
+        "├─ 🔄 /reset <用户ID>\n"
+        "└─ 👀 /resettime\n\n"
+        
+        "⏰ 上下班管理\n"
+        "├─ 🏢 /setworktime <上班> <下班>\n"
+        "├─ 👀 /worktime\n"
+        "├─ 🗑️ /delwork\n"
+        "└─ 🧹 /delwork_clear\n\n"
+        
+        "📊 数据管理\n"
+        "├─ 📤 /export\n"
+        "├─ 📅 /exportmonthly [年] [月]\n"
+        "├─ 📋 /monthlyreport [年] [月]\n"
+        "├─ 🗑️ /cleanup_monthly [年] [月]\n"
+        "├─ 📈 /monthly_stats_status\n"
+        "└─ 👤 /cleanup_inactive [天数]\n\n"
+        
+        "💾 数据显示\n"
+        "└─ ⚙️ /showsettings\n\n"
+        
+        "────────────────────────────────────────────\n"
+        "💡 提示：\n"
+        "• 发送 /help [命令] 查看详细说明\n"
+        "• 长按命令可快速复制\n"
+        "• 使用示例: /setchannel @频道名"
     )
-    await message.answer(admin_text, reply_markup=get_admin_keyboard(),reply_to_message_id=message.message_id)
-
+    
+    await message.answer(admin_text, reply_markup=get_admin_keyboard(), reply_to_message_id=message.message_id)
 
 # ========== 返回主菜单按钮处理 ==========
 @rate_limit(rate=5, per=60)
@@ -3976,7 +4006,7 @@ async def export_and_push_csv(
     file_name: str = None,
     target_date=None,
 ):
-    """导出群组数据为 CSV 并推送 - 基于 daily_statistics 表（完整修复版）"""
+    """导出群组数据为 CSV 并推送 - 基于 daily_statistics 表（完整版）"""
     await db.init_group(chat_id)
 
     # 规范 target_date
@@ -3995,7 +4025,7 @@ async def export_and_push_csv(
 
     activity_limits = await db.get_activity_limits_cached()
     
-    # 🎯 核心表头定义
+    # 🎯 修改表头，添加重置类型列
     headers = ["用户ID", "用户昵称", "重置类型"]
     for act in activity_limits.keys():
         headers.extend([f"{act}次数", f"{act}总时长"])
@@ -4005,18 +4035,20 @@ async def export_and_push_csv(
         "罚款总金额",
         "超时次数",
         "总超时时间",
-        "工作天数",      # 🆕 已包含
-        "工作时长",      # 🆕 已包含
+        "工作天数",
+        "工作时长",
     ])
     writer.writerow(headers)
 
+    # ✅ 保留第一个代码的数据存在性检查
     has_data = False
 
-    # 🎯 调用之前修复好的数据库查询函数
+    # 🎯 直接从 daily_statistics 获取数据
     group_stats = await db.get_group_statistics(chat_id, target_date)
 
     # 处理每个用户的数据
     for user_data in group_stats:
+        # 🆕 最小修复：只在需要的地方添加保护
         if not isinstance(user_data, dict):
             continue
 
@@ -4025,25 +4057,25 @@ async def export_and_push_csv(
         if not isinstance(user_activities, dict):
             user_activities = {}
 
-        # 检查是否包含有效数据（活动或罚款）
+        # ✅ 保留第一个代码的 has_data 检查逻辑
         total_count = user_data.get("total_activity_count", 0)
         total_time = user_data.get("total_accumulated_time", 0)
-        total_fines = user_data.get("total_fines", 0)
-        
-        if total_count > 0 or total_time > 0 or total_fines > 0:
+        if total_count > 0 or total_time > 0:
             has_data = True
 
-        # 🎯 软重置状态检查逻辑
+        # 🎯 第二个代码的改进：添加重置类型列
+        # 但 user_data 中可能没有 reset_type 字段，需要处理
         reset_type = "硬重置"
+        # 可以从数据库中查询软重置状态
         if target_date:
             try:
-                # 检查是否存在软重置标记行
+                # 检查是否有软重置标记
                 soft_reset_exists = await db.execute_with_retry(
                     "检查软重置",
                     """
                     SELECT 1 FROM daily_statistics 
                     WHERE chat_id = $1 AND user_id = $2 AND record_date = $3 
-                    AND activity_name = 'soft_reset'
+                    AND activity_name = 'soft_reset_flag' AND is_soft_reset = TRUE
                     LIMIT 1
                     """,
                     chat_id,
@@ -4056,16 +4088,15 @@ async def export_and_push_csv(
             except Exception as e:
                 logger.debug(f"检查软重置状态失败: {e}")
 
-        # 构建基础行数据
         row = [
             user_data.get("user_id", "未知"),
             user_data.get("nickname", "未知用户"),
-            reset_type
+            reset_type  # 🎯 新增重置类型列
         ]
 
-        # 填充各项动态配置的活动数据
         for act in activity_limits.keys():
             activity_info = user_activities.get(act, {})
+            # 🆕 安全获取活动数据
             if not isinstance(activity_info, dict):
                 activity_info = {}
 
@@ -4075,30 +4106,29 @@ async def export_and_push_csv(
             row.append(count)
             row.append(time_str)
 
-        # 格式化通用统计数据
         total_seconds_all = int(user_data.get("total_accumulated_time", 0) or 0)
         total_time_str = MessageFormatter.format_time_for_csv(total_seconds_all)
 
         overtime_seconds = int(user_data.get("total_overtime_time", 0) or 0)
         overtime_str = MessageFormatter.format_time_for_csv(overtime_seconds)
 
-        # 🆕 提取并格式化工作相关字段 (对应 database.py 中返回的 final_work_days 等)
+        # 🆕 安全获取工作相关字段
         work_days = user_data.get("work_days", 0)
-        work_hours_seconds = int(user_data.get("work_hours", 0) or 0)
-        work_hours_str = MessageFormatter.format_time_for_csv(work_hours_seconds)
+        work_hours = int(user_data.get("work_hours", 0) or 0)
+        work_hours_str = MessageFormatter.format_time_for_csv(work_hours)
 
         row.extend([
-            total_count,
+            total_count,  # ✅ 使用已经检查过的 total_count
             total_time_str,
             user_data.get("total_fines", 0),
             user_data.get("overtime_count", 0),
             overtime_str,
-            work_days,         # 写入 CSV
-            work_hours_str,    # 写入 CSV
+            work_days,  # 🆕 工作天数
+            work_hours_str,  # 🆕 工作时长
         ])
         writer.writerow(row)
 
-    # 数据空值检查
+    # ✅ 保留第一个代码的 no data 检查
     if not has_data:
         await bot.send_message(chat_id, "⚠️ 当前群组没有数据需要导出")
         return
@@ -4118,15 +4148,17 @@ async def export_and_push_csv(
         except:
             pass
 
+        # 🎯 改进描述
         caption = (
             f"📊 群组：<b>{chat_title}</b>\n"
             f"📅 统计日期：<code>{(target_date.strftime('%Y-%m-%d') if target_date else get_beijing_time().strftime('%Y-%m-%d'))}</code>\n"
             f"⏰ 导出时间：<code>{get_beijing_time().strftime('%Y-%m-%d %H:%M:%S')}</code>\n"
             f"{MessageFormatter.create_dashed_line()}\n"
-            f"💾 包含每个用户每日的活动统计及工作时长\n"
+            f"💾 包含每个用户每日的活动统计）\n"
         )
 
-        # 发送到请求数据的当前聊天
+        # ✅ 保留第一个代码的发送逻辑
+        # 先把文件发回到当前 chat（可选）
         try:
             csv_input_file = FSInputFile(temp_file, filename=file_name)
             await bot.send_document(
@@ -4135,8 +4167,9 @@ async def export_and_push_csv(
         except Exception as e:
             logger.warning(f"发送到当前聊天失败: {e}")
 
-        # 如果开启了推送功能，发送到管理员频道/群组
+        # ✅ 处理 to_admin_if_no_group 参数
         if to_admin_if_no_group:
+            # 使用统一的 NotificationService 推送到绑定的频道/群组/管理员
             await notification_service.send_document(
                 chat_id, FSInputFile(temp_file, filename=file_name), caption=caption
             )
