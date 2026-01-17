@@ -629,6 +629,11 @@ class PostgreSQLDatabase:
                 "CREATE INDEX IF NOT EXISTS idx_users_main ON users (chat_id, user_id)",
                 "CREATE INDEX IF NOT EXISTS idx_monthly_stats_main ON monthly_statistics (chat_id, user_id, statistic_date)",
                 "CREATE INDEX IF NOT EXISTS idx_daily_stats_main ON daily_statistics (chat_id, user_id, record_date, is_soft_reset)",
+                "CREATE INDEX IF NOT EXISTS idx_work_records_group_date ON work_records (chat_id, record_date)",
+                "CREATE INDEX IF NOT EXISTS idx_daily_stats_group_date ON daily_statistics (chat_id, record_date)",
+                "CREATE INDEX IF NOT EXISTS idx_activities_created_at ON user_activities (created_at)",
+                "CREATE INDEX IF NOT EXISTS idx_records_created_at ON work_records (created_at)",
+                "CREATE INDEX IF NOT EXISTS idx_users_activity_status ON users (chat_id, current_activity) WHERE current_activity IS NOT NULL"
             ]
 
             for index_sql in indexes:
