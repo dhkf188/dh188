@@ -634,6 +634,39 @@ async def can_perform_activities(chat_id: int, uid: int) -> tuple[bool, str]:
     return True, ""
 
 
+# 在 main.py 的 can_perform_activities 后面添加
+async def process_activity_start(message: types.Message, activity_name: str):
+    """处理点击键盘后的活动开始逻辑"""
+    chat_id = message.chat.id
+    uid = message.from_user.id
+
+    # 1. 权限检查 (你代码中已有的函数)
+    can_start, error_msg = await can_perform_activities(chat_id, uid)
+    if not can_start:
+        await message.answer(error_msg)
+        return
+
+    # 2. 检查是否已经在进行其他活动 (你代码中已有的函数)
+    is_active, current_act = await has_active_activity(chat_id, uid)
+    if is_active:
+        await message.answer(f"❌ 您当前正在进行【{current_act}】，请先点击回座！")
+        return
+
+    # 3. 检查次数限制 (你代码中已有的函数)
+    can_do, count, max_t = await check_activity_limit(chat_id, uid, activity_name)
+    if not can_do:
+        await message.answer(f"⚠️ 【{activity_name}】今日次数已达上限 ({count}/{max_t})")
+        return
+
+    # 4. 这里的逻辑参考你代码中处理特定指令打卡的部分
+    # 比如调用数据库开始记录，并发送成功消息
+    # ... (执行 db 相关的打卡操作)
+    await message.answer(
+        f"🚀 <b>{activity_name}</b> 已开始！\n结束请点击 <b>[✅ 回座]</b>",
+        parse_mode="HTML",
+    )
+
+
 async def calculate_fine(activity: str, overtime_minutes: float) -> int:
     """计算罚款金额"""
     fine_rates = await db.get_fine_rates_for_activity(activity)
@@ -3602,6 +3635,30 @@ async def handle_work_buttons(message: types.Message):
         await process_work_checkin(message, "work_start")
     elif text == "🔴 下班":
         await process_work_checkin(message, "work_end")
+
+
+# 在 main.py 的所有 Command 处理器之后添加
+@dp.message()
+async def handle_text_buttons(message: types.Message):
+    """拦截所有文本消息，匹配活动名称"""
+    if not message.text:
+        return
+
+    text = message.text
+
+    # 1. 过滤掉特殊功能按钮
+    if text in SPECIAL_BUTTONS:
+        # 如果是“✅ 回座”，这里可以手动调用回座逻辑
+        return
+
+    # 2. 获取活动列表并匹配
+    try:
+        activity_limits = await db.get_activity_limits_cached()
+        if text in activity_limits:
+            # 如果点击的是活动名称，则调用上面写好的处理函数
+            await process_activity_start(message, text)
+    except Exception as e:
+        logger.error(f"处理按钮点击失败: {e}")
 
 
 @admin_required
