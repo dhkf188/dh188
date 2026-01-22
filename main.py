@@ -636,35 +636,68 @@ async def can_perform_activities(chat_id: int, uid: int) -> tuple[bool, str]:
 
 # 在 main.py 的 can_perform_activities 后面添加
 async def process_activity_start(message: types.Message, activity_name: str):
-    """处理点击键盘后的活动开始逻辑"""
+    """处理点击键盘后的活动开始逻辑（已完善数据库和计时器逻辑）"""
     chat_id = message.chat.id
     uid = message.from_user.id
+    name = message.from_user.full_name
+    now = get_beijing_time()
 
-    # 1. 权限检查 (你代码中已有的函数)
-    can_start, error_msg = await can_perform_activities(chat_id, uid)
-    if not can_start:
-        await message.answer(error_msg)
-        return
+    # 使用用户锁防止并发重复打卡
+    user_lock = user_lock_manager.get_lock(chat_id, uid)
+    async with user_lock:
+        # 1. 权限检查 (是否上班)
+        can_start, error_msg = await can_perform_activities(chat_id, uid)
+        if not can_start:
+            await message.answer(error_msg)
+            return
 
-    # 2. 检查是否已经在进行其他活动 (你代码中已有的函数)
-    is_active, current_act = await has_active_activity(chat_id, uid)
-    if is_active:
-        await message.answer(f"❌ 您当前正在进行【{current_act}】，请先点击回座！")
-        return
+        # 2. 检查是否已经在进行其他活动
+        is_active, current_act = await has_active_activity(chat_id, uid)
+        if is_active:
+            await message.answer(
+                f"❌ 您当前正在进行【{current_act}】，请先点击回座！",
+                reply_markup=await get_main_keyboard(chat_id, await is_admin(uid)),
+            )
+            return
 
-    # 3. 检查次数限制 (你代码中已有的函数)
-    can_do, count, max_t = await check_activity_limit(chat_id, uid, activity_name)
-    if not can_do:
-        await message.answer(f"⚠️ 【{activity_name}】今日次数已达上限 ({count}/{max_t})")
-        return
+        # 3. 检查次数限制
+        can_do, count, max_t = await check_activity_limit(chat_id, uid, activity_name)
+        if not can_do:
+            await message.answer(
+                f"⚠️ 【{activity_name}】今日次数已达上限 ({count}/{max_t})",
+                reply_markup=await get_main_keyboard(chat_id, await is_admin(uid)),
+            )
+            return
 
-    # 4. 这里的逻辑参考你代码中处理特定指令打卡的部分
-    # 比如调用数据库开始记录，并发送成功消息
-    # ... (执行 db 相关的打卡操作)
-    await message.answer(
-        f"🚀 <b>{activity_name}</b> 已开始！\n结束请点击 <b>[✅ 回座]</b>",
-        parse_mode="HTML",
-    )
+        # 4. 🆕 执行数据库更新 (记录活动开始)
+        # 调用 database.py 中的 update_user_activity 方法
+        await db.update_user_activity(chat_id, uid, activity_name, str(now), name)
+
+        # 5. 🆕 获取活动时长限制并启动计时器
+        time_limit = await db.get_activity_time_limit(activity_name)
+        # 启动定时器 (activity_timer 会处理超时提醒)
+        await timer_manager.start_timer(chat_id, uid, activity_name, time_limit)
+
+        # 6. 🆕 发送正式的打卡消息并记录消息ID
+        # 使用 MessageFormatter 格式化消息内容
+        start_msg = MessageFormatter.format_activity_message(
+            uid,
+            name,
+            activity_name,
+            now.strftime("%m/%d %H:%M:%S"),
+            count + 1,
+            max_t,
+            time_limit,
+        )
+
+        sent_message = await message.answer(
+            start_msg,
+            reply_markup=await get_main_keyboard(chat_id, await is_admin(uid)),
+            parse_mode="HTML",
+        )
+
+        # 记录打卡消息 ID，以便后续通过“回座”按钮删除或修改此消息
+        await db.set_user_checkin_message_id(chat_id, uid, sent_message.message_id)
 
 
 async def calculate_fine(activity: str, overtime_minutes: float) -> int:
