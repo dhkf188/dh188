@@ -3405,7 +3405,7 @@ async def cmd_setworkfine(message: types.Message):
         迟到30分钟以上罚500
     """
     args = message.text.split()
-    
+
     # 1. 检查参数长度和格式
     if len(args) < 4 or (len(args) - 2) % 2 != 0:
         await message.answer(
@@ -3446,8 +3446,10 @@ async def cmd_setworkfine(message: types.Message):
 
         # 4. 生成反馈文本
         segments_text = "\n".join(
-            [f"⏰ 超过 {m} 分钟 → 💰 {a} 元"
-             for m, a in sorted(fine_segments.items(), key=lambda x: int(x[0]))]
+            [
+                f"⏰ 超过 {m} 分钟 → 💰 {a} 元"
+                for m, a in sorted(fine_segments.items(), key=lambda x: int(x[0]))
+            ]
         )
 
         type_text = "上班迟到" if checkin_type == "work_start" else "下班早退"
@@ -3643,7 +3645,6 @@ async def handle_rank(message: types.Message):
         await show_rank(message)
 
 
-@rate_limit(rate=5, per=60)
 async def handle_admin_panel_button(message: types.Message):
     """处理管理员面板按钮"""
     if not await is_admin(message.from_user.id):
@@ -3700,6 +3701,7 @@ async def handle_admin_panel_button(message: types.Message):
         "💡 <b>提示：</b>\n"
         "• /help [命令] 查看详情\n"
         "• 长按命令可复制\n"
+        # 修改这里，删除"id"字样
         "• 例: /setchannel @频道"
     )
 
@@ -4925,4 +4927,3 @@ if __name__ == "__main__":
         logger.info("机器人已被用户中断")
     except Exception as e:
         logger.error(f"机器人运行异常: {e}")
-
