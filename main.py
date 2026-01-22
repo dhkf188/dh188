@@ -6,7 +6,6 @@ from functools import wraps
 from datetime import datetime, timedelta, date
 from typing import Dict, Optional, List
 from contextlib import suppress
-from aiogram.types import BotCommand, BotCommandScopeAllChatAdministrators
 
 
 # 配置日志
@@ -65,6 +64,8 @@ from aiogram.types import (
     InlineKeyboardMarkup,
     InlineKeyboardButton,
     Message,
+    BotCommand,
+    BotCommandScopeAllChatAdministrators
 )
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
@@ -2602,6 +2603,9 @@ async def cmd_addactivity(message: types.Message):
         await db.update_activity_config(act, max_times, time_limit)
         await db.force_refresh_activity_cache()
 
+        # 刷新活动命令
+        asyncio.create_task(refresh_activity_commands())
+
         if existed:
             await message.answer(
                 f"✅ 已修改活动 <code>{act}</code>，次数上限 <code>{max_times}</code>，时间限制 <code>{time_limit}</code> 分钟",
@@ -2654,6 +2658,9 @@ async def cmd_delactivity(message: types.Message):
 
     await db.delete_activity_config(act)
     await db.force_refresh_activity_cache()  # 确保缓存立即更新
+
+    # 刷新活动命令
+    asyncio.create_task(refresh_activity_commands())
 
     await message.answer(
         f"✅ 活动 <code>{act}</code> 已删除",
@@ -4557,8 +4564,8 @@ async def start_health_server():
 
 # ========== 服务初始化 ==========
 async def initialize_services():
-    """初始化所有服务 - 最终完整版"""
-    logger.info("🔄 初始化服务...")
+    """初始化所有服务 - 最终完整整合版"""
+    logger.info("🔄 开始初始化全局服务...")
 
     try:
         # 1. 初始化数据库
@@ -4578,12 +4585,11 @@ async def initialize_services():
         bot = bot_manager.bot
         dp = bot_manager.dispatcher
 
-        # 🎯 关键：验证 bot 和 bot_manager 是否真的初始化了
+        # 🎯 关键：实例化并验证通知服务
         global notification_service
         notification_service = NotificationService(bot_manager=bot_manager)
-        notification_service.bot = bot
 
-        # 5. 🎯 核心修复：双重设置 NotificationService
+        # 5. 🎯 核心修复：显式设置 NotificationService 的依赖
         notification_service.bot_manager = bot_manager
         notification_service.bot = bot  # 直接使用上面获取的 bot 实例
 
@@ -4611,15 +4617,20 @@ async def initialize_services():
         dp.message.middleware(LoggingMiddleware())
         logger.info("✅ 日志中间件已注册")
 
-        # 10. 注册所有消息处理器
+        # 10. 注册所有消息处理器 (Handlers)
         await register_handlers()
         logger.info("✅ 消息处理器注册完成")
 
-        # 11. 恢复过期活动
+        # 11. 🎯 新增整合：注册所有活动斜杠命令 (Slash Commands)
+        # 放在 handler 注册之后，确保命令触发时逻辑已就绪
+        await register_activity_commands()
+        logger.info("✅ 活动斜杠命令注册完成")
+
+        # 12. 恢复过期活动
         recovered_count = await recover_expired_activities()
         logger.info(f"✅ 过期活动恢复完成: {recovered_count} 个活动已处理")
 
-        # 12. 🎯 最终健康检查
+        # 13. 🎯 最终健康检查
         health_status = await check_services_health()
         if all(health_status.values()):
             logger.info("🎉 所有服务初始化完成且健康")
@@ -4628,14 +4639,26 @@ async def initialize_services():
 
     except Exception as e:
         logger.error(f"❌ 服务初始化失败: {e}")
-        # 🎯 记录详细的调试信息
-        logger.error(f"调试信息 - bot: {bot}, bot_manager: {bot_manager}")
+        # 🎯 记录详细的调试信息以供排查
+        logger.error(f"调试信息 - bot 实例: {locals().get('bot', '未创建')}")
         logger.error(
-            f"调试信息 - notification_service.bot_manager: {getattr(notification_service, 'bot_manager', '未设置')}"
+            f"调试信息 - bot_manager 实例: {locals().get('bot_manager', '未创建')}"
         )
-        logger.error(
-            f"调试信息 - notification_service.bot: {getattr(notification_service, 'bot', '未设置')}"
+
+        # 使用 getattr 安全获取属性
+        ns_bm = (
+            getattr(notification_service, "bot_manager", "未设置")
+            if "notification_service" in globals()
+            else "未初始化"
         )
+        ns_bot = (
+            getattr(notification_service, "bot", "未设置")
+            if "notification_service" in globals()
+            else "未初始化"
+        )
+
+        logger.error(f"调试信息 - notification_service.bot_manager: {ns_bm}")
+        logger.error(f"调试信息 - notification_service.bot: {ns_bot}")
         raise
 
 
@@ -4749,6 +4772,172 @@ async def register_handlers():
     logger.info("✅ 所有消息处理器注册完成")
 
 
+async def register_activity_commands():
+    """注册所有活动斜杠命令"""
+    try:
+        # 获取所有活动配置
+        activity_limits = await db.get_activity_limits_cached()
+
+        if not activity_limits:
+            logger.warning("⚠️ 没有活动配置，无法注册活动命令")
+            return
+
+        # 动态创建活动命令处理器
+        for activity_name in activity_limits.keys():
+            # 为每个活动创建一个专用的命令处理器
+            handler = create_activity_command_handler(activity_name)
+
+            # 注册到 dispatcher
+            dp.message.register(handler, Command(activity_name))
+
+            logger.debug(f"✅ 注册活动命令: /{activity_name}")
+
+        # 更新 Telegram 的斜杠命令菜单
+        await update_telegram_commands_menu()
+
+        logger.info(f"✅ 已注册 {len(activity_limits)} 个活动命令")
+
+    except Exception as e:
+        logger.error(f"❌ 注册活动命令失败: {e}")
+
+
+def create_activity_command_handler(activity_name: str):
+    """为指定活动创建命令处理器"""
+
+    @rate_limit(rate=5, per=60)
+    @message_deduplicate
+    @with_retry(f"cmd_{activity_name}", max_retries=2)
+    @track_performance(f"cmd_{activity_name}")
+    async def activity_command_handler(message: types.Message):
+        """活动斜杠命令处理器"""
+        chat_id = message.chat.id
+        uid = message.from_user.id
+
+        logger.info(f"📱 用户 {uid} 使用斜杠命令开始活动: {activity_name}")
+
+        # 直接调用 start_activity 函数
+        await start_activity(message, activity_name)
+
+    return activity_command_handler
+
+
+async def update_telegram_commands_menu():
+    """更新 Telegram 的斜杠命令菜单"""
+    try:
+        # 获取所有活动配置
+        activity_limits = await db.get_activity_limits_cached()
+
+        if not activity_limits:
+            return
+
+        # 准备命令列表
+        commands = []
+
+        # 添加现有系统命令（保持原有菜单）
+        existing_commands = await bot.get_my_commands()
+        if existing_commands:
+            commands.extend(
+                [
+                    BotCommand(command=cmd.command, description=cmd.description)
+                    for cmd in existing_commands
+                ]
+            )
+
+        # 添加活动命令
+        for activity_name in activity_limits.keys():
+            # 创建简短描述（如果活动名是中文，可以截取部分）
+            description = (
+                f"开始{activity_name}"
+                if len(activity_name) <= 20
+                else f"{activity_name[:17]}..."
+            )
+
+            # 确保命令名是有效的（Telegram 命令只能包含小写字母、数字和下划线）
+            command_name = (
+                activity_name.lower()
+                .replace(" ", "_")
+                .replace("，", "_")
+                .replace(",", "_")
+            )
+
+            # 过滤掉无效字符
+            import re
+
+            command_name = re.sub(r"[^a-z0-9_]", "", command_name)
+
+            if command_name and len(command_name) <= 32:  # Telegram 命令最大长度
+                commands.append(
+                    BotCommand(
+                        command=command_name,
+                        description=description[:256],  # 描述最大长度
+                    )
+                )
+
+        # 去重（避免重复）
+        seen = set()
+        unique_commands = []
+        for cmd in commands:
+            if cmd.command not in seen:
+                seen.add(cmd.command)
+                unique_commands.append(cmd)
+
+        # 设置命令（Telegram 最多允许100个命令）
+        if unique_commands:
+            await bot.set_my_commands(commands=unique_commands[:100])  # 限制前100个
+            logger.info(f"✅ 已更新 Telegram 命令菜单: {len(unique_commands)} 个命令")
+
+    except Exception as e:
+        logger.error(f"❌ 更新 Telegram 命令菜单失败: {e}")
+
+
+async def refresh_activity_commands():
+    """刷新活动命令（当活动配置变化时调用）"""
+    try:
+        logger.info("🔄 正在刷新活动斜杠命令...")
+
+        # 注意：由于 aiogram 3.x 的动态注册特性，我们无法直接删除已注册的命令
+        # 但可以重新注册所有命令，新的命令会覆盖旧的
+
+        # 1. 先获取当前活动配置
+        old_activities = await db.get_activity_limits_cached()
+
+        # 2. 重新注册所有命令（会覆盖之前的）
+        await register_activity_commands()
+
+        # 3. 检查是否有删除的活动，可以清理缓存
+        new_activities = await db.get_activity_limits_cached()
+
+        # 记录变化
+        added = set(new_activities.keys()) - set(old_activities.keys())
+        removed = set(old_activities.keys()) - set(new_activities.keys())
+
+        if added:
+            logger.info(f"🆕 新增活动命令: {added}")
+        if removed:
+            logger.info(f"🗑️ 移除活动命令: {removed}")
+
+        logger.info("✅ 活动斜杠命令刷新完成")
+    except Exception as e:
+        logger.error(f"❌ 刷新活动命令失败: {e}")
+
+
+async def unregister_activity_commands():
+    """取消注册所有活动命令"""
+    try:
+        # 这里我们无法直接删除已注册的处理器，但可以在下次注册时覆盖
+        # 实际实现中，我们需要清除缓存并重新注册
+        activity_limits = await db.get_activity_limits_cached()
+
+        # 清除相关缓存
+        for activity_name in activity_limits.keys():
+            cache_key = f"activity_cmd_{activity_name}"
+            db._cache.pop(cache_key, None)
+
+        logger.info("✅ 已清理活动命令缓存")
+    except Exception as e:
+        logger.error(f"❌ 取消注册活动命令失败: {e}")
+
+
 # ========= render部署用的代码 ========
 async def external_keepalive():
     """外部保活服务调用 - 防止 Render 休眠"""
@@ -4835,14 +5024,13 @@ async def keepalive_loop():
 
 
 async def on_startup():
-    """启动时执行 - 包含全量快捷菜单"""
+    """启动时执行 - 包含全量快捷菜单及动态活动命令"""
     logger.info("🎯 机器人启动中...")
     try:
-        # 1. 定义【普通用户】菜单 (包含打卡指令)
+        # 1. 定义【普通用户】基础菜单 (包含打卡指令)
         user_commands = [
             BotCommand(command="workstart", description="🏢 上班打卡"),
             BotCommand(command="workend", description="🏠 下班打卡"),
-            BotCommand(command="ci", description="🏃 任务打卡 (格式: /ci 活动名)"),
             BotCommand(command="at", description="🔙 回座打卡 (格式: /at 备注)"),
             BotCommand(command="myinfo", description="👤 我的统计"),
             BotCommand(command="ranking", description="🏆 今日排行"),
@@ -4868,14 +5056,20 @@ async def on_startup():
         await bot_manager.bot.set_my_commands(
             commands=admin_commands, scope=BotCommandScopeAllChatAdministrators()
         )
-        logger.info("✅ 所有快捷指令（含打卡指令）已成功同步")
+        logger.info("✅ 基础快捷指令（含打卡指令）已成功同步")
 
-        # 4. 原有逻辑保持不变
+        # 4. 🎯 新增整合：更新动态活动斜杠命令菜单
+        # 此步骤通常用于从数据库读取活跃活动并追加到菜单中
+        await update_telegram_commands_menu()
+        logger.info("✅ 动态活动命令菜单已更新")
+
+        # 5. 原有通知逻辑
         logger.info("✅ 系统启动完成，准备接收消息")
         await send_startup_notification()
 
     except Exception as e:
-        logger.error(f"启动过程异常: {e}")
+        logger.error(f"❌ 启动过程异常: {e}")
+        # 建议此处记录堆栈追踪以便调试
         raise
 
 
