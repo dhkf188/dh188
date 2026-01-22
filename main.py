@@ -8,6 +8,7 @@ from typing import Dict, Optional, List
 from contextlib import suppress
 from aiogram.types import BotCommand, BotCommandScopeAllChatAdministrators
 
+
 # 配置日志
 logging.basicConfig(
     level=logging.INFO,
@@ -4816,17 +4817,38 @@ async def keepalive_loop():
 
 
 # ========== 启动流程 ==========
+# 可回退版本
+# async def on_startup():
+#     """启动时执行 - 更新版本"""
+#     logger.info("🎯 机器人启动中...")
+#     try:
+#         # 删除webhook确保使用轮询模式（已在bot_manager中处理）
+#         # 初始化服务（已在main中调用initialize_services）
+#         logger.info("✅ 系统启动完成，准备接收消息")
+
+#         # 发送启动通知给管理员
+#         await send_startup_notification()
+
+#     except Exception as e:
+#         logger.error(f"启动过程异常: {e}")
+#         raise
+
 async def on_startup():
-    """启动时执行 - 最终修复版"""
+    """启动时执行 - 包含全量快捷菜单"""
     logger.info("🎯 机器人启动中...")
     try:
-        # 1. 定义菜单
+        # 1. 定义【普通用户】菜单 (包含打卡指令)
         user_commands = [
-            BotCommand(command="start", description="🚀 启动并查看主菜单"),
+            BotCommand(command="workstart", description="🏢 上班打卡"),
+            BotCommand(command="workend", description="🏠 下班打卡"),
+            BotCommand(command="ci", description="🏃 任务打卡 (格式: /ci 活动名)"),
+            BotCommand(command="at", description="🔙 回座打卡 (格式: /at 备注)"),
             BotCommand(command="myinfo", description="👤 我的统计"),
             BotCommand(command="ranking", description="🏆 今日排行"),
+            BotCommand(command="help", description="❓ 使用帮助"),
         ]
         
+        # 2. 定义【管理员】专属菜单
         admin_commands = [
             BotCommand(command="actstatus", description="📊 活跃活动统计"),
             BotCommand(command="showsettings", description="⚙️ 查看系统配置"),
@@ -4834,27 +4856,28 @@ async def on_startup():
             BotCommand(command="worktime", description="⌚ 考勤时间设置"),
             BotCommand(command="export", description="📤 导出今日报表"),
             BotCommand(command="checkdb", description="🏥 数据库体检"),
-            BotCommand(command="help", description="❓ 指令详细说明"),
+            BotCommand(command="help", description="🛠 管理员全指令指南"),
         ]
 
-        # 2. 注册菜单
-        # 这里使用 bot_manager.bot 确保对象正确
+        # 3. 注册到 Telegram 服务器
+        # 注册默认菜单（所有人可见）
         await bot_manager.bot.set_my_commands(commands=user_commands)
         
-        # 关键修复点：使用 BotCommandScopeAllChatAdministrators()
+        # 覆盖管理员看到的菜单
         await bot_manager.bot.set_my_commands(
             commands=admin_commands, 
             scope=BotCommandScopeAllChatAdministrators() 
         )
-        logger.info("✅ 快捷指令菜单已成功同步至 Telegram")
+        logger.info("✅ 所有快捷指令（含打卡指令）已成功同步")
 
-        # 3. 原有逻辑保持不变
+        # 4. 原有逻辑保持不变
         logger.info("✅ 系统启动完成，准备接收消息")
         await send_startup_notification()
 
     except Exception as e:
         logger.error(f"启动过程异常: {e}")
         raise
+
 
 async def on_shutdown():
     """关闭时执行 - 更新版本"""
