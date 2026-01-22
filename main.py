@@ -1770,6 +1770,32 @@ async def cmd_help(message: types.Message):
     )
 
 
+# ========== 排行榜命令 ==========
+@rate_limit(rate=10, per=60)
+@track_performance("cmd_ranking")
+async def cmd_ranking(message: types.Message):
+    """显示排行榜"""
+    chat_id = message.chat.id
+    uid = message.from_user.id
+
+    user_lock = user_lock_manager.get_lock(chat_id, uid)
+    async with user_lock:
+        await show_rank(message)
+
+
+# ========== 我的统计命令 ==========
+@rate_limit(rate=10, per=60)
+@track_performance("cmd_myinfo")
+async def cmd_myinfo(message: types.Message):
+    """显示我的统计信息"""
+    chat_id = message.chat.id
+    uid = message.from_user.id
+
+    user_lock = user_lock_manager.get_lock(chat_id, uid)
+    async with user_lock:
+        await show_history(message)
+
+
 @rate_limit(rate=10, per=60)
 @message_deduplicate
 @with_retry("cmd_ci", max_retries=2)
@@ -4707,6 +4733,8 @@ async def register_handlers():
     dp.message.register(cmd_setsoftresettime, Command("setsoftresettime"))
     dp.message.register(cmd_softresettime, Command("softresettime"))
     dp.message.register(cmd_fix_message_refs, Command("fixmessages"))
+    dp.message.register(cmd_myinfo, Command("myinfo"))
+    dp.message.register(cmd_ranking, Command("ranking"))
 
     # 按钮处理器
     dp.message.register(
@@ -4833,6 +4861,7 @@ async def keepalive_loop():
 #         logger.error(f"启动过程异常: {e}")
 #         raise
 
+
 async def on_startup():
     """启动时执行 - 包含全量快捷菜单"""
     logger.info("🎯 机器人启动中...")
@@ -4847,7 +4876,7 @@ async def on_startup():
             BotCommand(command="ranking", description="🏆 今日排行"),
             BotCommand(command="help", description="❓ 使用帮助"),
         ]
-        
+
         # 2. 定义【管理员】专属菜单
         admin_commands = [
             BotCommand(command="actstatus", description="📊 活跃活动统计"),
@@ -4862,11 +4891,10 @@ async def on_startup():
         # 3. 注册到 Telegram 服务器
         # 注册默认菜单（所有人可见）
         await bot_manager.bot.set_my_commands(commands=user_commands)
-        
+
         # 覆盖管理员看到的菜单
         await bot_manager.bot.set_my_commands(
-            commands=admin_commands, 
-            scope=BotCommandScopeAllChatAdministrators() 
+            commands=admin_commands, scope=BotCommandScopeAllChatAdministrators()
         )
         logger.info("✅ 所有快捷指令（含打卡指令）已成功同步")
 
