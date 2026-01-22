@@ -6,7 +6,7 @@ from functools import wraps
 from datetime import datetime, timedelta, date
 from typing import Dict, Optional, List
 from contextlib import suppress
-from aiogram.types import BotCommand, BotCommandScopeAllChatAdmins
+from aiogram.types import BotCommand, BotCommandScopeAllChatAdministrators
 
 # 配置日志
 logging.basicConfig(
@@ -4817,18 +4817,16 @@ async def keepalive_loop():
 
 # ========== 启动流程 ==========
 async def on_startup():
-    """启动时执行 - 更新版本（含快捷菜单）"""
+    """启动时执行 - 最终修复版"""
     logger.info("🎯 机器人启动中...")
     try:
-        # 1. 设置快捷菜单 (Bot Command Menu)
-        # 普通用户菜单
+        # 1. 定义菜单
         user_commands = [
             BotCommand(command="start", description="🚀 启动并查看主菜单"),
             BotCommand(command="myinfo", description="👤 我的统计"),
             BotCommand(command="ranking", description="🏆 今日排行"),
         ]
         
-        # 管理员专用菜单
         admin_commands = [
             BotCommand(command="actstatus", description="📊 活跃活动统计"),
             BotCommand(command="showsettings", description="⚙️ 查看系统配置"),
@@ -4839,19 +4837,19 @@ async def on_startup():
             BotCommand(command="help", description="❓ 指令详细说明"),
         ]
 
-        # 注册到 Telegram
+        # 2. 注册菜单
+        # 这里使用 bot_manager.bot 确保对象正确
         await bot_manager.bot.set_my_commands(commands=user_commands)
+        
+        # 关键修复点：使用 BotCommandScopeAllChatAdministrators()
         await bot_manager.bot.set_my_commands(
             commands=admin_commands, 
-            scope=BotCommandScopeAllChatAdmins()  # 修正后的类名
+            scope=BotCommandScopeAllChatAdministrators() 
         )
-        logger.info("✅ 快捷指令菜单已同步至 Telegram")
+        logger.info("✅ 快捷指令菜单已成功同步至 Telegram")
 
-        # 2. 原有逻辑
-        # 初始化服务（已在main中调用initialize_services）
+        # 3. 原有逻辑保持不变
         logger.info("✅ 系统启动完成，准备接收消息")
-
-        # 发送启动通知给管理员
         await send_startup_notification()
 
     except Exception as e:
