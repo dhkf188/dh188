@@ -1426,6 +1426,21 @@ async def process_work_checkin(message: types.Message, checkin_type: str):
     uid = message.from_user.id
     name = message.from_user.full_name
 
+    if not await db.has_work_hours_enabled(chat_id):
+        await message.answer(
+            "❌ 本群组尚未启用上下班打卡功能\n\n"
+            "👑 请联系管理员使用命令：\n"
+            "<code>/setworktime 09:00 18:00</code>\n"
+            "设置上下班时间后即可使用",
+            reply_markup=await get_main_keyboard(
+                chat_id=chat_id, show_admin=await is_admin(uid)
+            ),
+            reply_to_message_id=message.message_id,
+            parse_mode="HTML",
+        )
+        logger.info(f"❌ 群组 {chat_id} 未启用上下班功能，用户 {uid} 尝试打卡")
+        return
+
     now = get_beijing_time()
     current_time = now.strftime("%H:%M")
 
@@ -3604,7 +3619,21 @@ async def handle_back_command(message: types.Message):
 @rate_limit(rate=5, per=60)
 async def handle_work_buttons(message: types.Message):
     """处理上下班按钮"""
+    chat_id = message.chat.id
+    uid = message.from_user.id
     text = message.text.strip()
+
+    # 🎯 新增检查：是否启用了上下班功能
+    if not await db.has_work_hours_enabled(chat_id):
+        await message.answer(
+            "❌ 本群组尚未启用上下班打卡功能\n\n" "👑 请联系管理员设置上下班时间",
+            reply_markup=await get_main_keyboard(
+                chat_id=chat_id, show_admin=await is_admin(uid)
+            ),
+            reply_to_message_id=message.message_id,
+        )
+        return
+
     if text == "🟢 上班":
         await process_work_checkin(message, "work_start")
     elif text == "🔴 下班":
