@@ -3779,10 +3779,17 @@ async def handle_all_text_messages(message: types.Message):
 
 
 # ========== 固定活动命令处理器 ==========
+@rate_limit(rate=10, per=60)
+@message_deduplicate
+@with_retry("fixed_activity", max_retries=2)
+@track_performance("fixed_activity")
 async def handle_fixed_activity(message: types.Message):
-    """处理固定活动命令"""
-    command = message.text.strip()
+    """处理固定活动命令（支持带用户名格式）"""
+    # 获取完整的命令文本
+    command_text = message.text.strip()
+    logger.info(f"🔍 收到命令: {command_text}")
 
+    # 定义活动映射
     activity_map = {
         "/wc": "小厕",
         "/bigwc": "大厕",
@@ -3791,15 +3798,22 @@ async def handle_fixed_activity(message: types.Message):
         "/rest": "休息",
     }
 
-    if command in activity_map:
-        act = activity_map[command]
-        logger.info(
-            f"🚀 用户 {message.from_user.id} 使用命令 {command} 开始活动: {act}"
-        )
+    # 1. 检查纯命令（如 /wc）
+    if command_text in activity_map:
+        act = activity_map[command_text]
+        logger.info(f"✅ 匹配到纯命令: {command_text} -> {act}")
         await start_activity(message, act)
-    else:
-        # 直接返回，让其他处理器处理
         return
+
+    # 2. 检查带用户名的命令（如 /wc@dh188_bot）
+    for cmd, act in activity_map.items():
+        if command_text.startswith(cmd + "@"):
+            logger.info(f"✅ 匹配到带用户名命令: {command_text} -> {act}")
+            await start_activity(message, act)
+            return
+
+    # 3. 都不是，让其他处理器处理
+    logger.warning(f"❌ 未匹配的命令: {command_text}")
 
 
 # ========== 用户功能 ==========
