@@ -55,7 +55,7 @@ from utils import (
 
 from bot_manager import bot_manager
 
-from aiogram import Bot, Dispatcher, types, BaseMiddleware
+from aiogram import Bot, Dispatcher, types, BaseMiddleware,F
 from aiogram.filters import Command
 from aiogram.types import (
     ReplyKeyboardMarkup,
@@ -178,32 +178,32 @@ async def calculate_work_fine(checkin_type: str, late_minutes: float) -> int:
 
 
 # ========== 通知函数 ==========
+# 修改 send_startup_notification 和 send_shutdown_notification 函数
+
+
 async def send_startup_notification():
-    """发送启动通知给管理员"""
+    """发送启动通知给管理员 - 安全版本"""
     try:
         startup_time = get_beijing_time().strftime("%Y-%m-%d %H:%M:%S")
         message = (
             f"🤖 <b>打卡机器人已启动</b>\n"
             f"⏰ 启动时间: <code>{startup_time}</code>\n"
-            f"🟢 系统状态: 正常运行\n"
-            f"💾 数据库: {'已连接' if await db.health_check() else '连接异常'}\n"
-            f"🔧 模式: 自动重连模式"
+            f"🟢 系统状态: 正常运行"
         )
 
         for admin_id in Config.ADMINS:
             try:
-                success = await bot_manager.send_message_with_retry(
-                    admin_id, message, parse_mode="HTML"
-                )
-                if success:
-                    logger.info(f"✅ 启动通知已发送给管理员 {admin_id}")
-                else:
-                    logger.error(f"❌ 发送启动通知给管理员 {admin_id} 失败")
+                # 尝试发送，但忽略权限错误
+                await bot.send_message(admin_id, message, parse_mode="HTML")
+                logger.info(f"✅ 启动通知已发送给管理员 {admin_id}")
             except Exception as e:
-                logger.error(f"发送启动通知给管理员 {admin_id} 失败: {e}")
+                if "can't initiate conversation" in str(e):
+                    logger.debug(f"管理员 {admin_id} 尚未启动对话，跳过通知")
+                else:
+                    logger.warning(f"发送启动通知给管理员 {admin_id} 失败: {e}")
 
     except Exception as e:
-        logger.error(f"发送启动通知失败: {e}")
+        logger.debug(f"发送启动通知失败: {e}")  # 改为debug级别
 
 
 async def send_shutdown_notification():
@@ -2645,7 +2645,7 @@ async def cmd_addactivity(message: types.Message):
     try:
         act, max_times, time_limit = args[1], int(args[2]), int(args[3])
         existed = await db.activity_exists(act)
-        
+
         # 执行数据库操作
         await db.update_activity_config(act, max_times, time_limit)
         await db.force_refresh_activity_cache()
@@ -2680,6 +2680,7 @@ async def cmd_addactivity(message: types.Message):
             f"❌ 添加/修改活动失败：{e}", reply_to_message_id=message.message_id
         )
 
+
 @admin_required
 @rate_limit(rate=3, per=30)
 async def cmd_delactivity(message: types.Message):
@@ -2710,7 +2711,7 @@ async def cmd_delactivity(message: types.Message):
         # 执行删除操作
         await db.delete_activity_config(act)
         await db.force_refresh_activity_cache()  # 确保缓存立即更新
-        
+
         # 异步刷新命令列表
         try:
             asyncio.create_task(refresh_activity_commands())
@@ -2720,12 +2721,14 @@ async def cmd_delactivity(message: types.Message):
 
         await message.answer(
             f"✅ 活动 <code>{act}</code> 已删除",
-            reply_markup=await get_main_keyboard(chat_id=message.chat.id, show_admin=True),
+            reply_markup=await get_main_keyboard(
+                chat_id=message.chat.id, show_admin=True
+            ),
             reply_to_message_id=message.message_id,
             parse_mode="HTML",
         )
         logger.info(f"删除活动: {act}")
-        
+
     except Exception as e:
         logger.error(f"删除活动失败: {e}")
         await message.answer(
