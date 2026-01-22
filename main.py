@@ -4942,17 +4942,7 @@ async def on_startup():
         # ⚠️ 这一点很重要，确保 /act_0 总是对应同一个活动
         sorted_activities = sorted(list(activity_limits.keys()))
 
-        # 3. 定义基础命令（保留常用功能）
-        commands_list = [
-            BotCommand(command="workstart", description="🟢 上班打卡"),
-            BotCommand(command="workend", description="🔴 下班打卡"),
-            BotCommand(command="at", description="✅ 立即回座"),
-            BotCommand(command="myinfo", description="📊 我的统计"),
-            BotCommand(command="ranking", description="🏆 今日排行"),
-            BotCommand(command="help", description="❓ 使用帮助"),
-        ]
-
-        # 4. 动态添加所有活动命令
+          # 3. 动态添加所有活动命令
         # Telegram 限制菜单最多显示 100 个命令
         for idx, act in enumerate(sorted_activities[:90]):
             # 生成命令：act_0, act_1, ...
@@ -4966,6 +4956,17 @@ async def on_startup():
                 desc = desc[:32]
 
             commands_list.append(BotCommand(command=command_name, description=desc))
+
+        # 4. 定义基础命令（保留常用功能）
+        commands_list = [
+            BotCommand(command="workstart", description="🟢 上班打卡"),
+            BotCommand(command="workend", description="🔴 下班打卡"),
+            BotCommand(command="at", description="✅ 立即回座"),
+            BotCommand(command="myinfo", description="📊 我的统计"),
+            BotCommand(command="ranking", description="🏆 今日排行"),
+            BotCommand(command="help", description="❓ 使用帮助"),
+        ]
+
 
         # 5. 注册到 Telegram 服务器
         # 注册用户菜单
