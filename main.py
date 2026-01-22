@@ -3779,15 +3779,10 @@ async def handle_all_text_messages(message: types.Message):
 
 
 # ========== 固定活动命令处理器 ==========
-@rate_limit(rate=10, per=60)
-@message_deduplicate
-@with_retry("fixed_activity", max_retries=2)
-@track_performance("fixed_activity")
 async def handle_fixed_activity(message: types.Message):
-    """处理固定活动命令（/wc, /bigwc, /eat, /smoke, /rest）"""
-    command = message.text.strip().lower()
+    """处理固定活动命令"""
+    command = message.text.strip()
 
-    # 映射命令到活动名称
     activity_map = {
         "/wc": "小厕",
         "/bigwc": "大厕",
@@ -3798,20 +3793,13 @@ async def handle_fixed_activity(message: types.Message):
 
     if command in activity_map:
         act = activity_map[command]
+        logger.info(
+            f"🚀 用户 {message.from_user.id} 使用命令 {command} 开始活动: {act}"
+        )
         await start_activity(message, act)
     else:
-        # 如果不是固定活动命令，显示帮助信息
-        await message.answer(
-            "❌ 未知指令\n\n"
-            "📋 可用活动指令：\n"
-            "• /wc - 🚽 小厕\n"
-            "• /bigwc - 🚻 大厕\n"
-            "• /eat - 🍚 吃饭\n"
-            "• /smoke - 🚬 抽烟\n"
-            "• /rest - 🛌 休息\n\n"
-            "💡 点击输入框右侧的 '/' 图标查看所有可用指令",
-            reply_to_message_id=message.message_id,
-        )
+        # 直接返回，让其他处理器处理
+        return
 
 
 # ========== 用户功能 ==========
@@ -4920,6 +4908,10 @@ async def on_startup():
             BotCommand(command="checkdb", description="🏥 数据库体检"),
             BotCommand(command="adminhelp", description="🛠 管理员全指令指南"),
         ]
+
+        logger.info(f"📋 要注册的命令列表: {[cmd.command for cmd in user_commands]}")
+        result = await bot_manager.bot.set_my_commands(commands=user_commands)
+        logger.info(f"✅ 命令注册结果: {result}")
 
         # 3. 注册到 Telegram 服务器
         # 注册默认菜单（所有人可见）
