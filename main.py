@@ -4699,40 +4699,46 @@ async def check_services_health():
     return health_status
 
 
-# [新增] 处理索引形式的活动命令 (如 /act_0)
+# [修改] 处理索引形式的活动命令 (如 /act_0)
 @rate_limit(rate=10, per=60)
 @message_deduplicate
 async def handle_indexed_activity_command(message: types.Message):
     """
     处理 /act_N 形式的动态命令
-    根据排序后的索引找到真实活动名称并打卡
+    原理：解析出真实活动名称（如"吃饭"），伪装成用户直接输入了该名称，
+    然后调用 handle_all_text_messages 进行处理。
     """
     try:
-        # 获取命令文本，例如 "/act_5"
+        # 1. 解析命令，例如 "/act_5" -> 5
         command = message.text.strip().lstrip("/")
-
-        # 提取索引数字
         if not command.startswith("act_"):
             return
-
+            
         try:
             index = int(command.split("_")[1])
         except (IndexError, ValueError):
             return
 
-        # 获取活动列表并排序（必须与 on_startup 中的排序逻辑完全一致）
+        # 2. 获取活动列表（确保排序逻辑一致）
         activity_limits = await db.get_activity_limits_cached()
         sorted_activities = sorted(list(activity_limits.keys()))
 
-        # 检查索引是否有效
+        # 3. 找到对应的活动名称
         if 0 <= index < len(sorted_activities):
             activity_name = sorted_activities[index]
-            # 执行打卡
-            await start_activity(message, activity_name)
+            
+            # [核心修改]：偷梁换柱
+            # 将消息内容修改为真实的活动名称（例如 "吃饭"）
+            message.text = activity_name
+            
+            # 直接调用通用的文本处理器，就像用户真的输入了"吃饭"一样
+            # 这样可以复用你现有的所有打卡逻辑（检查锁、记录时间等）
+            await handle_all_text_messages(message)
+            
         else:
             await message.answer(
-                "❌ 找不到该活动，可能是活动列表已变更，请联系管理员。",
-                reply_to_message_id=message.message_id,
+                "❌ 找不到该活动，列表可能已变更。",
+                reply_to_message_id=message.message_id
             )
 
     except Exception as e:
@@ -4752,7 +4758,7 @@ async def handle_generic_ci(message: types.Message):
 
 async def register_handlers():
     """注册所有消息处理器"""
-    # 1. 静态命令处理器
+    # --- 1. 静态命令 (保持不变) ---
     dp.message.register(cmd_start, Command("start"))
     dp.message.register(cmd_menu, Command("menu"))
     dp.message.register(cmd_help, Command("help"))
@@ -4787,20 +4793,22 @@ async def register_handlers():
     dp.message.register(cmd_setsoftresettime, Command("setsoftresettime"))
     dp.message.register(cmd_softresettime, Command("softresettime"))
     dp.message.register(cmd_fix_message_refs, Command("fixmessages"))
+
+    # --- 2. 特殊格式命令 (必须放在通用文本之前！！！) ---
     
-    # 2. 动态命令处理器 (必须放在通用文本之前！)
-    # 处理 /ci_xxx
-    dp.message.register(
-        handle_activity_command,
-        lambda message: message.text and message.text.startswith("/ci_"),
-    )
-    # [重点] 处理 /act_xxx (新增的功能)
+    # [重要] 新增的 act_ 命令必须在这里
     dp.message.register(
         handle_indexed_activity_command,
         lambda message: message.text and message.text.lstrip("/").startswith("act_")
     )
+    
+    # 原有的 ci_ 命令
+    dp.message.register(
+        handle_activity_command,
+        lambda message: message.text and message.text.startswith("/ci_"),
+    )
 
-    # 3. 具体按钮文字处理器
+    # --- 3. 按钮文字匹配 (保持不变) ---
     dp.message.register(
         handle_back_command,
         lambda message: message.text and message.text.strip() in ["✅ 回座", "回座"],
@@ -4830,19 +4838,18 @@ async def register_handlers():
         lambda message: message.text and message.text.strip() in ["🔙 返回主菜单"],
     )
 
-    # 4. [最后] 通用文本/兜底处理器
-    # 它会捕获所有上面没处理的文本，必须放在最后！
+    # --- 4. 通用文本/兜底 (必须放在最后！！！) ---
+    # 它会吃掉所有上面没匹配到的文本，所以一定要放最后
     dp.message.register(
         handle_all_text_messages, lambda message: message.text and message.text.strip()
     )
 
-    # 5. 回调处理器 (点击内联按钮)
+    # --- 5. 回调处理器 ---
     dp.callback_query.register(
         handle_quick_back, lambda c: c.data.startswith("quick_back:")
     )
 
     logger.info("✅ 所有消息处理器注册完成")
-
 
 
 
