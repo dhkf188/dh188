@@ -6,9 +6,7 @@ from functools import wraps
 from datetime import datetime, timedelta, date
 from typing import Dict, Optional, List
 from contextlib import suppress
-from aiogram.types import BotCommand, BotCommandScopeChatAdmins # 确保导入这两个类
-
-
+from aiogram.types import BotCommand, BotCommandScopeAllChatAdmins
 
 # 配置日志
 logging.basicConfig(
@@ -4818,20 +4816,19 @@ async def keepalive_loop():
 
 
 # ========== 启动流程 ==========
-
 async def on_startup():
-    """启动时执行 - 更新版本"""
+    """启动时执行 - 更新版本（含快捷菜单）"""
     logger.info("🎯 机器人启动中...")
     try:
-        # --- 1. 新增：注册指令菜单 (不影响原有逻辑) ---
-        # 普通用户看到的菜单
+        # 1. 设置快捷菜单 (Bot Command Menu)
+        # 普通用户菜单
         user_commands = [
-            BotCommand(command="start", description="🚀 启动主菜单"),
+            BotCommand(command="start", description="🚀 启动并查看主菜单"),
             BotCommand(command="myinfo", description="👤 我的统计"),
             BotCommand(command="ranking", description="🏆 今日排行"),
         ]
         
-        # 管理员看到的菜单 (更专业、全面)
+        # 管理员专用菜单
         admin_commands = [
             BotCommand(command="actstatus", description="📊 活跃活动统计"),
             BotCommand(command="showsettings", description="⚙️ 查看系统配置"),
@@ -4842,26 +4839,24 @@ async def on_startup():
             BotCommand(command="help", description="❓ 指令详细说明"),
         ]
 
-        # 提交给 Telegram 服务器
+        # 注册到 Telegram
         await bot_manager.bot.set_my_commands(commands=user_commands)
         await bot_manager.bot.set_my_commands(
             commands=admin_commands, 
-            scope=BotCommandScopeChatAdmins()
+            scope=BotCommandScopeAllChatAdmins()  # 修正后的类名
         )
-        logger.info("✅ 快捷指令菜单已成功同步至 Telegram")
-        # ------------------------------------------
+        logger.info("✅ 快捷指令菜单已同步至 Telegram")
 
-        # 原有逻辑：删除webhook确保使用轮询模式（已在bot_manager中处理）
-        # 原有逻辑：初始化服务（已在main中调用initialize_services）
+        # 2. 原有逻辑
+        # 初始化服务（已在main中调用initialize_services）
         logger.info("✅ 系统启动完成，准备接收消息")
 
-        # 原有逻辑：发送启动通知给管理员
+        # 发送启动通知给管理员
         await send_startup_notification()
 
     except Exception as e:
         logger.error(f"启动过程异常: {e}")
         raise
-
 
 async def on_shutdown():
     """关闭时执行 - 更新版本"""
