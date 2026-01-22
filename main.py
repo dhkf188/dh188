@@ -3772,7 +3772,6 @@ async def handle_all_text_messages(message: types.Message):
 
 
 # ========== 动态菜单命令处理器 ==========
-# ========== 动态菜单命令处理器 ==========
 @rate_limit(rate=10, per=60)
 @message_deduplicate
 async def handle_indexed_activity_command(message: types.Message):
@@ -3781,29 +3780,59 @@ async def handle_indexed_activity_command(message: types.Message):
     根据排序后的索引找到真实活动名称并打卡
     """
     try:
-        command = message.text.strip().lstrip("/")
+        logger.info(f"📥 收到命令消息: {message.text} (用户: {message.from_user.id})")
+
+        # 清理命令文本（可能包含机器人用户名）
+        command_text = message.text.strip()
+
+        # 移除可能的机器人用户名（如 /act_0@your_bot_name）
+        if "@" in command_text:
+            command_text = command_text.split("@")[0]
+
+        # 确保以 / 开头
+        if not command_text.startswith("/"):
+            command_text = "/" + command_text
+
+        # 提取命令部分（去掉 /）
+        command = command_text[1:]
+
+        logger.info(f"🔍 解析后命令: {command}")
+
         if not command.startswith("act_"):
+            logger.warning(f"不是 act_ 开头的命令: {command}")
             return
 
         try:
             index = int(command.split("_")[1])
-        except (IndexError, ValueError):
-            return
-
-        # 从全局映射表获取活动名
-        activity_name = activity_cmd_map.get(f"act_{index}")
-
-        if not activity_name:
+        except (IndexError, ValueError) as e:
+            logger.error(f"解析索引失败: {command}, 错误: {e}")
             await message.answer(
-                "❌ 找不到该活动，可能是活动列表已变更，请尝试重新输入 /start 刷新菜单。",
+                f"❌ 命令格式错误: {message.text}",
                 reply_to_message_id=message.message_id,
             )
             return
 
-        logger.info(f"📥 菜单快捷打卡: {activity_name} (用户: {message.from_user.id})")
+        logger.info(f"📊 找到索引: {index}")
+
+        # 从全局映射表获取活动名
+        cmd_key = f"act_{index}"
+        activity_name = activity_cmd_map.get(cmd_key)
+
+        logger.info(f"🔍 映射查找: {cmd_key} -> {activity_name}")
+
+        if not activity_name:
+            logger.warning(f"映射表中找不到 {cmd_key}，当前映射表: {activity_cmd_map}")
+            await message.answer(
+                "❌ 找不到该活动，可能是活动列表已变更，请尝试重新输入 /start 或 /menu。",
+                reply_to_message_id=message.message_id,
+            )
+            return
+
+        logger.info(f"🎯 准备打卡活动: {activity_name} (用户: {message.from_user.id})")
 
         # 检查活动是否存在
         if not await db.activity_exists(activity_name):
+            logger.warning(f"活动不存在于数据库: {activity_name}")
             await message.answer(
                 f"❌ 活动 '{activity_name}' 不存在或已被删除",
                 reply_to_message_id=message.message_id,
@@ -3815,10 +3844,11 @@ async def handle_indexed_activity_command(message: types.Message):
             return
 
         # 执行打卡 - 调用你现有的 start_activity 函数
+        logger.info(f"🚀 开始执行打卡: {activity_name}")
         await start_activity(message, activity_name)
 
     except Exception as e:
-        logger.error(f"处理索引活动命令失败: {e}")
+        logger.error(f"❌ 处理索引活动命令失败: {e}", exc_info=True)
         await message.answer(
             "❌ 处理快捷命令时出错，请尝试手动输入活动名称。",
             reply_to_message_id=message.message_id,
@@ -4764,11 +4794,13 @@ async def register_handlers():
     dp.message.register(cmd_softresettime, Command("softresettime"))
     dp.message.register(cmd_fix_message_refs, Command("fixmessages"))
 
-    # 🆕 动态菜单命令处理器（必须放在通用文本处理器之前！）
-    dp.message.register(
-        handle_indexed_activity_command,
-        lambda message: message.text and message.text.lstrip("/").startswith("act_"),
-    )
+    # 🆕 注册刷新菜单命令（如果添加了的话）
+    # dp.message.register(cmd_refresh_menu, Command("refreshmenu"))
+
+    # 🆕【关键修改】使用 Command 对象注册动态命令
+    # 注册所有可能的 /act_* 命令
+    for cmd_key in activity_cmd_map.keys():
+        dp.message.register(handle_indexed_activity_command, Command(cmd_key))
 
     # 按钮处理器
     dp.message.register(
@@ -4800,7 +4832,7 @@ async def register_handlers():
         lambda message: message.text and message.text.strip() in ["🔙 返回主菜单"],
     )
 
-    # 📌【重要】通用文本/兜底处理器 - 必须放在最后！
+    # 📌 通用文本/兜底处理器 - 必须放在最后！
     dp.message.register(
         handle_all_text_messages, lambda message: message.text and message.text.strip()
     )
@@ -4908,7 +4940,17 @@ async def on_startup():
         activity_limits = await db.get_activity_limits_cached()
         sorted_acts = sorted(list(activity_limits.keys()))
 
-        # 2. 准备固定基础命令
+        # 2. 动态生成活动指令
+        activity_cmd_map.clear()
+        for idx, act_name in enumerate(sorted_acts[:90]):  # Telegram上限100个命令
+            cmd_key = f"act_{idx}"
+            activity_cmd_map[cmd_key] = act_name
+            # 为所有用户添加活动指令
+            commands_list.append(
+                BotCommand(command=cmd_key, description=f"📍 {act_name}")
+            )
+
+        # 3. 准备固定基础命令
         commands_list = [
             BotCommand(command="start", description="🚀 启动机器人"),
             BotCommand(command="menu", description="📋 显示菜单"),
@@ -4921,21 +4963,20 @@ async def on_startup():
             BotCommand(command="rank", description="🏆 排行榜"),
         ]
 
-        # 3. 动态生成活动指令
-        activity_cmd_map.clear()
-        for idx, act_name in enumerate(sorted_acts[:90]):  # Telegram上限100个命令
-            cmd_key = f"act_{idx}"
-            activity_cmd_map[cmd_key] = act_name
-            # 为所有用户添加活动指令
-            commands_list.append(
-                BotCommand(command=cmd_key, description=f"📍 {act_name}")
-            )
-
         # 4. 注册命令到所有用户
         await bot.set_my_commands(commands=commands_list)
         logger.info(f"✅ 成功注册 {len(activity_cmd_map)} 个动态活动指令")
 
-        # 5. 发送启动通知（保持原有功能）
+        # 5. 测试：显示当前注册的命令
+        try:
+            registered_commands = await bot.get_my_commands()
+            logger.info(
+                f"📋 已注册命令: {[cmd.command for cmd in registered_commands]}"
+            )
+        except Exception as e:
+            logger.error(f"获取注册命令失败: {e}")
+
+        # 6. 发送启动通知
         await send_startup_notification()
 
     except Exception as e:
