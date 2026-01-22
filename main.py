@@ -4699,46 +4699,45 @@ async def check_services_health():
     return health_status
 
 
-# [修改] 处理索引形式的活动命令 (如 /act_0)
+# [新增] 处理索引形式的活动命令 (如 /act_0)
 @rate_limit(rate=10, per=60)
 @message_deduplicate
 async def handle_indexed_activity_command(message: types.Message):
     """
     处理 /act_N 形式的动态命令
-    原理：解析出真实活动名称（如"吃饭"），伪装成用户直接输入了该名称，
-    然后调用 handle_all_text_messages 进行处理。
+    根据排序后的索引找到真实活动名称并打卡
     """
     try:
-        # 1. 解析命令，例如 "/act_5" -> 5
         command = message.text.strip().lstrip("/")
         if not command.startswith("act_"):
             return
-            
+
         try:
             index = int(command.split("_")[1])
         except (IndexError, ValueError):
             return
 
-        # 2. 获取活动列表（确保排序逻辑一致）
         activity_limits = await db.get_activity_limits_cached()
         sorted_activities = sorted(list(activity_limits.keys()))
 
-        # 3. 找到对应的活动名称
         if 0 <= index < len(sorted_activities):
             activity_name = sorted_activities[index]
-            
-            # [核心修改]：偷梁换柱
-            # 将消息内容修改为真实的活动名称（例如 "吃饭"）
-            message.text = activity_name
-            
-            # 直接调用通用的文本处理器，就像用户真的输入了"吃饭"一样
-            # 这样可以复用你现有的所有打卡逻辑（检查锁、记录时间等）
-            await handle_all_text_messages(message)
-            
+
+            # [新增优化]：先检查用户是否已上班，防止非法打卡
+            user_status = await db.get_user_status(message.from_user.id)
+            if not user_status or not user_status.get("is_working"):
+                await message.answer("⚠️ 请先点击“🟢 上班”后再进行活动打卡。")
+                return
+
+            logger.info(
+                f"📥 菜单快捷打卡: {activity_name} (用户: {message.from_user.id})"
+            )
+            # 执行打卡
+            await start_activity(message, activity_name)
         else:
             await message.answer(
-                "❌ 找不到该活动，列表可能已变更。",
-                reply_to_message_id=message.message_id
+                "❌ 找不到该活动，可能是活动列表已变更，请尝试重新输入 /start 刷新菜单。",
+                reply_to_message_id=message.message_id,
             )
 
     except Exception as e:
@@ -4758,7 +4757,7 @@ async def handle_generic_ci(message: types.Message):
 
 async def register_handlers():
     """注册所有消息处理器"""
-    # --- 1. 静态命令 (保持不变) ---
+    # 1. 静态命令处理器
     dp.message.register(cmd_start, Command("start"))
     dp.message.register(cmd_menu, Command("menu"))
     dp.message.register(cmd_help, Command("help"))
@@ -4794,21 +4793,19 @@ async def register_handlers():
     dp.message.register(cmd_softresettime, Command("softresettime"))
     dp.message.register(cmd_fix_message_refs, Command("fixmessages"))
 
-    # --- 2. 特殊格式命令 (必须放在通用文本之前！！！) ---
-    
-    # [重要] 新增的 act_ 命令必须在这里
-    dp.message.register(
-        handle_indexed_activity_command,
-        lambda message: message.text and message.text.lstrip("/").startswith("act_")
-    )
-    
-    # 原有的 ci_ 命令
+    # 2. 动态命令处理器 (必须放在通用文本之前！)
+    # 处理 /ci_xxx
     dp.message.register(
         handle_activity_command,
         lambda message: message.text and message.text.startswith("/ci_"),
     )
+    # [重点] 处理 /act_xxx (新增的功能)
+    dp.message.register(
+        handle_indexed_activity_command,
+        lambda message: message.text and message.text.lstrip("/").startswith("act_"),
+    )
 
-    # --- 3. 按钮文字匹配 (保持不变) ---
+    # 3. 具体按钮文字处理器
     dp.message.register(
         handle_back_command,
         lambda message: message.text and message.text.strip() in ["✅ 回座", "回座"],
@@ -4838,19 +4835,18 @@ async def register_handlers():
         lambda message: message.text and message.text.strip() in ["🔙 返回主菜单"],
     )
 
-    # --- 4. 通用文本/兜底 (必须放在最后！！！) ---
-    # 它会吃掉所有上面没匹配到的文本，所以一定要放最后
+    # 4. [最后] 通用文本/兜底处理器
+    # 它会捕获所有上面没处理的文本，必须放在最后！
     dp.message.register(
         handle_all_text_messages, lambda message: message.text and message.text.strip()
     )
 
-    # --- 5. 回调处理器 ---
+    # 5. 回调处理器 (点击内联按钮)
     dp.callback_query.register(
         handle_quick_back, lambda c: c.data.startswith("quick_back:")
     )
 
     logger.info("✅ 所有消息处理器注册完成")
-
 
 
 # ========= render部署用的代码 ========
@@ -4949,7 +4945,17 @@ async def on_startup():
         # ⚠️ 这一点很重要，确保 /act_0 总是对应同一个活动
         sorted_activities = sorted(list(activity_limits.keys()))
 
-          # 3. 动态添加所有活动命令
+        # 3. 定义基础命令（保留常用功能）
+        commands_list = [
+            BotCommand(command="workstart", description="🟢 上班打卡"),
+            BotCommand(command="workend", description="🔴 下班打卡"),
+            BotCommand(command="at", description="✅ 立即回座"),
+            BotCommand(command="myinfo", description="📊 我的统计"),
+            BotCommand(command="ranking", description="🏆 今日排行"),
+            BotCommand(command="help", description="❓ 使用帮助"),
+        ]
+
+        # 4. 动态添加所有活动命令
         # Telegram 限制菜单最多显示 100 个命令
         for idx, act in enumerate(sorted_activities[:90]):
             # 生成命令：act_0, act_1, ...
@@ -4963,17 +4969,6 @@ async def on_startup():
                 desc = desc[:32]
 
             commands_list.append(BotCommand(command=command_name, description=desc))
-
-        # 4. 定义基础命令（保留常用功能）
-        commands_list = [
-            BotCommand(command="workstart", description="🟢 上班打卡"),
-            BotCommand(command="workend", description="🔴 下班打卡"),
-            BotCommand(command="at", description="✅ 立即回座"),
-            BotCommand(command="myinfo", description="📊 我的统计"),
-            BotCommand(command="ranking", description="🏆 今日排行"),
-            BotCommand(command="help", description="❓ 使用帮助"),
-        ]
-
 
         # 5. 注册到 Telegram 服务器
         # 注册用户菜单
