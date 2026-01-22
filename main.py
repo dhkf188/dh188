@@ -65,7 +65,7 @@ from aiogram.types import (
     InlineKeyboardButton,
     Message,
     BotCommand,
-    BotCommandScopeAllChatAdministrators
+    BotCommandScopeAllChatAdministrators,
 )
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
@@ -4822,69 +4822,92 @@ def create_activity_command_handler(activity_name: str):
 
 
 async def update_telegram_commands_menu():
-    """更新 Telegram 的斜杠命令菜单"""
+    """更新 Telegram 的斜杠命令菜单 - 专门用于添加活动命令"""
     try:
         # 获取所有活动配置
         activity_limits = await db.get_activity_limits_cached()
 
         if not activity_limits:
+            logger.warning("⚠️ 没有活动配置，无法更新活动命令")
             return
 
-        # 准备命令列表
-        commands = []
+        # 1. 先获取当前菜单（基础命令）
+        current_commands = await bot.get_my_commands()
 
-        # 添加现有系统命令（保持原有菜单）
-        existing_commands = await bot.get_my_commands()
-        if existing_commands:
-            commands.extend(
-                [
-                    BotCommand(command=cmd.command, description=cmd.description)
-                    for cmd in existing_commands
-                ]
-            )
+        # 2. 过滤掉可能重复的活动命令（避免重复添加）
+        # 找出当前已经是活动命令的那些
+        existing_activity_commands = set()
+        for cmd in current_commands:
+            # 检查是否是活动命令（可以通过描述或命令名判断）
+            if cmd.description.startswith("开始") or cmd.description.startswith("打卡"):
+                existing_activity_commands.add(cmd.command)
 
-        # 添加活动命令
+        # 3. 只保留基础命令（移除旧的活动命令）
+        base_commands = [
+            cmd
+            for cmd in current_commands
+            if cmd.command not in existing_activity_commands
+            and cmd.command
+            not in [
+                "actstatus",
+                "showsettings",
+                "finesstatus",
+                "worktime",
+                "export",
+                "checkdb",
+            ]  # 保留这些管理员命令
+        ]
+
+        # 4. 添加新的活动命令
+        activity_commands = []
         for activity_name in activity_limits.keys():
-            # 创建简短描述（如果活动名是中文，可以截取部分）
-            description = (
-                f"开始{activity_name}"
-                if len(activity_name) <= 20
-                else f"{activity_name[:17]}..."
-            )
+            # 创建命令名
+            import re
 
-            # 确保命令名是有效的（Telegram 命令只能包含小写字母、数字和下划线）
             command_name = (
                 activity_name.lower()
                 .replace(" ", "_")
                 .replace("，", "_")
                 .replace(",", "_")
             )
-
-            # 过滤掉无效字符
-            import re
-
             command_name = re.sub(r"[^a-z0-9_]", "", command_name)
 
-            if command_name and len(command_name) <= 32:  # Telegram 命令最大长度
-                commands.append(
-                    BotCommand(
-                        command=command_name,
-                        description=description[:256],  # 描述最大长度
-                    )
-                )
+            if not command_name or len(command_name) > 32:
+                continue
 
-        # 去重（避免重复）
+            # 跳过已存在的活动命令
+            if command_name in existing_activity_commands:
+                continue
+
+            # 创建描述
+            if len(activity_name) <= 6:
+                description = f"开始{activity_name}"
+            else:
+                description = f"打卡{activity_name[:5]}..."
+
+            activity_commands.append(
+                BotCommand(command=command_name, description=description[:256])
+            )
+
+        # 5. 合并命令
+        all_commands = base_commands + activity_commands
+
+        # 6. 去重
         seen = set()
         unique_commands = []
-        for cmd in commands:
+        for cmd in all_commands:
             if cmd.command not in seen:
                 seen.add(cmd.command)
                 unique_commands.append(cmd)
 
-        # 设置命令（Telegram 最多允许100个命令）
+        # 7. 设置新菜单
         if unique_commands:
-            await bot.set_my_commands(commands=unique_commands[:100])  # 限制前100个
-            logger.info(f"✅ 已更新 Telegram 命令菜单: {len(unique_commands)} 个命令")
+            await bot.set_my_commands(commands=unique_commands[:50])  # 限制50个
+            logger.info(
+                f"✅ 已更新命令菜单: {len(base_commands)}个基础命令 + {len(activity_commands)}个活动命令"
+            )
+        else:
+            logger.warning("⚠️ 更新后没有命令可设置")
 
     except Exception as e:
         logger.error(f"❌ 更新 Telegram 命令菜单失败: {e}")
@@ -4895,30 +4918,50 @@ async def refresh_activity_commands():
     try:
         logger.info("🔄 正在刷新活动斜杠命令...")
 
-        # 注意：由于 aiogram 3.x 的动态注册特性，我们无法直接删除已注册的命令
-        # 但可以重新注册所有命令，新的命令会覆盖旧的
-
         # 1. 先获取当前活动配置
         old_activities = await db.get_activity_limits_cached()
 
-        # 2. 重新注册所有命令（会覆盖之前的）
+        # 2. 重新注册所有命令处理器（会覆盖之前的）
         await register_activity_commands()
 
-        # 3. 检查是否有删除的活动，可以清理缓存
+        # 3. 🎯 关键：更新Telegram的斜杠命令菜单
+        await update_telegram_commands_menu()
+
+        logger.info("✅ 已更新命令菜单")
+
+        # 4. 获取新的活动配置
         new_activities = await db.get_activity_limits_cached()
 
-        # 记录变化
+        # 5. 记录变化
         added = set(new_activities.keys()) - set(old_activities.keys())
         removed = set(old_activities.keys()) - set(new_activities.keys())
 
         if added:
             logger.info(f"🆕 新增活动命令: {added}")
+            # 发送通知（可选）
+            for admin_id in Config.ADMINS:
+                try:
+                    await bot_manager.send_message_with_retry(
+                        admin_id,
+                        f"✅ 已添加活动: {', '.join(added)}\n"
+                        f"💡 用户现在可以使用 / 命令开始这些活动",
+                        parse_mode="HTML",
+                    )
+                except:
+                    pass
+
         if removed:
             logger.info(f"🗑️ 移除活动命令: {removed}")
 
         logger.info("✅ 活动斜杠命令刷新完成")
+
     except Exception as e:
         logger.error(f"❌ 刷新活动命令失败: {e}")
+        # 尝试重新初始化
+        try:
+            await register_activity_commands()
+        except Exception as e2:
+            logger.error(f"❌ 重新初始化也失败: {e2}")
 
 
 async def unregister_activity_commands():
@@ -5048,28 +5091,100 @@ async def on_startup():
             BotCommand(command="help", description="🛠 管理员全指令指南"),
         ]
 
-        # 3. 注册到 Telegram 服务器
-        # 注册默认菜单（所有人可见）
-        await bot_manager.bot.set_my_commands(commands=user_commands)
+        # 🎯 修改点1：先更新动态活动命令（这个函数需要改进）
+        logger.info("🔄 正在合并基础命令和活动命令...")
+
+        # 3. 🎯 修改：先调用 update_telegram_commands_menu() 但修改它的实现
+        # 或者直接在这里合并命令
+
+        # 获取活动命令
+        all_activity_commands = []
+        try:
+            activity_limits = await db.get_activity_limits_cached()
+            logger.info(
+                f"📊 发现 {len(activity_limits)} 个活动: {list(activity_limits.keys())}"
+            )
+
+            for activity_name in activity_limits.keys():
+                # 创建命令名（确保符合Telegram规范）
+                import re
+
+                command_name = re.sub(
+                    r"[^a-zA-Z0-9_]", "", activity_name.lower().replace(" ", "_")
+                )
+
+                if not command_name:
+                    command_name = f"act_{abs(hash(activity_name)) % 10000}"
+
+                # 创建描述
+                if len(activity_name) <= 6:
+                    description = f"开始{activity_name}"
+                else:
+                    description = f"打卡{activity_name[:5]}..."
+
+                # 限制长度
+                command_name = command_name[:32]
+                description = description[:256]
+
+                all_activity_commands.append(
+                    BotCommand(command=command_name, description=description)
+                )
+                logger.debug(f"📝 添加活动命令: /{command_name} -> {description}")
+        except Exception as e:
+            logger.error(f"❌ 获取活动命令失败: {e}")
+
+        # 4. 合并基础命令和活动命令
+        all_user_commands = (
+            user_commands + all_activity_commands[:30]
+        )  # Telegram最多50个命令
+
+        # 去重
+        seen_commands = set()
+        final_user_commands = []
+        for cmd in all_user_commands:
+            if cmd.command not in seen_commands:
+                seen_commands.add(cmd.command)
+                final_user_commands.append(cmd)
+
+        # 5. 注册合并后的菜单到 Telegram 服务器
+        logger.info(f"📋 注册 {len(final_user_commands)} 个用户命令")
+        await bot_manager.bot.set_my_commands(commands=final_user_commands)
+
+        # 合并管理员命令和活动命令
+        all_admin_commands = (
+            admin_commands + all_activity_commands[:20]
+        )  # 管理员也看到活动命令
+
+        # 去重
+        seen_admin_commands = set()
+        final_admin_commands = []
+        for cmd in all_admin_commands:
+            if cmd.command not in seen_admin_commands:
+                seen_admin_commands.add(cmd.command)
+                final_admin_commands.append(cmd)
 
         # 覆盖管理员看到的菜单
+        logger.info(f"📋 注册 {len(final_admin_commands)} 个管理员命令")
         await bot_manager.bot.set_my_commands(
-            commands=admin_commands, scope=BotCommandScopeAllChatAdministrators()
+            commands=final_admin_commands, scope=BotCommandScopeAllChatAdministrators()
         )
-        logger.info("✅ 基础快捷指令（含打卡指令）已成功同步")
 
-        # 4. 🎯 新增整合：更新动态活动斜杠命令菜单
-        # 此步骤通常用于从数据库读取活跃活动并追加到菜单中
-        await update_telegram_commands_menu()
-        logger.info("✅ 动态活动命令菜单已更新")
+        logger.info("✅ 基础快捷指令+活动命令已成功同步")
 
-        # 5. 原有通知逻辑
+        # 6. 🎯 修改：仍然调用 update_telegram_commands_menu() 但修改它的实现
+        # 让它只负责注册命令处理器，不设置菜单
+        await register_activity_commands()
+        logger.info("✅ 动态活动命令处理器已注册")
+
+        # 7. 原有通知逻辑
         logger.info("✅ 系统启动完成，准备接收消息")
         await send_startup_notification()
 
     except Exception as e:
         logger.error(f"❌ 启动过程异常: {e}")
-        # 建议此处记录堆栈追踪以便调试
+        import traceback
+
+        logger.error(f"完整堆栈追踪: {traceback.format_exc()}")
         raise
 
 
