@@ -634,72 +634,6 @@ async def can_perform_activities(chat_id: int, uid: int) -> tuple[bool, str]:
     return True, ""
 
 
-# 在 main.py 的 can_perform_activities 后面添加
-async def process_activity_start(message: types.Message, activity_name: str):
-    """处理点击键盘后的活动开始逻辑（已完善数据库和计时器逻辑）"""
-    chat_id = message.chat.id
-    uid = message.from_user.id
-    name = message.from_user.full_name
-    now = get_beijing_time()
-
-    # 使用用户锁防止并发重复打卡
-    user_lock = user_lock_manager.get_lock(chat_id, uid)
-    async with user_lock:
-        # 1. 权限检查 (是否上班)
-        can_start, error_msg = await can_perform_activities(chat_id, uid)
-        if not can_start:
-            await message.answer(error_msg)
-            return
-
-        # 2. 检查是否已经在进行其他活动
-        is_active, current_act = await has_active_activity(chat_id, uid)
-        if is_active:
-            await message.answer(
-                f"❌ 您当前正在进行【{current_act}】，请先点击回座！",
-                reply_markup=await get_main_keyboard(chat_id, await is_admin(uid)),
-            )
-            return
-
-        # 3. 检查次数限制
-        can_do, count, max_t = await check_activity_limit(chat_id, uid, activity_name)
-        if not can_do:
-            await message.answer(
-                f"⚠️ 【{activity_name}】今日次数已达上限 ({count}/{max_t})",
-                reply_markup=await get_main_keyboard(chat_id, await is_admin(uid)),
-            )
-            return
-
-        # 4. 🆕 执行数据库更新 (记录活动开始)
-        # 调用 database.py 中的 update_user_activity 方法
-        await db.update_user_activity(chat_id, uid, activity_name, str(now), name)
-
-        # 5. 🆕 获取活动时长限制并启动计时器
-        time_limit = await db.get_activity_time_limit(activity_name)
-        # 启动定时器 (activity_timer 会处理超时提醒)
-        await timer_manager.start_timer(chat_id, uid, activity_name, time_limit)
-
-        # 6. 🆕 发送正式的打卡消息并记录消息ID
-        # 使用 MessageFormatter 格式化消息内容
-        start_msg = MessageFormatter.format_activity_message(
-            uid,
-            name,
-            activity_name,
-            now.strftime("%m/%d %H:%M:%S"),
-            count + 1,
-            max_t,
-            time_limit,
-        )
-
-        sent_message = await message.answer(
-            start_msg,
-            reply_markup=await get_main_keyboard(chat_id, await is_admin(uid)),
-            parse_mode="HTML",
-        )
-
-        # 记录打卡消息 ID，以便后续通过“回座”按钮删除或修改此消息
-        await db.set_user_checkin_message_id(chat_id, uid, sent_message.message_id)
-
-
 async def calculate_fine(activity: str, overtime_minutes: float) -> int:
     """计算罚款金额"""
     fine_rates = await db.get_fine_rates_for_activity(activity)
@@ -3670,30 +3604,6 @@ async def handle_work_buttons(message: types.Message):
         await process_work_checkin(message, "work_end")
 
 
-# 在 main.py 的所有 Command 处理器之后添加
-@dp.message()
-async def handle_text_buttons(message: types.Message):
-    """拦截所有文本消息，匹配活动名称"""
-    if not message.text:
-        return
-
-    text = message.text
-
-    # 1. 过滤掉特殊功能按钮
-    if text in SPECIAL_BUTTONS:
-        # 如果是“✅ 回座”，这里可以手动调用回座逻辑
-        return
-
-    # 2. 获取活动列表并匹配
-    try:
-        activity_limits = await db.get_activity_limits_cached()
-        if text in activity_limits:
-            # 如果点击的是活动名称，则调用上面写好的处理函数
-            await process_activity_start(message, text)
-    except Exception as e:
-        logger.error(f"处理按钮点击失败: {e}")
-
-
 @admin_required
 @rate_limit(rate=2, per=60)
 @track_performance("handle_export_button")
@@ -3826,9 +3736,16 @@ async def handle_back_to_main_menu(message: types.Message):
 @rate_limit(rate=10, per=60)
 async def handle_all_text_messages(message: types.Message):
     """统一处理所有文本消息"""
-    text = message.text.strip()
+    text = message.text.strip()  # ✅ 使用 strip()
     chat_id = message.chat.id
     uid = message.from_user.id
+
+    logger.info(f"📨 通用处理器收到: '{text}'")
+
+    # 🆕【关键】排除已处理过的命令
+    if text.startswith("/act_"):
+        logger.info(f"⚠️ 通用处理器忽略 /act_ 命令")
+        return  # 让动态命令处理器处理
 
     # 如果是特殊按钮，直接返回让专门的处理程序处理
     if text in SPECIAL_BUTTONS:
@@ -3852,7 +3769,8 @@ async def handle_all_text_messages(message: types.Message):
         "• 点击活动按钮开始打卡\n"
         "• 输入'回座'或点击'✅ 回座'按钮结束当前活动\n"
         "• 点击'📊 我的记录'查看个人统计\n"
-        "• 点击'🏆 排行榜'查看群内排名",
+        "• 点击'🏆 排行榜'查看群内排名\n\n"
+        "💡 提示：输入 / 可以查看所有快捷命令",
         reply_markup=await get_main_keyboard(
             chat_id=chat_id, show_admin=await is_admin(uid)
         ),
@@ -4884,13 +4802,11 @@ async def register_handlers():
     dp.message.register(cmd_softresettime, Command("softresettime"))
     dp.message.register(cmd_fix_message_refs, Command("fixmessages"))
 
-    # 🆕 注册刷新菜单命令（如果添加了的话）
-    # dp.message.register(cmd_refresh_menu, Command("refreshmenu"))
-
-    # 🆕【关键修改】使用 Command 对象注册动态命令
-    # 注册所有可能的 /act_* 命令
-    for cmd_key in activity_cmd_map.keys():
-        dp.message.register(handle_indexed_activity_command, Command(cmd_key))
+    # 🆕 动态菜单命令处理器（必须放在通用文本处理器之前！）
+    dp.message.register(
+        handle_indexed_activity_command,
+        lambda message: message.text and message.text.strip().startswith("/act_"),
+    )
 
     # 按钮处理器
     dp.message.register(
@@ -4922,7 +4838,7 @@ async def register_handlers():
         lambda message: message.text and message.text.strip() in ["🔙 返回主菜单"],
     )
 
-    # 📌 通用文本/兜底处理器 - 必须放在最后！
+    # 📌【重要】通用文本/兜底处理器 - 必须放在最后！
     dp.message.register(
         handle_all_text_messages, lambda message: message.text and message.text.strip()
     )
