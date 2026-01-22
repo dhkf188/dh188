@@ -1796,6 +1796,26 @@ async def cmd_myinfo(message: types.Message):
         await show_history(message)
 
 
+# ========== 动态活动命令处理器 ==========
+@rate_limit(rate=10, per=60)
+@message_deduplicate
+async def handle_dynamic_activity_command(message: types.Message):
+    """处理动态活动命令（如 /抽烟、/大厕 等）"""
+    # 获取命令名（去掉前面的 "/"）
+    command_text = message.text.lstrip("/")
+
+    # 获取活动配置
+    activity_limits = await db.get_activity_limits_cached()
+
+    # 检查是否是有效的活动
+    if command_text not in activity_limits:
+        # 如果不是活动命令，让其他处理器处理
+        return
+
+    # 调用现有的开始活动函数
+    await start_activity(message, command_text)
+
+
 @rate_limit(rate=10, per=60)
 @message_deduplicate
 @with_retry("cmd_ci", max_retries=2)
@@ -2625,8 +2645,17 @@ async def cmd_addactivity(message: types.Message):
     try:
         act, max_times, time_limit = args[1], int(args[2]), int(args[3])
         existed = await db.activity_exists(act)
+        
+        # 执行数据库操作
         await db.update_activity_config(act, max_times, time_limit)
         await db.force_refresh_activity_cache()
+
+        # 异步刷新命令列表
+        try:
+            asyncio.create_task(refresh_activity_commands())
+            logger.info(f"已触发活动命令刷新: {act}")
+        except Exception as refresh_error:
+            logger.error(f"触发命令刷新失败: {refresh_error}")
 
         if existed:
             await message.answer(
@@ -2650,7 +2679,6 @@ async def cmd_addactivity(message: types.Message):
         await message.answer(
             f"❌ 添加/修改活动失败：{e}", reply_to_message_id=message.message_id
         )
-
 
 @admin_required
 @rate_limit(rate=3, per=30)
@@ -2678,16 +2706,35 @@ async def cmd_delactivity(message: types.Message):
         )
         return
 
-    await db.delete_activity_config(act)
-    await db.force_refresh_activity_cache()  # 确保缓存立即更新
+    try:
+        # 执行删除操作
+        await db.delete_activity_config(act)
+        await db.force_refresh_activity_cache()  # 确保缓存立即更新
+        
+        # 异步刷新命令列表
+        try:
+            asyncio.create_task(refresh_activity_commands())
+            logger.info(f"已触发删除活动命令刷新: {act}")
+        except Exception as refresh_error:
+            logger.error(f"触发命令刷新失败: {refresh_error}")
 
-    await message.answer(
-        f"✅ 活动 <code>{act}</code> 已删除",
-        reply_markup=await get_main_keyboard(chat_id=message.chat.id, show_admin=True),
-        reply_to_message_id=message.message_id,
-        parse_mode="HTML",
-    )
-    logger.info(f"删除活动: {act}")
+        await message.answer(
+            f"✅ 活动 <code>{act}</code> 已删除",
+            reply_markup=await get_main_keyboard(chat_id=message.chat.id, show_admin=True),
+            reply_to_message_id=message.message_id,
+            parse_mode="HTML",
+        )
+        logger.info(f"删除活动: {act}")
+        
+    except Exception as e:
+        logger.error(f"删除活动失败: {e}")
+        await message.answer(
+            f"❌ 删除活动失败：{e}",
+            reply_markup=await get_main_keyboard(
+                chat_id=message.chat.id, show_admin=True
+            ),
+            reply_to_message_id=message.message_id,
+        )
 
 
 # ========= 上下班指令 ========
@@ -4304,6 +4351,39 @@ async def export_and_push_csv(
             pass
 
 
+# ========== 活动命令刷新函数 ==========
+async def refresh_activity_commands():
+    """当活动配置变化时刷新命令列表"""
+    try:
+        logger.info("🔄 刷新活动命令列表...")
+
+        # 重新执行 on_startup 中的命令注册逻辑
+        activity_limits = await db.get_activity_limits_cached()
+
+        # 固定用户命令
+        user_commands = [
+            BotCommand(command="workstart", description="🏢 上班打卡"),
+            BotCommand(command="workend", description="🏠 下班打卡"),
+            BotCommand(command="at", description="🔙 回座"),
+            BotCommand(command="myinfo", description="👤 我的统计"),
+            BotCommand(command="ranking", description="🏆 今日排行"),
+            BotCommand(command="help", description="❓ 使用帮助"),
+            BotCommand(command="menu", description="📋 显示菜单"),
+        ]
+
+        # 添加活动命令
+        for activity_name in activity_limits.keys():
+            user_commands.append(
+                BotCommand(command=activity_name, description=f"打卡 {activity_name}")
+            )
+
+        await bot_manager.bot.set_my_commands(commands=user_commands)
+        logger.info(f"✅ 活动命令刷新完成，共 {len(activity_limits)} 个活动命令")
+
+    except Exception as e:
+        logger.error(f"刷新活动命令失败: {e}")
+
+
 # ========== 定时任务 ==========
 async def daily_reset_task():
     """每日自动重置任务 - 稳定修复版"""
@@ -4390,7 +4470,6 @@ async def daily_reset_task():
         await asyncio.sleep(30)
 
 
-# ========== 软重置定时任务 ==========
 # ========= 软重置(二次重置)定时任务 =========
 async def soft_reset_task():
     """
@@ -4735,6 +4814,7 @@ async def register_handlers():
     dp.message.register(cmd_fix_message_refs, Command("fixmessages"))
     dp.message.register(cmd_myinfo, Command("myinfo"))
     dp.message.register(cmd_ranking, Command("ranking"))
+    dp.message.register(handle_dynamic_activity_command, F.text.startswith("/"))
 
     # 按钮处理器
     dp.message.register(
@@ -4863,21 +4943,31 @@ async def keepalive_loop():
 
 
 async def on_startup():
-    """启动时执行 - 包含全量快捷菜单"""
+    """启动时执行 - 包含动态活动命令"""
     logger.info("🎯 机器人启动中...")
     try:
-        # 1. 定义【普通用户】菜单 (包含打卡指令)
+        # 1. 获取活动配置
+        activity_limits = await db.get_activity_limits_cached()
+
+        # 2. 定义固定用户命令
         user_commands = [
             BotCommand(command="workstart", description="🏢 上班打卡"),
             BotCommand(command="workend", description="🏠 下班打卡"),
-            BotCommand(command="ci", description="🏃 任务打卡 (格式: /ci 活动名)"),
-            BotCommand(command="at", description="🔙 回座打卡 (格式: /at 备注)"),
+            BotCommand(command="at", description="🔙 回座"),
             BotCommand(command="myinfo", description="👤 我的统计"),
             BotCommand(command="ranking", description="🏆 今日排行"),
             BotCommand(command="help", description="❓ 使用帮助"),
+            BotCommand(command="menu", description="📋 显示菜单"),
         ]
 
-        # 2. 定义【管理员】专属菜单
+        # 3. 为每个活动添加独立命令（关键！）
+        for activity_name in activity_limits.keys():
+            # 添加直接的活动命令
+            user_commands.append(
+                BotCommand(command=activity_name, description=f"打卡 {activity_name}")
+            )
+
+        # 4. 定义管理员命令
         admin_commands = [
             BotCommand(command="actstatus", description="📊 活跃活动统计"),
             BotCommand(command="showsettings", description="⚙️ 查看系统配置"),
@@ -4888,17 +4978,15 @@ async def on_startup():
             BotCommand(command="help", description="🛠 管理员全指令指南"),
         ]
 
-        # 3. 注册到 Telegram 服务器
-        # 注册默认菜单（所有人可见）
+        # 5. 注册到 Telegram 服务器
         await bot_manager.bot.set_my_commands(commands=user_commands)
+        logger.info(f"✅ 快捷指令已同步，包含 {len(activity_limits)} 个活动命令")
 
-        # 覆盖管理员看到的菜单
+        # 6. 覆盖管理员看到的菜单
         await bot_manager.bot.set_my_commands(
             commands=admin_commands, scope=BotCommandScopeAllChatAdministrators()
         )
-        logger.info("✅ 所有快捷指令（含打卡指令）已成功同步")
 
-        # 4. 原有逻辑保持不变
         logger.info("✅ 系统启动完成，准备接收消息")
         await send_startup_notification()
 
