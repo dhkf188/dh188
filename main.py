@@ -966,6 +966,12 @@ async def start_activity(message: types.Message, act: str):
     chat_id = message.chat.id
     uid = message.from_user.id
 
+    if act is None:
+        if message.text and message.text.startswith("/"):
+            act = message.text.split("@")[0][1:]
+        else:
+            return
+
     user_lock = user_lock_manager.get_lock(chat_id, uid)
     async with user_lock:
         await reset_daily_data_if_needed(chat_id, uid)
@@ -2585,8 +2591,10 @@ async def cmd_exportmonthly(message: types.Message):
 @admin_required
 @rate_limit(rate=3, per=30)
 async def cmd_addactivity(message: types.Message):
-    """添加新活动"""
+    """添加或修改新活动 - 整合版"""
     args = message.text.split()
+
+    # 1. 基础参数检查
     if len(args) != 4:
         await message.answer(
             Config.MESSAGES["addactivity_usage"],
@@ -2598,33 +2606,39 @@ async def cmd_addactivity(message: types.Message):
         return
 
     try:
+        # 2. 解析参数
         act, max_times, time_limit = args[1], int(args[2]), int(args[3])
+
+        # 3. 🆕 数据库操作：检查是否存在并更新
         existed = await db.activity_exists(act)
         await db.update_activity_config(act, max_times, time_limit)
+
+        # 4. 🆕 强制刷新缓存，确保逻辑立即生效
         await db.force_refresh_activity_cache()
 
-        # 刷新活动命令
-        asyncio.create_task(refresh_activity_commands())
+        # 5. 🆕 核心整合：异步触发 Telegram 命令菜单刷新
+        # 这样当用户下次输入 "/" 时，新活动会出现在弹窗列表中
+        asyncio.create_task(refresh_telegram_commands())
 
-        if existed:
-            await message.answer(
-                f"✅ 已修改活动 <code>{act}</code>，次数上限 <code>{max_times}</code>，时间限制 <code>{time_limit}</code> 分钟",
-                reply_markup=await get_main_keyboard(
-                    chat_id=message.chat.id, show_admin=True
-                ),
-                reply_to_message_id=message.message_id,
-                parse_mode="HTML",
-            )
-        else:
-            await message.answer(
-                f"✅ 已添加新活动 <code>{act}</code>，次数上限 <code>{max_times}</code>，时间限制 <code>{time_limit}</code> 分钟",
-                reply_markup=await get_main_keyboard(
-                    chat_id=message.chat.id, show_admin=True
-                ),
-                reply_to_message_id=message.message_id,
-                parse_mode="HTML",
-            )
+        # 6. 根据结果发送通知
+        status_text = "修改" if existed else "添加新"
+        await message.answer(
+            f"✅ 已{status_text}活动 <code>{act}</code>，"
+            f"次数上限 <code>{max_times}</code>，"
+            f"时间限制 <code>{time_limit}</code> 分钟",
+            reply_markup=await get_main_keyboard(
+                chat_id=message.chat.id, show_admin=True
+            ),
+            reply_to_message_id=message.message_id,
+            parse_mode="HTML",
+        )
+
+        logger.info(f"🛠 管理员 {message.from_user.id} {status_text}了活动: {act}")
+
+    except ValueError:
+        await message.answer("❌ 参数格式错误：次数和时间必须是数字。")
     except Exception as e:
+        logger.error(f"❌ 添加活动失败: {e}")
         await message.answer(
             f"❌ 添加/修改活动失败：{e}", reply_to_message_id=message.message_id
         )
@@ -2633,42 +2647,122 @@ async def cmd_addactivity(message: types.Message):
 @admin_required
 @rate_limit(rate=3, per=30)
 async def cmd_delactivity(message: types.Message):
-    """删除活动 - 优化版本"""
+    """
+    删除活动 - 整合版 (支持自动同步刷新命令菜单)
+    """
     args = message.text.split()
+    chat_id = message.chat.id
+
+    # 1. 检查参数合法性
     if len(args) != 2:
         await message.answer(
-            "❌ 用法：/delactivity <活动名>",
-            reply_markup=await get_main_keyboard(
-                chat_id=message.chat.id, show_admin=True
-            ),
-            reply_to_message_id=message.message_id,
-        )
-        return
-    act = args[1]
-    if not await db.activity_exists(act):
-        await message.answer(
-            f"❌ 活动 <code>{act}</code> 不存在",
-            reply_markup=await get_main_keyboard(
-                chat_id=message.chat.id, show_admin=True
-            ),
+            "❌ 用法：<code>/delactivity <活动名></code>",
+            reply_markup=await get_main_keyboard(chat_id=chat_id, show_admin=True),
             reply_to_message_id=message.message_id,
             parse_mode="HTML",
         )
         return
 
-    await db.delete_activity_config(act)
-    await db.force_refresh_activity_cache()  # 确保缓存立即更新
+    act = args[1]
 
-    # 刷新活动命令
-    asyncio.create_task(refresh_activity_commands())
+    try:
+        # 2. 检查活动是否存在
+        if not await db.activity_exists(act):
+            await message.answer(
+                f"❌ 活动 <code>{act}</code> 不存在",
+                reply_markup=await get_main_keyboard(chat_id=chat_id, show_admin=True),
+                reply_to_message_id=message.message_id,
+                parse_mode="HTML",
+            )
+            return
 
-    await message.answer(
-        f"✅ 活动 <code>{act}</code> 已删除",
-        reply_markup=await get_main_keyboard(chat_id=message.chat.id, show_admin=True),
-        reply_to_message_id=message.message_id,
-        parse_mode="HTML",
-    )
-    logger.info(f"删除活动: {act}")
+        # 3. 🆕 执行删除操作与缓存刷新
+        await db.delete_activity_config(act)
+        await db.force_refresh_activity_cache()  # 确保数据库缓存立即清理
+
+        # 4. 🆕 核心整合：异步触发 Telegram 命令菜单刷新
+        # 删除活动后，该活动将不再出现在输入 "/" 时的建议列表中
+        asyncio.create_task(refresh_telegram_commands())
+
+        # 5. 反馈执行结果
+        await message.answer(
+            f"✅ 活动 <code>{act}</code> 已从系统中删除并同步菜单",
+            reply_markup=await get_main_keyboard(chat_id=chat_id, show_admin=True),
+            reply_to_message_id=message.message_id,
+            parse_mode="HTML",
+        )
+
+        logger.info(f"🗑 管理员 {message.from_user.id} 删除了活动: {act}")
+
+    except Exception as e:
+        logger.error(f"❌ 删除活动失败: {e}")
+        await message.answer(
+            f"❌ 删除活动过程中出现错误：{e}", reply_to_message_id=message.message_id
+        )
+
+
+async def refresh_telegram_commands():
+    """刷新 Telegram 命令菜单"""
+    try:
+        logger.info("🔄 正在刷新 Telegram 命令菜单...")
+
+        # 1. 重新注册命令处理器
+        await register_activity_commands()
+
+        # 2. 重新构建命令列表
+        activity_limits = await db.get_activity_limits_cached()
+
+        # 基础命令
+        base_commands = [
+            BotCommand(command="start", description="🚀 启动机器人"),
+            BotCommand(command="workstart", description="🏢 上班打卡"),
+            BotCommand(command="workend", description="🏠 下班打卡"),
+            BotCommand(command="at", description="🔙 回座打卡"),
+            BotCommand(command="myinfo", description="👤 我的统计"),
+            BotCommand(command="ranking", description="🏆 今日排行"),
+            BotCommand(command="help", description="❓ 使用帮助"),
+            BotCommand(command="menu", description="📋 显示菜单"),
+        ]
+
+        # 活动命令
+        activity_commands = []
+        for activity_name in activity_limits.keys():
+            description = (
+                f"开始 {activity_name}"
+                if len(activity_name) <= 10
+                else f"打卡 {activity_name[:8]}..."
+            )
+            activity_commands.append(
+                BotCommand(command=activity_name, description=description[:256])
+            )
+
+        # 合并并限制数量
+        all_commands = base_commands + activity_commands
+        if len(all_commands) > 50:
+            all_commands = all_commands[:50]
+            logger.warning(f"⚠️ 命令数量截断至 50 个")
+
+        # 3. 更新到 Telegram
+        await bot_manager.bot.set_my_commands(commands=all_commands)
+
+        logger.info(f"✅ Telegram 命令菜单已刷新，共 {len(all_commands)} 个命令")
+
+        # 可选：通知管理员
+        for admin_id in Config.ADMINS:
+            try:
+                await bot_manager.send_message_with_retry(
+                    admin_id,
+                    f"📱 命令菜单已更新\n"
+                    f"• 活动数量: {len(activity_limits)}\n"
+                    f"• 总命令数: {len(all_commands)}\n"
+                    f"• 用户输入 / 即可看到活动列表",
+                    parse_mode="HTML",
+                )
+            except Exception as e:
+                logger.debug(f"通知管理员失败: {e}")
+
+    except Exception as e:
+        logger.error(f"❌ 刷新 Telegram 命令失败: {e}")
 
 
 # ========= 上下班指令 ========
@@ -3745,6 +3839,19 @@ async def handle_all_text_messages(message: types.Message):
     chat_id = message.chat.id
     uid = message.from_user.id
 
+    # 如果是命令格式（以/开头），交给命令处理器处理
+    if text.startswith("/"):
+        # 检查是否是活动命令
+        activity_limits = await db.get_activity_limits_cached()
+        command_name = text[1:]  # 移除斜杠
+
+        if command_name in activity_limits.keys():
+            logger.info(f"活动命令调用: {command_name} - 用户 {uid}")
+            await start_activity(message, command_name)
+            return
+        # 否则让 Telegram 的命令处理器处理
+        return
+
     # 如果是特殊按钮，直接返回让专门的处理程序处理
     if text in SPECIAL_BUTTONS:
         logger.debug(f"特殊按钮被点击: {text} - 用户 {uid}")
@@ -3767,7 +3874,8 @@ async def handle_all_text_messages(message: types.Message):
         "• 点击活动按钮开始打卡\n"
         "• 输入'回座'或点击'✅ 回座'按钮结束当前活动\n"
         "• 点击'📊 我的记录'查看个人统计\n"
-        "• 点击'🏆 排行榜'查看群内排名",
+        "• 点击'🏆 排行榜'查看群内排名\n\n"
+        "💡 提示：你也可以输入 / 然后选择活动命令",
         reply_markup=await get_main_keyboard(
             chat_id=chat_id, show_admin=await is_admin(uid)
         ),
@@ -4773,7 +4881,7 @@ async def register_handlers():
 
 
 async def register_activity_commands():
-    """注册所有活动斜杠命令"""
+    """注册所有活动斜杠命令 - 优化版本"""
     try:
         # 获取所有活动配置
         activity_limits = await db.get_activity_limits_cached()
@@ -4787,22 +4895,22 @@ async def register_activity_commands():
             # 为每个活动创建一个专用的命令处理器
             handler = create_activity_command_handler(activity_name)
 
-            # 注册到 dispatcher
+            # 清理可能存在的旧处理器
+            dp.message.unregister(handler, Command(activity_name))
+
+            # 重新注册到 dispatcher
             dp.message.register(handler, Command(activity_name))
 
-            logger.debug(f"✅ 注册活动命令: /{activity_name}")
+            logger.debug(f"✅ 注册活动命令处理器: /{activity_name}")
 
-        # 更新 Telegram 的斜杠命令菜单
-        await update_telegram_commands_menu()
-
-        logger.info(f"✅ 已注册 {len(activity_limits)} 个活动命令")
+        logger.info(f"✅ 已注册 {len(activity_limits)} 个活动命令处理器")
 
     except Exception as e:
         logger.error(f"❌ 注册活动命令失败: {e}")
 
 
 def create_activity_command_handler(activity_name: str):
-    """为指定活动创建命令处理器"""
+    """为指定活动创建命令处理器 - 优化版本"""
 
     @rate_limit(rate=5, per=60)
     @message_deduplicate
@@ -4815,7 +4923,6 @@ def create_activity_command_handler(activity_name: str):
 
         logger.info(f"📱 用户 {uid} 使用斜杠命令开始活动: {activity_name}")
 
-        # 直接调用 start_activity 函数
         await start_activity(message, activity_name)
 
     return activity_command_handler
@@ -5070,113 +5177,60 @@ async def on_startup():
     """启动时执行 - 包含全量快捷菜单及动态活动命令"""
     logger.info("🎯 机器人启动中...")
     try:
-        # 1. 定义【普通用户】基础菜单 (包含打卡指令)
+        # 1. 首先确保活动命令处理器已注册
+        await register_activity_commands()
+
+        # 2. 定义【普通用户】基础菜单 (不包含活动命令，它们会自动显示)
         user_commands = [
+            BotCommand(command="start", description="🚀 启动机器人"),
             BotCommand(command="workstart", description="🏢 上班打卡"),
             BotCommand(command="workend", description="🏠 下班打卡"),
-            BotCommand(command="at", description="🔙 回座打卡 (格式: /at 备注)"),
+            BotCommand(command="at", description="🔙 回座打卡"),
             BotCommand(command="myinfo", description="👤 我的统计"),
             BotCommand(command="ranking", description="🏆 今日排行"),
             BotCommand(command="help", description="❓ 使用帮助"),
+            BotCommand(command="menu", description="📋 显示菜单"),
         ]
 
-        # 2. 定义【管理员】专属菜单
-        admin_commands = [
-            BotCommand(command="actstatus", description="📊 活跃活动统计"),
-            BotCommand(command="showsettings", description="⚙️ 查看系统配置"),
-            BotCommand(command="finesstatus", description="📈 罚款费率查询"),
-            BotCommand(command="worktime", description="⌚ 考勤时间设置"),
-            BotCommand(command="export", description="📤 导出今日报表"),
-            BotCommand(command="checkdb", description="🏥 数据库体检"),
-            BotCommand(command="help", description="🛠 管理员全指令指南"),
-        ]
+        # 3. 获取活动配置并创建活动命令
+        activity_limits = await db.get_activity_limits_cached()
+        activity_commands = []
 
-        # 🎯 修改点1：先更新动态活动命令（这个函数需要改进）
-        logger.info("🔄 正在合并基础命令和活动命令...")
+        for activity_name in activity_limits.keys():
+            # 清理命令名，确保符合 Telegram 规范
+            import re
 
-        # 3. 🎯 修改：先调用 update_telegram_commands_menu() 但修改它的实现
-        # 或者直接在这里合并命令
+            # 使用活动名作为命令（中文也支持，但有限制）
+            # Telegram 命令支持 Unicode，但最好用英文
+            command_name = activity_name
 
-        # 获取活动命令
-        all_activity_commands = []
-        try:
-            activity_limits = await db.get_activity_limits_cached()
-            logger.info(
-                f"📊 发现 {len(activity_limits)} 个活动: {list(activity_limits.keys())}"
+            # 如果活动名是中文，也可以考虑使用拼音或缩写
+            # 这里我们直接使用活动名，用户输入/时会看到中文命令
+
+            description = (
+                f"开始 {activity_name}"
+                if len(activity_name) <= 10
+                else f"打卡 {activity_name[:8]}..."
             )
 
-            for activity_name in activity_limits.keys():
-                # 创建命令名（确保符合Telegram规范）
-                import re
-
-                command_name = re.sub(
-                    r"[^a-zA-Z0-9_]", "", activity_name.lower().replace(" ", "_")
-                )
-
-                if not command_name:
-                    command_name = f"act_{abs(hash(activity_name)) % 10000}"
-
-                # 创建描述
-                if len(activity_name) <= 6:
-                    description = f"开始{activity_name}"
-                else:
-                    description = f"打卡{activity_name[:5]}..."
-
-                # 限制长度
-                command_name = command_name[:32]
-                description = description[:256]
-
-                all_activity_commands.append(
-                    BotCommand(command=command_name, description=description)
-                )
-                logger.debug(f"📝 添加活动命令: /{command_name} -> {description}")
-        except Exception as e:
-            logger.error(f"❌ 获取活动命令失败: {e}")
+            activity_commands.append(
+                BotCommand(command=command_name, description=description[:256])
+            )
+            logger.debug(f"📝 添加活动命令: /{command_name} -> {description}")
 
         # 4. 合并基础命令和活动命令
-        all_user_commands = (
-            user_commands + all_activity_commands[:30]
-        )  # Telegram最多50个命令
+        all_commands = user_commands + activity_commands
 
-        # 去重
-        seen_commands = set()
-        final_user_commands = []
-        for cmd in all_user_commands:
-            if cmd.command not in seen_commands:
-                seen_commands.add(cmd.command)
-                final_user_commands.append(cmd)
+        # 5. 限制命令数量（Telegram 限制）
+        if len(all_commands) > 50:
+            logger.warning(f"⚠️ 命令数量超过限制 ({len(all_commands)} > 50)，将截断")
+            all_commands = all_commands[:50]
 
-        # 5. 注册合并后的菜单到 Telegram 服务器
-        logger.info(f"📋 注册 {len(final_user_commands)} 个用户命令")
-        await bot_manager.bot.set_my_commands(commands=final_user_commands)
+        # 6. 设置到 Telegram
+        await bot_manager.bot.set_my_commands(commands=all_commands)
+        logger.info(f"✅ 已设置 {len(all_commands)} 个命令到 Telegram 菜单")
 
-        # 合并管理员命令和活动命令
-        all_admin_commands = (
-            admin_commands + all_activity_commands[:20]
-        )  # 管理员也看到活动命令
-
-        # 去重
-        seen_admin_commands = set()
-        final_admin_commands = []
-        for cmd in all_admin_commands:
-            if cmd.command not in seen_admin_commands:
-                seen_admin_commands.add(cmd.command)
-                final_admin_commands.append(cmd)
-
-        # 覆盖管理员看到的菜单
-        logger.info(f"📋 注册 {len(final_admin_commands)} 个管理员命令")
-        await bot_manager.bot.set_my_commands(
-            commands=final_admin_commands, scope=BotCommandScopeAllChatAdministrators()
-        )
-
-        logger.info("✅ 基础快捷指令+活动命令已成功同步")
-
-        # 6. 🎯 修改：仍然调用 update_telegram_commands_menu() 但修改它的实现
-        # 让它只负责注册命令处理器，不设置菜单
-        await register_activity_commands()
-        logger.info("✅ 动态活动命令处理器已注册")
-
-        # 7. 原有通知逻辑
+        # 7. 原有的通知逻辑
         logger.info("✅ 系统启动完成，准备接收消息")
         await send_startup_notification()
 
