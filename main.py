@@ -143,28 +143,14 @@ SPECIAL_BUTTONS = {
     "🔴 下班": "work_end",
 }
 
-# 🆕 动态活动指令映射表
-ACTIVITY_CMD_MAP: Dict[str, str] = {}  # 格式: {"wc": "小厕", "eat": "吃饭"}
-
-
-# 🆕 工具函数：从活动名生成命令
-def generate_command_from_name(activity_name: str) -> str:
-    """从活动名称生成简洁的命令"""
-    # 如果是中文，提取前两个字符的拼音首字母
-    import re
-
-    if re.search(r"[\u4e00-\u9fff]", activity_name):
-        from pypinyin import lazy_pinyin
-
-        try:
-            initials = "".join([p[0] for p in lazy_pinyin(activity_name) if p])
-            return initials[:8].lower()
-        except:
-            # 如果拼音转换失败，使用英文简写
-            return activity_name[:8].lower()
-    else:
-        # 如果是英文，直接使用小写
-        return activity_name[:8].lower().replace(" ", "_")
+# 🆕 官方指令映射配置 (英文指令: 中文活动名)
+# Telegram 指令只支持小写字母、数字和下划线
+ACTIVITY_MAP = {
+    "wc_small": "小厕",
+    "wc_large": "大厕",
+    "smoke": "抽烟",
+    "eat": "吃饭",
+}
 
 
 class AdminStates(StatesGroup):
@@ -221,24 +207,9 @@ async def send_startup_notification():
                 if success:
                     logger.info(f"✅ 启动通知已发送给管理员 {admin_id}")
                 else:
-                    logger.debug(
-                        f"发送启动通知给管理员 {admin_id} 失败（可能未与机器人对话）"
-                    )
+                    logger.error(f"❌ 发送启动通知给管理员 {admin_id} 失败")
             except Exception as e:
-                error_msg = str(e).lower()
-                # 检查特定的权限错误
-                if any(
-                    keyword in error_msg
-                    for keyword in [
-                        "can't initiate conversation",
-                        "bot can't initiate",
-                        "forbidden: bot can't",
-                        "403",
-                    ]
-                ):
-                    logger.debug(f"管理员 {admin_id} 未与机器人对话，跳过私聊通知")
-                else:
-                    logger.error(f"发送启动通知给管理员 {admin_id} 失败: {e}")
+                logger.error(f"发送启动通知给管理员 {admin_id} 失败: {e}")
 
     except Exception as e:
         logger.error(f"发送启动通知失败: {e}")
@@ -260,32 +231,16 @@ async def send_shutdown_notification():
 
         for admin_id in Config.ADMINS:
             try:
-                # 🎯 修复：捕获"无法发起对话"的异常
+                # 使用带重试的发送
                 success = await bot_manager.send_message_with_retry(
                     admin_id, message, parse_mode="HTML"
                 )
                 if success:
                     logger.info(f"✅ 关闭通知已发送给管理员 {admin_id}")
                 else:
-                    # 不记录为错误，只是调试信息
-                    logger.debug(
-                        f"发送关闭通知给管理员 {admin_id} 失败（可能未与机器人对话）"
-                    )
+                    logger.debug(f"发送关闭通知给管理员 {admin_id} 失败")
             except Exception as e:
-                error_msg = str(e).lower()
-                # 检查特定的权限错误
-                if any(
-                    keyword in error_msg
-                    for keyword in [
-                        "can't initiate conversation",
-                        "bot can't initiate",
-                        "forbidden: bot can't",
-                        "403",
-                    ]
-                ):
-                    logger.debug(f"管理员 {admin_id} 未与机器人对话，跳过私聊通知")
-                else:
-                    logger.debug(f"发送关闭通知失败: {e}")
+                logger.debug(f"发送关闭通知失败: {e}")
 
     except Exception as e:
         logger.debug(f"准备关闭通知失败: {e}")
@@ -1840,6 +1795,30 @@ async def cmd_help(message: types.Message):
 
 
 @rate_limit(rate=10, per=60)
+@track_performance("cmd_myinfo")
+async def handle_myinfo_command(message: types.Message):
+    """处理 /myinfo 命令 - 显示我的记录"""
+    chat_id = message.chat.id
+    uid = message.from_user.id
+
+    user_lock = user_lock_manager.get_lock(chat_id, uid)
+    async with user_lock:
+        await show_history(message)
+
+
+@rate_limit(rate=10, per=60)
+@track_performance("cmd_ranking")
+async def handle_ranking_command(message: types.Message):
+    """处理 /ranking 命令 - 显示排行榜"""
+    chat_id = message.chat.id
+    uid = message.from_user.id
+
+    user_lock = user_lock_manager.get_lock(chat_id, uid)
+    async with user_lock:
+        await show_rank(message)
+
+
+@rate_limit(rate=10, per=60)
 @message_deduplicate
 @with_retry("cmd_ci", max_retries=2)
 @track_performance("cmd_ci")
@@ -2671,9 +2650,6 @@ async def cmd_addactivity(message: types.Message):
         await db.update_activity_config(act, max_times, time_limit)
         await db.force_refresh_activity_cache()
 
-        # 🆕 同步活动菜单
-        await sync_bot_commands()
-
         if existed:
             await message.answer(
                 f"✅ 已修改活动 <code>{act}</code>，次数上限 <code>{max_times}</code>，时间限制 <code>{time_limit}</code> 分钟",
@@ -2726,9 +2702,6 @@ async def cmd_delactivity(message: types.Message):
 
     await db.delete_activity_config(act)
     await db.force_refresh_activity_cache()  # 确保缓存立即更新
-
-    # 🆕 同步活动菜单
-    await sync_bot_commands()
 
     await message.answer(
         f"✅ 活动 <code>{act}</code> 已删除",
@@ -3896,37 +3869,6 @@ async def handle_fixed_activity(message: types.Message):
     logger.warning(f"❌ 未匹配的命令: {command_text}")
 
 
-@rate_limit(rate=10, per=60)
-@message_deduplicate
-@with_retry("dynamic_activity", max_retries=2)
-@track_performance("dynamic_activity")
-async def handle_dynamic_activity_command(message: types.Message):
-    """处理动态活动命令（从 ACTIVITY_CMD_MAP 映射）"""
-    # 获取完整的命令文本
-    command_text = message.text.strip()
-    logger.info(f"🔍 收到动态命令: {command_text}")
-
-    # 提取命令（去除开头的斜杠）
-    if command_text.startswith("/"):
-        # 处理带用户名的命令格式，如 /wc@dh188_bot
-        if "@" in command_text:
-            cmd = command_text.split("@")[0][1:]  # 去掉开头的斜杠
-        else:
-            cmd = command_text[1:]  # 去掉开头的斜杠
-    else:
-        cmd = command_text
-
-    # 检查是否在映射表中
-    if cmd in ACTIVITY_CMD_MAP:
-        act = ACTIVITY_CMD_MAP[cmd]
-        logger.info(f"✅ 匹配到动态命令: {cmd} -> {act}")
-        await start_activity(message, act)
-        return
-
-    # 让其他处理器处理
-    logger.warning(f"❌ 未匹配的动态命令: {command_text}")
-
-
 # ========== 用户功能 ==========
 async def show_history(message: types.Message):
     """显示用户历史记录 - 统一业务周期版本（兼容软/硬重置）"""
@@ -4769,24 +4711,15 @@ async def initialize_services():
         dp.message.middleware(LoggingMiddleware())
         logger.info("✅ 日志中间件已注册")
 
-        # 🆕 10. 同步活动菜单（必须在注册处理器之前）
-        success, user_count, admin_count = await sync_bot_commands()
-        if success:
-            logger.info(
-                f"✅ 活动菜单同步完成: 用户命令 {user_count} 个，管理员命令 {admin_count} 个"
-            )
-        else:
-            logger.warning("⚠️ 活动菜单同步失败，使用默认菜单")
-
-        # 11. 注册所有消息处理器
+        # 10. 注册所有消息处理器
         await register_handlers()
         logger.info("✅ 消息处理器注册完成")
 
-        # 12. 恢复过期活动
+        # 11. 恢复过期活动
         recovered_count = await recover_expired_activities()
         logger.info(f"✅ 过期活动恢复完成: {recovered_count} 个活动已处理")
 
-        # 13. 🎯 最终健康检查
+        # 12. 🎯 最终健康检查
         health_status = await check_services_health()
         if all(health_status.values()):
             logger.info("🎉 所有服务初始化完成且健康")
@@ -4855,10 +4788,9 @@ async def register_handlers():
     dp.message.register(handle_fixed_activity, Command("eat"))
     dp.message.register(handle_fixed_activity, Command("smoke"))
     dp.message.register(handle_fixed_activity, Command("rest"))
+    dp.message.register(handle_myinfo_command, Command("myinfo"))
+    dp.message.register(handle_ranking_command, Command("ranking"))
     # =======================================
-    dp.message.register(
-        handle_dynamic_activity_command, Command(commands=list(ACTIVITY_CMD_MAP.keys()))
-    )
 
     dp.message.register(cmd_export, Command("export"))
     dp.message.register(cmd_monthlyreport, Command("monthlyreport"))
@@ -4926,138 +4858,6 @@ async def register_handlers():
     )
 
     logger.info("✅ 所有消息处理器注册完成")
-
-
-async def sync_bot_commands():
-    """
-    从数据库读取活动，生成指令，同步到 Telegram 菜单
-    """
-    global ACTIVITY_CMD_MAP
-
-    try:
-        logger.info("🔄 正在从数据库加载活动指令菜单...")
-
-        # 1. 获取所有活动配置
-        activity_limits = await db.get_activity_limits_cached()
-
-        if not activity_limits:
-            logger.warning("⚠️ 数据库中暂无活动配置，使用基础菜单")
-            activity_limits = {}
-
-        # 2. 准备基础指令 (所有用户可见)
-        base_commands = [
-            BotCommand(command="workstart", description="🟢 上班打卡"),
-            BotCommand(command="workend", description="🔴 下班打卡"),
-            BotCommand(command="at", description="✅ 回座"),
-            BotCommand(command="myinfo", description="📊 我的记录"),
-            BotCommand(command="ranking", description="🏆 排行榜"),
-            BotCommand(command="help", description="❓ 使用帮助"),
-            BotCommand(command="menu", description="📋 显示菜单"),
-            BotCommand(command="start", description="🚀 开始使用"),
-        ]
-
-        # 3. 预定义固定活动命令（确保总是存在）
-        fixed_commands = [
-            BotCommand(command="wc", description="🚽 小厕"),
-            BotCommand(command="bigwc", description="🚻 大厕"),
-            BotCommand(command="eat", description="🍚 吃饭"),
-            BotCommand(command="smoke", description="🚬 抽烟"),
-            BotCommand(command="rest", description="🛌 休息"),
-        ]
-
-        # 4. 生成动态指令
-        new_map = {}
-        dynamic_commands = []
-        used_commands = set([cmd.command for cmd in fixed_commands + base_commands])
-
-        for act_name in activity_limits.keys():
-            # 跳过已存在的预定义活动
-            preset_map = {
-                "小厕": "wc",
-                "大厕": "bigwc",
-                "吃饭": "eat",
-                "抽烟": "smoke",
-                "休息": "rest",
-                "睡觉": "sleep",
-            }
-
-            if act_name in preset_map:
-                cmd = preset_map[act_name]
-                if cmd not in used_commands:
-                    used_commands.add(cmd)
-                    new_map[cmd] = act_name
-                continue
-
-            # 为新活动生成命令
-            base_cmd = generate_command_from_name(act_name)
-
-            # 确保命令唯一
-            cmd = base_cmd
-            counter = 1
-            while cmd in used_commands and counter < 100:
-                cmd = f"{base_cmd}{counter}"
-                counter += 1
-
-            used_commands.add(cmd)
-            new_map[cmd] = act_name
-
-            # 添加到菜单列表
-            description = f"📝 {act_name}"
-            if len(description) > 32:
-                description = f"📝 {act_name[:28]}..."
-            dynamic_commands.append(BotCommand(command=cmd, description=description))
-
-        # 5. 更新全局映射
-        ACTIVITY_CMD_MAP = new_map
-        logger.info(f"📋 生成了 {len(dynamic_commands)} 个动态活动指令")
-
-        # 6. 构建最终菜单
-        user_menu = fixed_commands + dynamic_commands + base_commands
-
-        # 限制总命令数量
-        if len(user_menu) > 100:
-            logger.warning(f"⚠️ 命令数量过多 ({len(user_menu)} > 100)，进行截断")
-            user_menu = user_menu[:100]
-
-        # 7. 推送菜单给普通用户
-        try:
-            await bot_manager.bot.set_my_commands(commands=user_menu)
-            logger.info(f"✅ 普通用户菜单已同步 ({len(user_menu)} 个命令)")
-        except Exception as e:
-            logger.error(f"❌ 同步普通用户菜单失败: {e}")
-            return False, 0, 0
-
-        # 8. 推送菜单给管理员
-        admin_base = [
-            BotCommand(command="admin", description="👑 管理面板"),
-            BotCommand(command="addactivity", description="➕ 新增活动"),
-            BotCommand(command="delactivity", description="➖ 删除活动"),
-            BotCommand(command="export", description="📤 导出今日"),
-            BotCommand(command="showsettings", description="⚙️ 查看配置"),
-            BotCommand(command="setworktime", description="⏰ 设置考勤"),
-            BotCommand(command="setresettime", description="🔄 设置重置"),
-            BotCommand(command="setfines_all", description="💰 批量罚款"),
-            BotCommand(command="actstatus", description="📊 活动状态"),
-        ]
-
-        admin_menu = user_menu + admin_base
-        if len(admin_menu) > 100:
-            admin_menu = admin_menu[:100]
-
-        try:
-            await bot_manager.bot.set_my_commands(
-                commands=admin_menu, scope=BotCommandScopeAllChatAdministrators()
-            )
-            logger.info(f"✅ 管理员菜单已同步 ({len(admin_menu)} 个命令)")
-        except Exception as e:
-            logger.error(f"❌ 同步管理员菜单失败: {e}")
-            return False, len(user_menu), 0
-
-        return True, len(user_menu), len(admin_menu)
-
-    except Exception as e:
-        logger.error(f"❌ 同步指令菜单失败: {e}", exc_info=True)
-        return False, 0, 0
 
 
 # ========= render部署用的代码 ========
@@ -5149,16 +4949,51 @@ async def on_startup():
     """启动时执行 - 包含固定活动打卡指令"""
     logger.info("🎯 机器人启动中...")
     try:
-        # 1. 首先同步数据库中的活动配置到菜单
-        success, user_cmd_count, admin_cmd_count = await sync_bot_commands()
-        if success:
-            logger.info(
-                f"✅ 动态活动菜单同步成功: 用户命令 {user_cmd_count} 个，管理员命令 {admin_cmd_count} 个"
-            )
-        else:
-            logger.warning("⚠️ 动态活动菜单同步失败，使用默认菜单")
+        # 1. 定义【普通用户】固定活动菜单
+        user_commands = [
+            # 固定活动指令
+            BotCommand(command="wc", description="🚽 小厕"),
+            BotCommand(command="bigwc", description="🚻 大厕"),
+            BotCommand(command="eat", description="🍚 吃饭"),
+            BotCommand(command="smoke", description="🚬 抽烟"),
+            BotCommand(command="rest", description="🛌 休息"),
+            # 核心功能指令
+            BotCommand(command="workstart", description="🟢 上班打卡"),
+            BotCommand(command="workend", description="🔴 下班打卡"),
+            BotCommand(command="at", description="✅ 回座"),
+            # 查看功能
+            BotCommand(command="myinfo", description="📊 我的记录"),
+            BotCommand(command="ranking", description="🏆 排行榜"),
+            BotCommand(command="help", description="❓ 使用帮助"),
+        ]
 
-        # 2. 原有逻辑保持不变
+        # 2. 定义【管理员】专属菜单（继承用户菜单并添加管理员功能）
+        admin_commands = user_commands + [
+            BotCommand(command="actstatus", description="📊 活跃活动统计"),
+            BotCommand(command="showsettings", description="⚙️ 查看系统配置"),
+            BotCommand(command="finesstatus", description="📈 罚款费率查询"),
+            BotCommand(command="worktime", description="⌚ 考勤时间设置"),
+            BotCommand(command="export", description="📤 导出今日报表"),
+            BotCommand(command="checkdb", description="🏥 数据库体检"),
+            BotCommand(command="adminhelp", description="🛠 管理员全指令指南"),
+        ]
+
+        logger.info(f"📋 要注册的命令列表: {[cmd.command for cmd in user_commands]}")
+        result = await bot_manager.bot.set_my_commands(commands=user_commands)
+        logger.info(f"✅ 命令注册结果: {result}")
+
+        # 3. 注册到 Telegram 服务器
+        # 注册默认菜单（所有人可见）
+        await bot_manager.bot.set_my_commands(commands=user_commands)
+        logger.info("✅ 普通用户指令菜单已同步")
+
+        # 覆盖管理员看到的菜单
+        await bot_manager.bot.set_my_commands(
+            commands=admin_commands, scope=BotCommandScopeAllChatAdministrators()
+        )
+        logger.info("✅ 管理员指令菜单已同步")
+
+        # 4. 原有逻辑保持不变
         logger.info("✅ 系统启动完成，准备接收消息")
         await send_startup_notification()
 
@@ -5186,13 +5021,6 @@ async def on_shutdown():
         # 停止心跳管理器
         await heartbeat_manager.stop()
         logger.info("✅ 心跳管理器已停止")
-
-        # 🎯 修复：等待aiohttp连接关闭
-        import aiohttp
-
-        if hasattr(aiohttp, "ClientSession") and aiohttp.ClientSession._instance:
-            await aiohttp.ClientSession._instance.close()
-            await asyncio.sleep(0.1)
 
         # 发送关闭通知
         await send_shutdown_notification()
@@ -5256,21 +5084,7 @@ async def main():
             except asyncio.CancelledError:
                 pass
 
-        # 🎯 添加额外的等待确保所有任务完成
-        tasks = [t for t in asyncio.all_tasks() if t is not asyncio.current_task()]
-        if tasks:
-            logger.info(f"🔄 等待 {len(tasks)} 个任务完成...")
-            await asyncio.gather(*tasks, return_exceptions=True)
-            await asyncio.sleep(0.5)
-
         await on_shutdown()
-
-        # 🎯 最后清理 asyncio
-        loop = asyncio.get_event_loop()
-        if loop.is_running():
-            loop.stop()
-        if not loop.is_closed():
-            loop.close()
 
 
 if __name__ == "__main__":
