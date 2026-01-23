@@ -221,9 +221,24 @@ async def send_startup_notification():
                 if success:
                     logger.info(f"✅ 启动通知已发送给管理员 {admin_id}")
                 else:
-                    logger.error(f"❌ 发送启动通知给管理员 {admin_id} 失败")
+                    logger.debug(
+                        f"发送启动通知给管理员 {admin_id} 失败（可能未与机器人对话）"
+                    )
             except Exception as e:
-                logger.error(f"发送启动通知给管理员 {admin_id} 失败: {e}")
+                error_msg = str(e).lower()
+                # 检查特定的权限错误
+                if any(
+                    keyword in error_msg
+                    for keyword in [
+                        "can't initiate conversation",
+                        "bot can't initiate",
+                        "forbidden: bot can't",
+                        "403",
+                    ]
+                ):
+                    logger.debug(f"管理员 {admin_id} 未与机器人对话，跳过私聊通知")
+                else:
+                    logger.error(f"发送启动通知给管理员 {admin_id} 失败: {e}")
 
     except Exception as e:
         logger.error(f"发送启动通知失败: {e}")
@@ -245,16 +260,32 @@ async def send_shutdown_notification():
 
         for admin_id in Config.ADMINS:
             try:
-                # 使用带重试的发送
+                # 🎯 修复：捕获"无法发起对话"的异常
                 success = await bot_manager.send_message_with_retry(
                     admin_id, message, parse_mode="HTML"
                 )
                 if success:
                     logger.info(f"✅ 关闭通知已发送给管理员 {admin_id}")
                 else:
-                    logger.debug(f"发送关闭通知给管理员 {admin_id} 失败")
+                    # 不记录为错误，只是调试信息
+                    logger.debug(
+                        f"发送关闭通知给管理员 {admin_id} 失败（可能未与机器人对话）"
+                    )
             except Exception as e:
-                logger.debug(f"发送关闭通知失败: {e}")
+                error_msg = str(e).lower()
+                # 检查特定的权限错误
+                if any(
+                    keyword in error_msg
+                    for keyword in [
+                        "can't initiate conversation",
+                        "bot can't initiate",
+                        "forbidden: bot can't",
+                        "403",
+                    ]
+                ):
+                    logger.debug(f"管理员 {admin_id} 未与机器人对话，跳过私聊通知")
+                else:
+                    logger.debug(f"发送关闭通知失败: {e}")
 
     except Exception as e:
         logger.debug(f"准备关闭通知失败: {e}")
@@ -4741,7 +4772,9 @@ async def initialize_services():
         # 🆕 10. 同步活动菜单（必须在注册处理器之前）
         success, user_count, admin_count = await sync_bot_commands()
         if success:
-            logger.info(f"✅ 活动菜单同步完成: 用户命令 {user_count} 个，管理员命令 {admin_count} 个")
+            logger.info(
+                f"✅ 活动菜单同步完成: 用户命令 {user_count} 个，管理员命令 {admin_count} 个"
+            )
         else:
             logger.warning("⚠️ 活动菜单同步失败，使用默认菜单")
 
@@ -5154,6 +5187,13 @@ async def on_shutdown():
         await heartbeat_manager.stop()
         logger.info("✅ 心跳管理器已停止")
 
+        # 🎯 修复：等待aiohttp连接关闭
+        import aiohttp
+
+        if hasattr(aiohttp, "ClientSession") and aiohttp.ClientSession._instance:
+            await aiohttp.ClientSession._instance.close()
+            await asyncio.sleep(0.1)
+
         # 发送关闭通知
         await send_shutdown_notification()
         logger.info("✅ 关闭通知已发送")
@@ -5216,7 +5256,21 @@ async def main():
             except asyncio.CancelledError:
                 pass
 
+        # 🎯 添加额外的等待确保所有任务完成
+        tasks = [t for t in asyncio.all_tasks() if t is not asyncio.current_task()]
+        if tasks:
+            logger.info(f"🔄 等待 {len(tasks)} 个任务完成...")
+            await asyncio.gather(*tasks, return_exceptions=True)
+            await asyncio.sleep(0.5)
+
         await on_shutdown()
+
+        # 🎯 最后清理 asyncio
+        loop = asyncio.get_event_loop()
+        if loop.is_running():
+            loop.stop()
+        if not loop.is_closed():
+            loop.close()
 
 
 if __name__ == "__main__":
