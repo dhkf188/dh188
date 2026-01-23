@@ -106,6 +106,24 @@ class RobustBotManager:
             except Exception as e:
                 error_msg = str(e).lower()
 
+                # 🎯 新增：检查是否是"无法发起对话"错误
+                if any(
+                    keyword in error_msg
+                    for keyword in [
+                        "can't initiate conversation",
+                        "bot can't initiate conversation",
+                        "cannot start a conversation",
+                        "bot can't start conversation",
+                        "bot can't send messages",
+                        "forbidden: bot can't initiate",
+                        "forbidden: bot can't send messages to this user",
+                    ]
+                ):
+                    logger.debug(
+                        f"📤 无法向用户 {chat_id} 发起私聊对话（用户未与机器人对话）"
+                    )
+                    return True  # 🎯 改为返回True，表示这不是一个错误，只是正常情况
+
                 # 网络相关错误 - 重试
                 if any(
                     keyword in error_msg
@@ -144,6 +162,9 @@ class RobustBotManager:
                         "chat not found",
                         "bot was blocked",
                         "user is deactivated",
+                        "not enough rights",
+                        "need administrator rights",
+                        "group chat was upgraded to a supergroup",
                     ]
                 ):
                     logger.warning(f"📤 发送消息失败(权限问题): {e}")
