@@ -1794,6 +1794,7 @@ async def cmd_help(message: types.Message):
     )
 
 
+# 🆕 ========== 新增：我的记录和排行榜命令 ==========
 @rate_limit(rate=10, per=60)
 @track_performance("cmd_myinfo")
 async def handle_myinfo_command(message: types.Message):
@@ -4464,7 +4465,67 @@ async def daily_reset_task():
         await asyncio.sleep(30)
 
 
-# ========== 软重置定时任务 ==========
+# ========== 每月自动报告任务 ==========
+async def monthly_auto_report_task():
+    """每月自动报告任务 - 调用已有方法"""
+    logger.info("📅 每月自动报告任务已启动")
+
+    while True:
+        try:
+            now = get_beijing_time()
+            current_timestamp = now.timestamp()
+
+            # 每月1号上午9点执行
+            if now.day == 1 and now.hour == 9 and now.minute == 0:
+                logger.info("📊 每月1号，开始自动推送月度报告...")
+
+                # 获取上个月的年月
+                last_month = now.replace(day=1) - timedelta(days=1)
+                year = last_month.year
+                month = last_month.month
+
+                # 获取所有群组
+                all_groups = await db.get_all_groups()
+
+                for chat_id in all_groups:
+                    try:
+                        # 🎯 调用你已有的 generate_monthly_report 方法
+                        report = await generate_monthly_report(chat_id, year, month)
+
+                        if report:
+                            # 发送报告
+                            await bot.send_message(
+                                chat_id,
+                                f"📅 <b>【{year}年{month}月】月度报告自动推送</b>\n\n{report}",
+                                parse_mode="HTML",
+                            )
+
+                            # 🎯 调用你已有的 export_monthly_csv 方法
+                            await export_monthly_csv(chat_id, year, month)
+
+                            logger.info(f"✅ 群组 {chat_id} 月度报告已推送")
+                        else:
+                            # 无数据通知
+                            await bot.send_message(
+                                chat_id,
+                                f"📊 <b>【{year}年{month}月】月度报告</b>\n\n"
+                                f"ℹ️ 上个月没有活动数据需要报告",
+                                parse_mode="HTML",
+                            )
+
+                    except Exception as e:
+                        logger.error(f"❌ 群组 {chat_id} 自动报告失败: {e}")
+                        continue
+
+                logger.info("✅ 所有群组月度报告推送完成")
+
+            await asyncio.sleep(60)  # 每分钟检查一次
+
+        except Exception as e:
+            logger.error(f"❌ 每月自动报告任务异常: {e}")
+            await asyncio.sleep(300)
+
+
 # ========= 软重置(二次重置)定时任务 =========
 async def soft_reset_task():
     """
@@ -5059,6 +5120,7 @@ async def main():
         asyncio.create_task(soft_reset_task(), name="soft_reset")
         asyncio.create_task(memory_cleanup_task(), name="memory_cleanup")
         asyncio.create_task(health_monitoring_task(), name="health_monitoring")
+        asyncio.create_task(monthly_auto_report_task(), name="monthly_auto_report")
 
         # 启动机器人
         logger.info("🤖 启动机器人（带自动重连机制）...")
