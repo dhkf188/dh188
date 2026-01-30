@@ -4751,6 +4751,7 @@ async def initialize_services():
 
 async def check_services_health():
     """完整的服务健康检查"""
+
     health_status = {
         "database": await db.health_check(),
         "bot_manager_exists": bot_manager is not None,
@@ -4936,79 +4937,71 @@ async def external_keepalive():
 
 
 async def keepalive_loop():
-    """
-    🚀 顶级工业级 Render 保活循环
-    - 外部公网流量防休眠（核心）
-    - 内部健康检查兜底
-    - 数据库连接保活
-    - 强制内存回收 + GC日志
-    - 日志带 UTC 时间戳
-    """
-    # 智能获取外部 URL
+
     external_url = os.environ.get("RENDER_EXTERNAL_URL") or getattr(Config, "WEBHOOK_URL", None)
     if external_url:
-        external_url = external_url.rstrip('/')  # 去掉末尾斜杠
+        external_url = external_url.rstrip("/")
 
     port = int(os.environ.get("PORT", 10000))
+    logger.info(f"🚀 保活循环启动 | 外部URL: {external_url or '未设置'} | 内部端口: {port}")
 
-    logger.info(f"🚀 保活任务启动 | 外部URL: {external_url} | 内部端口: {port}")
-
-    # Session 复用提高效率
     async with aiohttp.ClientSession(
         timeout=aiohttp.ClientTimeout(total=20),
-        headers={"User-Agent": "Bot-KeepAlive-Service"}
+        headers={"User-Agent": "Bot-KeepAlive-Service"},
     ) as session:
 
         while True:
             try:
-                # 间隔 5 分钟
                 await asyncio.sleep(300)
 
-                timestamp = datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')
-                logger.debug(f"🕒 保活循环触发时间: {timestamp}")
-
-                # --- A. 外部公网保活 ---
+                # ------------------------
+                # 外部公网保活（核心）
+                # ------------------------
                 if external_url:
                     try:
                         async with session.get(f"{external_url}/health") as resp:
-                            status = resp.status
-                            logger.debug(f"🌍 外部网关保活成功 | 状态码: {status}")
+                            if resp.status != 200:
+                                logger.warning(f"🌍 外部保活异常 | 状态码: {resp.status}")
                     except Exception as e:
-                        logger.warning(f"🌍 外部保活波动 (可能网络抖动): {e}")
+                        logger.warning(f"🌍 外部保活失败: {e}")
 
-                # --- B. 内部健康检查 ---
+                # ------------------------
+                # 内部健康检查
+                # ------------------------
                 try:
                     async with session.get(f"http://127.0.0.1:{port}/health") as resp:
-                        status = resp.status
-                        if status == 200:
-                            logger.debug(f"🏠 内部健康检查成功 | 状态码: {status}")
-                        else:
-                            logger.warning(f"🏠 内部健康检查返回异常 | 状态码: {status}")
+                        if resp.status != 200:
+                            logger.warning(f"🏠 内部健康检查异常 | 状态码: {resp.status}")
                 except Exception as e:
                     logger.warning(f"🏠 内部健康检查失败: {e}")
 
-                # --- C. 数据库连接保活 ---
+                # ------------------------
+                # 数据库连接保活
+                # ------------------------
                 try:
                     if hasattr(db, "connection_health_check"):
                         await db.connection_health_check()
-                        logger.debug("🗄️ 数据库连接保活成功")
                 except Exception as e:
-                    logger.warning(f"🗄️ 数据库连接波动: {e}")
+                    logger.warning(f"🗄️ 数据库保活异常: {e}")
 
-                # --- D. 内存清理 + GC ---
+                # ------------------------
+                # 内存回收 (轻量日志)
+                # ------------------------
                 try:
                     collected = gc.collect()
                     if collected:
                         logger.debug(f"🧹 GC 回收对象数: {collected}")
-                except Exception as e:
-                    logger.debug(f"GC 执行失败: {e}")
+                except Exception:
+                    pass
 
             except asyncio.CancelledError:
-                logger.info("🛑 保活循环已停止")
+                logger.info("🛑 保活循环已取消")
                 break
             except Exception as e:
-                logger.error(f"⚠️ 保活循环遇到未预料的异常: {e}")
-                await asyncio.sleep(60)  # 异常后延迟再试
+                # 核心异常日志，保持循环继续
+                logger.error(f"⚠️ 保活循环遇到异常: {e}")
+                await asyncio.sleep(60)
+
 
 
 # ========== 启动流程 =========
