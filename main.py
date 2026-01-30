@@ -2496,7 +2496,6 @@ async def optimized_monthly_export(chat_id: int, year: int, month: int):
             user_activities = user_stat.get("activities", {})
             if isinstance(user_activities, str):
                 try:
-                    
 
                     user_activities = json.loads(user_activities)
                 except:
@@ -2742,7 +2741,6 @@ async def cmd_setworktime(message: types.Message):
         work_end = args[2]
 
         # 验证时间格式
-        
 
         time_pattern = re.compile(r"^([0-1]?[0-9]|2[0-3]):([0-5][0-9])$")
 
@@ -4388,7 +4386,6 @@ async def export_and_push_csv(
 # ========== 定时任务 ==========
 
 
-
 async def daily_reset_task():
     """每日自动重置任务 - 性能优化与高可用版"""
     logger.info("🚀 每日重置监控任务已启动")
@@ -4650,8 +4647,6 @@ async def start_health_server():
     # 核心：自动读取 Render 分配的端口，读取不到则默认用 10000 (本地测试用)
     port = int(os.getenv("PORT", 10000))
 
-    
-
     app = web.Application()
 
     # 添加一个根路径处理函数，让监控工具（如 UptimeRobot）访问时能得到响应
@@ -4904,7 +4899,6 @@ async def keepalive_loop():
 
             # 1. 调用自己的健康检查端点
             try:
-                
 
                 port = int(os.environ.get("PORT", 8080))
                 async with aiohttp.ClientSession(
@@ -4927,7 +4921,6 @@ async def keepalive_loop():
             try:
                 await performance_optimizer.memory_cleanup()
                 # 🆕 强制垃圾回收
-                
 
                 collected = gc.collect()
                 if collected > 0:
@@ -5102,48 +5095,132 @@ async def on_shutdown():
 #         await on_shutdown()
 
 
-async def main():
-    """Render-safe 主函数（Polling 版）"""
+# async def main():
+#     """Render-safe 主函数（Polling 版）"""
 
+#     is_render = "RENDER" in os.environ
+
+#     if is_render:
+#         logger.info("🎯 Render 环境检测成功，启用安全模式")
+#         Config.DB_MAX_CONNECTIONS = 3
+#         Config.ENABLE_FILE_LOGGING = False
+
+#     logger.info("🚀 启动打卡机器人系统（Render-safe polling 模式）")
+
+#     # 1️⃣ 初始化
+#     await initialize_services()
+
+#     # 2️⃣ 启动健康检查服务器（必须最先）
+#     await start_health_server()
+
+#     # 3️⃣ 启动后台周期任务（允许失败，不影响主循环）
+#     asyncio.create_task(daily_reset_task(), name="daily_reset")
+#     asyncio.create_task(soft_reset_task(), name="soft_reset")
+#     asyncio.create_task(memory_cleanup_task(), name="memory_cleanup")
+#     asyncio.create_task(health_monitoring_task(), name="health_monitor")
+
+#     # 4️⃣ 启动机器人（初始化）
+#     await on_startup()
+
+#     # 5️⃣ ⚠️ 关键：Polling 必须作为独立 Task
+#     polling_task = asyncio.create_task(
+#         bot_manager.start_polling_with_retry(), name="telegram_polling"
+#     )
+
+#     logger.info("🤖 Telegram polling 已启动（Render-safe）")
+
+#     # 6️⃣ ⚠️ Render-safe 核心：主协程永远阻塞
+#     # Render 只关心 HTTP 是否活着
+#     try:
+#         await asyncio.Event().wait()
+#     finally:
+#         logger.info("🛑 Render 正在关闭实例，开始清理...")
+#         polling_task.cancel()
+#         await on_shutdown()
+
+async def main():
+    """全环境通用 - 工业级稳固版 (适配 Render/VPS/Docker)"""
+    import os
+    import asyncio
+    import sys
+    from contextlib import suppress
+
+    # 1. 环境检测
     is_render = "RENDER" in os.environ
+    health_server_site = None  # 用于存储健康服务器实例
 
     if is_render:
-        logger.info("🎯 Render 环境检测成功，启用安全模式")
+        logger.info("🎯 检测到 Render 环境，应用低功耗安全配置")
         Config.DB_MAX_CONNECTIONS = 3
         Config.ENABLE_FILE_LOGGING = False
 
-    logger.info("🚀 启动打卡机器人系统（Render-safe polling 模式）")
-
-    # 1️⃣ 初始化
-    await initialize_services()
-
-    # 2️⃣ 启动健康检查服务器（必须最先）
-    await start_health_server()
-
-    # 3️⃣ 启动后台周期任务（允许失败，不影响主循环）
-    asyncio.create_task(daily_reset_task(), name="daily_reset")
-    asyncio.create_task(soft_reset_task(), name="soft_reset")
-    asyncio.create_task(memory_cleanup_task(), name="memory_cleanup")
-    asyncio.create_task(health_monitoring_task(), name="health_monitor")
-
-    # 4️⃣ 启动机器人（初始化）
-    await on_startup()
-
-    # 5️⃣ ⚠️ 关键：Polling 必须作为独立 Task
-    polling_task = asyncio.create_task(
-        bot_manager.start_polling_with_retry(), name="telegram_polling"
-    )
-
-    logger.info("🤖 Telegram polling 已启动（Render-safe）")
-
-    # 6️⃣ ⚠️ Render-safe 核心：主协程永远阻塞
-    # Render 只关心 HTTP 是否活着
     try:
+        logger.info("🚀 启动打卡机器人系统...")
+
+        # 2. 初始化核心服务（数据库等）
+        await initialize_services()
+
+        # 3. 启动健康检查服务器 (适配 Render 端口)
+        # 修改点：保存返回值 site，以便后续安全关闭
+        health_server_site = await start_health_server()
+
+        # 4. 启动周期性后台任务
+        # 使用 list 存储任务引用，防止被垃圾回收
+        background_tasks = [
+            asyncio.create_task(daily_reset_task(), name="daily_reset"),
+            asyncio.create_task(soft_reset_task(), name="soft_reset"),
+            asyncio.create_task(memory_cleanup_task(), name="memory_cleanup"),
+            asyncio.create_task(health_monitoring_task(), name="health_monitor"),
+        ]
+        
+        # 针对 Render 的保活任务
+        if is_render:
+            background_tasks.append(asyncio.create_task(keepalive_loop(), name="render_keepalive"))
+
+        # 5. 启动机器人逻辑
+        await on_startup()
+        
+        # 将 Polling 放入后台独立任务
+        polling_task = asyncio.create_task(
+            bot_manager.start_polling_with_retry(),
+            name="telegram_polling"
+        )
+
+        logger.info("🤖 机器人系统全功能已就绪")
+
+        # 6. 核心：钉死进程，不让程序退出
+        # 这样即便 Polling 崩溃重启，主程序和 Web Server 依然活着
         await asyncio.Event().wait()
+
+    except asyncio.CancelledError:
+        logger.info("👋 收到系统关闭指令")
+    except Exception as e:
+        logger.error(f"❌ 系统运行异常: {e}")
+        if is_render:
+            sys.exit(1) # 告诉 Render 启动失败，触发自动重启
     finally:
-        logger.info("🛑 Render 正在关闭实例，开始清理...")
-        polling_task.cancel()
+        logger.info("🛑 开始清理并优雅关闭...")
+        
+        # A. 停止轮询
+        if 'polling_task' in locals():
+            polling_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await polling_task
+
+        # B. 关闭健康服务器（关键：防止重启时端口占用）
+        if health_server_site:
+            with suppress(Exception):
+                await health_server_site.stop()
+                logger.info("✅ 健康检查服务器已释放端口")
+
+        # C. 停止所有后台任务
+        if 'background_tasks' in locals():
+            for task in background_tasks:
+                task.cancel()
+        
+        # D. 执行统一的清理逻辑（关闭数据库等）
         await on_shutdown()
+        logger.info("🎉 进程已安全结束")
 
 
 if __name__ == "__main__":
