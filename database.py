@@ -2802,7 +2802,7 @@ class PostgreSQLDatabase:
                 data["activities"] = parsed_activities
 
                 # 🟢 调试日志
-                self.logger.debug(
+                logger.debug(
                     f"用户 {data['user_id']} 重置状态: {data['is_soft_reset']}, "
                     f"活动数: {data['total_activity_count']}, "
                     f"时长: {data['total_accumulated_time']}"
@@ -2810,7 +2810,7 @@ class PostgreSQLDatabase:
 
                 result.append(data)
 
-            self.logger.info(f"数据库查询返回 {len(result)} 条记录（含软硬重置区分）")
+            logger.info(f"数据库查询返回 {len(result)} 条记录（含软硬重置区分）")
             return result
 
     async def get_all_groups(self) -> List[int]:
