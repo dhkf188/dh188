@@ -4225,8 +4225,13 @@ async def export_and_push_csv(
     operation_id = f"export_{chat_id}_{int(start_time)}"
     logger.info(f"🚀 [{operation_id}] 开始导出群组 {chat_id} 的数据...")
 
+    # 初始化变量，确保在所有分支中都有定义
+    temp_file = None
+    group_stats = []
+    activity_limits = Config.DEFAULT_ACTIVITY_LIMITS.copy()
+
     try:
-        # 初始化群组（第一个代码的确切位置）
+        # 初始化群组
         await db.init_group(chat_id)
 
         # ========== 2. 安全转换函数 ==========
@@ -4298,6 +4303,7 @@ async def export_and_push_csv(
                     logger.info(
                         f"✅ [{operation_id}] 从月度表获取到 {len(group_stats)} 条数据"
                     )
+                    # 从月度表获取时使用默认配置
                     activity_limits = Config.DEFAULT_ACTIVITY_LIMITS.copy()
                 else:
                     logger.warning(f"⚠️ [{operation_id}] 月度表无数据，回退到常规表")
@@ -4308,15 +4314,44 @@ async def export_and_push_csv(
                 from_monthly_table = False
 
         if not from_monthly_table:
-            # 并发获取活动配置和统计数据（第二个代码优化）
             try:
+                # 并发获取活动配置和统计数据（第二个代码优化）
                 activity_task = asyncio.create_task(db.get_activity_limits_cached())
                 stats_task = asyncio.create_task(
                     db.get_group_statistics(chat_id, target_date)
                 )
-                activity_limits, group_stats = await asyncio.gather(
-                    activity_task, stats_task
+
+                # 使用 return_exceptions=True 避免单个任务异常影响其他任务
+                results = await asyncio.gather(
+                    activity_task, stats_task, return_exceptions=True
                 )
+
+                # 处理活动配置结果
+                if isinstance(results[0], Exception):
+                    logger.error(f"❌ [{operation_id}] 获取活动配置失败: {results[0]}")
+                    # 尝试从数据库获取
+                    try:
+                        activity_limits = await db.get_activity_limits()
+                        if not activity_limits:
+                            activity_limits = Config.DEFAULT_ACTIVITY_LIMITS.copy()
+                    except Exception as e:
+                        logger.error(f"❌ [{operation_id}] 获取活动配置回退失败: {e}")
+                        activity_limits = Config.DEFAULT_ACTIVITY_LIMITS.copy()
+                elif results[0]:
+                    activity_limits = results[0]
+                else:
+                    logger.warning(f"⚠️ [{operation_id}] 活动配置为空，使用默认配置")
+                    activity_limits = Config.DEFAULT_ACTIVITY_LIMITS.copy()
+
+                # 处理统计数据结果
+                if isinstance(results[1], Exception):
+                    logger.error(f"❌ [{operation_id}] 获取统计数据失败: {results[1]}")
+                    group_stats = []
+                elif results[1]:
+                    group_stats = results[1]
+                else:
+                    group_stats = []
+
             except Exception as e:
                 logger.error(f"❌ [{operation_id}] 并发获取数据失败: {e}")
                 logger.error(traceback.format_exc())
@@ -4328,10 +4363,10 @@ async def export_and_push_csv(
                     group_stats = await db.get_group_statistics(chat_id, target_date)
                 except Exception as inner_e:
                     logger.error(f"❌ [{operation_id}] 回退获取数据也失败: {inner_e}")
-                    logger.error(traceback.format_exc())
                     activity_limits = Config.DEFAULT_ACTIVITY_LIMITS.copy()
                     group_stats = []
 
+        # 最终验证
         if not activity_limits:
             logger.warning(f"⚠️ [{operation_id}] 没有活动配置，使用默认配置")
             activity_limits = Config.DEFAULT_ACTIVITY_LIMITS.copy()
@@ -4340,7 +4375,7 @@ async def export_and_push_csv(
             logger.warning(f"⚠️ [{operation_id}] 获取统计数据为空或不是列表")
             group_stats = []
 
-        logger.info(f"📊 [{operation_id}] 数据库返回 {len(group_stats)} 条统计数据")
+        logger.info(f"📊 [{operation_id}] 获取到 {len(group_stats)} 条统计数据")
 
         # ========== 5. 数据验证 ==========
         if len(group_stats) == 0:
@@ -4353,7 +4388,7 @@ async def export_and_push_csv(
                     await bot.send_message(chat_id, no_data_msg)
                 except Exception as e:
                     logger.debug(f"[{operation_id}] 发送无数据消息失败: {e}")
-            return True
+            return True  # 没有数据也算成功（第一个代码的逻辑）
 
         # ========== 6. 构造CSV表头 ==========
         csv_buffer = StringIO()
@@ -4475,11 +4510,13 @@ async def export_and_push_csv(
                     await bot.send_message(chat_id, no_data_msg)
                 except Exception as e:
                     logger.debug(f"[{operation_id}] 发送无数据消息失败: {e}")
-            return True
+            return True  # 没有数据也算成功（第一个代码的逻辑）
 
         # ========== 9. 生成CSV文件 ==========
         csv_content = csv_buffer.getvalue()
         csv_buffer.close()
+
+        # 创建临时文件名
         temp_file = f"temp_{operation_id}_{file_name}"
 
         # ========== 10. 并行执行文件操作 ==========
@@ -4494,13 +4531,16 @@ async def export_and_push_csv(
                 return True
             except Exception as e:
                 logger.error(f"❌ [{operation_id}] 异步写入文件失败: {e}")
+                logger.error(traceback.format_exc())
                 # 回退到同步写入（第一个代码的回退思想）
                 try:
                     with open(temp_file, "w", encoding="utf-8-sig") as f:
                         f.write(csv_content)
+                    logger.info(f"✅ [{operation_id}] 同步写入文件成功")
                     return True
                 except Exception as sync_e:
                     logger.error(f"❌ [{operation_id}] 同步写入文件也失败: {sync_e}")
+                    logger.error(traceback.format_exc())
                     return False
 
         async def get_chat_title_async():
@@ -4518,8 +4558,15 @@ async def export_and_push_csv(
         )
 
         if not write_result:
-            error_msg = Config.MESSAGES.get("export_process_failed", "❌ 导出过程失败")
-            raise Exception(error_msg)
+            # 文件写入失败，尝试发送错误消息
+            try:
+                error_msg = Config.MESSAGES.get(
+                    "export_process_failed", "❌ 导出过程失败"
+                )
+                await bot.send_message(chat_id, f"{error_msg}\n错误: 文件写入失败")
+            except Exception as msg_e:
+                logger.debug(f"[{operation_id}] 发送错误消息失败: {msg_e}")
+            return False
 
         # ========== 11. 构建富文本描述 ==========
         display_date = target_date.strftime("%Y年%m月%d日")
@@ -4539,18 +4586,13 @@ async def export_and_push_csv(
             f"📅 统计日期：<code>{display_date}</code>\n"
             f"⏰ 导出时间：<code>{beijing_now.strftime('%Y-%m-%d %H:%M:%S')}</code>\n"
             f"{dashed_line}\n"
-            f"📈 <b>数据统计</b>\n"
-            f"• 独立用户：<code>{len(unique_users)}</code> 人\n"
-            f"• 总数据行：<code>{total_records}</code> 行\n"
-            f"• A班(硬重置)：<code>{reset_type_counts['A班']}</code> 行\n"
-            f"• B班(软重置)：<code>{reset_type_counts['B班']}</code> 行\n"
-            f"{dashed_line}\n"
-            f"💾 <i>数据已按班次分开展示</i>"
+            f"💾 <i>包含每个用户每日的活动统计及工作时长</i>"
         )
 
         # ========== 12. 发送到当前群组 ==========
         input_file = FSInputFile(temp_file, filename=file_name)
-        send_success = False
+        send_to_group_success = False
+        send_to_admin_success = False
 
         try:
             await bot.send_document(
@@ -4560,7 +4602,7 @@ async def export_and_push_csv(
                 parse_mode="HTML",
                 reply_to_message_id=None,  # 不回复特定消息（第一个代码的逻辑）
             )
-            send_success = True
+            send_to_group_success = True
             logger.info(f"✅ [{operation_id}] CSV文件已发送到群组 {chat_id}")
         except Exception as e:
             logger.error(f"❌ [{operation_id}] 发送到群组失败: {e}")
@@ -4597,6 +4639,7 @@ async def export_and_push_csv(
                     await notification_service.send_document(
                         chat_id, input_file, caption=caption
                     )
+                    send_to_admin_success = True
                     logger.info(f"✅ [{operation_id}] 数据已推送到通知服务")
                 else:
                     logger.warning(
@@ -4613,10 +4656,10 @@ async def export_and_push_csv(
                 # 等待一小段时间确保文件发送完成
                 await asyncio.sleep(2)
 
-                if os.path.exists(temp_file):
+                if temp_file and os.path.exists(temp_file):
                     os.remove(temp_file)
                     logger.debug(f"🧹 [{operation_id}] 已清理临时文件: {temp_file}")
-                else:
+                elif temp_file:
                     logger.debug(f"🧹 [{operation_id}] 临时文件不存在: {temp_file}")
             except Exception as e:
                 logger.debug(f"🧹 [{operation_id}] 清理临时文件失败: {e}")
@@ -4627,14 +4670,16 @@ async def export_and_push_csv(
         # ========== 15. 性能统计和日志 ==========
         duration = time.time() - start_time
         logger.info(
-            f"✅ [{operation_id}] 数据导出成功完成\n"
+            f"✅ [{operation_id}] 数据导出处理完成\n"
             f"   文件: {file_name}\n"
             f"   用户数: {len(unique_users)}, 数据行: {total_records}\n"
             f"   A班: {reset_type_counts['A班']}, B班: {reset_type_counts['B班']}\n"
-            f"   耗时: {duration:.2f}秒"
+            f"   耗时: {duration:.2f}秒\n"
+            f"   发送结果: 群组={send_to_group_success}, 通知服务={send_to_admin_success}"
         )
 
-        return send_success or True  # 即使群组发送失败，如果通知服务成功也算成功
+        # ========== 16. 返回结果 ==========
+        return send_to_group_success
 
     except Exception as e:
         logger.error(f"❌ [{operation_id}] 导出过程发生未捕获异常: {e}")
@@ -4651,8 +4696,9 @@ async def export_and_push_csv(
 
         # 清理临时文件（如果有）
         try:
-            if "temp_file" in locals() and os.path.exists(temp_file):
+            if temp_file and os.path.exists(temp_file):
                 os.remove(temp_file)
+                logger.debug(f"🧹 [{operation_id}] 异常时清理临时文件: {temp_file}")
         except Exception as cleanup_e:
             logger.debug(f"[{operation_id}] 异常时清理文件失败: {cleanup_e}")
 
