@@ -4201,7 +4201,7 @@ async def export_and_push_csv(
     file_name: str = None,
     target_date=None,
 ):
-    """导出群组数据为 CSV 并推送 - 基于 daily_statistics 表（完整修复版）"""
+    """导出群组数据为 CSV 并推送 - 支持软/硬重置分行显示（优化版）"""
     await db.init_group(chat_id)
 
     # 规范 target_date
@@ -4218,7 +4218,15 @@ async def export_and_push_csv(
     csv_buffer = StringIO()
     writer = csv.writer(csv_buffer)
 
-    activity_limits = await db.get_activity_limits_cached()
+    # 获取活动配置
+    try:
+        activity_limits = await db.get_activity_limits_cached()
+        if not activity_limits:
+            await bot.send_message(chat_id, "⚠️ 当前没有配置任何活动，无法导出数据")
+            return
+    except Exception as e:
+        logger.error(f"获取活动配置失败: {e}")
+        activity_limits = await db.get_activity_limits()
 
     # 🎯 核心表头定义
     headers = ["用户ID", "用户昵称", "重置类型"]
@@ -4231,62 +4239,58 @@ async def export_and_push_csv(
             "罚款总金额",
             "超时次数",
             "总超时时间",
-            "工作天数",  # 🆕 已包含
-            "工作时长",  # 🆕 已包含
+            "工作天数",
+            "工作时长",
         ]
     )
     writer.writerow(headers)
 
     has_data = False
+    user_count = 0
+    reset_type_counts = {"硬重置": 0, "软重置": 0}
 
-    # 🎯 调用之前修复好的数据库查询函数
-    group_stats = await db.get_group_statistics(chat_id, target_date)
+    # 🎯 调用修改后的数据库查询函数
+    logger.info(f"开始获取群组 {chat_id} 的统计数据...")
+    try:
+        group_stats = await db.get_group_statistics(chat_id, target_date)
+        logger.info(f"数据库返回 {len(group_stats)} 条统计数据")
+    except Exception as e:
+        logger.error(f"获取统计数据失败: {e}")
+        await bot.send_message(chat_id, f"❌ 获取统计数据失败：{e}")
+        return
 
-    # 处理每个用户的数据
-    for user_data in group_stats:
+    # 处理每个用户的数据（可能包含多行：硬重置行 + 软重置行）
+    for idx, user_data in enumerate(group_stats):
         if not isinstance(user_data, dict):
+            logger.warning(f"跳过第 {idx} 条非字典数据")
             continue
+
+        # 🟢 直接从数据库返回的数据中获取重置状态
+        is_soft_reset = user_data.get("is_soft_reset", False)
+        reset_type = "B班" if is_soft_reset else "A班"
+        reset_type_counts[reset_type] += 1
 
         # 安全处理 activities 字段
         user_activities = user_data.get("activities", {})
         if not isinstance(user_activities, dict):
             user_activities = {}
 
-        # 检查是否包含有效数据（活动或罚款）
+        # 检查是否包含有效数据
         total_count = user_data.get("total_activity_count", 0)
         total_time = user_data.get("total_accumulated_time", 0)
         total_fines = user_data.get("total_fines", 0)
 
+        # 🟢 即使计数为0，也要显示行（为了区分软硬重置）
         if total_count > 0 or total_time > 0 or total_fines > 0:
             has_data = True
 
-        # 🎯 软重置状态检查逻辑
-        reset_type = "硬重置"
-        if target_date:
-            try:
-                # 检查是否存在软重置标记行
-                soft_reset_exists = await db.execute_with_retry(
-                    "检查软重置",
-                    """
-                    SELECT 1 FROM daily_statistics 
-                    WHERE chat_id = $1 AND user_id = $2 AND record_date = $3 
-                    AND activity_name = 'soft_reset'
-                    LIMIT 1
-                    """,
-                    chat_id,
-                    user_data.get("user_id"),
-                    target_date,
-                    fetchval=True,
-                )
-                if soft_reset_exists:
-                    reset_type = "软重置"
-            except Exception as e:
-                logger.debug(f"检查软重置状态失败: {e}")
-
         # 构建基础行数据
+        user_id = user_data.get("user_id", "未知")
+        nickname = user_data.get("nickname", "未知用户")
+
         row = [
-            user_data.get("user_id", "未知"),
-            user_data.get("nickname", "未知用户"),
+            user_id,
+            nickname,
             reset_type,
         ]
 
@@ -4309,7 +4313,7 @@ async def export_and_push_csv(
         overtime_seconds = int(user_data.get("total_overtime_time", 0) or 0)
         overtime_str = MessageFormatter.format_time_for_csv(overtime_seconds)
 
-        # 🆕 提取并格式化工作相关字段 (对应 database.py 中返回的 final_work_days 等)
+        # 提取并格式化工作相关字段
         work_days = user_data.get("work_days", 0)
         work_hours_seconds = int(user_data.get("work_hours", 0) or 0)
         work_hours_str = MessageFormatter.format_time_for_csv(work_hours_seconds)
@@ -4321,19 +4325,34 @@ async def export_and_push_csv(
                 user_data.get("total_fines", 0),
                 user_data.get("overtime_count", 0),
                 overtime_str,
-                work_days,  # 写入 CSV
-                work_hours_str,  # 写入 CSV
+                work_days,
+                work_hours_str,
             ]
         )
-        writer.writerow(row)
 
-    # 数据空值检查
+        writer.writerow(row)
+        user_count += 1
+
+        # 调试日志
+        logger.debug(
+            f"写入第 {idx+1} 行: 用户 {user_id} ({nickname}), "
+            f"重置类型: {reset_type}, "
+            f"活动数: {total_count}, 时长: {total_seconds_all}秒"
+        )
+
+    # 如果没有数据，仍然导出空表（为了显示结构）
     if not has_data:
-        await bot.send_message(chat_id, "⚠️ 当前群组没有数据需要导出")
-        return
+        logger.warning(f"群组 {chat_id} 没有有效数据，导出空表")
+        # 仍然继续导出，让用户看到表头结构
 
     csv_content = csv_buffer.getvalue()
     csv_buffer.close()
+
+    # 生成统计信息
+    total_rows = user_count
+    unique_users = len(
+        set([d.get("user_id") for d in group_stats if isinstance(d, dict)])
+    )
 
     temp_file = f"temp_{file_name}"
     try:
@@ -4352,29 +4371,45 @@ async def export_and_push_csv(
             f"📅 统计日期：<code>{(target_date.strftime('%Y-%m-%d') if target_date else get_beijing_time().strftime('%Y-%m-%d'))}</code>\n"
             f"⏰ 导出时间：<code>{get_beijing_time().strftime('%Y-%m-%d %H:%M:%S')}</code>\n"
             f"{MessageFormatter.create_dashed_line()}\n"
-            f"💾 包含每个用户每日的活动统计及工作时长\n"
+            f"📈 数据统计：\n"
+            f"• 总行数：<code>{total_rows}</code> 行\n"
+            f"• 独立用户：<code>{unique_users}</code> 人\n"
+            f"• 硬重置记录：<code>{reset_type_counts['硬重置']}</code> 行\n"
+            f"• 软重置记录：<code>{reset_type_counts['软重置']}</code> 行\n"
+            f"{MessageFormatter.create_dashed_line()}\n"
+            f"💾 已区分硬重置和软重置数据为独立行"
         )
 
-        # 发送到请求数据的当前聊天
+        # 发送到当前聊天
         try:
             csv_input_file = FSInputFile(temp_file, filename=file_name)
             await bot.send_document(
                 chat_id, csv_input_file, caption=caption, parse_mode="HTML"
             )
+            logger.info(f"✅ CSV文件已发送到群组 {chat_id}")
         except Exception as e:
             logger.warning(f"发送到当前聊天失败: {e}")
 
-        # 如果开启了推送功能，发送到管理员频道/群组
+        # 发送到管理员频道/群组
         if to_admin_if_no_group:
-            await notification_service.send_document(
-                chat_id, FSInputFile(temp_file, filename=file_name), caption=caption
-            )
+            try:
+                await notification_service.send_document(
+                    chat_id, FSInputFile(temp_file, filename=file_name), caption=caption
+                )
+                logger.info(f"✅ CSV文件已推送到通知服务")
+            except Exception as e:
+                logger.warning(f"推送到通知服务失败: {e}")
 
-        logger.info(f"✅ 数据导出并推送完成: {file_name}")
+        logger.info(
+            f"✅ 数据导出完成: {file_name}, "
+            f"总行数: {total_rows}, "
+            f"硬重置: {reset_type_counts['硬重置']}, "
+            f"软重置: {reset_type_counts['软重置']}"
+        )
 
     except Exception as e:
         logger.error(f"❌ 导出过程出错: {e}")
-        await bot.send_message(chat_id, f"❌ 导出失败：{e}")
+        await bot.send_message(chat_id, f"❌ 导出失败：{str(e)[:200]}")
     finally:
         try:
             if os.path.exists(temp_file):
@@ -4641,6 +4676,7 @@ async def health_check(request):
             status=500,
         )
 
+
 async def start_health_server():
     """优化后的健康检查服务器 - 解决 404 并保留完整功能"""
     port = int(os.getenv("PORT", 10000))
@@ -4653,7 +4689,7 @@ async def start_health_server():
     # 2. 绑定路由 (核心修复)
     app.router.add_get("/", root_handle)
     # 完美对接 keepalive_loop 的请求路径
-    app.router.add_get("/health", health_check) 
+    app.router.add_get("/health", health_check)
 
     runner = web.AppRunner(app)
     await runner.setup()
@@ -4938,7 +4974,9 @@ async def external_keepalive():
 
 async def keepalive_loop():
     """完整的保活循环: 外部保活 + 内部检查 + 数据库保活 + 内存回收"""
-    external_url = os.environ.get("RENDER_EXTERNAL_URL") or getattr(Config, "WEBHOOK_URL", None)
+    external_url = os.environ.get("RENDER_EXTERNAL_URL") or getattr(
+        Config, "WEBHOOK_URL", None
+    )
     if external_url:
         external_url = external_url.rstrip("/")
 
@@ -4959,7 +4997,9 @@ async def keepalive_loop():
                     try:
                         async with session.get(f"{external_url}/health") as resp:
                             if resp.status != 200:
-                                logger.warning(f"🌍 外部保活异常 | 状态码: {resp.status}")
+                                logger.warning(
+                                    f"🌍 外部保活异常 | 状态码: {resp.status}"
+                                )
                             else:
                                 logger.debug("🌍 外部保活成功")
                     except Exception as e:
@@ -4969,7 +5009,9 @@ async def keepalive_loop():
                 try:
                     async with session.get(f"http://127.0.0.1:{port}/health") as resp:
                         if resp.status != 200:
-                            logger.warning(f"🏠 内部健康检查异常 | 状态码: {resp.status}")
+                            logger.warning(
+                                f"🏠 内部健康检查异常 | 状态码: {resp.status}"
+                            )
                 except Exception as e:
                     logger.warning(f"🏠 内部健康检查失败: {e}")
 
@@ -4996,7 +5038,6 @@ async def keepalive_loop():
                 await asyncio.sleep(60)
 
 
-
 # ========== 启动流程 =========
 async def on_startup():
     """启动时执行 - 解决冲突并保留完整指令逻辑"""
@@ -5004,7 +5045,7 @@ async def on_startup():
     try:
         # ✅ 新增：强行踢掉其他冲突实例，确保线上唯一运行
         await bot_manager.bot.delete_webhook(drop_pending_updates=True)
-        
+
         # 1. 定义指令列表
         user_commands = [
             BotCommand(command="wc", description="🚽 小厕"),
@@ -5032,7 +5073,7 @@ async def on_startup():
 
         # ✅ 打印你需要的注册日志
         logger.info(f"📋 要注册的命令列表: {[cmd.command for cmd in user_commands]}")
-        
+
         # 2. 注册普通用户菜单
         res_user = await bot_manager.bot.set_my_commands(commands=user_commands)
         logger.info(f"✅ 普通用户命令注册结果: {res_user}")
@@ -5272,4 +5313,3 @@ if __name__ == "__main__":
         logger.info("机器人已被用户中断")
     except Exception as e:
         logger.error(f"机器人运行异常: {e}")
-
