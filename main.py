@@ -1344,7 +1344,7 @@ async def _process_back_locked(message: types.Message, chat_id: int, uid: int):
                 # 使用已经计算好的 elapsed_time_str (例如 "15分30秒")
                 eat_end_notification_text = (
                     f"🍽️ <b>吃饭结束通知</b>\n"
-                    f"👤 用户：{MessageFormatter.format_user_link(uid, user_data.get('nickname', '用户'))}\n"
+                    f"{MessageFormatter.format_user_link(uid, user_data.get('nickname', '用户'))} 回来了\n"
                     f"⏱️ 吃饭耗时：<code>{elapsed_time_str}</code>\n"
                 )
 
