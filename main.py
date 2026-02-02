@@ -1088,29 +1088,26 @@ async def start_activity(message: types.Message, act: str):
 
         logger.info(f"📝 用户 {uid} 开始活动 {act}，消息ID: {sent_message.message_id}")
 
-        # ==================== ✨ 新增功能：吃饭推送 (已修正) ✨ ====================
+        # ==================== ✨ 新增功能开始：吃饭推送 ✨ ====================
         if act == "吃饭":
             try:
-                # 1. 获取群名 (使用 message.bot 更稳妥)
+                # 获取群名（用于通知显示）
                 chat_title = str(chat_id)
                 try:
-                    # 尝试获取群组信息以显示真实群名
-                    chat_info = await message.bot.get_chat(chat_id)
+                    chat_info = await bot.get_chat(chat_id)
                     chat_title = chat_info.title or chat_title
                 except Exception:
                     pass
 
-                # 2. 构建推送文案
-                # 注意：如果 MessageFormatter 没有 create_dashed_line 方法，可以用 "----------------" 代替
+                # 构建推送文案
                 eat_notification_text = (
                     f"🍽️ <b>吃饭通知</b>\n"
-                    f"🏢 群组：<code>{chat_title}</code>\n"
-                    f"------------------------------\n"
-                    f"👤 用户：{MessageFormatter.format_user_link(uid, name)}\n"
-                    f"⏰ 开始时间：<code>{now.strftime('%H:%M:%S')}</code>\n"
+                    f" {MessageFormatter.format_user_link(uid, name)} 去吃饭了\n"
+                    f"⏰ 吃饭时间：<code>{now.strftime('%H:%M:%S')}</code>\n"
                 )
 
-                # 3. 异步发送 (确保 main.py 头部有: from utils import notification_service)
+                # 使用现有的 notification_service 异步发送
+                # 它会自动判断是否绑定了频道/群组并进行推送
                 asyncio.create_task(
                     notification_service.send_notification(
                         chat_id, eat_notification_text
@@ -1332,7 +1329,7 @@ async def _process_back_locked(message: types.Message, chat_id: int, uid: int):
                 )
             )
 
-        # ========== ✨ 新增功能开始：吃饭回座推送 ✨ ============
+        # ==================== ✨ 吃饭回座推送 (优化版) ✨ ====================
         if act == "吃饭":
             try:
                 # 1. 获取群名
@@ -1348,19 +1345,16 @@ async def _process_back_locked(message: types.Message, chat_id: int, uid: int):
                 eat_end_notification_text = (
                     f"🍽️ <b>吃饭结束通知</b>\n"
                     f"👤 用户：{MessageFormatter.format_user_link(uid, user_data.get('nickname', '用户'))}\n"
-                    f"⏰ 结束时间：<code>{now.strftime('%H:%M:%S')}</code>\n"
-                    f"⏱️ 实际耗时：<code>{elapsed_time_str}</code>\n"
+                    f"⏱️ 吃饭耗时：<code>{elapsed_time_str}</code>\n"
                 )
 
                 # 如果有超时或罚款，也可以加进去
-                if is_overtime:
-                    eat_end_notification_text += (
-                        f"⚠️ 状态：超时 (罚款 {fine_amount}元)\n"
-                    )
-                else:
-                    eat_end_notification_text += f"✅ 状态：正常\n"
-
-                eat_end_notification_text += "欢迎回座！"
+                # if is_overtime:
+                #     eat_end_notification_text += (
+                #         f"⚠️ 状态：超时 (罚款 {fine_amount}元)\n"
+                #     )
+                # else:
+                #     eat_end_notification_text += f"✅ 状态：正常\n"
 
                 # 3. 异步发送
                 asyncio.create_task(
