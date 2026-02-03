@@ -2056,7 +2056,7 @@ class PostgreSQLDatabase:
         self,
         chat_id: int,
         user_id: int,
-        record_date,
+        record_date: date,
         checkin_type: str,
         checkin_time: str,
         status: str,
@@ -2065,15 +2065,17 @@ class PostgreSQLDatabase:
     ):
         """添加上下班记录 - 实时四表同步写入版本"""
 
-        # 🧠 强制使用业务日期，忽略外部传入的 record_date
-        business_date = await self.get_business_date(chat_id)
+        # 🧠 尊重裁决层结果：使用外部传入的 record_date
+        # 统计月份取业务日期的 1 号
+        business_date = record_date
         statistic_date = business_date.replace(day=1)
 
         self._ensure_pool_initialized()
         async with self.pool.acquire() as conn:
             async with conn.transaction():
 
-                # ========== 1. 获取当前的 is_soft_reset 状态 ==========
+                # ========== 1. 获取该业务日期对应的 is_soft_reset 状态 ==========
+                # 必须查询该特定 business_date 的记录，以确保统计在正确的班次维度（A/B班）
                 current_soft_reset = False
                 soft_reset_row = await conn.fetchrow(
                     """
@@ -2089,7 +2091,7 @@ class PostgreSQLDatabase:
                 if soft_reset_row:
                     current_soft_reset = soft_reset_row["is_soft_reset"]
 
-                # ========== 2. work_records 表（上下班记录） ==========
+                # ========== 2. work_records 表（上下班记录明细） ==========
                 await conn.execute(
                     """
                     INSERT INTO work_records 
@@ -2113,8 +2115,8 @@ class PostgreSQLDatabase:
                     fine_amount,
                 )
 
-                # ========== 3. daily_statistics 表（新增） ==========
-                # 3.1 工作罚款到 daily_statistics
+                # ========== 3. daily_statistics 表（每日/每班统计） ==========
+                # 3.1 罚款统计
                 if fine_amount > 0:
                     activity_name = "work_fines"
                     if checkin_type == "work_start":
@@ -2141,9 +2143,10 @@ class PostgreSQLDatabase:
                         current_soft_reset,
                     )
 
-                # 3.2 下班时记录工作天数到 daily_statistics
+                # 3.2 下班时：统计工作天数和本次班次的总时长
                 work_duration_seconds = 0
                 if checkin_type == "work_end":
+                    # 记录工作天数 (activity_count + 1)
                     await conn.execute(
                         """
                         INSERT INTO daily_statistics 
@@ -2161,7 +2164,7 @@ class PostgreSQLDatabase:
                         current_soft_reset,
                     )
 
-                    # 计算并记录工作时长到 daily_statistics
+                    # 计算工作时长：找到同一业务日期的上班记录
                     work_start_record = await conn.fetchrow(
                         """
                         SELECT checkin_time FROM work_records 
@@ -2175,20 +2178,23 @@ class PostgreSQLDatabase:
 
                     if work_start_record:
                         try:
-                            start_time = datetime.strptime(
-                                work_start_record["checkin_time"], "%H:%M"
+                            # 提取时间偏移量进行计算
+                            s_hour, s_min = map(
+                                int, work_start_record["checkin_time"].split(":")
                             )
-                            end_time = datetime.strptime(checkin_time, "%H:%M")
+                            e_hour, e_min = map(int, checkin_time.split(":"))
 
-                            work_duration_minutes = (
-                                end_time - start_time
-                            ).total_seconds() / 60
+                            start_total_min = s_hour * 60 + s_min
+                            end_total_min = e_hour * 60 + e_min
+
+                            # 核心跨天处理逻辑
+                            work_duration_minutes = end_total_min - start_total_min
                             if work_duration_minutes < 0:
-                                work_duration_minutes += 24 * 60
+                                work_duration_minutes += 24 * 60  # 补足跨天差值
 
                             work_duration_seconds = int(work_duration_minutes * 60)
 
-                            # 工作时长到 daily_statistics
+                            # 将时长累加到 daily_statistics
                             await conn.execute(
                                 """
                                 INSERT INTO daily_statistics 
@@ -2206,47 +2212,28 @@ class PostgreSQLDatabase:
                                 work_duration_seconds,
                                 current_soft_reset,
                             )
+                        except Exception as e:
+                            logger.error(f"计算班次工作时长失败: {e}")
 
-                        except Exception:
-                            # 即使计算失败也继续
-                            pass
-
-                # ========== 4. monthly_statistics 表（原有逻辑） ==========
-                # 4.1 工作天数到 monthly_statistics
+                # ========== 4. monthly_statistics 表（月度统计） ==========
                 if checkin_type == "work_end":
-                    try:
-                        await conn.execute(
-                            """
-                            INSERT INTO monthly_statistics 
-                            (chat_id, user_id, statistic_date, activity_name, activity_count, accumulated_time)
-                            VALUES ($1, $2, $3, 'work_days', 1, 0)
-                            ON CONFLICT (chat_id, user_id, statistic_date, activity_name) 
-                            DO UPDATE SET 
-                                activity_count = monthly_statistics.activity_count + 1,
-                                updated_at = CURRENT_TIMESTAMP
-                            """,
-                            chat_id,
-                            user_id,
-                            statistic_date,
-                        )
-                    except Exception:
-                        # 即使计算失败也记录工作天数
-                        await conn.execute(
-                            """
-                            INSERT INTO monthly_statistics 
-                            (chat_id, user_id, statistic_date, activity_name, activity_count, accumulated_time)
-                            VALUES ($1, $2, $3, 'work_days', 1, 0)
-                            ON CONFLICT (chat_id, user_id, statistic_date, activity_name) 
-                            DO UPDATE SET 
-                                activity_count = monthly_statistics.activity_count + 1,
-                                updated_at = CURRENT_TIMESTAMP
-                            """,
-                            chat_id,
-                            user_id,
-                            statistic_date,
-                        )
+                    # 4.1 月度工作天数
+                    await conn.execute(
+                        """
+                        INSERT INTO monthly_statistics 
+                        (chat_id, user_id, statistic_date, activity_name, activity_count, accumulated_time)
+                        VALUES ($1, $2, $3, 'work_days', 1, 0)
+                        ON CONFLICT (chat_id, user_id, statistic_date, activity_name) 
+                        DO UPDATE SET 
+                            activity_count = monthly_statistics.activity_count + 1,
+                            updated_at = CURRENT_TIMESTAMP
+                        """,
+                        chat_id,
+                        user_id,
+                        statistic_date,
+                    )
 
-                    # 4.2 工作时长到 monthly_statistics
+                    # 4.2 月度累积时长
                     if work_duration_seconds > 0:
                         await conn.execute(
                             """
@@ -2264,7 +2251,7 @@ class PostgreSQLDatabase:
                             work_duration_seconds,
                         )
 
-                # ========== 5. users 表罚款统计 ==========
+                # ========== 5. users 表（总资产/总罚款统计） ==========
                 if fine_amount > 0:
                     await conn.execute(
                         "UPDATE users SET total_fines = total_fines + $1 WHERE chat_id = $2 AND user_id = $3",
@@ -2273,13 +2260,12 @@ class PostgreSQLDatabase:
                         user_id,
                     )
 
-        # ========== 6. 清理缓存 ==========
+        # ========== 6. 清理缓存并记录日志 ==========
         self._cache.pop(f"user:{chat_id}:{user_id}", None)
 
         logger.debug(
-            f"✅ 上下班记录四表同步写入完成: {chat_id}-{user_id} - {checkin_type} "
-            f"(时间: {checkin_time}, 罚款: {fine_amount}元, "
-            f"软重置状态: {current_soft_reset})"
+            f"✅ 上下班四表写入成功: 用户:{user_id} 业务日期:{business_date} "
+            f"类型:{checkin_type} 状态:{status} 罚款:{fine_amount} 时长(秒):{work_duration_seconds}"
         )
 
     async def has_work_record_today(
