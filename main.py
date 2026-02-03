@@ -2245,18 +2245,25 @@ async def process_work_checkin(message: types.Message, checkin_type: str):
 # --- 必须的辅助函数 (如果 utils.py 或 database.py 里没有) ---
 async def reset_daily_data_if_needed_with_date(chat_id, uid, business_date):
     """确保指定日期的用户记录已初始化"""
-    # 检查 daily_statistics 是否存在该日期的记录 (即便为空)
-    # 如果没有，可能需要执行 reset_user_daily_data 来清理旧状态并从新日期开始
-    # 这里简化为：如果没有记录，则认为还没初始化过今天
-    exists = await db.fetchval(
-        "SELECT 1 FROM daily_statistics WHERE chat_id=$1 AND user_id=$2 AND record_date=$3",
-        chat_id,
-        uid,
-        business_date,
-    )
-    if not exists:
-        # 重置旧的用户状态 (Total count = 0 等)，并将 last_updated 设为 business_date
+    
+    # 1. 使用正确的数据库查询方法
+    # 注意：必须使用 await，且通过 db.pool 获取连接执行
+    async with db.pool.acquire() as conn:
+        # 使用 fetchval 获取单个值（如果不存在返回 None）
+        exists = await conn.fetchval(
+            "SELECT 1 FROM daily_statistics WHERE chat_id=$1 AND user_id=$2 AND record_date=$3",
+            chat_id,
+            uid,
+            business_date,
+        )
+    
+    # 2. 判断是否存在
+    if exists is None:
+        # 3. 如果没有记录，执行重置初始化逻辑
+        # 确保 reset_user_daily_data 是 async 函数并使用了 await
         await db.reset_user_daily_data(chat_id, uid, business_date)
+        return True
+    return False
 
 
 async def get_current_shift_info(
