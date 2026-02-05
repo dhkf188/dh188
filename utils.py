@@ -111,17 +111,17 @@ class MessageFormatter:
             f"{first_line}\n"
             f"✅ 打卡成功：{MessageFormatter.format_copyable_text(activity)} - {MessageFormatter.format_copyable_text(time_str)}\n"
             f"▫️ 本次活动类型：{MessageFormatter.format_copyable_text(activity)}\n"
-            f"⏰ 单次时长限制：{MessageFormatter.format_copyable_text(str(time_limit))} 分钟 \n"
+            f"⏰ 单次时长限制：{MessageFormatter.format_copyable_text(str(time_limit))}分钟 \n"
             f"📈 今日{MessageFormatter.format_copyable_text(activity)}次数：第 {MessageFormatter.format_copyable_text(str(count))} 次（上限 {MessageFormatter.format_copyable_text(str(max_times))} 次）\n"
         )
 
         if count >= max_times:
-            message += f"🚨 警告：本次结束后，您今日的{MessageFormatter.format_copyable_text(activity)}次数将达到上限，请留意！\n"
+            message += f"🚨 警告：本次结束后，您今日的{MessageFormatter.format_copyable_text(activity)}次数将达到上限，请留意！"
 
         message += (
             f"{dashed_line}\n"
             f"💡 操作提示\n"
-            f"完成后请及时点击 👉【✅ 回座】👈按钮。"
+            f"活动结束后请及时点击 👉【✅ 回座打卡】👈按钮。"
         )
 
         return message
@@ -1068,6 +1068,87 @@ async def send_reset_notification(
 
     except Exception as e:
         logger.error(f"发送重置通知失败 {chat_id}: {e}")
+
+# ========== 双班系统核心函数 ==========
+
+def parse_time_to_minutes(time_str: str) -> int:
+    """将 HH:MM 格式的时间转换为分钟数"""
+    try:
+        hours, minutes = map(int, time_str.split(':'))
+        return hours * 60 + minutes
+    except Exception:
+        return 0
+
+
+def is_time_in_day_shift(current_time: datetime, day_start: str, day_end: str) -> bool:
+    """
+    判断当前时间是否属于白班时间窗口（支持跨天）
+    
+    参数:
+        current_time: 当前时间（datetime对象）
+        day_start: 白班开始时间，格式 "HH:MM"
+        day_end: 白班结束时间，格式 "HH:MM"
+    
+    返回:
+        True: 当前在白班时段
+        False: 当前在夜班时段
+    """
+    # 将时间转换为分钟数
+    start_minutes = parse_time_to_minutes(day_start)
+    end_minutes = parse_time_to_minutes(day_end)
+    
+    # 当前时间的分钟数
+    current_minutes = current_time.hour * 60 + current_time.minute
+    
+    # 判断是否跨天
+    if start_minutes < end_minutes:
+        # 非跨天情况：start <= current < end
+        return start_minutes <= current_minutes < end_minutes
+    else:
+        # 跨天情况：current >= start OR current < end
+        return current_minutes >= start_minutes or current_minutes < end_minutes
+
+
+async def determine_shift_id(
+    chat_id: int, 
+    user_id: int, 
+    current_time: datetime, 
+    db_instance
+) -> int:
+    """
+    确定用户当前应该使用哪个班次ID（核心算法）
+    优先级：打卡锁定 > 模式判断 > 时间窗口判定
+    
+    返回:
+        0: 白班
+        1: 夜班
+    """
+    try:
+        # 1. 打卡锁定（最高优先级）
+        user_status = await db_instance.get_user_status(chat_id, user_id)
+        if user_status and user_status.get('on_duty_shift') is not None:
+            return user_status['on_duty_shift']
+        
+        # 2. 获取群组配置
+        group_data = await db_instance.get_group_cached(chat_id)
+        
+        # 3. 模式判断
+        if not group_data.get('dual_mode', False):
+            # 单班模式，永远为白班
+            return 0
+        
+        # 4. 时间窗口判定
+        day_start = group_data.get('day_start', '09:00')
+        day_end = group_data.get('day_end', '21:00')
+        
+        if is_time_in_day_shift(current_time, day_start, day_end):
+            return 0  # 白班
+        else:
+            return 1  # 夜班
+            
+    except Exception as e:
+        logger.error(f"班次判定失败: {e}")
+        return 0  # 默认白班
 
 
 # 全局实例
