@@ -611,13 +611,14 @@ async def reset_daily_data_if_needed(chat_id: int, uid: int):
 
 
 async def check_activity_limit(
-    chat_id: int, uid: int, act: str
+    chat_id: int, uid: int, act: str, shift_id: int = None
 ) -> tuple[bool, int, int]:
-    """检查活动次数是否达到上限"""
+    """检查活动次数是否达到上限 - 支持按班次"""
     await db.init_group(chat_id)
     await db.init_user(chat_id, uid)
 
-    current_count = await db.get_user_activity_count(chat_id, uid, act)
+    # 🆕 传入 shift_id
+    current_count = await db.get_user_activity_count(chat_id, uid, act, shift_id)
     max_times = await db.get_activity_max_times(act)
 
     return current_count < max_times, current_count, max_times
@@ -980,7 +981,7 @@ async def activity_timer(chat_id: int, uid: int, act: str, limit: int):
 
 # ========== 核心打卡功能 ==========
 async def start_activity(message: types.Message, act: str):
-    """开始活动 - 记录打卡消息ID"""
+    """开始活动 - 按班次计算次数（完整整合版）"""
     chat_id = message.chat.id
     uid = message.from_user.id
 
@@ -988,24 +989,24 @@ async def start_activity(message: types.Message, act: str):
     async with user_lock:
         await reset_daily_data_if_needed(chat_id, uid)
 
-        # 快速检查活动是否存在
+        # ===== 1️⃣ 快速检查活动是否存在 =====
         if not await db.activity_exists(act):
             await message.answer(
-                f"❌ 活动 '{act}' 不存在", reply_to_message_id=message.message_id
+                f"❌ 活动 '{act}' 不存在",
+                reply_to_message_id=message.message_id
             )
             return
 
-        # 检查活动限制（如被封禁等）
+        # ===== 2️⃣ 检查用户是否允许操作（封禁等）=====
         can_perform, reason = await can_perform_activities(chat_id, uid)
         if not can_perform:
             await message.answer(reason)
             return
 
-        # 开始活动逻辑
         name = message.from_user.full_name
         now = get_beijing_time()
 
-        # 检查活动人数限制
+        # ===== 3️⃣ 检查活动人数限制 =====
         user_limit = await db.get_activity_user_limit(act)
         if user_limit > 0:
             current_users = await db.get_current_activity_users(chat_id, act)
@@ -1026,7 +1027,7 @@ async def start_activity(message: types.Message, act: str):
                 )
                 return
 
-        # 检查是否已有进行中的活动
+        # ===== 4️⃣ 检查是否已有进行中的活动 =====
         has_active, current_act = await has_active_activity(chat_id, uid)
         if has_active:
             await message.answer(
@@ -1039,37 +1040,59 @@ async def start_activity(message: types.Message, act: str):
             )
             return
 
-        # 再次重置每日数据（保持与你原代码一致）
+        # ===== 5️⃣ 再次重置每日数据（保持你原逻辑）=====
         await reset_daily_data_if_needed(chat_id, uid)
 
-        # 检查活动次数限制
+        # =====================================================
+        # 🆕 6️⃣ 【关键新增】确保用户“本次活动所属班次”已确定
+        # =====================================================
+        user_status = await db.get_user_status(chat_id, uid)
+
+        if not user_status or user_status.get('on_duty_shift') is None:
+            shift_id = await determine_shift_id(chat_id, uid, now, db)
+            await db.update_user_shift_status(
+                chat_id,
+                uid,
+                shift_id,
+                checkin_time=now
+            )
+        else:
+            shift_id = user_status.get('on_duty_shift')
+
+        # =====================================================
+        # 🆕 7️⃣ 按【班次】检查活动次数限制
+        # =====================================================
         can_start, current_count, max_times = await check_activity_limit(
-            chat_id, uid, act
+            chat_id, uid, act, shift_id
         )
+
         if not can_start:
             await message.answer(
-                Config.MESSAGES["max_times_reached"].format(act, max_times),
+                f"❌ 本班次活动 '<code>{act}</code>' 次数已达上限 "
+                f"({current_count}/{max_times})",
                 reply_markup=await get_main_keyboard(
                     chat_id=chat_id,
                     show_admin=await is_admin(uid),
                 ),
                 reply_to_message_id=message.message_id,
+                parse_mode="HTML",
             )
             return
 
-        # 更新用户活动状态
-        await db.update_user_activity(chat_id, uid, act, str(now), name)
-        shift_id = await determine_shift_id(chat_id, uid, now, db)
-        await db.update_user_shift_status(chat_id, uid, shift_id, checkin_time=now)
+        # ===== 8️⃣ 更新用户活动状态 =====
+        await db.update_user_activity(
+            chat_id, uid, act, str(now), name
+        )
 
-
-        # 获取活动时长限制
+        # ===== 9️⃣ 获取活动时长限制 =====
         time_limit = await db.get_activity_time_limit(act)
 
-        # 启动计时器
-        await timer_manager.start_timer(chat_id, uid, act, time_limit)
+        # ===== 🔟 启动计时器 =====
+        await timer_manager.start_timer(
+            chat_id, uid, act, time_limit
+        )
 
-        # ✅ 发送打卡消息（关键点）
+        # ===== 1️⃣1️⃣ 发送活动打卡消息 =====
         sent_message = await message.answer(
             MessageFormatter.format_activity_message(
                 uid,
@@ -1088,15 +1111,18 @@ async def start_activity(message: types.Message, act: str):
             parse_mode="HTML",
         )
 
-        # ✅ 保存打卡消息ID
-        await db.update_user_checkin_message(chat_id, uid, sent_message.message_id)
+        # ===== 1️⃣2️⃣ 保存打卡消息 ID =====
+        await db.update_user_checkin_message(
+            chat_id, uid, sent_message.message_id
+        )
 
-        logger.info(f"📝 用户 {uid} 开始活动 {act}，消息ID: {sent_message.message_id}")
+        logger.info(
+            f"📝 用户 {uid} 开始活动 {act}（班次 {shift_id}），消息ID: {sent_message.message_id}"
+        )
 
-        # ==================== ✨ 新增功能开始：吃饭推送 ✨ ====================
+        # ==================== ✨ 吃饭推送（原逻辑完整保留）✨ ====================
         if act == "吃饭":
             try:
-                # 获取群名（用于通知显示）
                 chat_title = str(chat_id)
                 try:
                     chat_info = await bot.get_chat(chat_id)
@@ -1104,20 +1130,18 @@ async def start_activity(message: types.Message, act: str):
                 except Exception:
                     pass
 
-                # 构建推送文案
                 eat_notification_text = (
                     f"🍽️ <b>吃饭通知</b>\n"
                     f" {MessageFormatter.format_user_link(uid, name)} 去吃饭了\n"
                     f"⏰ 吃饭时间：<code>{now.strftime('%H:%M:%S')}</code>\n"
                 )
 
-                # 使用现有的 notification_service 异步发送
-                # 它会自动判断是否绑定了频道/群组并进行推送
                 asyncio.create_task(
                     notification_service.send_notification(
                         chat_id, eat_notification_text
                     )
                 )
+
                 logger.info(f"🍽️ 已触发用户 {uid} 的吃饭推送")
 
             except Exception as e:
@@ -1249,7 +1273,7 @@ async def _process_back_locked(message: types.Message, chat_id: int, uid: int):
         # 获取最新数据
         user_data_task = asyncio.create_task(db.get_user_cached(chat_id, uid))
         user_activities_task = asyncio.create_task(
-            db.get_user_all_activities(chat_id, uid)
+            db.get_user_activities_by_shift(chat_id, uid, shift_id)
         )
         user_data = await user_data_task
         user_activities = await user_activities_task
@@ -1648,7 +1672,7 @@ async def process_work_checkin(message: types.Message, checkin_type: str):
         if not valid_time:
             # 根据班次决定时间窗口
             if shift_name in ["白班☀️", "夜班🌙"]:
-                hours_before = 1
+                hours_before = 2
                 hours_after = 6
             else:
                 hours_before = 7
@@ -4480,6 +4504,11 @@ async def show_history(message: types.Message):
     # 🔹 用户基础信息（只用于展示昵称 & 罚款等字段）
     user_data = await db.get_user_cached(chat_id, uid)
 
+    user_status = await db.get_user_status(chat_id, uid)
+    shift_id = user_status.get('on_duty_shift', 0) if user_status else 0
+
+    user_activities = await db.get_user_activities_by_shift(chat_id, uid, shift_id)
+
     if not user_data:
         await message.answer(
             "暂无记录，请先进行打卡活动",
@@ -4490,8 +4519,9 @@ async def show_history(message: types.Message):
         )
         return
 
+    shift_name = "白班" if shift_id == 0 else "夜班"
     first_line = (
-        f"👤 用户：{MessageFormatter.format_user_link(uid, user_data['nickname'])}"
+        f"👤 {shift_name}：{MessageFormatter.format_user_link(uid, user_data['nickname'])}"
     )
 
     text = (
