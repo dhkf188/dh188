@@ -1077,24 +1077,102 @@ class PostgreSQLDatabase:
             return result
         return None
 
-    async def get_activity_count(
-        self, chat_id: int, user_id: int, activity: str
+    async def get_user_activity_count(
+        self, chat_id: int, user_id: int, activity: str, shift_id: int = None
     ) -> int:
+        """获取用户指定活动在当前班次的次数"""
         today = await self.get_business_date(chat_id)
-        count = await self.execute_with_retry(
-            "获取活动次数",
+        
+        if shift_id is None:
+            # 如果没有提供 shift_id，则获取用户当前班次
+            user_status = await self.get_user_status(chat_id, user_id)
+            if user_status and user_status.get('on_duty_shift') is not None:
+                shift_id = user_status['on_duty_shift']
+            else:
+                # 如果没有班次信息，则使用默认白班(0)
+                shift_id = 0
+        
+        try:
+            # 使用班次过滤查询
+            count = await self.execute_with_retry(
+                "按班次获取活动次数",
+                """
+                SELECT SUM(activity_count) as total_count
+                FROM user_activities 
+                WHERE chat_id = $1 AND user_id = $2 AND activity_date = $3 
+                AND activity_name = $4 AND shift_id = $5
+                """,
+                chat_id, user_id, today, activity, shift_id,
+                fetchval=True,
+                timeout=5,
+            )
+            return int(count) if count else 0
+        except Exception as e:
+            logger.error(f"获取用户活动次数失败 {chat_id}-{user_id}-{activity}: {e}")
+            return 0
+
+    async def get_user_all_activities(
+        self, chat_id: int, user_id: int, shift_id: int = None
+    ) -> Dict[str, Dict]:
+        """获取用户所有活动数据 - 支持按班次查询"""
+        today = await self.get_business_date(chat_id)
+        
+        if shift_id is not None:
+            # 按班次查询
+            query = """
+                SELECT activity_name, activity_count, accumulated_time 
+                FROM user_activities 
+                WHERE chat_id = $1 AND user_id = $2 AND activity_date = $3 
+                AND shift_id = $4
             """
-            SELECT activity_count FROM user_activities 
-            WHERE chat_id = $1 AND user_id = $2 AND activity_date = $3 AND activity_name = $4
-            """,
-            chat_id,
-            user_id,
-            today,
-            activity,
-            fetchval=True,  # 🎯 只需要单个值
-            timeout=5,  # 🎯 简单查询设置短超时
-        )
-        return count if count else 0
+            params = [chat_id, user_id, today, shift_id]
+        else:
+            # 兼容旧代码：查询所有班次
+            query = """
+                SELECT activity_name, SUM(activity_count) as total_count, 
+                       SUM(accumulated_time) as total_time
+                FROM user_activities 
+                WHERE chat_id = $1 AND user_id = $2 AND activity_date = $3
+                GROUP BY activity_name
+            """
+            params = [chat_id, user_id, today]
+        
+        self._ensure_pool_initialized()
+        async with self.pool.acquire() as conn:
+            rows = await conn.fetch(query, *params)
+            
+            activities = {}
+            for row in rows:
+                activities[row["activity_name"]] = {
+                    "count": row["total_count"] if "total_count" in row else row["activity_count"],
+                    "time": row["total_time"] if "total_time" in row else row["accumulated_time"],
+                }
+            return activities
+
+    async def get_user_activities_by_shift(
+        self, chat_id: int, user_id: int, shift_id: int
+    ) -> Dict[str, Dict]:
+        """按班次获取用户活动数据"""
+        today = await self.get_business_date(chat_id)
+        
+        query = """
+            SELECT activity_name, activity_count, accumulated_time 
+            FROM user_activities 
+            WHERE chat_id = $1 AND user_id = $2 AND activity_date = $3 
+            AND shift_id = $4
+        """
+        
+        self._ensure_pool_initialized()
+        async with self.pool.acquire() as conn:
+            rows = await conn.fetch(query, chat_id, user_id, today, shift_id)
+            
+            activities = {}
+            for row in rows:
+                activities[row["activity_name"]] = {
+                    "count": row["activity_count"],
+                    "time": row["accumulated_time"],
+                }
+            return activities
 
     async def get_user_cached(self, chat_id: int, user_id: int) -> Optional[Dict]:
         """带缓存的获取用户数据 - 优化版"""
@@ -2277,44 +2355,6 @@ class PostgreSQLDatabase:
         except Exception as e:
             logger.error(f"❌ 软重置失败 {chat_id}-{user_id}: {e}")
             return False
-
-    async def get_user_activity_count(
-        self, chat_id: int, user_id: int, activity: str
-    ) -> int:
-        """获取用户今日活动次数"""
-        today = await self.get_business_date(chat_id)
-        self._ensure_pool_initialized()
-        async with self.pool.acquire() as conn:
-            row = await conn.fetchrow(
-                "SELECT activity_count FROM user_activities WHERE chat_id = $1 AND user_id = $2 AND activity_date = $3 AND activity_name = $4",
-                chat_id,
-                user_id,
-                today,
-                activity,
-            )
-            return row["activity_count"] if row else 0
-
-    async def get_user_all_activities(
-        self, chat_id: int, user_id: int
-    ) -> Dict[str, Dict]:
-        """获取用户所有活动数据"""
-        today = await self.get_business_date(chat_id)
-        self._ensure_pool_initialized()
-        async with self.pool.acquire() as conn:
-            rows = await conn.fetch(
-                "SELECT activity_name, activity_count, accumulated_time FROM user_activities WHERE chat_id = $1 AND user_id = $2 AND activity_date = $3",
-                chat_id,
-                user_id,
-                today,
-            )
-
-            activities = {}
-            for row in rows:
-                activities[row["activity_name"]] = {
-                    "count": row["activity_count"],
-                    "time": row["accumulated_time"],
-                }
-            return activities
 
     # ========== 上下班记录操作 ==========
     async def add_work_record(
