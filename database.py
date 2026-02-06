@@ -701,7 +701,6 @@ class PostgreSQLDatabase:
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                     UNIQUE(chat_id, user_id, statistic_date, shift_id, activity_name, is_soft_reset)
-);
                 )
                 """,
             ]
