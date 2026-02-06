@@ -596,7 +596,7 @@ class PostgreSQLDatabase:
                     is_overtime BOOLEAN DEFAULT FALSE,
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                    UNIQUE(chat_id, user_id, activity_date, activity_name)
+                    UNIQUE(chat_id, user_id, activity_date, shift_id, activity_name)
                 )
                 """,
                 # work_records表
@@ -686,6 +686,8 @@ class PostgreSQLDatabase:
                     id SERIAL PRIMARY KEY,
                     chat_id BIGINT,
                     user_id BIGINT,
+                    statistic_date DATE NOT NULL,
+                    shift_id SMALLINT DEFAULT 0,
                     record_date DATE,
                     activity_name TEXT,
                     activity_count INTEGER DEFAULT 0,
@@ -698,7 +700,8 @@ class PostgreSQLDatabase:
                     is_soft_reset BOOLEAN DEFAULT FALSE,
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                    UNIQUE(chat_id, user_id, record_date, activity_name, is_soft_reset)
+                    UNIQUE(chat_id, user_id, statistic_date, shift_id, activity_name, is_soft_reset)
+);
                 )
                 """,
             ]
@@ -1587,7 +1590,7 @@ class PostgreSQLDatabase:
             logger.error(f"Error in complete_user_activity: {e}", exc_info=True)
             raise
 
-            
+
     async def reset_shift_data(self, chat_id: int, shift_id: int, is_hard_reset: bool = True):
         """
         重置班次数据 - 完整版
