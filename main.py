@@ -1049,16 +1049,21 @@ async def start_activity(message: types.Message, act: str):
         user_status = await db.get_user_status(chat_id, uid)
 
         if not user_status or user_status.get('on_duty_shift') is None:
-            shift_id = await determine_shift_id(chat_id, uid, now, db)
-            await db.update_user_shift_status(
-                chat_id,
-                uid,
-                shift_id,
-                checkin_time=now
-            )
+            try:
+                shift_id = await determine_activity_shift_id(chat_id, uid, now, db)
+                await db.update_user_shift_status(
+                    chat_id,
+                    uid,
+                    shift_id,
+                    checkin_time=now
+                )
+            except Exception as e:
+                logger.error(f"确定活动班次失败: {e}")
+                shift_id = 0
+
         else:
             shift_id = user_status.get('on_duty_shift')
-
+    
         # =====================================================
         # 🆕 7️⃣ 按【班次】检查活动次数限制
         # =====================================================
