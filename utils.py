@@ -936,52 +936,52 @@ def calculate_cross_day_time_diff(
         return 0, current_dt
 
 
-async def is_valid_checkin_time(
-    chat_id: int, checkin_type: str, current_time: datetime
-) -> Tuple[bool, datetime]:
-    """
-    检查是否在允许的打卡时间窗口内（前后 7 小时）
-    """
-    try:
-        work_hours = await db.get_group_work_time(chat_id)
-        if checkin_type == "work_start":
-            expected_time_str = work_hours["work_start"]
-        else:
-            expected_time_str = work_hours["work_end"]
+# async def is_valid_checkin_time(
+#     chat_id: int, checkin_type: str, current_time: datetime
+# ) -> Tuple[bool, datetime]:
+#     """
+#     检查是否在允许的打卡时间窗口内（前后 7 小时）
+#     """
+#     try:
+#         work_hours = await db.get_group_work_time(chat_id)
+#         if checkin_type == "work_start":
+#             expected_time_str = work_hours["work_start"]
+#         else:
+#             expected_time_str = work_hours["work_end"]
 
-        exp_h, exp_m = map(int, expected_time_str.split(":"))
+#         exp_h, exp_m = map(int, expected_time_str.split(":"))
 
-        # 在 -1/0/+1 天范围内生成候选 expected_dt
-        candidates = []
-        for d in (-1, 0, 1):
-            candidate = current_time.replace(
-                hour=exp_h, minute=exp_m, second=0, microsecond=0
-            ) + timedelta(days=d)
-            candidates.append(candidate)
+#         # 在 -1/0/+1 天范围内生成候选 expected_dt
+#         candidates = []
+#         for d in (-1, 0, 1):
+#             candidate = current_time.replace(
+#                 hour=exp_h, minute=exp_m, second=0, microsecond=0
+#             ) + timedelta(days=d)
+#             candidates.append(candidate)
 
-        # 选择与 current_time 时间差绝对值最小的 candidate
-        expected_dt = min(
-            candidates, key=lambda t: abs((t - current_time).total_seconds())
-        )
+#         # 选择与 current_time 时间差绝对值最小的 candidate
+#         expected_dt = min(
+#             candidates, key=lambda t: abs((t - current_time).total_seconds())
+#         )
 
-        # 允许前后窗口：7小时
-        earliest = expected_dt - timedelta(hours=7)
-        latest = expected_dt + timedelta(hours=7)
+#         # 允许前后窗口：7小时
+#         earliest = expected_dt - timedelta(hours=7)
+#         latest = expected_dt + timedelta(hours=7)
 
-        is_valid = earliest <= current_time <= latest
+#         is_valid = earliest <= current_time <= latest
 
-        if not is_valid:
-            logger.warning(
-                f"打卡时间超出允许窗口: {checkin_type}, 当前: {current_time.strftime('%Y-%m-%d %H:%M')}, "
-                f"允许: {earliest.strftime('%Y-%m-%d %H:%M')} ~ {latest.strftime('%Y-%m-%d %H:%M')}"
-            )
+#         if not is_valid:
+#             logger.warning(
+#                 f"打卡时间超出允许窗口: {checkin_type}, 当前: {current_time.strftime('%Y-%m-%d %H:%M')}, "
+#                 f"允许: {earliest.strftime('%Y-%m-%d %H:%M')} ~ {latest.strftime('%Y-%m-%d %H:%M')}"
+#             )
 
-        return is_valid, expected_dt
+#         return is_valid, expected_dt
 
-    except Exception as e:
-        logger.error(f"检查打卡时间范围失败: {e}")
-        fallback = current_time.replace(hour=9, minute=0, second=0, microsecond=0)
-        return True, fallback
+#     except Exception as e:
+#         logger.error(f"检查打卡时间范围失败: {e}")
+#         fallback = current_time.replace(hour=9, minute=0, second=0, microsecond=0)
+#         return True, fallback
 
 
 # ========== 装饰器和工具函数 ==========
@@ -1112,44 +1112,344 @@ def is_time_in_day_shift(current_time: datetime, day_start: str, day_end: str) -
 async def determine_shift_id(
     chat_id: int, 
     user_id: int, 
-    current_time: datetime, 
-    db_instance
-) -> int:
+    checkin_type: str, 
+    current_time: datetime,
+    db
+) -> Tuple[bool, datetime, str, int, str]:
     """
-    确定用户当前应该使用哪个班次ID（核心算法）
-    优先级：打卡锁定 > 模式判断 > 时间窗口判定
-    
-    返回:
-        0: 白班
-        1: 夜班
+    合并版：检查班次并验证时间有效性
+    返回：(是否有效, 期望时间, 班次名称, 班次ID, 错误信息)
     """
     try:
-        # 1. 打卡锁定（最高优先级）
-        user_status = await db_instance.get_user_status(chat_id, user_id)
-        if user_status and user_status.get('on_duty_shift') is not None:
-            return user_status['on_duty_shift']
+        # 1. 获取群组配置
+        group_config = await db.get_group_shift_config(chat_id)
         
-        # 2. 获取群组配置
-        group_data = await db_instance.get_group_cached(chat_id)
+        # 2. 获取工作时间（用于单班模式）
+        work_hours = await db.get_group_work_time(chat_id)
         
-        # 3. 模式判断
-        if not group_data.get('dual_mode', False):
-            # 单班模式，永远为白班
-            return 0
-        
-        # 4. 时间窗口判定
-        day_start = group_data.get('day_start', '09:00')
-        day_end = group_data.get('day_end', '21:00')
-        
-        if is_time_in_day_shift(current_time, day_start, day_end):
-            return 0  # 白班
-        else:
-            return 1  # 夜班
+        # 3. 如果未开启双班模式
+        if not group_config.get('dual_mode', False):
+            # 单班模式逻辑
+            if checkin_type == "work_start":
+                expected_time_str = work_hours["work_start"]
+            else:
+                expected_time_str = work_hours["work_end"]
             
+            exp_h, exp_m = map(int, expected_time_str.split(":"))
+            
+            # 生成候选 expected_dt（考虑跨天）
+            candidates = []
+            for d in (-1, 0, 1):
+                candidate = current_time.replace(
+                    hour=exp_h, minute=exp_m, second=0, microsecond=0
+                ) + timedelta(days=d)
+                candidates.append(candidate)
+            
+            # 选择与 current_time 时间差绝对值最小的 candidate
+            expected_dt = min(
+                candidates, key=lambda t: abs((t - current_time).total_seconds())
+            )
+            
+            # 单班模式时间窗口：前后7小时
+            hours_before = 7
+            hours_after = 7
+            earliest = expected_dt - timedelta(hours=hours_before)
+            latest = expected_dt + timedelta(hours=hours_after)
+            
+            is_valid = earliest <= current_time <= latest
+            shift_id = 0
+            shift_name = "单班"
+            
+            if not is_valid:
+                error_msg = (
+                    f"⏰ 当前时间不在允许的打卡范围内！\n\n"
+                    f"📅 期望打卡时间：<code>{expected_dt.strftime('%H:%M')}</code>\n"
+                    f"🕒 允许范围（含日期）：\n"
+                    f"   • 开始：<code>{earliest.strftime('%Y-%m-%d %H:%M')}</code>\n"
+                    f"   • 结束：<code>{latest.strftime('%Y-%m-%d %H:%M')}</code>\n\n"
+                    f"💡 打卡规则：\n"
+                    f"• 允许时间：期望时间前后 {hours_before}/{hours_after} 小时\n"
+                    f"• 当前时间：<code>{current_time.strftime('%H:%M')}</code>"
+                )
+                logger.warning(
+                    f"单班模式打卡时间超出允许窗口: {checkin_type}, "
+                    f"当前: {current_time.strftime('%Y-%m-%d %H:%M')}"
+                )
+            else:
+                error_msg = ""
+            
+            return is_valid, expected_dt, shift_name, shift_id, error_msg
+        
+        # 4. 双班模式逻辑
+        # 先检查用户是否已经打过上班卡（保持现有班次）
+        if checkin_type == "work_start":
+            user_status = await db.get_user_status(chat_id, user_id)
+            if user_status and user_status.get('on_duty_shift') is not None:
+                # 已有班次，使用现有班次
+                shift_id = user_status['on_duty_shift']
+                
+                # 根据班次获取期望时间
+                day_start_str = group_config.get('day_start', '09:00')
+                day_end_str = group_config.get('day_end', '21:00')
+                expected_time_str = day_start_str if shift_id == 0 else day_end_str
+                
+                # 设置时间窗口
+                hours_before = 1
+                hours_after = 6
+                
+                # 解析期望时间
+                exp_h, exp_m = map(int, expected_time_str.split(":"))
+                
+                # 生成候选 expected_dt（考虑跨天）
+                candidates = []
+                for d in (-1, 0, 1):
+                    candidate = current_time.replace(
+                        hour=exp_h, minute=exp_m, second=0, microsecond=0
+                    ) + timedelta(days=d)
+                    candidates.append(candidate)
+                
+                # 选择与 current_time 时间差绝对值最小的 candidate
+                expected_dt = min(
+                    candidates, key=lambda t: abs((t - current_time).total_seconds())
+                )
+                
+                # 设置时间窗口
+                earliest = expected_dt - timedelta(hours=hours_before)
+                latest = expected_dt + timedelta(hours=hours_after)
+                
+                is_valid = earliest <= current_time <= latest
+                shift_name = "白班☀️" if shift_id == 0 else "夜班🌙"
+                
+                if not is_valid:
+                    error_msg = (
+                        f"⏰ 当前时间不在允许的打卡范围内！\n\n"
+                        f"📅 班次：{shift_name}\n"
+                        f"🕒 期望打卡时间：<code>{expected_dt.strftime('%H:%M')}</code>\n"
+                        f"📋 允许范围（含日期）：\n"
+                        f"   • 开始：<code>{earliest.strftime('%Y-%m-%d %H:%M')}</code>\n"
+                        f"   • 结束：<code>{latest.strftime('%Y-%m-%d %H:%M')}</code>\n\n"
+                        f"💡 打卡规则：\n"
+                        f"• 允许时间：期望时间前后 {hours_before}/{hours_after} 小时\n"
+                        f"• 当前时间：<code>{current_time.strftime('%H:%M')}</code>"
+                    )
+                    logger.warning(
+                        f"双班模式已有班次打卡时间超出允许窗口: {shift_name}, "
+                        f"当前: {current_time.strftime('%Y-%m-%d %H:%M')}"
+                    )
+                else:
+                    error_msg = ""
+                
+                return is_valid, expected_dt, shift_name, shift_id, error_msg
+        
+        # 5. 双班模式，首次上班打卡或下班打卡
+        # 获取白班开始和结束时间
+        day_start_str = group_config.get('day_start', '09:00')
+        day_end_str = group_config.get('day_end', '21:00')
+        
+        # 如果是下班打卡，使用工作时间配置
+        if checkin_type == "work_end":
+            if checkin_type == "work_start":
+                expected_time_str = work_hours["work_start"]
+            else:
+                expected_time_str = work_hours["work_end"]
+            
+            # 下班打卡使用通用规则
+            exp_h, exp_m = map(int, expected_time_str.split(":"))
+            
+            # 生成候选 expected_dt（考虑跨天）
+            candidates = []
+            for d in (-1, 0, 1):
+                candidate = current_time.replace(
+                    hour=exp_h, minute=exp_m, second=0, microsecond=0
+                ) + timedelta(days=d)
+                candidates.append(candidate)
+            
+            # 选择与 current_time 时间差绝对值最小的 candidate
+            expected_dt = min(
+                candidates, key=lambda t: abs((t - current_time).total_seconds())
+            )
+            
+            # 下班打卡时间窗口：前后7小时
+            hours_before = 7
+            hours_after = 7
+            earliest = expected_dt - timedelta(hours=hours_before)
+            latest = expected_dt + timedelta(hours=hours_after)
+            
+            is_valid = earliest <= current_time <= latest
+            shift_id = 0  # 下班不区分班次
+            shift_name = "下班"
+            
+            if not is_valid:
+                error_msg = (
+                    f"⏰ 当前时间不在允许的打卡范围内！\n\n"
+                    f"📅 期望打卡时间：<code>{expected_dt.strftime('%H:%M')}</code>\n"
+                    f"🕒 允许范围（含日期）：\n"
+                    f"   • 开始：<code>{earliest.strftime('%Y-%m-%d %H:%M')}</code>\n"
+                    f"   • 结束：<code>{latest.strftime('%Y-%m-%d %H:%M')}</code>\n\n"
+                    f"💡 打卡规则：\n"
+                    f"• 允许时间：期望时间前后 {hours_before}/{hours_after} 小时\n"
+                    f"• 当前时间：<code>{current_time.strftime('%H:%M')}</code>"
+                )
+                logger.warning(
+                    f"下班打卡时间超出允许窗口: {checkin_type}, "
+                    f"当前: {current_time.strftime('%Y-%m-%d %H:%M')}"
+                )
+            else:
+                error_msg = ""
+            
+            return is_valid, expected_dt, shift_name, shift_id, error_msg
+        
+        # 6. 双班模式，首次上班打卡（需要判断班次）
+        # 转换为分钟数
+        day_start_minutes = parse_time_to_minutes(day_start_str)  # 09:00 = 540
+        day_end_minutes = parse_time_to_minutes(day_end_str)      # 21:00 = 1260
+        current_minutes = current_time.hour * 60 + current_time.minute
+        
+        # 计算各时间窗口（支持前1小时，后6小时）
+        day_shift_window_start = day_start_minutes - 60   # 白班开始前1小时
+        day_shift_window_end = day_start_minutes + 6*60   # 白班开始后6小时
+        
+        night_shift_window_start = day_end_minutes - 60   # 夜班开始前1小时
+        night_shift_window_end = (day_end_minutes + 6*60) % (24*60)  # 夜班开始后6小时（可能跨天）
+        
+        # 判断当前时间在哪个班次的时间窗口内
+        is_day_shift = False
+        is_night_shift = False
+        
+        # 处理白班时间窗口（可能跨天）
+        if day_shift_window_start >= 0:
+            if day_shift_window_end < 24*60:
+                is_day_shift = day_shift_window_start <= current_minutes < day_shift_window_end
+            else:
+                day_shift_window_end_adj = day_shift_window_end - 24*60
+                is_day_shift = (day_shift_window_start <= current_minutes) or (current_minutes < day_shift_window_end_adj)
+        else:
+            day_shift_window_start_adj = day_shift_window_start + 24*60
+            if day_shift_window_end < 24*60:
+                is_day_shift = current_minutes < day_shift_window_end
+            else:
+                is_day_shift = True
+        
+        # 处理夜班时间窗口（可能跨天）
+        if night_shift_window_start >= 0:
+            if night_shift_window_end < 24*60:
+                is_night_shift = night_shift_window_start <= current_minutes < night_shift_window_end
+            else:
+                night_shift_window_end_adj = night_shift_window_end - 24*60
+                is_night_shift = (night_shift_window_start <= current_minutes) or (current_minutes < night_shift_window_end_adj)
+        else:
+            night_shift_window_start_adj = night_shift_window_start + 24*60
+            if night_shift_window_end < 24*60:
+                is_night_shift = current_minutes < night_shift_window_end
+            else:
+                is_night_shift = True
+        
+        # 优先级：如果时间同时在两个窗口内，优先按更近的班次开始时间判断
+        if is_day_shift and is_night_shift:
+            distance_to_day = abs(current_minutes - day_start_minutes)
+            if distance_to_day > 12*60:
+                distance_to_day = 24*60 - distance_to_day
+            
+            distance_to_night = abs(current_minutes - day_end_minutes)
+            if distance_to_night > 12*60:
+                distance_to_night = 24*60 - distance_to_night
+            
+            if distance_to_day < distance_to_night:
+                is_night_shift = False
+            else:
+                is_day_shift = False
+        
+        # 根据时间判断班次
+        shift_id = 0  # 默认白班
+        expected_time_str = day_start_str
+        hours_before = 1
+        hours_after = 6
+        
+        if current_minutes == 20*60 + 30:  # 20:30的特殊处理
+            shift_id = 1
+            expected_time_str = day_end_str
+        elif is_night_shift:
+            shift_id = 1
+            expected_time_str = day_end_str
+        elif is_day_shift:
+            shift_id = 0
+            expected_time_str = day_start_str
+        else:
+            # 如果不在任何窗口内，按距离判断
+            if abs(current_minutes - day_start_minutes) < abs(current_minutes - day_end_minutes):
+                if abs(current_minutes - day_start_minutes) <= 6*60:
+                    shift_id = 0
+                    expected_time_str = day_start_str
+                else:
+                    shift_id = 1
+                    expected_time_str = day_end_str
+            else:
+                if abs(current_minutes - day_end_minutes) <= 6*60:
+                    shift_id = 1
+                    expected_time_str = day_end_str
+                else:
+                    shift_id = 0
+                    expected_time_str = day_start_str
+        
+        # 解析期望时间
+        exp_h, exp_m = map(int, expected_time_str.split(":"))
+        
+        # 生成候选 expected_dt（考虑跨天）
+        candidates = []
+        for d in (-1, 0, 1):
+            candidate = current_time.replace(
+                hour=exp_h, minute=exp_m, second=0, microsecond=0
+            ) + timedelta(days=d)
+            candidates.append(candidate)
+        
+        # 选择与 current_time 时间差绝对值最小的 candidate
+        expected_dt = min(
+            candidates, key=lambda t: abs((t - current_time).total_seconds())
+        )
+        
+        # 设置时间窗口
+        earliest = expected_dt - timedelta(hours=hours_before)
+        latest = expected_dt + timedelta(hours=hours_after)
+        
+        is_valid = earliest <= current_time <= latest
+        shift_name = "白班☀️" if shift_id == 0 else "夜班🌙"
+        
+        if not is_valid:
+            error_msg = (
+                f"⏰ 当前时间不在允许的打卡范围内！\n\n"
+                f"📅 班次：{shift_name}\n"
+                f"🕒 期望打卡时间：<code>{expected_dt.strftime('%H:%M')}</code>\n"
+                f"📋 允许范围（含日期）：\n"
+                f"   • 开始：<code>{earliest.strftime('%Y-%m-%d %H:%M')}</code>\n"
+                f"   • 结束：<code>{latest.strftime('%Y-%m-%d %H:%M')}</code>\n\n"
+                f"💡 打卡规则：\n"
+                f"• 允许时间：期望时间前后 {hours_before}/{hours_after} 小时\n"
+                f"• 当前时间：<code>{current_time.strftime('%H:%M')}</code>"
+            )
+            logger.warning(
+                f"双班模式首次打卡时间超出允许窗口: {shift_name}, "
+                f"当前: {current_time.strftime('%Y-%m-%d %H:%M')}"
+            )
+        else:
+            error_msg = ""
+        
+        # 记录日志
+        logger.info(
+            f"用户 {user_id} 在 {current_time.strftime('%H:%M')} 打卡，"
+            f"判定为{shift_name} "
+            f"(白班窗口:{day_shift_window_start//60:02d}:{day_shift_window_start%60:02d}-"
+            f"{day_shift_window_end//60:02d}:{day_shift_window_end%60:02d}, "
+            f"夜班窗口:{night_shift_window_start//60:02d}:{night_shift_window_start%60:02d}-"
+            f"{night_shift_window_end//60:02d}:{night_shift_window_end%60:02d})"
+        )
+        
+        return is_valid, expected_dt, shift_name, shift_id, error_msg
+        
     except Exception as e:
-        logger.error(f"班次判定失败: {e}")
-        return 0  # 默认白班
-
+        logger.error(f"检查班次和时间有效性失败: {e}")
+        fallback = current_time.replace(hour=9, minute=0, second=0, microsecond=0)
+        error_msg = f"系统错误：{str(e)[:100]}"
+        return True, fallback, "默认", 0, error_msg
 
 # 全局实例
 user_lock_manager = UserLockManager()
