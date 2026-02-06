@@ -1537,7 +1537,7 @@ async def process_work_checkin(message: types.Message, checkin_type: str):
         # ✅ 并行预计算
         work_hours_task = asyncio.create_task(db.get_group_work_time(chat_id))
         shift_check_task = asyncio.create_task(
-            check_shift_and_time_validity(chat_id, uid, checkin_type, now, db)
+            determine_shift_id(chat_id, uid, checkin_type, now, db)
         )
 
         # ✅ 初始化群组与用户数据
