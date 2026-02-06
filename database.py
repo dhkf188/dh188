@@ -1472,7 +1472,7 @@ class PostgreSQLDatabase:
                 try:
                     from utils import determine_shift_id
                     current_time = self.get_beijing_time()
-                    shift_id = await determine_shift_id(chat_id, user_id, current_time, self)
+                    shift_id = await determine_shift_id(chat_id, user_id, "work_start", current_time, self)
                     logger.debug(f"根据时间判定班次: {shift_id}")
                 except Exception as e:
                     logger.warning(f"班次判定失败，使用默认白班: {e}")
