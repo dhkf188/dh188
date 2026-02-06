@@ -57,7 +57,7 @@ from utils import (
     NotificationService,
     get_beijing_time,
     calculate_cross_day_time_diff,
-    is_valid_checkin_time,
+    # is_valid_checkin_time,
     rate_limit,
     send_reset_notification,
     determine_shift_id,
@@ -1524,22 +1524,6 @@ async def process_work_checkin(message: types.Message, checkin_type: str):
     now = get_beijing_time()
     current_time = now.strftime("%H:%M")
 
-    group_config = await db.get_group_shift_config(chat_id)
-    if checkin_type == "work_start":
-        if group_config['dual_mode']:
-            shift_id = 0 if is_time_in_day_shift(now, group_config['day_start'], group_config['day_end']) else 1
-        else:
-            shift_id = 0
-    
-        await db.update_user_shift_status(chat_id, uid, shift_id, checkin_time=now)
-        shift_text = "白班" if shift_id == 0 else "夜班"
-        result_msg = f"{emoji} <b>{action_text}打卡完成（{shift_text}）</b>\n"
-    else:
-        user_status = await db.get_user_status(chat_id, uid)
-        shift_id = user_status.get('on_duty_shift', 0) if user_status else 0
-        shift_text = "白班" if shift_id == 0 else "夜班"
-        result_msg = f"{emoji} <b>{action_text}打卡完成（{shift_text}）</b>\n"
-
     # 🧠 使用业务日期代替自然日
     business_date = await db.get_business_date(chat_id, now)
 
@@ -1552,6 +1536,9 @@ async def process_work_checkin(message: types.Message, checkin_type: str):
 
         # ✅ 并行预计算
         work_hours_task = asyncio.create_task(db.get_group_work_time(chat_id))
+        shift_check_task = asyncio.create_task(
+            check_shift_and_time_validity(chat_id, uid, checkin_type, now, db)
+        )
 
         # ✅ 初始化群组与用户数据
         try:
@@ -1566,7 +1553,11 @@ async def process_work_checkin(message: types.Message, checkin_type: str):
             )
             return
 
-        # ✅ 检查是否重复打卡（基于业务日期）
+        # ✅ 获取群组配置判断是否双班模式
+        group_config = await db.get_group_shift_config(chat_id)
+        is_dual_mode = group_config.get('dual_mode', False)
+
+        # ✅ 检查是否重复打卡（基于业务日期和班次模式）
         try:
             has_record_today = await db.has_work_record_today(
                 chat_id, uid, checkin_type
@@ -1575,7 +1566,8 @@ async def process_work_checkin(message: types.Message, checkin_type: str):
             logger.error(f"[{trace_id}] ❌ 检查重复打卡失败: {e}")
             has_record_today = False
 
-        if has_record_today:
+        if has_record_today and not is_dual_mode:
+            # 单班模式：不允许重复打卡
             today_records = await db.get_today_work_records_fixed(chat_id, uid)
             existing_record = today_records.get(checkin_type)
             action_text = "上班" if checkin_type == "work_start" else "下班"
@@ -1595,11 +1587,14 @@ async def process_work_checkin(message: types.Message, checkin_type: str):
                 reply_to_message_id=message.message_id,
                 parse_mode="HTML",
             )
-            logger.info(f"[{trace_id}] 🔁 检测到重复{action_text}打卡，终止处理。")
+            logger.info(f"[{trace_id}] 🔁 单班模式检测到重复{action_text}打卡，终止处理。")
             return
+        elif has_record_today and is_dual_mode:
+            # 双班模式：允许多次打卡，记录日志但不阻止
+            logger.info(f"[{trace_id}] 🔁 双班模式检测到重复{action_text}打卡，但允许继续。")
 
-        # 🆕 添加异常情况检查：已经下班但又打上班卡
-        if checkin_type == "work_start":
+        # 🆕 添加异常情况检查：已经下班但又打上班卡（仅单班模式限制）
+        if checkin_type == "work_start" and not is_dual_mode:
             has_work_end_today = await db.has_work_record_today(
                 chat_id, uid, "work_end"
             )
@@ -1617,10 +1612,17 @@ async def process_work_checkin(message: types.Message, checkin_type: str):
                     reply_to_message_id=message.message_id,
                     parse_mode="HTML",
                 )
-                logger.info(f"[{trace_id}] 🔁 检测到异常：下班后再次上班打卡")
+                logger.info(f"[{trace_id}] 🔁 单班模式检测到异常：下班后再次上班打卡")
                 return
+        elif checkin_type == "work_start" and is_dual_mode:
+            # 双班模式：允许下班后重新打上班卡
+            has_work_end_today = await db.has_work_record_today(
+                chat_id, uid, "work_end"
+            )
+            if has_work_end_today:
+                logger.info(f"[{trace_id}] 🔁 双班模式：用户已下班，允许重新打上班卡")
 
-        # ✅ 下班前检查上班记录
+        # ✅ 下班前检查上班记录（双班模式也检查，确保有上班记录）
         if checkin_type == "work_end":
             has_work_start_today = await db.has_work_record_today(
                 chat_id, uid, "work_start"
@@ -1638,28 +1640,37 @@ async def process_work_checkin(message: types.Message, checkin_type: str):
                 logger.warning(f"[{trace_id}] ⚠️ 用户试图下班打卡但未上班")
                 return
 
-        # 🆕 添加时间范围检查
-        try:
-            valid_time, expected_dt = await is_valid_checkin_time(
-                chat_id, checkin_type, now
-            )
-        except Exception as e:
-            logger.error(f"[{trace_id}] ❌ is_valid_checkin_time 调用失败: {e}")
-            valid_time, expected_dt = True, now
+        # ✅ 获取预计算结果
+        work_hours = await work_hours_task
+        valid_time, expected_dt, shift_name, shift_id, error_msg = await shift_check_task
 
+        # 🆕 修改时间范围检查
         if not valid_time:
-            allowed_start = (expected_dt - timedelta(hours=7)).strftime(
+            # 根据班次决定时间窗口
+            if shift_name in ["白班☀️", "夜班🌙"]:
+                hours_before = 1
+                hours_after = 6
+            else:
+                hours_before = 7
+                hours_after = 7
+
+            allowed_start = (expected_dt - timedelta(hours=hours_before)).strftime(
                 "%Y-%m-%d %H:%M"
             )
-            allowed_end = (expected_dt + timedelta(hours=7)).strftime("%Y-%m-%d %H:%M")
+            allowed_end = (expected_dt + timedelta(hours=hours_after)).strftime(
+                "%Y-%m-%d %H:%M"
+            )
 
             await message.answer(
-                f"⏰ 当前时间不在允许的打卡范围内（仅前后7小时可以打卡）！\n\n"
-                f"📅 打卡允许时间：<code>{expected_dt.strftime('%H:%M')}</code>\n"
-                f"🕒 允许范围（含日期）：\n"
+                f"⏰ 当前时间不在允许的打卡范围内！\n\n"
+                f"📅 班次：{shift_name}\n"
+                f"🕒 期望打卡时间：<code>{expected_dt.strftime('%H:%M')}</code>\n"
+                f"📋 允许范围（含日期）：\n"
                 f"   • 开始：<code>{allowed_start}</code>\n"
                 f"   • 结束：<code>{allowed_end}</code>\n\n"
-                f"💡 如果你确认时间有特殊情况，请联系管理员处理。",
+                f"💡 打卡规则：\n"
+                f"• 允许时间：期望时间前后 {hours_before}/{hours_after} 小时\n"
+                f"• 当前时间：<code>{now.strftime('%H:%M')}</code>",
                 reply_markup=await get_main_keyboard(
                     chat_id=chat_id, show_admin=await is_admin(uid)
                 ),
@@ -1667,7 +1678,7 @@ async def process_work_checkin(message: types.Message, checkin_type: str):
                 parse_mode="HTML",
             )
             logger.info(
-                f"[{trace_id}] ⏰ 打卡时间范围检查失败（不在 ±7 小时内），终止处理"
+                f"[{trace_id}] ⏰ 打卡时间范围检查失败（不在 ±{hours_before}/{hours_after} 小时内），终止处理"
             )
             return
 
@@ -2516,53 +2527,218 @@ async def cmd_softresettime(message: types.Message):
 
 
 # ========== 双班管理命令 ==========
-
 @admin_required
 @rate_limit(rate=3, per=30)
 async def cmd_setdualmode(message: types.Message):
-    """设置双班模式"""
+    """设置双班模式 - 完整整合版
+    用法：
+    1. 开启双班并设置时间：/setdualmode on 09:00 21:00
+    2. 使用默认时间开启：/setdualmode on
+    3. 关闭双班：/setdualmode off
+    4. 查看状态：/setdualmode status
+    5. 修改时间（已开启时）：/setdualmode 09:00 21:00
+    """
     args = message.text.split()
-    if len(args) != 2:
-        await message.answer(
-            "❌ 用法：/setdualmode <on/off>\n"
-            "📝 示例：\n"
-            "  /setdualmode on  # 开启双班\n"
-            "  /setdualmode off # 关闭双班\n\n"
-            "💡 开启后需要设置白班时间：/setdaytime 09:00 21:00",
-            reply_to_message_id=message.message_id,
-        )
-        return
     
-    mode = args[1].lower()
-    if mode not in ["on", "off"]:
+    if len(args) == 1:
+        # 显示帮助
         await message.answer(
-            "❌ 参数错误，请输入 on 或 off",
+            "📋 <b>双班模式设置命令</b>\n\n"
+            "🔄 <b>开启双班：</b>\n"
+            "• <code>/setdualmode on 09:00 21:00</code> - 开启并设置时间\n"
+            "• <code>/setdualmode on</code> - 开启（使用默认时间 09:00-21:00）\n\n"
+            "⚙️ <b>修改时间（双班已开启时）：</b>\n"
+            "<code>/setdualmode 09:00 21:00</code>\n\n"
+            "🚫 <b>关闭双班：</b>\n"
+            "<code>/setdualmode off</code>\n\n"
+            "📊 <b>查看状态：</b>\n"
+            "<code>/setdualmode status</code>\n\n"
+            "💡 <b>说明：</b>\n"
+            "• 白班时间内打卡 → 白班记录\n"
+            "• 白班时间外打卡 → 夜班记录\n"
+            "• 支持提前30分钟打卡\n"
+            "• 班次一旦确定，当日活动都按此班次记录",
+            parse_mode="HTML",
             reply_to_message_id=message.message_id,
         )
         return
     
     chat_id = message.chat.id
-    dual_mode = (mode == "on")
     
     try:
-        await db.update_group_shift_config(
-            chat_id, 
-            dual_mode, 
-            day_start="09:00",  # 默认值
-            day_end="21:00"     # 默认值
-        )
+        # ========== 情况1：查看状态 ==========
+        if args[1].lower() == "status":
+            await show_shift_status_inline(message)
+            return
         
-        status_text = "🟢 已开启" if dual_mode else "🔴 已关闭"
-        await message.answer(
-            f"✅ 双班模式{status_text}\n\n"
-            f"📊 当前状态：{'双班制' if dual_mode else '单班制'}\n"
-            f"⏰ 默认白班时间：09:00 - 21:00\n\n"
-            f"💡 如需调整白班时间，请使用：\n"
-            f"<code>/setdaytime 开始时间 结束时间</code>",
-            parse_mode="HTML",
-            reply_to_message_id=message.message_id,
-        )
+        # ========== 情况2：关闭双班 ==========
+        elif args[1].lower() == "off":
+            # 获取当前配置
+            group_config = await db.get_group_shift_config(chat_id)
+            
+            # 更新配置（关闭双班，但保留时间设置）
+            await db.update_group_shift_config(
+                chat_id, 
+                False,  # dual_mode = False
+                group_config['day_start'],  # 保持原有时间
+                group_config['day_end']     # 保持原有时间
+            )
+            
+            await message.answer(
+                f"✅ <b>双班模式已关闭</b>\n\n"
+                f"📊 <b>当前状态：单班制</b>\n"
+                f"• 所有记录归为白班\n"
+                f"• 不再区分白班/夜班\n\n"
+                f"💡 如需再次开启：\n"
+                f"<code>/setdualmode on 09:00 21:00</code>",
+                parse_mode="HTML",
+                reply_to_message_id=message.message_id,
+            )
+            return
         
+        # ========== 情况3：开启双班（带时间参数） ==========
+        elif args[1].lower() == "on":
+            if len(args) == 4:
+                # 格式：/setdualmode on 09:00 21:00
+                start_time = args[2]
+                end_time = args[3]
+            elif len(args) == 2:
+                # 格式：/setdualmode on（使用默认时间）
+                start_time = "09:00"
+                end_time = "21:00"
+            else:
+                await message.answer(
+                    "❌ 参数错误！正确格式：\n"
+                    "• <code>/setdualmode on 09:00 21:00</code>\n"
+                    "• <code>/setdualmode on</code>（使用默认时间）",
+                    parse_mode="HTML",
+                    reply_to_message_id=message.message_id,
+                )
+                return
+            
+            # 验证时间格式
+            time_pattern = re.compile(r"^([0-1]?[0-9]|2[0-3]):([0-5][0-9])$")
+            if not time_pattern.match(start_time) or not time_pattern.match(end_time):
+                await message.answer(
+                    "❌ 时间格式错误！请使用 HH:MM 格式（24小时制）\n"
+                    "📝 示例：09:00、21:00、22:00",
+                    reply_to_message_id=message.message_id,
+                )
+                return
+            
+            # 更新配置
+            await db.update_group_shift_config(
+                chat_id, 
+                True,  # dual_mode = True
+                start_time, 
+                end_time
+            )
+            
+            # 判断是否跨天
+            from utils import parse_time_to_minutes
+            start_min = parse_time_to_minutes(start_time)
+            end_min = parse_time_to_minutes(end_time)
+            is_cross_day = start_min >= end_min
+            
+            await message.answer(
+                f"✅ <b>双班模式已开启</b>\n\n"
+                f"☀️ <b>白班配置</b>\n"
+                f"• 时间窗口：<code>{start_time}</code> - <code>{end_time}</code>\n"
+                f"• 时段类型：{'跨天' if is_cross_day else '非跨天'}\n\n"
+                f"🌙 <b>夜班配置</b>\n"
+                f"• 时间窗口：白班以外时段\n\n"
+                f"💡 <b>使用说明：</b>\n"
+                f"• 在此时间段内打卡归为白班\n"
+                f"• 其余时间打卡归为夜班\n"
+                f"• 班次确定后，当日活动都按此班次记录\n"
+                f"• 支持提前30分钟打卡\n\n"
+                f"📋 <b>管理命令：</b>\n"
+                f"• <code>/setdualmode 10:00 22:00</code> - 修改时间\n"
+                f"• <code>/setdualmode off</code> - 关闭双班\n"
+                f"• <code>/setdualmode status</code> - 查看状态\n"
+                f"• <code>/shiftreset 0/1</code> - 重置班次数据",
+                parse_mode="HTML",
+                reply_to_message_id=message.message_id,
+            )
+            return
+        
+        # ========== 情况4：直接修改时间（无on/off参数） ==========
+        elif len(args) == 3:
+            # 格式：/setdualmode 09:00 21:00（直接修改时间）
+            start_time = args[1]
+            end_time = args[2]
+            
+            # 验证时间格式
+            time_pattern = re.compile(r"^([0-1]?[0-9]|2[0-3]):([0-5][0-9])$")
+            if not time_pattern.match(start_time) or not time_pattern.match(end_time):
+                await message.answer(
+                    "❌ 时间格式错误！请使用 HH:MM 格式（24小时制）\n"
+                    "📝 示例：09:00、21:00、22:00",
+                    reply_to_message_id=message.message_id,
+                )
+                return
+            
+            # 获取当前配置
+            group_config = await db.get_group_shift_config(chat_id)
+            
+            if not group_config['dual_mode']:
+                await message.answer(
+                    "❌ 双班模式未开启！\n\n"
+                    "💡 请先开启双班模式：\n"
+                    "<code>/setdualmode on 09:00 21:00</code>",
+                    parse_mode="HTML",
+                    reply_to_message_id=message.message_id,
+                )
+                return
+            
+            # 更新配置
+            await db.update_group_shift_config(
+                chat_id, 
+                True,  # 保持双班开启
+                start_time, 
+                end_time
+            )
+            
+            # 判断是否跨天
+            from utils import parse_time_to_minutes
+            start_min = parse_time_to_minutes(start_time)
+            end_min = parse_time_to_minutes(end_time)
+            is_cross_day = start_min >= end_min
+            
+            await message.answer(
+                f"✅ <b>双班时间已更新</b>\n\n"
+                f"☀️ <b>白班配置</b>\n"
+                f"• 时间窗口：<code>{start_time}</code> - <code>{end_time}</code>\n"
+                f"• 时段类型：{'跨天' if is_cross_day else '非跨天'}\n\n"
+                f"🌙 <b>夜班配置</b>\n"
+                f"• 时间窗口：白班以外时段\n\n"
+                f"💡 <b>注意：</b>\n"
+                f"• 已打卡用户的班次不会自动变更\n"
+                f"• 新用户将按新时间判断班次\n"
+                f"• 如需重置现有用户班次，请使用：\n"
+                f"  <code>/shiftreset 0</code>（重置白班）\n"
+                f"  <code>/shiftreset 1</code>（重置夜班）",
+                parse_mode="HTML",
+                reply_to_message_id=message.message_id,
+            )
+            return
+        
+        else:
+            await message.answer(
+                "❌ 参数错误！请使用以下格式：\n\n"
+                "🔄 <b>开启双班：</b>\n"
+                "• <code>/setdualmode on 09:00 21:00</code>\n"
+                "• <code>/setdualmode on</code>（默认时间）\n\n"
+                "⚙️ <b>修改时间：</b>\n"
+                "<code>/setdualmode 09:00 21:00</code>\n\n"
+                "🚫 <b>关闭双班：</b>\n"
+                "<code>/setdualmode off</code>\n\n"
+                "📊 <b>查看状态：</b>\n"
+                "<code>/setdualmode status</code>",
+                parse_mode="HTML",
+                reply_to_message_id=message.message_id,
+            )
+            
     except Exception as e:
         logger.error(f"设置双班模式失败: {e}")
         await message.answer(
@@ -2571,72 +2747,103 @@ async def cmd_setdualmode(message: types.Message):
         )
 
 
-@admin_required
-@rate_limit(rate=3, per=30)
-async def cmd_setdaytime(message: types.Message):
-    """设置白班时间"""
-    args = message.text.split()
-    if len(args) != 3:
-        await message.answer(
-            "❌ 用法：/setdaytime <开始时间> <结束时间>\n"
-            "📝 示例：/setdaytime 09:00 21:00\n\n"
-            "💡 说明：\n"
-            "• 此时间为白班时间窗口\n"
-            "• 其余时间自动归为夜班\n"
-            "• 支持跨天设置，如：/setdaytime 22:00 08:00",
-            reply_to_message_id=message.message_id,
-        )
-        return
-    
-    start_time = args[1]
-    end_time = args[2]
-    
-    # 验证时间格式
-    time_pattern = re.compile(r"^([0-1]?[0-9]|2[0-3]):([0-5][0-9])$")
-    if not time_pattern.match(start_time) or not time_pattern.match(end_time):
-        await message.answer(
-            "❌ 时间格式错误！请使用 HH:MM 格式（24小时制）\n"
-            "📝 示例：09:00、21:00、22:00",
-            reply_to_message_id=message.message_id,
-        )
-        return
-    
+async def show_shift_status_inline(message: types.Message):
+    """显示班次状态（内联版）"""
     chat_id = message.chat.id
     
     try:
-        # 先获取当前配置
+        # 获取配置
         group_config = await db.get_group_shift_config(chat_id)
+        now = get_beijing_time()
         
-        # 更新配置
-        await db.update_group_shift_config(
-            chat_id, 
-            group_config['dual_mode'],  # 保持原有双班模式
-            start_time, 
-            end_time
+        from utils import is_time_in_day_shift
+        current_shift = "白班" if is_time_in_day_shift(now, group_config['day_start'], group_config['day_end']) else "夜班"
+        
+        # 获取各班次在线人数
+        async with db.pool.acquire() as conn:
+            # 白班在线人数
+            day_shift_online = await conn.fetchval(
+                """
+                SELECT COUNT(DISTINCT u.user_id) 
+                FROM users u
+                JOIN user_status us ON u.chat_id = us.chat_id AND u.user_id = us.user_id
+                WHERE u.chat_id = $1 
+                  AND us.on_duty_shift = 0
+                  AND u.current_activity IS NOT NULL
+                """,
+                chat_id,
+            ) or 0
+            
+            # 夜班在线人数
+            night_shift_online = await conn.fetchval(
+                """
+                SELECT COUNT(DISTINCT u.user_id) 
+                FROM users u
+                JOIN user_status us ON u.chat_id = us.chat_id AND u.user_id = us.user_id
+                WHERE u.chat_id = $1 
+                  AND us.on_duty_shift = 1
+                  AND u.current_activity IS NOT NULL
+                """,
+                chat_id,
+            ) or 0
+            
+            # 各班次总人数
+            day_shift_total = await conn.fetchval(
+                "SELECT COUNT(*) FROM user_status WHERE chat_id = $1 AND on_duty_shift = 0",
+                chat_id,
+            ) or 0
+            
+            night_shift_total = await conn.fetchval(
+                "SELECT COUNT(*) FROM user_status WHERE chat_id = $1 AND on_duty_shift = 1",
+                chat_id,
+            ) or 0
+        
+        status_text = (
+            f"📊 <b>班次系统状态</b>\n\n"
+            f"🏢 群组：<code>{chat_id}</code>\n"
+            f"🔄 模式：{'双班制' if group_config['dual_mode'] else '单班制'}\n"
+            f"⏰ 当前时间：<code>{now.strftime('%H:%M')}</code>（{current_shift}时段）\n\n"
         )
         
-        # 判断是否跨天
-        from utils import parse_time_to_minutes
-        start_min = parse_time_to_minutes(start_time)
-        end_min = parse_time_to_minutes(end_time)
-        is_cross_day = start_min >= end_min
+        if group_config['dual_mode']:
+            status_text += (
+                f"☀️ <b>白班配置</b>\n"
+                f"• 时间窗口：<code>{group_config['day_start']}</code> - <code>{group_config['day_end']}</code>\n"
+                f"• 在班人数：<code>{day_shift_total}</code> 人\n"
+                f"• 在线活动：<code>{day_shift_online}</code> 人\n\n"
+                
+                f"🌙 <b>夜班配置</b>\n"
+                f"• 时间窗口：白班以外时段\n"
+                f"• 在班人数：<code>{night_shift_total}</code> 人\n"
+                f"• 在线活动：<code>{night_shift_online}</code> 人\n\n"
+            )
+        else:
+            status_text += (
+                f"📝 <b>单班模式</b>\n"
+                f"• 所有记录归为白班\n"
+                f"• 在班人数：<code>{day_shift_total}</code> 人\n"
+                f"• 在线活动：<code>{day_shift_online}</code> 人\n\n"
+            )
+        
+        status_text += (
+            f"💡 <b>管理命令</b>\n"
+            f"• <code>/setdualmode on 09:00 21:00</code> - 开启双班\n"
+            f"• <code>/setdualmode 08:00 20:00</code> - 修改时间\n"
+            f"• <code>/setdualmode off</code> - 关闭双班\n"
+            f"• <code>/setdualmode status</code> - 查看此状态\n"
+            f"• <code>/shiftreset 0/1</code> - 重置班次数据"
+        )
         
         await message.answer(
-            f"✅ 白班时间已设置\n\n"
-            f"⏰ 白班窗口：<code>{start_time}</code> - <code>{end_time}</code>\n"
-            f"📅 时段类型：{'跨天' if is_cross_day else '非跨天'}\n\n"
-            f"💡 说明：\n"
-            f"• 在此时间段内打卡归为白班\n"
-            f"• 其余时间打卡归为夜班\n"
-            f"• 班次一旦确定，后续活动都按此班次记录",
+            status_text,
             parse_mode="HTML",
             reply_to_message_id=message.message_id,
         )
         
     except Exception as e:
-        logger.error(f"设置白班时间失败: {e}")
+        logger.error(f"查看班次状态失败: {e}")
         await message.answer(
-            f"❌ 设置失败：{e}",
+            f"❌ 获取状态失败：{e}",
             reply_to_message_id=message.message_id,
         )
 
@@ -5554,7 +5761,6 @@ async def register_handlers():
     dp.message.register(cmd_softresettime, Command("softresettime"))
     dp.message.register(cmd_fix_message_refs, Command("fixmessages"))
     dp.message.register(cmd_setdualmode, Command("setdualmode"))
-    dp.message.register(cmd_setdaytime, Command("setdaytime"))
     dp.message.register(cmd_shiftstatus, Command("shiftstatus"))
     dp.message.register(cmd_shiftreset, Command("shiftreset"))
 
