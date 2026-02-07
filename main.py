@@ -1679,6 +1679,11 @@ async def process_work_checkin(message: types.Message, checkin_type: str):
                 )
                 logger.warning(f"[{trace_id}] ⚠️ 用户试图下班打卡但未上班")
                 return
+        
+        logger.info(f"🔍 班次判定调试:\n"
+            f"   当前时间: {now.strftime('%Y-%m-%d %H:%M:%S')}\n"
+            f"   打卡类型: {checkin_type}\n"
+            f"   群组配置: {group_config}")
 
         # ✅ 获取预计算结果
         work_hours = await work_hours_task
