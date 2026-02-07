@@ -4514,12 +4514,41 @@ async def show_history(message: types.Message):
     await db.init_group(chat_id)
     await db.init_user(chat_id, uid)
 
+    # 🔹 获取群组配置判断是否双班模式
+    group_config = await db.get_group_shift_config(chat_id)
+    is_dual_mode = group_config.get('dual_mode', False)
+
+    # 🔹 智能确定班次ID
+    # 1. 先尝试从用户状态获取
+    user_status = await db.get_user_status(chat_id, uid)
+    shift_id = 0  # 默认白班
+    
+    if user_status and user_status.get('on_duty_shift') is not None:
+        # 用户已经有确定的班次
+        shift_id = user_status['on_duty_shift']
+    elif is_dual_mode:
+        # 双班模式但用户还没有上班打卡，根据当前时间智能判断班次
+        try:
+            now = get_beijing_time()
+            # 使用 utils 中的函数判断班次
+            shift_id = await determine_activity_shift_id(chat_id, uid, now, db)
+        except Exception as e:
+            logger.error(f"智能判断班次失败: {e}")
+            # 降级：使用白班时间窗口判断
+            try:
+                from utils import is_time_in_day_shift
+                if is_time_in_day_shift(now, group_config['day_start'], group_config['day_end']):
+                    shift_id = 0  # 白班
+                else:
+                    shift_id = 1  # 夜班
+            except Exception:
+                shift_id = 0  # 默认白班
+    # 单班模式保持 shift_id = 0
+
     # 🔹 用户基础信息（只用于展示昵称 & 罚款等字段）
     user_data = await db.get_user_cached(chat_id, uid)
 
-    user_status = await db.get_user_status(chat_id, uid)
-    shift_id = user_status.get('on_duty_shift', 0) if user_status else 0
-
+    # 根据班次获取用户活动数据
     user_activities = await db.get_user_activities_by_shift(chat_id, uid, shift_id)
 
     if not user_data:
@@ -4532,49 +4561,62 @@ async def show_history(message: types.Message):
         )
         return
 
-    shift_name = "白班" if shift_id == 0 else "夜班"
-    first_line = (
-        f"👤 {shift_name}：{MessageFormatter.format_user_link(uid, user_data['nickname'])}"
-    )
+    # 确定班次名称显示
+    if is_dual_mode:
+        shift_name = "白班☀️" if shift_id == 0 else "夜班🌙"
+    else:
+        shift_name = "单班"
+
+    # 🎯 构建标题行：如果是双班模式显示班次图标，单班模式不显示
+    if is_dual_mode:
+        first_line = f"👤 {shift_name}：{MessageFormatter.format_user_link(uid, user_data['nickname'])}"
+    else:
+        first_line = f"👤 {MessageFormatter.format_user_link(uid, user_data['nickname'])}"
 
     text = (
         f"{first_line}\n"
         f"📅 统计周期：<code>{business_date.strftime('%Y-%m-%d')}</code>\n"
         f"⏰ 重置时间：{reset_hour:02d}:{reset_minute:02d}\n"
-        f"📊 当前周期记录：\n\n"
     )
+    
+    # 如果是双班模式，在标题中添加班次信息
+    if is_dual_mode:
+        text += f"📊 当前班次记录（{shift_name}）：\n\n"
+    else:
+        text += f"📊 当前周期记录：\n\n"
 
     has_records = False
     activity_limits = await db.get_activity_limits_cached()
 
-    # 🧮 从 user_activities 表获取权威数据（不受软重置影响）
+    # 🧮 从 user_activities 表获取权威数据（按班次过滤）
     async with db.pool.acquire() as conn:
         rows = await conn.fetch(
             """
             SELECT activity_name, activity_count, accumulated_time
             FROM user_activities
-            WHERE chat_id = $1 AND user_id = $2 AND activity_date = $3
+            WHERE chat_id = $1 AND user_id = $2 AND activity_date = $3 AND shift_id = $4
             """,
             chat_id,
             uid,
             business_date,
+            shift_id,
         )
 
-    user_activities = {}
+    user_activities_dict = {}
     total_time_all = 0
     total_count_all = 0
 
     for row in rows:
-        user_activities[row["activity_name"]] = {
+        user_activities_dict[row["activity_name"]] = {
             "count": row["activity_count"],
             "time": row["accumulated_time"],
         }
         total_time_all += row["accumulated_time"]
         total_count_all += row["activity_count"]
 
-    # 🧾 输出活动明细
+    # 🧾 输出活动明细（只显示当前班次的数据）
     for act in activity_limits.keys():
-        activity_info = user_activities.get(act, {})
+        activity_info = user_activities_dict.get(act, {})
         total_time = activity_info.get("time", 0)
         count = activity_info.get("count", 0)
         max_times = activity_limits[act]["max_times"]
@@ -4588,18 +4630,51 @@ async def show_history(message: types.Message):
             )
             has_records = True
 
-    # 🧮 汇总统计（来自权威流水数据）
-    text += f"\n📈 当前周期总统计：\n"
-    text += f"• 总累计时间：<code>{MessageFormatter.format_time(int(total_time_all))}</code>\n"
-    text += f"• 总活动次数：<code>{total_count_all}</code> 次\n"
+    # 🧮 汇总统计（来自当前班次的流水数据）
+    if total_time_all > 0 or total_count_all > 0:
+        text += f"\n📈 当前班次统计：\n"
+        text += f"• 累计时间：<code>{MessageFormatter.format_time(int(total_time_all))}</code>\n"
+        text += f"• 活动次数：<code>{total_count_all}</code> 次\n"
+    else:
+        text += "\n📊 当前班次暂无活动记录\n"
 
     # 💰 罚款显示仍来自 users 表（因为罚款是跨周期累计的）
     total_fine = user_data.get("total_fines", 0)
     if total_fine > 0:
         text += f"• 累计罚款：<code>{total_fine}</code> 元"
 
-    if not has_records and total_count_all == 0:
-        text += "\n暂无记录，请先进行打卡活动"
+    # 如果是双班模式，添加切换班次提示
+    if is_dual_mode and not has_records:
+        other_shift_id = 1 if shift_id == 0 else 0
+        other_shift_name = "夜班🌙" if shift_id == 0 else "白班☀️"
+        
+        # 检查另一个班次是否有数据
+        try:
+            async with db.pool.acquire() as conn:
+                other_rows = await conn.fetch(
+                    """
+                    SELECT COUNT(*) as count
+                    FROM user_activities
+                    WHERE chat_id = $1 AND user_id = $2 AND activity_date = $3 AND shift_id = $4
+                    """,
+                    chat_id,
+                    uid,
+                    business_date,
+                    other_shift_id,
+                )
+                
+                other_count = other_rows[0]["count"] if other_rows else 0
+                if other_count > 0:
+                    text += f"\n\n💡 提示：您可能在{other_shift_name}有活动记录"
+        except Exception:
+            pass
+
+    # 如果没有任何记录
+    if not has_records and total_count_all == 0 and total_fine == 0:
+        if is_dual_mode:
+            text += "\n💪 开始第一个活动吧！"
+        else:
+            text += "\n💪 开始第一个活动吧！"
 
     await message.answer(
         text,
