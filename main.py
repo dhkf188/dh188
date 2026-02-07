@@ -1056,7 +1056,8 @@ async def start_activity(message: types.Message, act: str):
                     chat_id,
                     uid,
                     shift_id,
-                    checkin_time=now
+                    checkin_time=now,
+                    checkout_time=None
                 )
             except Exception as e:
                 logger.error(f"确定活动班次失败: {e}")
