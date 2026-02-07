@@ -897,13 +897,12 @@ class HeartbeatManager:
         }
 
 
-# 工具函数
+# ------ 工具函数 -------
 def get_beijing_time() -> datetime:
-    """获取北京时间（带时区信息）"""
-    # 确保返回的是 aware datetime
-    utc_now = datetime.now(pytz.UTC)
-    beijing_time = utc_now.astimezone(beijing_tz)
-    return beijing_time
+
+    return datetime.now(beijing_tz)
+
+
 
 
 def calculate_cross_day_time_diff(
