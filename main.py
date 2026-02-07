@@ -61,7 +61,8 @@ from utils import (
     rate_limit,
     send_reset_notification,
     determine_shift_id,
-    is_time_in_day_shift
+    is_time_in_day_shift,
+    determine_activity_shift_id
 )
 
 from bot_manager import bot_manager
@@ -1275,7 +1276,23 @@ async def _process_back_locked(message: types.Message, chat_id: int, uid: int):
         # 取消计时器
         await timer_manager.cancel_timer(f"{chat_id}-{uid}")
 
-        # 获取最新数据
+        # 🆕 先获取用户状态以确定班次ID
+        user_status_task = asyncio.create_task(db.get_user_status(chat_id, uid))
+        user_status = await user_status_task
+        
+        # 🆕 确定班次ID (默认0=白班)
+        shift_id = 0
+        if user_status and user_status.get('on_duty_shift') is not None:
+            shift_id = user_status['on_duty_shift']
+        else:
+            # 如果用户没有班次状态，根据当前时间判断
+            try:
+                shift_id = await determine_activity_shift_id(chat_id, uid, now, db)
+            except Exception as e:
+                logger.error(f"自动判定班次失败，使用默认白班: {e}")
+                shift_id = 0
+
+        # 获取最新数据和按班次的活动数据
         user_data_task = asyncio.create_task(db.get_user_cached(chat_id, uid))
         user_activities_task = asyncio.create_task(
             db.get_user_activities_by_shift(chat_id, uid, shift_id)
@@ -1382,14 +1399,6 @@ async def _process_back_locked(message: types.Message, chat_id: int, uid: int):
                     f"⏱️ 吃饭耗时：<code>{elapsed_time_str}</code>\n"
                 )
 
-                # 如果有超时或罚款，也可以加进去
-                # if is_overtime:
-                #     eat_end_notification_text += (
-                #         f"⚠️ 状态：超时 (罚款 {fine_amount}元)\n"
-                #     )
-                # else:
-                #     eat_end_notification_text += f"✅ 状态：正常\n"
-
                 # 3. 异步发送
                 asyncio.create_task(
                     notification_service.send_notification(
@@ -1419,7 +1428,6 @@ async def _process_back_locked(message: types.Message, chat_id: int, uid: int):
         active_back_processing.pop(key, None)
         duration = round(time.time() - start_time, 2)
         logger.info(f"回座结束 chat_id={chat_id}, uid={uid}，耗时 {duration}s")
-
 
 # 🎯 【新增】异步发送超时通知函数
 async def send_overtime_notification_async(
