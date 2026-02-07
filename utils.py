@@ -1414,81 +1414,50 @@ async def determine_shift_for_first_work(
     group_config: Dict
 ) -> Tuple[bool, datetime, str, int, str]:
     """
-    双班模式首次上班打卡判定
-    返回：(是否有效, 期望时间, 班次名称, 班次ID, 错误信息)
+    双班模式首次上班打卡判定 - 修复跨天白班问题
     """
     try:
-        day_start_str = group_config.get('day_start', '09:00')
-        day_end_str = group_config.get('day_end', '21:00')
+        day_start_str = group_config.get('day_start', '09:00')  # 白班开始时间
+        day_end_str = group_config.get('day_end', '21:00')      # 白班结束时间（可能是第二天）
         
-        # 转换为分钟数
-        day_start_minutes = parse_time_to_minutes(day_start_str)
-        day_end_minutes = parse_time_to_minutes(day_end_str)
-        current_minutes = current_time.hour * 60 + current_time.minute
+        # 🎯 关键修复：使用正确的白班判断
+        is_in_day_shift = is_time_in_day_shift(current_time, day_start_str, day_end_str)
         
-        # 计算时间窗口
-        window_info = calculate_time_windows(
-            day_start_minutes, day_end_minutes, current_minutes
-        )
-        
-        # 根据时间判断班次
-        shift_id = 0  # 默认白班
-        expected_time_str = day_start_str
-        hours_before = 2
-        hours_after = 6
-        
-        # 特殊时间点处理
-        if current_minutes == 20 * 60 + 30:  # 20:30的特殊处理
-            shift_id = 1
-            expected_time_str = day_end_str
-        elif window_info["is_night_shift"]:
-            shift_id = 1
-            expected_time_str = day_end_str
-        elif window_info["is_day_shift"]:
+        if is_in_day_shift:
+            # 在白班时段内 → 白班
             shift_id = 0
-            expected_time_str = day_start_str
+            expected_time_str = day_start_str  # 期望白班开始时间 14:00
+            hours_before = 2
+            hours_after = 6
+            is_night_shift = False
         else:
-            # 如果不在任何窗口内，按距离判断
-            if abs(current_minutes - day_start_minutes) < abs(current_minutes - day_end_minutes):
-                if abs(current_minutes - day_start_minutes) <= 6 * 60:
-                    shift_id = 0
-                    expected_time_str = day_start_str
-                else:
-                    shift_id = 1
-                    expected_time_str = day_end_str
-            else:
-                if abs(current_minutes - day_end_minutes) <= 6 * 60:
-                    shift_id = 1
-                    expected_time_str = day_end_str
-                else:
-                    shift_id = 0
-                    expected_time_str = day_start_str
+            # 在夜班时段内 → 夜班
+            shift_id = 1
+            expected_time_str = day_end_str    # 期望夜班开始时间 02:00
+            hours_before = 2
+            hours_after = 6
+            is_night_shift = True
         
         # 检查时间有效性
         is_valid, expected_dt, error_msg = await check_time_validity(
-            current_time, expected_time_str, hours_before, hours_after
+            current_time, expected_time_str, hours_before, hours_after, is_night_shift
         )
         
         shift_name = "白班☀️" if shift_id == 0 else "夜班🌙"
         
-        # 记录日志
         logger.info(
-            f"用户 {user_id} 在 {current_time.strftime('%H:%M')} 打卡，"
-            f"判定为{shift_name} "
-            f"(白班窗口:{window_info['day_shift_window_start']//60:02d}:"
-            f"{window_info['day_shift_window_start']%60:02d}-"
-            f"{window_info['day_shift_window_end']//60:02d}:"
-            f"{window_info['day_shift_window_end']%60:02d}, "
-            f"夜班窗口:{window_info['night_shift_window_start']//60:02d}:"
-            f"{window_info['night_shift_window_start']%60:02d}-"
-            f"{window_info['night_shift_window_end']//60:02d}:"
-            f"{window_info['night_shift_window_end']%60:02d})"
+            f"🎯 班次判定: 用户{user_id}, 时间{current_time.strftime('%m/%d %H:%M')}\n"
+            f"   白班时段: {day_start_str}-{day_end_str}\n"
+            f"   是否在白班内: {is_in_day_shift}\n"
+            f"   判定班次: {shift_name}, 期望时间: {expected_time_str}\n"
+            f"   时间窗口: ±{hours_before}/{hours_after}小时\n"
+            f"   是否有效: {is_valid}, 错误: {error_msg[:50] if error_msg else '无'}"
         )
         
         return is_valid, expected_dt, shift_name, shift_id, error_msg
         
     except Exception as e:
-        logger.error(f"首次上班打卡判定失败: {e}")
+        logger.error(f"首次上班打卡判定失败: {e}", exc_info=True)
         fallback = current_time.replace(hour=9, minute=0, second=0, microsecond=0)
         return True, fallback, "默认", 0, f"系统错误：{str(e)[:100]}"
 
