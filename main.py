@@ -474,7 +474,7 @@ async def handle_expired_activity(
 ):
     """处理已过期的活动（用于服务重启后的恢复）"""
     try:
-        now = get_beijing_time()
+        now = datetime.now(beijing_tz)
         elapsed = int((now - start_time).total_seconds())
         nickname = "用户"
 
@@ -564,7 +564,7 @@ async def recover_expired_activities():
 async def reset_daily_data_if_needed(chat_id: int, uid: int):
     """业务日期统一版每日重置（完全对齐业务日期体系）"""
     try:
-        now = get_beijing_time()
+        now = datetime.now(beijing_tz)
 
         # 🧠 获取业务日期（系统唯一的“今天”）
         business_date = await db.get_business_date(chat_id, now)
@@ -876,7 +876,7 @@ async def activity_timer(chat_id: int, uid: int, act: str, limit: int):
                     break
 
                 start_time = datetime.fromisoformat(user_data["activity_start_time"])
-                now = get_beijing_time()
+                now = datetime.now(beijing_tz)
                 elapsed = int((now - start_time).total_seconds())
                 remaining = limit * 60 - elapsed
                 nickname = user_data.get("nickname", str(uid))
@@ -1005,7 +1005,7 @@ async def start_activity(message: types.Message, act: str):
             return
 
         name = message.from_user.full_name
-        now = get_beijing_time()
+        now = datetime.now(beijing_tz)
 
         # ===== 3️⃣ 检查活动人数限制 =====
         user_limit = await db.get_activity_user_limit(act)
@@ -1180,7 +1180,7 @@ async def _process_back_locked(message: types.Message, chat_id: int, uid: int):
     active_back_processing[key] = True
 
     try:
-        now = get_beijing_time()
+        now = datetime.now(beijing_tz)
 
         # 获取用户数据
         user_data = await db.get_user_cached(chat_id, uid)
@@ -1559,7 +1559,7 @@ async def process_work_checkin(message: types.Message, checkin_type: str):
         logger.info(f"❌ 群组 {chat_id} 未启用上下班功能，用户 {uid} 尝试打卡")
         return
 
-    now = get_beijing_time()
+    now = datetime.now(beijing_tz)
     current_time = now.strftime("%H:%M")
 
     # 🧠 使用业务日期代替自然日
@@ -2792,7 +2792,7 @@ async def show_shift_status_inline(message: types.Message):
     try:
         # 获取配置
         group_config = await db.get_group_shift_config(chat_id)
-        now = get_beijing_time()
+        now = datetime.now(beijing_tz)
         
         from utils import is_time_in_day_shift
         current_shift = "白班" if is_time_in_day_shift(now, group_config['day_start'], group_config['day_end']) else "夜班"
@@ -2935,7 +2935,7 @@ async def cmd_shiftstatus(message: types.Message):
                 chat_id,
             ) or 0
         
-        now = get_beijing_time()
+        now = datetime.now(beijing_tz)
         from utils import is_time_in_day_shift
         current_shift = "白班" if is_time_in_day_shift(now, group_config['day_start'], group_config['day_end']) else "夜班"
         
@@ -4530,7 +4530,7 @@ async def show_history(message: types.Message):
     elif is_dual_mode:
         # 双班模式但用户还没有上班打卡，根据当前时间智能判断班次
         try:
-            now = get_beijing_time()
+            now = datetime.now(beijing_tz)
             # 使用 utils 中的函数判断班次
             shift_id = await determine_activity_shift_id(chat_id, uid, now, db)
         except Exception as e:
@@ -4987,7 +4987,7 @@ async def export_and_push_csv(
                 return "0分0秒"
 
         # ========== 3. 规范日期与文件名 ==========
-        beijing_now = get_beijing_time()
+        beijing_now = datetime.now(beijing_tz)
 
         # target_date 处理（第一个代码的完整逻辑）
         if target_date is not None:
@@ -5504,7 +5504,7 @@ async def daily_reset_task():
 
     while True:
         try:
-            now = get_beijing_time()
+            now = datetime.now(beijing_tz)
             all_groups = await db.get_all_groups()
 
             # 并发处理所有群组，但受 Semaphore 控制
@@ -5527,7 +5527,7 @@ async def soft_reset_task():
     executed_cache: dict[int, date] = {}  # 记录每个群最后一次软重置业务日期
 
     while True:
-        now = get_beijing_time()
+        now = datetime.now(beijing_tz)
         logger.debug(f"软重置任务检查，当前时间: {now}")
 
         try:
