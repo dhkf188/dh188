@@ -1052,6 +1052,8 @@ async def start_activity(message: types.Message, act: str):
         if not user_status or user_status.get('on_duty_shift') is None:
             try:
                 shift_id = await determine_activity_shift_id(chat_id, uid, now, db)
+                if now.tzinfo is None:
+                    now = beijing_tz.localize(now)
                 await db.update_user_shift_status(
                     chat_id,
                     uid,
