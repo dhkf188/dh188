@@ -902,6 +902,14 @@ def get_beijing_time() -> datetime:
 
     return datetime.now(beijing_tz)
 
+def ensure_beijing(dt: datetime) -> datetime:
+    """
+    确保 datetime 为北京时间 aware
+    """
+    if dt.tzinfo is None:
+        return beijing_tz.localize(dt)
+    return dt.astimezone(beijing_tz)
+
 
 
 
@@ -1112,63 +1120,111 @@ def is_time_in_day_shift(current_time: datetime, day_start: str, day_end: str) -
 
 
 # 在 utils.py 中添加以下函数
-
 async def check_time_validity(
     current_time: datetime,
     expected_time_str: str,
     hours_before: int,
-    hours_after: int
+    hours_after: int,
+    is_night_shift: bool = False
 ) -> Tuple[bool, datetime, str]:
     """
-    检查时间有效性
-    返回：(是否有效, 期望时间, 错误信息)
+    检查打卡时间是否有效 - 终极优化版
+    
+    支持场景：
+    1. 普通白班（09:00-18:00）
+    2. 夜班跨天（18:00-02:00）
+    3. 白班跨天（22:00-06:00）
     """
     try:
-        # 解析期望时间
+        # 1️⃣ 确保北京时间
+        current_time = ensure_beijing(current_time)
+        
+        # 2️⃣ 解析期望时间
         exp_h, exp_m = map(int, expected_time_str.split(":"))
         
-        # 生成候选 expected_dt（考虑跨天）
-        candidates = []
-        for d in (-1, 0, 1):
-            candidate = current_time.replace(
-                hour=exp_h, minute=exp_m, second=0, microsecond=0
-            ) + timedelta(days=d)
-            candidates.append(candidate)
+        # 3️⃣ 确定期望时间的日期
+        base_date = current_time.date()
         
-        # 选择与 current_time 时间差绝对值最小的 candidate
+        # 处理跨天情况
+        if is_night_shift:
+            # 夜班情况
+            candidates = []
+            for delta_day in [-1, 0, 1]:
+                target_date = base_date + timedelta(days=delta_day)
+                candidate = beijing_tz.localize(
+                    datetime(
+                        target_date.year, target_date.month, target_date.day,
+                        exp_h, exp_m, 0
+                    )
+                )
+                candidates.append(candidate)
+        elif exp_h < 6 and hours_before > exp_h:
+            # 白班开始时间在凌晨（跨天白班）
+            candidates = []
+            for delta_day in [-1, 0, 1]:
+                target_date = base_date + timedelta(days=delta_day)
+                candidate = beijing_tz.localize(
+                    datetime(
+                        target_date.year, target_date.month, target_date.day,
+                        exp_h, exp_m, 0
+                    )
+                )
+                candidates.append(candidate)
+        else:
+            # 普通白班
+            candidates = []
+            for delta_day in [-1, 0, 1]:
+                candidate = current_time.replace(
+                    hour=exp_h, minute=exp_m, second=0, microsecond=0
+                ) + timedelta(days=delta_day)
+                candidates.append(candidate)
+        
+        # 4️⃣ 选择最接近的候选时间
         expected_dt = min(
-            candidates, key=lambda t: abs((t - current_time).total_seconds())
+            candidates, 
+            key=lambda t: abs((t - current_time).total_seconds())
         )
         
-        # 设置时间窗口
+        # 5️⃣ 计算时间窗口
         earliest = expected_dt - timedelta(hours=hours_before)
         latest = expected_dt + timedelta(hours=hours_after)
         
+        # 6️⃣ 检查是否在窗口内
         is_valid = earliest <= current_time <= latest
         
         if not is_valid:
+            # 计算具体偏差
+            if current_time < earliest:
+                delta_hours = (earliest - current_time).total_seconds() / 3600
+                delta_str = f"早 {delta_hours:.1f} 小时"
+            else:
+                delta_hours = (current_time - latest).total_seconds() / 3600
+                delta_str = f"晚 {delta_hours:.1f} 小时"
+            
             error_msg = (
-                f"⏰ 当前时间不在允许的打卡范围内！\n\n"
-                f"🕒 期望打卡时间：<code>{expected_dt.strftime('%H:%M')}</code>\n"
-                f"📋 允许范围（含日期）：\n"
-                f"   • 开始：<code>{earliest.strftime('%Y-%m-%d %H:%M')}</code>\n"
-                f"   • 结束：<code>{latest.strftime('%Y-%m-%d %H:%M')}</code>\n\n"
-                f"💡 打卡规则：\n"
-                f"• 允许时间：期望时间前后 {hours_before}/{hours_after} 小时\n"
-                f"• 当前时间：<code>{current_time.strftime('%H:%M')}</code>"
-            )
-            logger.warning(
-                f"打卡时间超出允许窗口: {expected_time_str}, "
-                f"当前: {current_time.strftime('%Y-%m-%d %H:%M')}"
+                f"⏰ 时间范围错误\n\n"
+                f"📅 当前时间：{current_time.strftime('%m/%d %H:%M')}\n"
+                f"🎯 期望时间：{expected_dt.strftime('%m/%d %H:%M')}\n"
+                f"⏱️ 允许范围：{earliest.strftime('%m/%d %H:%M')} - {latest.strftime('%m/%d %H:%M')}\n"
+                f"📊 状态：{delta_str}\n"
+                f"👷 班次：{'夜班🌙' if is_night_shift else '白班☀️'}"
             )
         else:
             error_msg = ""
         
+        # 7️⃣ 调试日志
+        logger.debug(
+            f"时间检查: 当前{current_time.strftime('%m/%d %H:%M')}, "
+            f"期望{expected_dt.strftime('%m/%d %H:%M')}, "
+            f"窗口[{earliest.strftime('%m/%d %H:%M')}-{latest.strftime('%m/%d %H:%M')}], "
+            f"有效:{is_valid}, 夜班:{is_night_shift}"
+        )
+        
         return is_valid, expected_dt, error_msg
         
     except Exception as e:
-        logger.error(f"检查时间有效性失败: {e}")
-        return False, current_time, f"系统错误：{str(e)[:100]}"
+        logger.error(f"时间检查失败: {e}", exc_info=True)
+        return False, current_time, f"系统错误：时间检查异常"
 
 
 def calculate_time_windows(
