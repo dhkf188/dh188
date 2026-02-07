@@ -1375,6 +1375,13 @@ class PostgreSQLDatabase:
     ):
         """更新用户班次状态"""
         try:
+            def ensure_beijing(dt: datetime) -> datetime:
+                if dt is None:
+                    return None
+                if dt.tzinfo is None:
+                    return beijing_tz.localize(dt)
+                else:
+                    return dt.astimezone(beijing_tz)
             if checkin_time:
                 checkin_time = ensure_beijing(checkin_time)
 
