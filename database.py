@@ -1376,6 +1376,8 @@ class PostgreSQLDatabase:
         """更新用户班次状态"""
         try:
             if checkin_time:
+                if checkin_time.tzinfo is None:
+                    checkin_time = beijing_tz.localize(checkin_time)
                 # 上班逻辑：插入或更新在岗班次
                 await self.execute_with_retry(
                     "更新用户上班状态",
@@ -1391,6 +1393,8 @@ class PostgreSQLDatabase:
                     chat_id, user_id, on_duty_shift, checkin_time,
                 )
             elif checkout_time:
+                if checkout_time.tzinfo is None:
+                    checkout_time = beijing_tz.localize(checkout_time)
                 # 优化：下班时必须将 on_duty_shift 置为 NULL，否则状态逻辑会判定该用户仍在岗
                 await self.execute_with_retry(
                     "更新用户下班状态",
