@@ -1843,14 +1843,14 @@ async def process_work_checkin(message: types.Message, checkin_type: str):
             try:
                 # 🆕 修改：传入班次ID
                 await db.add_work_record(
-                    chat_id,
-                    uid,
-                    business_date,
-                    checkin_type,
-                    current_time,
-                    status,
-                    time_diff_minutes,
-                    fine_amount,
+                    chat_id=chat_id,
+                    user_id=uid,
+                    record_date=business_date,
+                    checkin_type=checkin_type,
+                    checkin_time=current_time,
+                    status=status,
+                    time_diff_minutes=time_diff_minutes,
+                    fine_amount=fine_amount,
                     shift_id=shift_id  # 🆕 添加班次信息
                 )
                 logger.info(f"[{trace_id}] ✅ 打卡记录已保存：班次{shift_id}，状态{status}")
