@@ -2271,9 +2271,10 @@ class PostgreSQLDatabase:
         status: str,
         time_diff_minutes: float,
         fine_amount: int = 0,
+        shift_id: int = 0,  # 🆕 添加班次参数，默认0=白班
     ):
-        """添加上下班记录 - 实时四表同步写入版本"""
-
+        """添加上下班记录 - 实时四表同步写入版本（支持班次）"""
+        
         # 🧠 强制使用业务日期，忽略外部传入的 record_date
         business_date = await self.get_business_date(chat_id)
         statistic_date = business_date.replace(day=1)
@@ -2281,7 +2282,6 @@ class PostgreSQLDatabase:
         self._ensure_pool_initialized()
         async with self.pool.acquire() as conn:
             async with conn.transaction():
-
                 # ========== 1. 获取当前的 is_soft_reset 状态 ==========
                 current_soft_reset = False
                 soft_reset_row = await conn.fetchrow(
@@ -2298,14 +2298,15 @@ class PostgreSQLDatabase:
                 if soft_reset_row:
                     current_soft_reset = soft_reset_row["is_soft_reset"]
 
-                # ========== 2. work_records 表（上下班记录） ==========
+                # ========== 2. work_records 表（上下班记录）- 添加shift_id ==========
                 await conn.execute(
                     """
                     INSERT INTO work_records 
-                    (chat_id, user_id, record_date, checkin_type, checkin_time, status, time_diff_minutes, fine_amount)
-                    VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+                    (chat_id, user_id, record_date, shift_id, checkin_type, checkin_time, status, time_diff_minutes, fine_amount)
+                    VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
                     ON CONFLICT (chat_id, user_id, record_date, checkin_type) 
                     DO UPDATE SET 
+                        shift_id = EXCLUDED.shift_id,
                         checkin_time = EXCLUDED.checkin_time,
                         status = EXCLUDED.status,
                         time_diff_minutes = EXCLUDED.time_diff_minutes,
@@ -2315,6 +2316,7 @@ class PostgreSQLDatabase:
                     chat_id,
                     user_id,
                     business_date,
+                    shift_id,  # 🆕 添加班次ID
                     checkin_type,
                     checkin_time,
                     status,
@@ -2492,9 +2494,9 @@ class PostgreSQLDatabase:
         )
 
     async def has_work_record_today(
-        self, chat_id: int, user_id: int, checkin_type: str
+        self, chat_id: int, user_id: int, checkin_type: str, shift_id: int = None
     ) -> bool:
-        """检查今天是否有上下班记录 - 每个群组独立重置时间"""
+        """检查今天是否有上下班记录 - 支持班次"""
         try:
             # 每个群组独立的重置时间计算
             group_data = await self.get_group_cached(chat_id)
@@ -2514,13 +2516,27 @@ class PostgreSQLDatabase:
 
             self._ensure_pool_initialized()
             async with self.pool.acquire() as conn:
-                row = await conn.fetchrow(
-                    "SELECT 1 FROM work_records WHERE chat_id = $1 AND user_id = $2 AND checkin_type = $3 AND record_date >= $4",
-                    chat_id,
-                    user_id,
-                    checkin_type,
-                    period_start.date(),
-                )
+                if shift_id is not None:
+                    # 按班次查询
+                    row = await conn.fetchrow(
+                        """
+                        SELECT 1 FROM work_records 
+                        WHERE chat_id = $1 AND user_id = $2 
+                        AND checkin_type = $3 AND shift_id = $4
+                        AND record_date >= $5
+                        """,
+                        chat_id, user_id, checkin_type, shift_id, period_start.date(),
+                    )
+                else:
+                    # 不按班次查询（兼容旧代码）
+                    row = await conn.fetchrow(
+                        """
+                        SELECT 1 FROM work_records 
+                        WHERE chat_id = $1 AND user_id = $2 
+                        AND checkin_type = $3 AND record_date >= $4
+                        """,
+                        chat_id, user_id, checkin_type, period_start.date(),
+                    )
                 return row is not None
         except Exception as e:
             logger.error(f"检查工作记录失败 {chat_id}-{user_id}: {e}")
