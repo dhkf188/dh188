@@ -1365,6 +1365,7 @@ class PostgreSQLDatabase:
             logger.error(f"获取用户状态失败: {e}")
             return None
 
+
     async def update_user_shift_status(
         self, 
         chat_id: int, 
@@ -1375,8 +1376,15 @@ class PostgreSQLDatabase:
     ):
         """
         更新用户班次状态 - 支持同一天多次上班
+        修复了 offset-naive 和 offset-aware 的兼容性问题
         """
         try:
+            # 统一处理时区：将带有时区的时间转换为不带时区的本地时间，防止计算冲突
+            if checkin_time and checkin_time.tzinfo is not None:
+                checkin_time = checkin_time.replace(tzinfo=None)
+            if checkout_time and checkout_time.tzinfo is not None:
+                checkout_time = checkout_time.replace(tzinfo=None)
+
             if checkin_time:
                 # 上班：设置班次
                 await self.execute_with_retry(
@@ -1410,10 +1418,13 @@ class PostgreSQLDatabase:
                 logger.info(f"✅ 用户下班: {chat_id}-{user_id} -> 班次清除")
             
             # 清理缓存
-            self._cache.pop(f"user_status:{chat_id}:{user_id}", None)
+            cache_key = f"user_status:{chat_id}:{user_id}"
+            if cache_key in self._cache:
+                self._cache.pop(cache_key, None)
             
         except Exception as e:
             logger.error(f"更新用户班次状态失败: {e}")
+            raise  # 建议抛出异常，以便上层 retry_manager 捕获
 
     async def get_group_shift_config(self, chat_id: int) -> Dict:
         """获取群组班次配置"""
