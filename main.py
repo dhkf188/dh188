@@ -1767,11 +1767,15 @@ async def process_work_checkin(message: types.Message, checkin_type: str):
         # 🟢 更新用户班次状态
         # =====================================
         if checkin_type == "work_start":
+            if now.tzinfo is None:
+                now = beijing_tz.localize(now)
             await db.update_user_shift_status(
                 chat_id, uid, shift_id, checkin_time=now
             )
             logger.info(f"[{trace_id}] 用户{uid}开始班次{shift_id} ({shift_name})")
         else:
+            if now.tzinfo is None:
+                now = beijing_tz.localize(now)
             await db.update_user_shift_status(
                 chat_id, uid, None, checkout_time=now
             )
