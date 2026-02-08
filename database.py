@@ -1373,22 +1373,14 @@ class PostgreSQLDatabase:
         checkin_time: Optional[datetime] = None,
         checkout_time: Optional[datetime] = None
     ):
-        """更新用户班次状态"""
+        """
+        更新用户班次状态 - 支持同一天多次上班
+        """
         try:
-            def ensure_beijing(dt: datetime) -> datetime:
-                if dt is None:
-                    return None
-                if dt.tzinfo is None:
-                    return beijing_tz.localize(dt)
-                else:
-                    return dt.astimezone(beijing_tz)
             if checkin_time:
-                checkin_time = ensure_beijing(checkin_time)
-
-                checkin_time_db = checkin_time.replace(tzinfo=None)
-                # 上班逻辑：插入或更新在岗班次
+                # 上班：设置班次
                 await self.execute_with_retry(
-                    "更新用户上班状态",
+                    "用户上班",
                     """
                     INSERT INTO user_status (chat_id, user_id, on_duty_shift, last_checkin_time, updated_at)
                     VALUES ($1, $2, $3, $4, CURRENT_TIMESTAMP)
@@ -1398,27 +1390,27 @@ class PostgreSQLDatabase:
                         last_checkin_time = EXCLUDED.last_checkin_time,
                         updated_at = CURRENT_TIMESTAMP
                     """,
-                    chat_id, user_id, on_duty_shift, checkin_time_db,
+                    chat_id, user_id, on_duty_shift, checkin_time,
                 )
-            elif checkout_time:
-                checkout_time = ensure_beijing(checkout_time)
+                logger.info(f"✅ 用户上班: {chat_id}-{user_id} -> 班次{on_duty_shift}")
                 
-                checkout_time_db = checkout_time.replace(tzinfo=None)
-                # 优化：下班时必须将 on_duty_shift 置为 NULL，否则状态逻辑会判定该用户仍在岗
+            elif checkout_time:
+                # 下班：只清空班次，不清除记录
                 await self.execute_with_retry(
-                    "更新用户下班状态",
+                    "用户下班",
                     """
                     UPDATE user_status 
-                    SET on_duty_shift = NULL, last_checkout_time = $1, updated_at = CURRENT_TIMESTAMP
+                    SET on_duty_shift = NULL, 
+                        last_checkout_time = $1, 
+                        updated_at = CURRENT_TIMESTAMP
                     WHERE chat_id = $2 AND user_id = $3
                     """,
-                    checkout_time_db, chat_id, user_id,
+                    checkout_time, chat_id, user_id,
                 )
+                logger.info(f"✅ 用户下班: {chat_id}-{user_id} -> 班次清除")
             
-            # 优化：清理相关的所有缓存，确保 UI 状态同步
+            # 清理缓存
             self._cache.pop(f"user_status:{chat_id}:{user_id}", None)
-            self._cache.pop(f"user:{chat_id}:{user_id}", None)
-            logger.debug(f"✅ 用户班次状态更新: {chat_id}-{user_id} -> shift={on_duty_shift}")
             
         except Exception as e:
             logger.error(f"更新用户班次状态失败: {e}")
