@@ -1601,6 +1601,58 @@ async def determine_shift_id(
         fallback = current_time.replace(hour=9, minute=0, second=0, microsecond=0)
         return True, fallback, "默认", 0, f"系统错误：{str(e)[:100]}"
 
+def calculate_time_windows(
+    day_start_minutes: int, 
+    day_end_minutes: int, 
+    current_minutes: int
+) -> Dict[str, Any]:
+    """
+    计算时间窗口信息（用于活动班次判定）
+    
+    返回：
+    {
+        "is_day_shift": bool,      # 是否在白班窗口内
+        "is_night_shift": bool,    # 是否在夜班窗口内
+        "distance_to_day": int,    # 距离白班开始时间的分钟数
+        "distance_to_night": int   # 距离夜班开始时间的分钟数
+    }
+    """
+    try:
+        # 判断是否在白班窗口内
+        is_day_shift = is_time_in_territory(current_minutes, day_start_minutes, day_end_minutes)
+        
+        # 判断是否在夜班窗口内（夜班是白班以外的时段）
+        is_night_shift = not is_day_shift
+        
+        # 计算距离白班开始时间的分钟数
+        distance_to_day = min(
+            abs(current_minutes - day_start_minutes),
+            24 * 60 - abs(current_minutes - day_start_minutes)
+        )
+        
+        # 计算距离夜班开始时间的分钟数（夜班开始时间 = 白班结束时间）
+        night_start_minutes = day_end_minutes
+        distance_to_night = min(
+            abs(current_minutes - night_start_minutes),
+            24 * 60 - abs(current_minutes - night_start_minutes)
+        )
+        
+        return {
+            "is_day_shift": is_day_shift,
+            "is_night_shift": is_night_shift,
+            "distance_to_day": distance_to_day,
+            "distance_to_night": distance_to_night
+        }
+        
+    except Exception as e:
+        logger.error(f"计算时间窗口失败: {e}")
+        return {
+            "is_day_shift": False,
+            "is_night_shift": True,
+            "distance_to_day": 9999,
+            "distance_to_night": 0
+        }
+
 async def determine_activity_shift_id(
     chat_id: int, 
     user_id: int, 
@@ -1645,13 +1697,8 @@ async def determine_activity_shift_id(
             return 1  # 夜班
         else:
             # 如果不在任何窗口内，按距离判断
-            distance_to_day = abs(current_minutes - day_start_minutes)
-            if distance_to_day > 12 * 60:
-                distance_to_day = 24 * 60 - distance_to_day
-            
-            distance_to_night = abs(current_minutes - day_end_minutes)
-            if distance_to_night > 12 * 60:
-                distance_to_night = 24 * 60 - distance_to_night
+            distance_to_day = window_info["distance_to_day"]
+            distance_to_night = window_info["distance_to_night"]
             
             return 0 if distance_to_day < distance_to_night else 1
         
