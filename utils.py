@@ -1226,87 +1226,186 @@ async def check_time_validity(
         logger.error(f"时间检查失败: {e}", exc_info=True)
         return False, current_time, f"系统错误：时间检查异常"
 
+# ========== 新增函数 ==========
+
+def get_time_range(base_minutes: int, before: int, after: int) -> tuple[int, int]:
+    """
+    获取时间范围（支持跨天）
+    
+    参数:
+        base_minutes: 基准时间（分钟）
+        before: 提前多少小时
+        after: 延后多少小时
+    
+    返回:
+        (start_minutes, end_minutes) 时间范围的起止分钟数
+    """
+    start_minutes = (base_minutes - before * 60) % (24 * 60)
+    end_minutes = (base_minutes + after * 60) % (24 * 60)
+    return start_minutes, end_minutes
+
+
+def calculate_expected_datetime(
+    current_time: datetime, 
+    expected_minutes: int,
+    territory_type: str
+) -> datetime:
+    """
+    计算期望的datetime对象
+    
+    参数:
+        current_time: 当前时间
+        expected_minutes: 期望时间的分钟数
+        territory_type: 领土类型（'day_checkin', 'night_checkout'等）
+    
+    返回:
+        期望时间的datetime对象
+    """
+    from datetime import timedelta
+    from config import beijing_tz
+    
+    # 确保当前时间是北京时间
+    if current_time.tzinfo is None:
+        current_time = beijing_tz.localize(current_time)
+    
+    # 计算期望时间的小时和分钟
+    expected_hour = expected_minutes // 60 % 24
+    expected_minute = expected_minutes % 60
+    
+    # 创建基础datetime
+    expected_dt = current_time.replace(
+        hour=expected_hour, minute=expected_minute, 
+        second=0, microsecond=0
+    )
+    
+    # 🟢 智能日期调整
+    current_hour = current_time.hour
+    current_minute = current_time.minute
+    
+    # 情况1：夜班且期望时间比当前时间早很多
+    if 'night' in territory_type:
+        if expected_hour < current_hour - 12:
+            # 期望时间远早于当前时间，可能是第二天
+            expected_dt += timedelta(days=1)
+        elif expected_hour <= 6 and current_hour >= 18:
+            # 期望在凌晨，当前在晚上，期望是第二天
+            expected_dt += timedelta(days=1)
+    
+    # 情况2：白班跨天
+    elif 'day' in territory_type:
+        if expected_hour < current_hour - 12:
+            # 期望时间远早于当前时间
+            expected_dt += timedelta(days=1)
+    
+    logger.debug(
+        f"期望时间计算: 当前{current_time.strftime('%m/%d %H:%M')}, "
+        f"期望分钟{expected_minutes}({expected_hour:02d}:{expected_minute:02d}), "
+        f"领土{territory_type}, 结果{expected_dt.strftime('%m/%d %H:%M')}"
+    )
+    
+    return expected_dt
+
+
+# ========== 替换原函数 ==========
+
 def calculate_shift_territories(
-    day_start_str: str,    # 白班开始时间 "09:00"
-    day_end_str: str,      # 白班结束时间 "21:00"
+    day_start_str: str,
+    day_end_str: str,
     current_time: datetime,
-    action_type: str       # 'checkin' 或 'checkout'
+    action_type: str
 ) -> tuple[Optional[int], str, Optional[datetime]]:
     """
-    根据管理员设定的双班时间动态计算领土
-    
-    规则：
-    1. 上班领土：白班：[T_day-2h, T_day+6h]，夜班：[T_night-2h, T_night+6h]
-    2. 下班领土：白班：[T_day+6h, T_day+18h]，夜班：[T_night+6h, T_night+18h]
-    3. T_night = T_day + 12h（如果day_end_str是白班结束时间）
-    
-    返回: (shift_id, territory_type, expected_time)
-        shift_id: 0=白班, 1=夜班
-        territory_type: 'day_checkin', 'night_checkin', 'day_checkout', 'night_checkout'
-        expected_time: 期望打卡时间（用于计算迟到早退）
+    改进版班次领土计算（替换原版）
     """
     try:
-        # 转换为分钟
         current_minutes = current_time.hour * 60 + current_time.minute
-        day_start_minutes = parse_time_to_minutes(day_start_str)  # 09:00 -> 540
-        day_end_minutes = parse_time_to_minutes(day_end_str)      # 21:00 -> 1260
+        day_start_min = parse_time_to_minutes(day_start_str)
+        day_end_min = parse_time_to_minutes(day_end_str)
         
-        # 计算夜班开始时间（白班开始时间+12小时）
-        night_start_minutes = (day_start_minutes + 12 * 60) % (24 * 60)  # 21:00
+        # 处理跨天白班
+        if day_end_min <= day_start_min:
+            day_end_min += 24 * 60
         
-        # 计算各个领土范围
-        territories = {
-            # 上班领土
-            'day_checkin': {
-                'shift_id': 0,
-                'territory': get_territory_range(day_start_minutes, 'checkin'),
-                'expected_time': minutes_to_time_str(day_start_minutes)
-            },
-            'night_checkin': {
-                'shift_id': 1,
-                'territory': get_territory_range(night_start_minutes, 'checkin'),
-                'expected_time': minutes_to_time_str(night_start_minutes)
-            },
-            # 下班领土
-            'day_checkout': {
-                'shift_id': 0,
-                'territory': get_territory_range(day_start_minutes, 'checkout'),
-                'expected_time': minutes_to_time_str((day_start_minutes + 9 * 60) % (24 * 60))  # 白班下班时间
-            },
-            'night_checkout': {
-                'shift_id': 1,
-                'territory': get_territory_range(night_start_minutes, 'checkout'),
-                'expected_time': minutes_to_time_str((night_start_minutes + 9 * 60) % (24 * 60))  # 夜班下班时间
-            }
+        # 计算夜班开始时间
+        night_start_min = (day_start_min + 12 * 60) % (24 * 60)
+        
+        # 使用标准班次时长（9小时）
+        STANDARD_SHIFT_HOURS = 9
+        day_end_expected = (day_start_min + STANDARD_SHIFT_HOURS * 60) % (24 * 60)
+        night_end_expected = (night_start_min + STANDARD_SHIFT_HOURS * 60) % (24 * 60)
+        
+        # 领土规则
+        TERRITORY_RULES = {
+            'checkin': {'before': 2, 'after': 6},
+            'checkout': {'before': 6, 'after': 18}
         }
         
-        # 根据动作类型筛选领土
-        valid_territories = {}
-        for territory_type, info in territories.items():
-            if action_type in territory_type:
-                valid_territories[territory_type] = info
+        # 定义领土
+        territories = [
+            # 白班上班
+            {
+                'shift_id': 0,
+                'type': 'day_checkin',
+                'base_time': day_start_min,
+                'expected_time': day_start_min,
+                'action': 'checkin',
+                'territory': get_time_range(day_start_min, **TERRITORY_RULES['checkin'])
+            },
+            # 白班下班
+            {
+                'shift_id': 0,
+                'type': 'day_checkout',
+                'base_time': day_end_expected,
+                'expected_time': day_end_expected,
+                'action': 'checkout',
+                'territory': get_time_range(day_end_expected, **TERRITORY_RULES['checkout'])
+            },
+            # 夜班上班
+            {
+                'shift_id': 1,
+                'type': 'night_checkin',
+                'base_time': night_start_min,
+                'expected_time': night_start_min,
+                'action': 'checkin',
+                'territory': get_time_range(night_start_min, **TERRITORY_RULES['checkin'])
+            },
+            # 夜班下班
+            {
+                'shift_id': 1,
+                'type': 'night_checkout',
+                'base_time': night_end_expected,
+                'expected_time': night_end_expected,
+                'action': 'checkout',
+                'territory': get_time_range(night_end_expected, **TERRITORY_RULES['checkout'])
+            }
+        ]
         
-        # 检查当前时间属于哪个领土
-        for territory_type, info in valid_territories.items():
-            territory_start, territory_end = info['territory']
-            if is_time_in_territory(current_minutes, territory_start, territory_end):
-                # 计算期望时间
-                expected_hour, expected_minute = map(int, info['expected_time'].split(':'))
-                expected_dt = current_time.replace(
-                    hour=expected_hour, minute=expected_minute, second=0, microsecond=0
-                )
-                
-                # 如果是夜班且期望时间比当前时间早，说明是第二天
-                if 'night' in territory_type and expected_hour < current_time.hour:
-                    expected_dt += timedelta(days=1)
-                
-                return info['shift_id'], territory_type, expected_dt
+        # 筛选符合条件的领土
+        candidates = [
+            t for t in territories 
+            if t['action'] == action_type and 
+            is_time_in_territory(current_minutes, t['territory'][0], t['territory'][1])
+        ]
         
-        # 没有找到匹配的领土
-        return None, "none", None
+        if not candidates:
+            return None, "none", None
+        
+        # 取第一个匹配的（理论上只有一个）
+        best = candidates[0]
+        expected_dt = calculate_expected_datetime(
+            current_time, best['expected_time'], best['type']
+        )
+        
+        logger.debug(
+            f"领土计算: 当前{current_time.strftime('%H:%M')}, "
+            f"动作{action_type}, 领土{best['type']}, "
+            f"班次{best['shift_id']}, 期望{expected_dt.strftime('%m/%d %H:%M')}"
+        )
+        
+        return best['shift_id'], best['type'], expected_dt
         
     except Exception as e:
-        logger.error(f"计算班次领土失败: {e}")
+        logger.error(f"计算班次领土失败: {e}", exc_info=True)
         return None, "error", None
 
 def get_territory_range(base_minutes: int, action_type: str):
@@ -1462,31 +1561,38 @@ async def determine_shift_for_first_work(
     group_config: Dict
 ) -> Tuple[bool, datetime, str, int, str]:
     """
-    双班模式首次上班打卡判定 - 修复跨天白班问题
+    双班模式首次上班打卡判定 - 使用统一的领土逻辑
     """
     try:
-        day_start_str = group_config.get('day_start', '09:00')  # 白班开始时间
-        day_end_str = group_config.get('day_end', '21:00')      # 白班结束时间（可能是第二天）
+        day_start_str = group_config.get('day_start', '09:00')
+        day_end_str = group_config.get('day_end', '21:00')
         
-        # 🎯 关键修复：使用正确的白班判断
-        is_in_day_shift = is_time_in_day_shift(current_time, day_start_str, day_end_str)
+        # 🟢 使用统一的领土逻辑，参数顺序正确！
+        shift_id, territory_type, expected_dt = calculate_shift_territories(
+            day_start_str, day_end_str, current_time, 'checkin'  # 第一次上班肯定是checkin
+        )
         
-        if is_in_day_shift:
-            # 在白班时段内 → 白班
-            shift_id = 0
-            expected_time_str = day_start_str  # 期望白班开始时间 14:00
-            hours_before = 2
-            hours_after = 6
-            is_night_shift = False
+        if shift_id is None:
+            # 不在任何领土内
+            error_msg = (
+                f"⏰ 当前时间不在允许的打卡范围内！\n\n"
+                f"📅 当前时间：{current_time.strftime('%m/%d %H:%M')}\n"
+                f"🔄 动作类型：上班\n"
+                f"📍 白班上班领土：{day_start_str}前后2/6小时\n"
+                f"📍 夜班上班领土：{day_end_str}前后2/6小时"
+            )
+            return False, current_time, "无效", 0, error_msg
+        
+        # 🟢 根据领土类型确定时间窗口
+        if 'checkin' in territory_type:
+            hours_before, hours_after = 2, 6  # 上班：前2后6
         else:
-            # 在夜班时段内 → 夜班
-            shift_id = 1
-            expected_time_str = day_end_str    # 期望夜班开始时间 02:00
-            hours_before = 2
-            hours_after = 6
-            is_night_shift = True
+            hours_before, hours_after = 6, 18  # 下班：前6后18
         
-        # 检查时间有效性
+        # 🟢 检查时间有效性
+        expected_time_str = expected_dt.strftime('%H:%M')
+        is_night_shift = 'night' in territory_type
+        
         is_valid, expected_dt, error_msg = await check_time_validity(
             current_time, expected_time_str, hours_before, hours_after, is_night_shift
         )
@@ -1494,12 +1600,11 @@ async def determine_shift_for_first_work(
         shift_name = "白班☀️" if shift_id == 0 else "夜班🌙"
         
         logger.info(
-            f"🎯 班次判定: 用户{user_id}, 时间{current_time.strftime('%m/%d %H:%M')}\n"
-            f"   白班时段: {day_start_str}-{day_end_str}\n"
-            f"   是否在白班内: {is_in_day_shift}\n"
+            f"🎯 首次上班判定: 用户{user_id}, 时间{current_time.strftime('%H:%M')}\n"
+            f"   领土类型: {territory_type}\n"
             f"   判定班次: {shift_name}, 期望时间: {expected_time_str}\n"
             f"   时间窗口: ±{hours_before}/{hours_after}小时\n"
-            f"   是否有效: {is_valid}, 错误: {error_msg[:50] if error_msg else '无'}"
+            f"   是否有效: {is_valid}"
         )
         
         return is_valid, expected_dt, shift_name, shift_id, error_msg
