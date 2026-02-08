@@ -309,43 +309,209 @@ class PostgreSQLDatabase:
         return self.get_beijing_time().date()
 
     # ========== 核心业务日期逻辑(管理员设定的周器时间-统一) ==========
-    async def get_business_date(
-        self, chat_id: int, current_dt: datetime = None
-    ) -> date:
+
+    async def get_business_date(self, chat_id: int, current_dt: datetime = None) -> date:
         """
-        获取当前的'业务日期'。
-        如果当前时间还没到设置的重置时间，则业务日期算作昨天。
+        🎯 智能业务日期计算
+        规则：
+        1. 如果设置了上下班时间 → 使用上下班时间计算
+        2. 如果没有上下班时间 → 使用夜班重置时间计算
+        3. 如果开启了双班 → 使用白班时间窗口计算
         """
         if current_dt is None:
             current_dt = self.get_beijing_time()
-
-        # 获取群组设置的重置时间
+        
+        # 获取群组配置
         group_data = await self.get_group_cached(chat_id)
-        if group_data:
-            reset_hour = group_data.get("reset_hour", Config.DAILY_RESET_HOUR)
-            reset_minute = group_data.get("reset_minute", Config.DAILY_RESET_MINUTE)
+        
+        # 判断是否有上下班时间设置
+        work_hours = await self.get_group_work_time(chat_id)
+        has_work_hours = await self.has_work_hours_enabled(chat_id)
+        
+        # 判断是否双班模式
+        group_config = await self.get_group_shift_config(chat_id)
+        is_dual_mode = group_config.get('dual_mode', False)
+        
+        # ========== 情况1：双班模式 ==========
+        if is_dual_mode:
+            # 双班模式：使用白班时间窗口
+            day_start = group_config.get('day_start', '09:00')
+            day_end = group_config.get('day_end', '21:00')
+            
+            # 解析时间
+            from utils import parse_time_to_minutes
+            start_min = parse_time_to_minutes(day_start)
+            end_min = parse_time_to_minutes(day_end)
+            current_min = current_dt.hour * 60 + current_dt.minute
+            
+            # 判断是否跨天
+            is_cross_day = start_min >= end_min
+            
+            if is_cross_day:
+                # 跨天情况（如 21:00-09:00）
+                if start_min <= current_min < 24 * 60:  # 21:00-24:00
+                    business_date = current_dt.date()
+                elif 0 <= current_min < end_min:  # 00:00-09:00
+                    business_date = current_dt.date()
+                else:  # 09:00-21:00（非白班时间）
+                    business_date = current_dt.date()
+            else:
+                # 不跨天情况（如 09:00-21:00）
+                if start_min <= current_min < end_min:  # 在白班时间内
+                    business_date = current_dt.date()
+                else:  # 在白班时间外
+                    business_date = current_dt.date()
+                    
+            logger.debug(f"双班模式业务日期: {business_date} (白班: {day_start}-{day_end})")
+        
+        # ========== 情况2：有上下班时间 ==========
+        elif has_work_hours:
+            work_start = work_hours.get("work_start", "09:00")
+            work_end = work_hours.get("work_end", "18:00")
+            
+            # 解析上下班时间
+            from utils import parse_time_to_minutes
+            start_min = parse_time_to_minutes(work_start)
+            end_min = parse_time_to_minutes(work_end)
+            current_min = current_dt.hour * 60 + current_dt.minute
+            
+            # 如果当前时间 < 上班时间，业务日期是昨天
+            if current_min < start_min:
+                business_date = (current_dt - timedelta(days=1)).date()
+            else:
+                business_date = current_dt.date()
+                
+            logger.debug(f"上下班模式业务日期: {business_date} (上班: {work_start})")
+        
+        # ========== 情况3：默认使用夜班重置时间 ==========
         else:
-            reset_hour = Config.DAILY_RESET_HOUR
-            reset_minute = Config.DAILY_RESET_MINUTE
-
-        # 构建今天的重置时间点
-        reset_time_today = current_dt.replace(
-            hour=reset_hour, minute=reset_minute, second=0, microsecond=0
-        )
-
-        # 如果当前时间小于重置时间，说明还在上一天的业务周期内
-        business_date = (
-            (current_dt - timedelta(days=1)).date()
-            if current_dt < reset_time_today
-            else current_dt.date()
-        )
-
-        logger.debug(
-            f"📅 业务日期计算: chat_id={chat_id}, 当前时间={current_dt}, "
-            f"重置时间={reset_time_today}, 业务日期={business_date}"
-        )
-
+            # 获取夜班重置时间
+            soft_reset_hour, soft_reset_minute = await self.get_group_soft_reset_time(chat_id)
+            
+            # 构建重置时间点
+            reset_time = current_dt.replace(
+                hour=soft_reset_hour, 
+                minute=soft_reset_minute, 
+                second=0, 
+                microsecond=0
+            )
+            
+            # 如果当前时间 < 重置时间，业务日期是昨天
+            if current_dt < reset_time:
+                business_date = (current_dt - timedelta(days=1)).date()
+            else:
+                business_date = current_dt.date()
+                
+            logger.debug(f"默认模式业务日期: {business_date} (重置: {soft_reset_hour:02d}:{soft_reset_minute:02d})")
+        
         return business_date
+
+
+
+
+
+    async def get_business_period(self, chat_id: int, target_date: date) -> tuple[datetime, datetime]:
+        """
+        🎯 获取指定业务日期的完整周期时间范围
+        返回: (周期开始时间, 周期结束时间)
+        """
+        # 获取群组配置
+        group_data = await self.get_group_cached(chat_id)
+        group_config = await self.get_group_shift_config(chat_id)
+        work_hours = await self.get_group_work_time(chat_id)
+        has_work_hours = await self.has_work_hours_enabled(chat_id)
+        is_dual_mode = group_config.get('dual_mode', False)
+        
+        # 从 utils 导入时间解析函数
+        from utils import parse_time_to_minutes
+        
+        # ========== 情况1：双班模式 ==========
+        if is_dual_mode:
+            day_start = group_config.get('day_start', '09:00')
+            day_end = group_config.get('day_end', '21:00')
+            
+            # 解析时间
+            start_min = parse_time_to_minutes(day_start)
+            end_min = parse_time_to_minutes(day_end)
+            
+            # 构建开始时间（目标日期的白班开始时间）
+            period_start = datetime.combine(
+                target_date, 
+                time(hour=start_min // 60, minute=start_min % 60)
+            )
+            
+            # 判断是否跨天
+            is_cross_day = start_min >= end_min
+            
+            if is_cross_day:
+                # 跨天：结束时间是第二天
+                period_end = period_start + timedelta(days=1)
+                period_end = period_end.replace(
+                    hour=end_min // 60, 
+                    minute=end_min % 60
+                )
+            else:
+                # 不跨天：同一天结束
+                period_end = datetime.combine(
+                    target_date,
+                    time(hour=end_min // 60, minute=end_min % 60)
+                )
+        
+        # ========== 情况2：有上下班时间 ==========
+        elif has_work_hours:
+            work_start = work_hours.get("work_start", "09:00")
+            work_end = work_hours.get("work_end", "18:00")
+            
+            # 解析时间
+            start_min = parse_time_to_minutes(work_start)
+            end_min = parse_time_to_minutes(work_end)
+            
+            # 构建开始时间（目标日期的上班时间）
+            period_start = datetime.combine(
+                target_date,
+                time(hour=start_min // 60, minute=start_min % 60)
+            )
+            
+            # 构建结束时间（目标日期的下班时间）
+            period_end = datetime.combine(
+                target_date,
+                time(hour=end_min // 60, minute=end_min % 60)
+            )
+            
+            # 如果下班时间小于上班时间，说明跨天（如夜班）
+            if end_min < start_min:
+                period_end = period_end + timedelta(days=1)
+        
+        # ========== 情况3：默认模式 ==========
+        else:
+            # 获取夜班重置时间
+            soft_reset_hour, soft_reset_minute = await self.get_group_soft_reset_time(chat_id)
+            
+            # 周期开始：重置时间
+            period_start = datetime.combine(
+                target_date,
+                time(hour=soft_reset_hour, minute=soft_reset_minute)
+            )
+            
+            # 周期结束：第二天重置时间
+            period_end = period_start + timedelta(days=1)
+        
+        # 添加时区信息
+        period_start = beijing_tz.localize(period_start)
+        period_end = beijing_tz.localize(period_end)
+        
+        logger.debug(
+            f"业务周期计算: {target_date}\n"
+            f"   开始: {period_start}\n"
+            f"   结束: {period_end}\n"
+            f"   时长: {(period_end - period_start).total_seconds() / 3600:.1f}小时"
+        )
+        
+        return period_start, period_end
+
+    def get_beijing_time(self) -> datetime:
+        """获取北京时间（请确保类中有此实现）"""
+        pass
 
     
     async def get_group_statistics_by_shift(
@@ -1701,17 +1867,7 @@ class PostgreSQLDatabase:
                     chat_id, today, shift_id, user_ids
                 )
                 
-                # 3. 批量清理每日统计
-                daily_deleted = await conn.execute(
-                    """
-                    DELETE FROM daily_statistics
-                    WHERE chat_id = $1 
-                    AND record_date = $2 
-                    AND shift_id = $3
-                    AND user_id = ANY($4)
-                    """,
-                    chat_id, today, shift_id, user_ids
-                )
+              
                 
                 if is_hard_reset:
                     # 4. 批量清理工作记录（硬重置）
@@ -3794,6 +3950,78 @@ class PostgreSQLDatabase:
 
         logger.info(f"🧹 清理了 {deleted_count} 个长期未活动的用户以及他们的所有记录")
         return deleted_count
+
+
+    async def cleanup_old_daily_statistics(self, chat_id: int, cleanup_time: datetime):
+        """
+        🎯 智能清理旧的 daily_statistics 数据
+        根据业务周期计算要清理的数据
+        """
+        try:
+            # 获取当前业务日期
+            current_business_date = await self.get_business_date(chat_id, cleanup_time)
+            
+            # 获取当前业务周期的开始时间
+            current_period_start, current_period_end = await self.get_business_period(
+                chat_id, current_business_date
+            )
+            
+            # 要清理的截止日期 = 当前业务周期开始前一天
+            cleanup_cutoff_date = current_period_start.date() - timedelta(days=1)
+            
+            logger.info(f"🧹 智能清理 daily_statistics: 群组{chat_id}")
+            logger.info(f"   当前业务周期: {current_business_date}")
+            logger.info(f"   当前周期开始: {current_period_start}")
+            logger.info(f"   清理截止日期: <= {cleanup_cutoff_date}")
+            
+            async with self.pool.acquire() as conn:
+                # 1. 查询要清理的数据量
+                stats_to_clean = await conn.fetchval(
+                    """
+                    SELECT COUNT(*) FROM daily_statistics 
+                    WHERE chat_id = $1 AND record_date <= $2
+                    """,
+                    chat_id, cleanup_cutoff_date
+                ) or 0
+                
+                # 2. 查询要保留的新数据量（当前周期及之后）
+                stats_to_keep = await conn.fetchval(
+                    """
+                    SELECT COUNT(*) FROM daily_statistics 
+                    WHERE chat_id = $1 AND record_date >= $2
+                    """,
+                    chat_id, current_period_start.date()
+                ) or 0
+                
+                # 3. 只清理截止日期之前的数据
+                deleted = await conn.execute(
+                    """
+                    DELETE FROM daily_statistics 
+                    WHERE chat_id = $1 AND record_date <= $2
+                    """,
+                    chat_id, cleanup_cutoff_date
+                )
+                
+                # 这里调用了之前定义的类私有方法 _parse_count
+                deleted_count = self._parse_count(deleted)
+                
+                # 4. 记录统计
+                logger.info(
+                    f"✅ daily_statistics 智能清理完成: 群组{chat_id}\n"
+                    f"   清理旧记录: {deleted_count}/{stats_to_clean}\n"
+                    f"   保留新记录: {stats_to_keep}条（{current_period_start.date()}及之后）\n"
+                    f"   📅 业务周期: {current_business_date}"
+                )
+                
+                return True
+                
+        except Exception as e:
+            logger.error(f"❌ 智能清理 daily_statistics 失败: {e}")
+            return False
+
+    def _parse_count(self, sql_result) -> int:
+        """用于解析 SQL 执行结果的方法（已在之前提供）"""
+        pass
 
     # ========== 活动人数限制 ==========
     async def set_activity_user_limit(self, activity: str, max_users: int):
