@@ -982,7 +982,7 @@ async def activity_timer(chat_id: int, uid: int, act: str, limit: int):
 # 在main.py中找到定时任务部分，修改为：
 
 async def shift_based_daily_reset():
-    """基于班次的每日重置调度器 - 修复版"""
+    """基于班次的每日重置调度器"""
     logger.info("⏰ 班次重置调度器启动...")
     
     while True:
@@ -998,19 +998,12 @@ async def shift_based_daily_reset():
                 try:
                     # 获取群组配置
                     group_data = await db.get_group_cached(chat_id)
+                    reset_hour = group_data.get("reset_hour", 23)  # 默认23点白班重置
+                    reset_minute = group_data.get("reset_minute", 0)
                     
-                    # 🎯 分别获取两个重置时间
-                    # 白班重置时间
-                    day_reset_hour = group_data.get("reset_hour", 23)
-                    day_reset_minute = group_data.get("reset_minute", 0)
-                    
-                    # 夜班重置时间
-                    night_reset_hour = group_data.get("soft_reset_hour", 11)  # 默认11点
-                    night_reset_minute = group_data.get("soft_reset_minute", 0)
-                    
-                    # 🎯 白班重置（23:00 或自定义时间）
-                    if current_hour == day_reset_hour and current_minute == day_reset_minute:
-                        logger.info(f"⏰ {day_reset_hour:02d}:{day_reset_minute:02d} 执行白班重置: 群组{chat_id}")
+                    # 🎯 23:00 白班重置（硬重置）
+                    if current_hour == 23 and current_minute == reset_minute:
+                        logger.info(f"⏰ 23:{reset_minute:02d} 执行白班重置: 群组{chat_id}")
                         
                         # 1. 先完成所有未结束的活动
                         await db.complete_all_pending_activities_before_reset(chat_id, now)
@@ -1021,11 +1014,11 @@ async def shift_based_daily_reset():
                         # 3. 发送重置通知
                         await send_reset_notification(chat_id, "白班重置完成", now)
                     
-                    # 🎯 夜班重置（11:00 或自定义时间）
-                    elif current_hour == night_reset_hour and current_minute == night_reset_minute:
-                        logger.info(f"⏰ {night_reset_hour:02d}:{night_reset_minute:02d} 执行夜班重置: 群组{chat_id}")
+                    # 🎯 11:00 夜班重置（软重置）
+                    elif current_hour == 11 and current_minute == reset_minute:
+                        logger.info(f"⏰ 11:{reset_minute:02d} 执行夜班重置: 群组{chat_id}")
                         
-                        # 1. 导出昨天的数据
+                        # 1. 先导出昨天的数据（可选步骤）
                         yesterday = now.date() - timedelta(days=1)
                         logger.info(f"💾 准备导出昨日数据: {yesterday}")
                         
@@ -1038,10 +1031,6 @@ async def shift_based_daily_reset():
                         # 4. 发送重置通知
                         await send_reset_notification(chat_id, "夜班重置完成，数据已清理", now)
                     
-                    # 🎯 额外的保护：如果夜班重置时间设为 0:0（禁用）
-                    elif night_reset_hour == 0 and night_reset_minute == 0:
-                        logger.debug(f"群组{chat_id} 夜班重置已禁用")
-                    
                 except Exception as e:
                     logger.error(f"群组{chat_id}重置失败: {e}")
                     
@@ -1051,6 +1040,7 @@ async def shift_based_daily_reset():
         except Exception as e:
             logger.error(f"班次重置调度器异常: {e}")
             await asyncio.sleep(60)
+
 
 # ========== 核心打卡功能 ==========
 async def start_activity(message: types.Message, act: str):
@@ -5075,10 +5065,9 @@ async def export_and_push_csv(
     target_date=None,
     is_daily_reset: bool = False,
     from_monthly_table: bool = False,
-    is_night_shift_export: bool = False,  # 🆕 新增：夜班重置导出标记
 ) -> bool:
     """
-    导出群组数据为 CSV 并推送 - 终极完整整合版（支持智能业务周期）
+    导出群组数据为 CSV 并推送 - 终极完整整合版
     返回: True/False 表示导出是否成功
     """
     # ========== 0. 前置检查 ==========
@@ -5099,16 +5088,10 @@ async def export_and_push_csv(
     operation_id = f"export_{chat_id}_{int(start_time)}"
     logger.info(f"🚀 [{operation_id}] 开始导出群组 {chat_id} 的数据...")
 
-    # 初始化变量
+    # 初始化变量，确保在所有分支中都有定义
     temp_file = None
     group_stats = []
     activity_limits = Config.DEFAULT_ACTIVITY_LIMITS.copy()
-    
-    # 🆕 新增：业务周期信息变量
-    business_period_info = ""
-    export_type_info = "手动导出"
-    period_start = None
-    period_end = None
 
     try:
         # 初始化群组
@@ -5116,14 +5099,15 @@ async def export_and_push_csv(
 
         # ========== 2. 安全转换函数 ==========
         def safe_int(value, default=0):
-            """安全转换为整数"""
+            """安全转换为整数（完全保留第一个代码逻辑）"""
             if value is None:
                 return default
             try:
+                # 处理字符串如 'B班'
                 if isinstance(value, str):
                     if value.isdigit():
                         return int(value)
-                    elif value.replace(".", "", 1).isdigit():
+                    elif value.replace(".", "", 1).isdigit():  # 处理浮点数
                         return int(float(value))
                     else:
                         return default
@@ -5132,140 +5116,44 @@ async def export_and_push_csv(
                 return default
 
         def safe_format_time(seconds):
-            """安全格式化时间"""
+            """安全格式化时间（使用第一个代码的MessageFormatter）"""
             try:
                 return MessageFormatter.format_time_for_csv(safe_int(seconds))
             except Exception:
                 return "0分0秒"
 
-        # ========== 3. 智能计算导出日期和业务周期 ==========
+        # ========== 3. 规范日期与文件名 ==========
         beijing_now = datetime.now(beijing_tz)
 
-        # 🆕 新增：夜班重置导出的智能计算
-        if is_night_shift_export:
-            export_type_info = "夜班重置导出"
-            
-            # 计算昨天的业务周期
-            yesterday_dt = beijing_now - timedelta(days=1)
-            
-            try:
-                # 获取昨天的业务日期
-                yesterday_business_date = await db.get_business_date(chat_id, yesterday_dt)
-                logger.info(f"📅 昨天业务日期: {yesterday_business_date}")
-                
-                # 获取昨天业务周期的完整时间范围
-                try:
-                    # 🆕 新增：尝试使用新的 get_business_period 方法
-                    period_start, period_end = await db.get_business_period(chat_id, yesterday_business_date)
-                    
-                    business_period_info = (
-                        f"📊 <b>业务周期详情</b>\n"
-                        f"• 业务日期：<code>{yesterday_business_date.strftime('%Y-%m-%d')}</code>\n"
-                        f"• 周期范围：<code>{period_start.strftime('%m/%d %H:%M')}</code> - "
-                        f"<code>{period_end.strftime('%m/%d %H:%M')}</code>\n"
-                        f"• 周期时长：<code>{(period_end - period_start).total_seconds() / 3600:.1f}</code> 小时"
-                    )
-                    
-                    logger.info(f"📅 昨天业务周期: {period_start} - {period_end}")
-                    
-                except AttributeError as e:
-                    # 如果数据库没有 get_business_period 方法，降级处理
-                    logger.warning(f"⚠️ 无法获取详细业务周期: {e}")
-                    business_period_info = (
-                        f"📊 <b>业务周期详情</b>\n"
-                        f"• 业务日期：<code>{yesterday_business_date.strftime('%Y-%m-%d')}</code>\n"
-                        f"• 周期类型：自动计算（基于群组配置）"
-                    )
-                
-                target_date = yesterday_business_date
-                
-                # 🆕 获取群组配置信息
-                try:
-                    group_config = await db.get_group_shift_config(chat_id)
-                    work_hours = await db.get_group_work_time(chat_id)
-                    has_work_hours = await db.has_work_hours_enabled(chat_id)
-                    
-                    if group_config.get('dual_mode', False):
-                        day_start = group_config.get('day_start', '09:00')
-                        day_end = group_config.get('day_end', '21:00')
-                        config_info = f"双班模式 ({day_start}-{day_end})"
-                    elif has_work_hours:
-                        work_start = work_hours.get("work_start", "09:00")
-                        work_end = work_hours.get("work_end", "18:00")
-                        config_info = f"上下班模式 ({work_start}-{work_end})"
-                    else:
-                        soft_hour, soft_minute = await db.get_group_soft_reset_time(chat_id)
-                        config_info = f"默认模式 (重置时间: {soft_hour:02d}:{soft_minute:02d})"
-                    
-                    business_period_info += f"\n• 群组配置：{config_info}"
-                    
-                except Exception as e:
-                    logger.warning(f"⚠️ 获取群组配置失败: {e}")
-                    config_info = "默认配置"
-                
-            except Exception as e:
-                logger.error(f"❌ 计算昨天业务周期失败: {e}")
-                # 降级处理：使用昨天的日期
-                target_date = yesterday_dt.date()
-                business_period_info = f"📅 <b>业务日期</b>：<code>{target_date.strftime('%Y-%m-%d')}</code>"
-                
-        # 处理 target_date 参数
-        elif target_date is not None:
+        # target_date 处理（第一个代码的完整逻辑）
+        if target_date is not None:
             if hasattr(target_date, "date"):
                 target_date = target_date.date()
             elif not isinstance(target_date, date):
                 try:
+                    # 尝试转换字符串为日期
                     if isinstance(target_date, str):
                         target_date = datetime.strptime(target_date, "%Y-%m-%d").date()
                 except Exception as e:
                     logger.warning(f"⚠️ 无法解析target_date: {target_date}, 错误: {e}")
                     target_date = None
-        
-        # 默认：使用当前业务日期
+
+        # 使用业务日期作为默认
         if target_date is None:
             target_date = await db.get_business_date(chat_id)
-        
-        # 🆕 判断导出类型
-        if is_daily_reset and not is_night_shift_export:
-            export_type_info = "日常重置导出"
-        elif is_daily_reset:
-            export_type_info = "夜班重置导出"
 
-        # ========== 4. 生成智能文件名 ==========
+        # 生成文件名（第一个代码的完整逻辑）
         if not file_name:
-            if is_night_shift_export:
-                # 夜班重置导出：包含配置信息
-                try:
-                    group_config = await db.get_group_shift_config(chat_id)
-                    if group_config.get('dual_mode', False):
-                        shift_suffix = "dual"
-                    elif await db.has_work_hours_enabled(chat_id):
-                        shift_suffix = "work"
-                    else:
-                        shift_suffix = "default"
-                    
-                    file_name = f"night_export_{chat_id}_{target_date.strftime('%Y%m%d')}_{shift_suffix}.csv"
-                    
-                except Exception as e:
-                    logger.warning(f"⚠️ 生成智能文件名失败: {e}")
-                    file_name = f"night_export_{chat_id}_{target_date.strftime('%Y%m%d')}.csv"
-                    
-            elif is_daily_reset:
-                # 日常重置导出
-                file_name = f"daily_backup_{chat_id}_{target_date.strftime('%Y%m%d')}.csv"
+            if is_daily_reset:
+                # 每日重置导出使用固定格式
+                file_name = (
+                    f"daily_backup_{chat_id}_{target_date.strftime('%Y%m%d')}.csv"
+                )
             else:
-                # 手动导出
+                # 手动导出带时间戳
                 file_name = f"manual_export_{chat_id}_{beijing_now.strftime('%Y%m%d_%H%M%S')}.csv"
 
-        logger.info(
-            f"📊 [{operation_id}] 导出配置:\n"
-            f"   群组: {chat_id}\n"
-            f"   导出类型: {export_type_info}\n"
-            f"   目标日期: {target_date}\n"
-            f"   文件名: {file_name}"
-        )
-
-        # ========== 5. 获取统计数据 ==========
+        # ========== 4. 获取统计数据 ==========
         logger.info(
             f"🔍 [{operation_id}] 获取群组 {chat_id} 的统计数据，日期: {target_date}"
         )
@@ -5278,6 +5166,7 @@ async def export_and_push_csv(
                     logger.info(
                         f"✅ [{operation_id}] 从月度表获取到 {len(group_stats)} 条数据"
                     )
+                    # 从月度表获取时使用默认配置
                     activity_limits = Config.DEFAULT_ACTIVITY_LIMITS.copy()
                 else:
                     logger.warning(f"⚠️ [{operation_id}] 月度表无数据，回退到常规表")
@@ -5289,12 +5178,13 @@ async def export_and_push_csv(
 
         if not from_monthly_table:
             try:
-                # 并发获取活动配置和统计数据
+                # 并发获取活动配置和统计数据（第二个代码优化）
                 activity_task = asyncio.create_task(db.get_activity_limits_cached())
                 stats_task = asyncio.create_task(
                     db.get_group_statistics(chat_id, target_date)
                 )
 
+                # 使用 return_exceptions=True 避免单个任务异常影响其他任务
                 results = await asyncio.gather(
                     activity_task, stats_task, return_exceptions=True
                 )
@@ -5302,6 +5192,7 @@ async def export_and_push_csv(
                 # 处理活动配置结果
                 if isinstance(results[0], Exception):
                     logger.error(f"❌ [{operation_id}] 获取活动配置失败: {results[0]}")
+                    # 尝试从数据库获取
                     try:
                         activity_limits = await db.get_activity_limits()
                         if not activity_limits:
@@ -5327,7 +5218,7 @@ async def export_and_push_csv(
             except Exception as e:
                 logger.error(f"❌ [{operation_id}] 并发获取数据失败: {e}")
                 logger.error(traceback.format_exc())
-                # 回退到顺序获取
+                # 回退到顺序获取（第一个代码的回退逻辑）
                 try:
                     activity_limits = await db.get_activity_limits_cached()
                     if not activity_limits:
@@ -5349,7 +5240,7 @@ async def export_and_push_csv(
 
         logger.info(f"📊 [{operation_id}] 获取到 {len(group_stats)} 条统计数据")
 
-        # ========== 6. 数据验证 ==========
+        # ========== 5. 数据验证 ==========
         if len(group_stats) == 0:
             logger.warning(f"⚠️ [{operation_id}] 群组 {chat_id} 没有数据需要导出")
             if not is_daily_reset:
@@ -5360,14 +5251,15 @@ async def export_and_push_csv(
                     await bot.send_message(chat_id, no_data_msg)
                 except Exception as e:
                     logger.debug(f"[{operation_id}] 发送无数据消息失败: {e}")
-            return True  # 没有数据也算成功
+            return True  # 没有数据也算成功（第一个代码的逻辑）
 
-        # ========== 7. 构造CSV表头 ==========
+        # ========== 6. 构造CSV表头 ==========
         csv_buffer = StringIO()
         writer = csv.writer(csv_buffer)
 
+        # 构建完整表头（第一个代码的逻辑）
         headers = ["用户ID", "用户昵称", "重置类型"]
-        activity_names = sorted(activity_limits.keys())
+        activity_names = sorted(activity_limits.keys())  # 排序确保一致性
         for act in activity_names:
             headers.extend([f"{act}次数", f"{act}总时长"])
 
@@ -5378,14 +5270,14 @@ async def export_and_push_csv(
                 "罚款总金额",
                 "超时次数",
                 "总超时时间",
-                "工作天数",
-                "工作时长",
+                "工作天数",  # 🆕 第一个代码的字段
+                "工作时长",  # 🆕 第一个代码的字段
             ]
         )
 
         writer.writerow(headers)
 
-        # ========== 8. 数据处理和统计 ==========
+        # ========== 7. 数据处理和统计 ==========
         unique_users = set()
         total_records = 0
         reset_type_counts = {"A班": 0, "B班": 0}
@@ -5398,7 +5290,7 @@ async def export_and_push_csv(
 
             total_records += 1
 
-            # 判定 A/B 班
+            # 判定 A/B 班（第一个代码的完整逻辑）
             is_soft_reset = user_data.get("is_soft_reset", False)
             reset_type = "B班" if is_soft_reset else "A班"
             reset_type_counts[reset_type] += 1
@@ -5413,7 +5305,7 @@ async def export_and_push_csv(
             if not isinstance(user_activities, dict):
                 user_activities = {}
 
-            # 检查是否有有效数据
+            # 检查是否有有效数据（第一个代码的逻辑）
             total_activity_count = safe_int(user_data.get("total_activity_count"))
             total_accumulated_time = safe_int(user_data.get("total_accumulated_time"))
             total_fines = safe_int(user_data.get("total_fines"))
@@ -5444,11 +5336,17 @@ async def export_and_push_csv(
                 row.append(count)
                 row.append(safe_format_time(time_seconds))
 
-            # 填充通用统计数据
+            # 填充通用统计数据（包含工作字段）
             overtime_count = safe_int(user_data.get("overtime_count"))
             total_overtime_time = safe_int(user_data.get("total_overtime_time"))
-            work_days = safe_int(user_data.get("work_days", 0))
-            work_hours = safe_int(user_data.get("work_hours", 0))
+            work_days = safe_int(user_data.get("work_days", 0))  # 🆕 第一个代码的字段
+            work_hours = safe_int(user_data.get("work_hours", 0))  # 🆕 第一个代码的字段
+
+            # 🆕 调试日志：检查工作相关字段（第一个代码的调试日志）
+            logger.debug(
+                f"📊 [{operation_id}] 用户 {user_id} 工作数据: "
+                f"工作天数={work_days}, 工作时长={work_hours}秒"
+            )
 
             row.extend(
                 [
@@ -5457,14 +5355,14 @@ async def export_and_push_csv(
                     total_fines,
                     overtime_count,
                     safe_format_time(total_overtime_time),
-                    work_days,
-                    safe_format_time(work_hours),
+                    work_days,  # 🆕 第一个代码的字段
+                    safe_format_time(work_hours),  # 🆕 第一个代码的字段
                 ]
             )
 
             writer.writerow(row)
 
-        # ========== 9. 最终数据验证 ==========
+        # ========== 8. 最终数据验证 ==========
         if not has_valid_data and total_records == 0:
             logger.warning(f"⚠️ [{operation_id}] 群组 {chat_id} 没有有效数据需要导出")
             if not is_daily_reset:
@@ -5475,18 +5373,18 @@ async def export_and_push_csv(
                     await bot.send_message(chat_id, no_data_msg)
                 except Exception as e:
                     logger.debug(f"[{operation_id}] 发送无数据消息失败: {e}")
-            return True
+            return True  # 没有数据也算成功（第一个代码的逻辑）
 
-        # ========== 10. 生成CSV文件 ==========
+        # ========== 9. 生成CSV文件 ==========
         csv_content = csv_buffer.getvalue()
         csv_buffer.close()
 
         # 创建临时文件名
         temp_file = f"temp_{operation_id}_{file_name}"
 
-        # ========== 11. 并行执行文件操作 ==========
+        # ========== 10. 并行执行文件操作 ==========
         async def write_file_async():
-            """异步写入文件"""
+            """异步写入文件（UTF-8 with BOM for Excel）"""
             try:
                 async with aiofiles.open(temp_file, "w", encoding="utf-8-sig") as f:
                     await f.write(csv_content)
@@ -5497,7 +5395,7 @@ async def export_and_push_csv(
             except Exception as e:
                 logger.error(f"❌ [{operation_id}] 异步写入文件失败: {e}")
                 logger.error(traceback.format_exc())
-                # 回退到同步写入
+                # 回退到同步写入（第一个代码的回退思想）
                 try:
                     with open(temp_file, "w", encoding="utf-8-sig") as f:
                         f.write(csv_content)
@@ -5517,13 +5415,13 @@ async def export_and_push_csv(
                 logger.debug(f"[{operation_id}] 获取群组标题失败: {e}")
                 return f"群组 {chat_id}"
 
-        # 并发执行
+        # 并发执行（第二个代码优化）
         write_result, chat_title = await asyncio.gather(
             write_file_async(), get_chat_title_async()
         )
 
         if not write_result:
-            # 文件写入失败
+            # 文件写入失败，尝试发送错误消息
             try:
                 error_msg = Config.MESSAGES.get(
                     "export_process_failed", "❌ 导出过程失败"
@@ -5533,10 +5431,10 @@ async def export_and_push_csv(
                 logger.debug(f"[{operation_id}] 发送错误消息失败: {msg_e}")
             return False
 
-        # ========== 12. 构建富文本描述 ==========
+        # ========== 11. 构建富文本描述 ==========
         display_date = target_date.strftime("%Y年%m月%d日")
-        
-        # 使用 MessageFormatter 的工具方法
+
+        # 使用 MessageFormatter 的工具方法（第一个代码的完整逻辑）
         try:
             if hasattr(MessageFormatter, "create_dashed_line"):
                 dashed_line = MessageFormatter.create_dashed_line()
@@ -5545,23 +5443,16 @@ async def export_and_push_csv(
         except Exception:
             dashed_line = "─" * 30
 
-        # 🆕 构建智能描述
         caption = (
             f"📊 <b>数据导出报告</b>\n"
             f"🏢 群组：<code>{chat_title}</code>\n"
             f"📅 统计日期：<code>{display_date}</code>\n"
             f"⏰ 导出时间：<code>{beijing_now.strftime('%Y-%m-%d %H:%M:%S')}</code>\n"
-            f"🔁 导出类型：<code>{export_type_info}</code>\n"
             f"{dashed_line}\n"
+            f"💾 <i>包含每个用户每日的活动统计及工作时长</i>"
         )
-        
-        # 🆕 添加业务周期信息
-        if business_period_info:
-            caption += f"{business_period_info}\n{dashed_line}\n"
-        
-        caption += f"💾 <i>包含每个用户每日的活动统计及工作时长</i>"
 
-        # ========== 13. 发送到当前群组 ==========
+        # ========== 12. 发送到当前群组 ==========
         input_file = FSInputFile(temp_file, filename=file_name)
         send_to_group_success = False
         send_to_admin_success = False
@@ -5572,15 +5463,15 @@ async def export_and_push_csv(
                 document=input_file,
                 caption=caption,
                 parse_mode="HTML",
-                reply_to_message_id=None,
+                reply_to_message_id=None,  # 不回复特定消息（第一个代码的逻辑）
             )
             send_to_group_success = True
             logger.info(f"✅ [{operation_id}] CSV文件已发送到群组 {chat_id}")
         except Exception as e:
             logger.error(f"❌ [{operation_id}] 发送到群组失败: {e}")
-            logger.error(traceback.format_exc())
+            logger.error(traceback.format_exc())  # 添加堆栈追踪
 
-            # 尝试发送错误消息到群组
+            # 尝试发送错误消息到群组（第一个代码的逻辑）
             try:
                 error_msg = Config.MESSAGES.get(
                     "export_failed", "❌ 数据导出失败，请稍后重试"
@@ -5589,10 +5480,10 @@ async def export_and_push_csv(
             except Exception as msg_e:
                 logger.debug(f"[{operation_id}] 发送错误消息失败: {msg_e}")
 
-        # ========== 14. 推送到通知服务 ==========
+        # ========== 13. 推送到通知服务 ==========
         if to_admin_if_no_group and notification_service:
             try:
-                # 确保通知服务有正确的实例
+                # 确保通知服务有正确的实例（第一个代码的完整逻辑）
                 if (
                     hasattr(notification_service, "bot_manager")
                     and not notification_service.bot_manager
@@ -5619,11 +5510,13 @@ async def export_and_push_csv(
                     )
             except Exception as e:
                 logger.warning(f"⚠️ [{operation_id}] 推送到通知服务失败: {e}")
+                # 不阻止主流程（第一个代码的逻辑）
 
-        # ========== 15. 后台清理 ==========
+        # ========== 14. 后台清理 ==========
         async def cleanup_background():
-            """后台清理临时文件"""
+            """后台清理临时文件（第二个代码优化）"""
             try:
+                # 等待一小段时间确保文件发送完成
                 await asyncio.sleep(2)
 
                 if temp_file and os.path.exists(temp_file):
@@ -5634,28 +5527,28 @@ async def export_and_push_csv(
             except Exception as e:
                 logger.debug(f"🧹 [{operation_id}] 清理临时文件失败: {e}")
 
-        # 在后台执行清理任务
+        # 在后台执行清理任务，不阻塞主流程
         asyncio.create_task(cleanup_background())
 
-        # ========== 16. 性能统计和日志 ==========
+        # ========== 15. 性能统计和日志 ==========
         duration = time.time() - start_time
         logger.info(
             f"✅ [{operation_id}] 数据导出处理完成\n"
             f"   文件: {file_name}\n"
-            f"   导出类型: {export_type_info}\n"
             f"   用户数: {len(unique_users)}, 数据行: {total_records}\n"
             f"   A班: {reset_type_counts['A班']}, B班: {reset_type_counts['B班']}\n"
             f"   耗时: {duration:.2f}秒\n"
             f"   发送结果: 群组={send_to_group_success}, 通知服务={send_to_admin_success}"
         )
 
+        # ========== 16. 返回结果 ==========
         return send_to_group_success
 
     except Exception as e:
         logger.error(f"❌ [{operation_id}] 导出过程发生未捕获异常: {e}")
         logger.error(traceback.format_exc())
 
-        # 尝试发送错误消息
+        # 尝试发送错误消息（第一个代码的逻辑）
         try:
             error_msg = Config.MESSAGES.get(
                 "export_failed", "❌ 数据导出失败，请稍后重试"
@@ -5664,7 +5557,7 @@ async def export_and_push_csv(
         except Exception as msg_e:
             logger.debug(f"[{operation_id}] 发送错误消息失败: {msg_e}")
 
-        # 清理临时文件
+        # 清理临时文件（如果有）
         try:
             if temp_file and os.path.exists(temp_file):
                 os.remove(temp_file)
@@ -5673,6 +5566,7 @@ async def export_and_push_csv(
             logger.debug(f"[{operation_id}] 异常时清理文件失败: {cleanup_e}")
 
         return False
+
 
 # ========== 定时任务 ==========
 
