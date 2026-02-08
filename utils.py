@@ -1226,81 +1226,88 @@ async def check_time_validity(
         logger.error(f"时间检查失败: {e}", exc_info=True)
         return False, current_time, f"系统错误：时间检查异常"
 
-
-def calculate_time_windows(
-    day_start_minutes: int,
-    day_end_minutes: int,
-    current_minutes: int
-) -> Dict[str, Any]:
+def calculate_shift_territories(
+    day_start_str: str,    # 白班开始时间 "09:00"
+    day_end_str: str,      # 白班结束时间 "21:00"
+    current_time: datetime,
+    action_type: str       # 'checkin' 或 'checkout'
+) -> tuple[Optional[int], str, Optional[datetime]]:
     """
-    计算时间窗口和班次判定
-    返回包含窗口信息和班次判定结果的字典
+    根据管理员设定的双班时间动态计算领土
+    
+    规则：
+    1. 上班领土：白班：[T_day-2h, T_day+6h]，夜班：[T_night-2h, T_night+6h]
+    2. 下班领土：白班：[T_day+6h, T_day+18h]，夜班：[T_night+6h, T_night+18h]
+    3. T_night = T_day + 12h（如果day_end_str是白班结束时间）
+    
+    返回: (shift_id, territory_type, expected_time)
+        shift_id: 0=白班, 1=夜班
+        territory_type: 'day_checkin', 'night_checkin', 'day_checkout', 'night_checkout'
+        expected_time: 期望打卡时间（用于计算迟到早退）
     """
-    # 计算各时间窗口（支持前2小时，后6小时）
-    day_shift_window_start = day_start_minutes - 2 * 60   # 白班开始前2小时
-    day_shift_window_end = day_start_minutes + 6 * 60     # 白班开始后6小时
-    
-    night_shift_window_start = day_end_minutes - 2 * 60   # 夜班开始前2小时
-    night_shift_window_end = (day_end_minutes + 6 * 60) % (24 * 60)  # 夜班开始后6小时
-    
-    # 判断当前时间在哪个班次的时间窗口内
-    is_day_shift = False
-    is_night_shift = False
-    
-    # 处理白班时间窗口（可能跨天）
-    if day_shift_window_start >= 0:
-        if day_shift_window_end < 24 * 60:
-            is_day_shift = day_shift_window_start <= current_minutes < day_shift_window_end
-        else:
-            day_shift_window_end_adj = day_shift_window_end - 24 * 60
-            is_day_shift = (day_shift_window_start <= current_minutes) or (current_minutes < day_shift_window_end_adj)
-    else:
-        day_shift_window_start_adj = day_shift_window_start + 24 * 60
-        if day_shift_window_end < 24 * 60:
-            is_day_shift = current_minutes < day_shift_window_end
-        else:
-            is_day_shift = True
-    
-    # 处理夜班时间窗口（可能跨天）
-    if night_shift_window_start >= 0:
-        if night_shift_window_end < 24 * 60:
-            is_night_shift = night_shift_window_start <= current_minutes < night_shift_window_end
-        else:
-            night_shift_window_end_adj = night_shift_window_end - 24 * 60
-            is_night_shift = (night_shift_window_start <= current_minutes) or (current_minutes < night_shift_window_end_adj)
-    else:
-        night_shift_window_start_adj = night_shift_window_start + 24 * 60
-        if night_shift_window_end < 24 * 60:
-            is_night_shift = current_minutes < night_shift_window_end
-        else:
-            is_night_shift = True
-    
-    # 优先级：如果时间同时在两个窗口内，优先按更近的班次开始时间判断
-    if is_day_shift and is_night_shift:
-        distance_to_day = abs(current_minutes - day_start_minutes)
-        if distance_to_day > 12 * 60:
-            distance_to_day = 24 * 60 - distance_to_day
+    try:
+        # 转换为分钟
+        current_minutes = current_time.hour * 60 + current_time.minute
+        day_start_minutes = parse_time_to_minutes(day_start_str)  # 09:00 -> 540
+        day_end_minutes = parse_time_to_minutes(day_end_str)      # 21:00 -> 1260
         
-        distance_to_night = abs(current_minutes - day_end_minutes)
-        if distance_to_night > 12 * 60:
-            distance_to_night = 24 * 60 - distance_to_night
+        # 计算夜班开始时间（白班开始时间+12小时）
+        night_start_minutes = (day_start_minutes + 12 * 60) % (24 * 60)  # 21:00
         
-        if distance_to_day < distance_to_night:
-            is_night_shift = False
-        else:
-            is_day_shift = False
-    
-    return {
-        "is_day_shift": is_day_shift,
-        "is_night_shift": is_night_shift,
-        "day_shift_window_start": day_shift_window_start,
-        "day_shift_window_end": day_shift_window_end,
-        "night_shift_window_start": night_shift_window_start,
-        "night_shift_window_end": night_shift_window_end,
-        "current_minutes": current_minutes,
-        "day_start_minutes": day_start_minutes,
-        "day_end_minutes": day_end_minutes,
-    }
+        # 计算各个领土范围
+        territories = {
+            # 上班领土
+            'day_checkin': {
+                'shift_id': 0,
+                'territory': get_territory_range(day_start_minutes, 'checkin'),
+                'expected_time': minutes_to_time_str(day_start_minutes)
+            },
+            'night_checkin': {
+                'shift_id': 1,
+                'territory': get_territory_range(night_start_minutes, 'checkin'),
+                'expected_time': minutes_to_time_str(night_start_minutes)
+            },
+            # 下班领土
+            'day_checkout': {
+                'shift_id': 0,
+                'territory': get_territory_range(day_start_minutes, 'checkout'),
+                'expected_time': minutes_to_time_str((day_start_minutes + 9 * 60) % (24 * 60))  # 白班下班时间
+            },
+            'night_checkout': {
+                'shift_id': 1,
+                'territory': get_territory_range(night_start_minutes, 'checkout'),
+                'expected_time': minutes_to_time_str((night_start_minutes + 9 * 60) % (24 * 60))  # 夜班下班时间
+            }
+        }
+        
+        # 根据动作类型筛选领土
+        valid_territories = {}
+        for territory_type, info in territories.items():
+            if action_type in territory_type:
+                valid_territories[territory_type] = info
+        
+        # 检查当前时间属于哪个领土
+        for territory_type, info in valid_territories.items():
+            territory_start, territory_end = info['territory']
+            if is_time_in_territory(current_minutes, territory_start, territory_end):
+                # 计算期望时间
+                expected_hour, expected_minute = map(int, info['expected_time'].split(':'))
+                expected_dt = current_time.replace(
+                    hour=expected_hour, minute=expected_minute, second=0, microsecond=0
+                )
+                
+                # 如果是夜班且期望时间比当前时间早，说明是第二天
+                if 'night' in territory_type and expected_hour < current_time.hour:
+                    expected_dt += timedelta(days=1)
+                
+                return info['shift_id'], territory_type, expected_dt
+        
+        # 没有找到匹配的领土
+        return None, "none", None
+        
+    except Exception as e:
+        logger.error(f"计算班次领土失败: {e}")
+        return None, "error", None
 
 async def determine_shift_for_single_mode(
     chat_id: int,
@@ -1376,6 +1383,7 @@ async def determine_shift_for_existing_shift(
 
 async def determine_shift_for_end_work(
     chat_id: int,
+    user_id: int,
     checkin_type: str,
     current_time: datetime,
     db
@@ -1399,7 +1407,7 @@ async def determine_shift_for_end_work(
             current_time, expected_time_str, hours_before, hours_after
         )
         
-        return is_valid, expected_dt, "下班", 0, error_msg
+        return is_valid, expected_dt, "下班", user_id, error_msg
         
     except Exception as e:
         logger.error(f"下班打卡判定失败: {e}")
@@ -1467,46 +1475,91 @@ async def determine_shift_id(
     checkin_type: str, 
     current_time: datetime,
     db
-) -> Tuple[bool, datetime, str, int, str]:
+) -> tuple[bool, datetime, str, int, str]:
     """
-    合并版：检查班次并验证时间有效性（重构后）
-    返回：(是否有效, 期望时间, 班次名称, 班次ID, 错误信息)
+    新版：根据动态领土判定班次
     """
     try:
         # 1. 获取群组配置
         group_config = await db.get_group_shift_config(chat_id)
         
-        # 2. 单班模式
+        # 2. 单班模式 - 简单判定
         if not group_config.get('dual_mode', False):
             return await determine_shift_for_single_mode(
                 chat_id, checkin_type, current_time, db
             )
         
-        # 3. 双班模式逻辑
-        # 先检查用户是否已经打过上班卡（保持现有班次）
-        if checkin_type == "work_start":
-            user_status = await db.get_user_status(chat_id, user_id)
-            if user_status and user_status.get('on_duty_shift') is not None:
-                return await determine_shift_for_existing_shift(
-                    chat_id, user_id, checkin_type, current_time, db, group_config, user_status
-                )
+        # 3. 双班模式 - 动态领土判定
+        action_type = 'checkin' if checkin_type == 'work_start' else 'checkout'
         
-        # 4. 下班打卡
-        if checkin_type == "work_end":
-            return await determine_shift_for_end_work(
-                chat_id, checkin_type, current_time, db
-            )
+        # 获取白班时间配置
+        day_start_str = group_config.get('day_start', '09:00')
+        day_end_str = group_config.get('day_end', '21:00')
         
-        # 5. 双班模式，首次上班打卡
-        return await determine_shift_for_first_work(
-            chat_id, user_id, current_time, group_config
+        # 计算领土
+        shift_id, territory_type, expected_dt = calculate_shift_territories(
+            day_start_str, day_end_str, current_time, action_type
         )
         
+        if shift_id is None:
+            # 当前时间不在任何领土内
+            territory_names = {
+                'day_checkin': f"{day_start_str}前后2/6小时",
+                'night_checkin': f"{(parse_time_to_minutes(day_start_str) + 12*60)//60:02d}:{(parse_time_to_minutes(day_start_str) + 12*60)%60:02d}前后2/6小时",
+                'day_checkout': f"{day_start_str}+6小时前后6小时",
+                'night_checkout': f"{(parse_time_to_minutes(day_start_str) + 12*60)//60:02d}:{(parse_time_to_minutes(day_start_str) + 12*60)%60:02d}+6小时前后6小时"
+            }
+            
+            error_msg = (
+                f"⏰ 当前时间不在允许的打卡范围内！\n\n"
+                f"📅 当前时间：{current_time.strftime('%m/%d %H:%M')}\n"
+                f"🔄 动作类型：{'上班' if action_type == 'checkin' else '下班'}\n\n"
+                f"📍 允许的领土范围：\n"
+            )
+            
+            for t_type, t_desc in territory_names.items():
+                if action_type in t_type:
+                    error_msg += f"• {t_desc}\n"
+            
+            return False, current_time, "无效", 0, error_msg
+        
+        # 4. 检查重复打卡（上班时）
+        if checkin_type == 'work_start':
+            user_status = await db.get_user_status(chat_id, user_id)
+            if user_status and user_status.get('on_duty_shift') == shift_id:
+                shift_name = "白班☀️" if shift_id == 0 else "夜班🌙"
+                return False, expected_dt, shift_name, shift_id, f"❌ 您已在{shift_name}在岗中，无法重复上班打卡！"
+        
+        # 5. 检查是否有班次可以下班（下班时）
+        elif checkin_type == 'work_end':
+            user_status = await db.get_user_status(chat_id, user_id)
+            if not user_status or user_status.get('on_duty_shift') is None:
+                return False, expected_dt, "未知", 0, "❌ 您当前没有在岗，无法打下班卡！"
+            
+            # 检查班次是否匹配
+            current_shift = user_status.get('on_duty_shift')
+            if current_shift != shift_id:
+                current_shift_name = "白班☀️" if current_shift == 0 else "夜班🌙"
+                target_shift_name = "白班☀️" if shift_id == 0 else "夜班🌙"
+                return False, expected_dt, target_shift_name, shift_id, f"❌ 您当前在{current_shift_name}在岗，无法打{target_shift_name}的下班卡！"
+        
+        # 6. 返回结果
+        shift_name = "白班☀️" if shift_id == 0 else "夜班🌙"
+        territory_desc = {
+            'day_checkin': f"白班上班",
+            'night_checkin': f"夜班上班",
+            'day_checkout': f"白班下班",
+            'night_checkout': f"夜班下班"
+        }.get(territory_type, "")
+        
+        full_shift_name = f"{shift_name}{territory_desc}"
+        
+        return True, expected_dt, full_shift_name, shift_id, ""
+        
     except Exception as e:
-        logger.error(f"检查班次和时间有效性失败: {e}")
+        logger.error(f"动态领土判定失败: {e}")
         fallback = current_time.replace(hour=9, minute=0, second=0, microsecond=0)
-        error_msg = f"系统错误：{str(e)[:100]}"
-        return True, fallback, "默认", 0, error_msg
+        return True, fallback, "默认", 0, f"系统错误：{str(e)[:100]}"
 
 async def determine_activity_shift_id(
     chat_id: int, 
