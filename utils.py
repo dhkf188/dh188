@@ -1309,6 +1309,46 @@ def calculate_shift_territories(
         logger.error(f"计算班次领土失败: {e}")
         return None, "error", None
 
+def get_territory_range(base_minutes: int, action_type: str):
+    """
+    获取领土范围
+    
+    规则：
+    1. 上班领土：前2小时，后6小时
+    2. 下班领土：前6小时，后18小时
+    """
+    if action_type == 'checkin':
+        # 上班：前2小时，后6小时
+        hours_before = 2
+        hours_after = 6
+    else:
+        # 下班：前6小时，后18小时
+        hours_before = 6
+        hours_after = 18
+    
+    start_minutes = (base_minutes - hours_before * 60) % (24 * 60)
+    end_minutes = (base_minutes + hours_after * 60) % (24 * 60)
+    return start_minutes, end_minutes
+
+
+def is_time_in_territory(current_minutes: int, territory_start: int, territory_end: int) -> bool:
+    """
+    判断当前时间是否在领土内（支持跨天）
+    """
+    if territory_start < territory_end:
+        # 非跨天情况：start <= current < end
+        return territory_start <= current_minutes < territory_end
+    else:
+        # 跨天情况：current >= start OR current < end
+        return current_minutes >= territory_start or current_minutes < territory_end
+
+
+def minutes_to_time_str(minutes: int) -> str:
+    """将分钟数转换为 HH:MM 格式的字符串"""
+    hours = minutes // 60
+    mins = minutes % 60
+    return f"{hours:02d}:{mins:02d}"
+
 async def determine_shift_for_single_mode(
     chat_id: int,
     checkin_type: str,
