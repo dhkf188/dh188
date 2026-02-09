@@ -598,30 +598,74 @@ class ActivityTimerManager:
         """设置活动定时器回调"""
         self.activity_timer_callback = callback
 
-    async def start_timer(self, chat_id: int, uid: int, act: str, limit: int):
-        """启动活动定时器"""
-        key = f"{chat_id}-{uid}"
-        await self.cancel_timer(key)
+
+    async def start_timer(
+        self,
+        chat_id: int,
+        uid: int,
+        act: str,
+        limit: int,
+        shift: str = "day",
+    ) -> bool:
+        """启动活动定时器 - 支持班次"""
+
+        timer_key = f"{chat_id}-{uid}-{shift}"
+
+        # 取消同班次旧定时器
+        if timer_key in self.active_timers:
+            await self.cancel_timer(timer_key)
 
         if not self.activity_timer_callback:
             logger.error("ActivityTimerManager: 未设置回调函数")
-            return
+            return False
 
+        # 创建异步任务
         timer_task = asyncio.create_task(
-            self._activity_timer_wrapper(chat_id, uid, act, limit), name=f"timer_{key}"
+            self._activity_timer_wrapper(chat_id, uid, act, limit, shift),
+            name=f"timer_{timer_key}",
         )
-        self._timers[key] = timer_task
-        logger.debug(f"启动定时器: {key} - {act}")
 
-    async def _activity_timer_wrapper(
-        self, chat_id: int, uid: int, act: str, limit: int
-    ):
-        """定时器包装器"""
+        # 存储定时器信息
+        self.active_timers[timer_key] = {
+            "task": timer_task,
+            "activity": act,
+            "limit": limit,
+            "shift": shift,
+        }
+
+        logger.info(f"⏰ 启动定时器: {timer_key} - {act}（班次: {shift}）")
+        return True
+
+    async def cancel_timer(self, timer_key: str):
+        """取消并清理指定的定时器"""
+        if timer_key in self.active_timers:
+            timer_info = self.active_timers.pop(timer_key)
+            task = timer_info["task"]
+            if not task.done():
+                task.cancel()
+                try:
+                    await task
+                except asyncio.CancelledError:
+                    pass
+            logger.info(f"🗑️ 定时器已取消: {timer_key}")
+
+    async def _activity_timer_wrapper(self, chat_id: int, uid: int, act: str, limit: int, shift: str):
+        """定时器包装器：在等待指定时间后触发回调"""
         try:
+            # 假设 limit 是秒数
+            await asyncio.sleep(limit)
+            
+            # 触发回调逻辑
             if self.activity_timer_callback:
-                await self.activity_timer_callback(chat_id, uid, act, limit)
-        except Exception as e:
-            logger.error(f"定时器异常 {chat_id}-{uid}: {e}")
+                await self.activity_timer_callback(chat_id, uid, act, shift)
+                
+        except asyncio.CancelledError:
+            # 任务被正常取消，不执行回调
+            raise
+        finally:
+            # 执行结束后清理自己
+            timer_key = f"{chat_id}-{uid}-{shift}"
+            self.active_timers.pop(timer_key, None)
 
     async def cancel_timer(self, key: str):
         """取消定时器"""
