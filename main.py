@@ -1791,9 +1791,16 @@ async def process_work_checkin(message: types.Message, checkin_type: str):
                     try:
                         # 保存详细班次信息
                         await db.add_work_record(
-                            chat_id, uid, business_date, 'work_end', 
-                            current_time, status, time_diff_minutes, 
-                            fine_amount, shift_state_current, current_shift_detail
+                            chat_id=chat_id,
+                            user_id=uid,
+                            record_date=business_date,
+                            checkin_type='work_start',
+                            checkin_time=current_time,
+                            status=status,
+                            time_diff_minutes=time_diff_minutes,
+                            fine_amount=fine_amount,
+                            shift=determined_shift_simple,
+                            shift_detail=determined_shift_detail
                         )
                         break
                     except Exception as e:
@@ -1943,9 +1950,16 @@ async def process_work_checkin(message: types.Message, checkin_type: str):
             
             # 写入数据库（保存详细班次信息）
             await db.add_work_record(
-                chat_id, uid, business_date, 'work_start', 
-                current_time, status, time_diff_minutes, 
-                fine_amount, determined_shift_simple, determined_shift_detail
+                chat_id=chat_id,
+                user_id=uid,
+                record_date=business_date,
+                checkin_type='work_start',
+                checkin_time=current_time,
+                status=status,
+                time_diff_minutes=time_diff_minutes,
+                fine_amount=fine_amount,
+                shift=determined_shift_simple,
+                shift_detail=determined_shift_detail
             )
             
             # 发送成功消息
@@ -2066,9 +2080,16 @@ async def process_work_checkin(message: types.Message, checkin_type: str):
             for attempt in range(2):
                 try:
                     await db.add_work_record(
-                        chat_id, uid, business_date, 'work_end', 
-                        current_time, status, time_diff_minutes, 
-                        fine_amount, determined_shift_simple, determined_shift_detail
+                        chat_id=chat_id,
+                        user_id=uid,
+                        record_date=business_date,
+                        checkin_type='work_start',
+                        checkin_time=current_time,
+                        status=status,
+                        time_diff_minutes=time_diff_minutes,
+                        fine_amount=fine_amount,
+                        shift=determined_shift_simple,
+                        shift_detail=determined_shift_detail
                     )
                     break
                 except Exception as e:
