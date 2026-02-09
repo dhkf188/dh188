@@ -2161,14 +2161,14 @@ async def calculate_shift_window_for_checkin(
 
 
 async def _check_shift_work_record(chat_id: int, user_id: int, 
-                                   checkin_type: str, shift: str) -> bool:
+                                   checkin_type: str, shift: str, 
+                                   business_date: date) -> bool:
     """
     检查指定班次的打卡记录
     支持夜班跨天查询
     """
     try:
-        # 获取当前业务日期
-        business_date = await db.get_business_date(chat_id)
+        # ✅ 现在接受 business_date 参数，不需要再调用 db.get_business_date()
         
         # 如果是夜班，考虑跨天情况
         if shift == 'night':
@@ -2206,15 +2206,16 @@ async def _check_shift_work_record(chat_id: int, user_id: int,
         return False
 
 
+# ✅ 修正后的函数定义（添加 business_date 参数）
 async def _get_existing_work_record(chat_id: int, user_id: int, 
-                                   checkin_type: str, shift: str) -> Optional[Dict]:
+                                   checkin_type: str, shift: str,
+                                   business_date: date) -> Optional[Dict]:
     """
     获取已存在的打卡记录详情
     用于详细重复打卡展示
     """
     try:
-        # 获取当前业务日期
-        business_date = await db.get_business_date(chat_id)
+        # ✅ 现在接受 business_date 参数
         
         # 构建查询条件
         async with db.pool.acquire() as conn:
