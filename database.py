@@ -491,6 +491,7 @@ class PostgreSQLDatabase:
                     nickname TEXT,
                     current_activity TEXT,
                     activity_start_time TEXT,
+                    shift TEXT DEFAULT 'day',
                     checkin_message_id BIGINT DEFAULT NULL,
                     total_accumulated_time INTEGER DEFAULT 0,
                     total_activity_count INTEGER DEFAULT 0,
