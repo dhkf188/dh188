@@ -517,7 +517,7 @@ class PostgreSQLDatabase:
                     shift TEXT DEFAULT 'day',
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                    UNIQUE(chat_id, user_id, activity_date, activity_name)
+                    UNIQUE(chat_id, user_id, activity_date, activity_name, shift)
                 )
                 """,
                 # 4. work_records表
