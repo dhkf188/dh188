@@ -2101,7 +2101,7 @@ class PostgreSQLDatabase:
         time_diff_minutes: float,
         fine_amount: int = 0,
         shift: str = "day",
-        shift: str = None
+        shift_detail: str = None
     ):
         """
         添加上下班记录 - 完整同步版
