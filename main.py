@@ -789,11 +789,15 @@ def get_admin_keyboard() -> ReplyKeyboardMarkup:
 
 
 # ========== 活动定时提醒 ==========
-async def activity_timer(chat_id: int, uid: int, act: str, limit: int):
-    """最终无遗漏 + 稳健可用版活动定时器
+async def activity_timer(chat_id: int, uid: int, act: str, limit: int, shift: str = "day"):
+    """最终无遗漏 + 稳健可用版活动定时器（支持班次）
     (引用回复 + 自动降级 + 自动重试 + 每10分钟超时提醒 + 2小时强制回座)
     """
     try:
+        # 添加班次文本
+        shift_text = "白班" if shift == "day" else "夜班"
+        logger.info(f"⏰ 定时器启动: {chat_id}-{uid} - {act}（{shift_text}）")
+        
         # ===== 状态标记 =====
         one_minute_warning_sent = False
         timeout_immediate_sent = False
@@ -841,7 +845,7 @@ async def activity_timer(chat_id: int, uid: int, act: str, limit: int):
                     [
                         InlineKeyboardButton(
                             text="👉 点击✅立即回座 👈",
-                            callback_data=f"quick_back:{chat_id}:{uid}",
+                            callback_data=f"quick_back:{chat_id}:{uid}:{shift}",  # 添加 shift 到 callback_data
                         )
                     ]
                 ]
@@ -863,6 +867,7 @@ async def activity_timer(chat_id: int, uid: int, act: str, limit: int):
                     f"{MessageFormatter.create_dashed_line()}\n"
                     f"👤 用户：{MessageFormatter.format_user_link(uid, nickname)}\n"
                     f"📝 活动：<code>{act}</code>\n"
+                    f"📊 班次：<code>{shift_text}</code>\n"  # 添加班次信息
                     f"⏰ 自动回座时间：<code>{get_beijing_time().strftime('%m/%d %H:%M:%S')}</code>\n"
                     f"⏱️ 总活动时长：<code>{MessageFormatter.format_time(elapsed)}</code>\n"
                     f"⚠️ 系统自动回座原因：超时超过2小时\n"
@@ -879,7 +884,7 @@ async def activity_timer(chat_id: int, uid: int, act: str, limit: int):
                     notification_text,
                     notification_type="channel",
                 )
-                logger.info(f"✅ 强制回座通知推送成功: chat={chat_id}, uid={uid}")
+                logger.info(f"✅ 强制回座通知推送成功: chat={chat_id}, uid={uid}（班次: {shift}）")
                 return True
             except Exception as e:
                 logger.error(f"❌ 强制回座通知推送失败: {e}")
@@ -905,8 +910,9 @@ async def activity_timer(chat_id: int, uid: int, act: str, limit: int):
                 if elapsed >= 120 * 60 and not force_back_sent:
                     force_back_sent = True
                     fine_amount = await calculate_fine(act, 120)
+                    # 在 complete_user_activity 中传递 shift 参数
                     await db.complete_user_activity(
-                        chat_id, uid, act, elapsed, fine_amount, True
+                        chat_id, uid, act, elapsed, fine_amount, True, shift
                     )
                     break_force = True
 
@@ -916,6 +922,7 @@ async def activity_timer(chat_id: int, uid: int, act: str, limit: int):
                     f"🛑 <b>自动安全回座</b>\n"
                     f"👤 用户：{MessageFormatter.format_user_link(uid, nickname)}\n"
                     f"📝 活动：<code>{act}</code>\n"
+                    f"📊 班次：<code>{shift_text}</code>\n"  # 添加班次信息
                     f"⚠️ 超时超过2小时，系统已自动回座\n"
                     f"💰 本次罚款：<code>{fine_amount}</code> 元"
                 )
@@ -939,6 +946,7 @@ async def activity_timer(chat_id: int, uid: int, act: str, limit: int):
                 msg = (
                     f"⏳ <b>即将超时警告</b>\n"
                     f"👤 {MessageFormatter.format_user_link(uid, nickname)}\n"
+                    f"📊 班次：<code>{shift_text}</code>\n"  # 添加班次信息
                     f"🕓 本次 {MessageFormatter.format_copyable_text(act)} 还有 <code>1</code> 分钟！\n"
                     f"💡 请及时回座，避免超时罚款"
                 )
@@ -956,6 +964,7 @@ async def activity_timer(chat_id: int, uid: int, act: str, limit: int):
                     msg = (
                         f"⚠️ <b>超时警告</b>\n"
                         f"👤 {MessageFormatter.format_user_link(uid, nickname)} 已超时！\n"
+                        f"📊 班次：<code>{shift_text}</code>\n"  # 添加班次信息
                         f"🏃‍♂️ 请立即回座，避免产生更多罚款！"
                     )
                     last_reminder_minute = 0
@@ -966,6 +975,7 @@ async def activity_timer(chat_id: int, uid: int, act: str, limit: int):
                     msg = (
                         f"🔔 <b>超时警告</b>\n"
                         f"👤 {MessageFormatter.format_user_link(uid, nickname)} 已超时 <code>5</code> 分钟！\n"
+                        f"📊 班次：<code>{shift_text}</code>\n"  # 添加班次信息
                         f"😤 罚款正在累积，请立即回座！"
                     )
                     last_reminder_minute = 5
@@ -980,6 +990,7 @@ async def activity_timer(chat_id: int, uid: int, act: str, limit: int):
                     msg = (
                         f"🚨 <b>超时警告</b>\n"
                         f"👤 {MessageFormatter.format_user_link(uid, nickname)} 已超时 <code>{overtime_minutes}</code> 分钟！\n"
+                        f"📊 班次：<code>{shift_text}</code>\n"  # 添加班次信息
                         f"💢 请立刻回座，系统将持续记录超时,避免产生更多罚款！"
                     )
 
@@ -989,9 +1000,9 @@ async def activity_timer(chat_id: int, uid: int, act: str, limit: int):
             await asyncio.sleep(30)
 
     except asyncio.CancelledError:
-        logger.info(f"定时器 {chat_id}-{uid} 被取消")
+        logger.info(f"定时器 {chat_id}-{uid} 被取消（班次: {shift}）")
     except Exception as e:
-        logger.error(f"定时器错误: {e}")
+        logger.error(f"定时器错误（班次: {shift}）: {e}")
     finally:
         try:
             await db.clear_user_checkin_message(chat_id, uid)
