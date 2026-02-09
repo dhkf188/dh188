@@ -513,6 +513,7 @@ class PostgreSQLDatabase:
                     activity_name TEXT,
                     activity_count INTEGER DEFAULT 0,
                     accumulated_time INTEGER DEFAULT 0,
+                    shift TEXT DEFAULT 'day',
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                     UNIQUE(chat_id, user_id, activity_date, activity_name)
@@ -530,8 +531,10 @@ class PostgreSQLDatabase:
                     status TEXT,
                     time_diff_minutes REAL,
                     fine_amount INTEGER DEFAULT 0,
+                    shift TEXT DEFAULT 'day',
+                    shift_detail TEXT,
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                    UNIQUE(chat_id, user_id, record_date, checkin_type)
+                    UNIQUE(chat_id, user_id, record_date, checkin_type, shift)
                 )
                 """,
                 # 5. activity_configs表
@@ -583,6 +586,7 @@ class PostgreSQLDatabase:
                     activity_name TEXT,
                     activity_count INTEGER DEFAULT 0,
                     accumulated_time INTEGER DEFAULT 0,
+                    shift TEXT DEFAULT 'day',
                     work_days INTEGER DEFAULT 0,
                     work_hours INTEGER DEFAULT 0,
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
@@ -614,6 +618,7 @@ class PostgreSQLDatabase:
                     overtime_time INTEGER DEFAULT 0,
                     work_days INTEGER DEFAULT 0,
                     work_hours INTEGER DEFAULT 0,
+                    shift TEXT DEFAULT 'day',
                     is_soft_reset BOOLEAN DEFAULT FALSE,
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
@@ -2095,6 +2100,7 @@ class PostgreSQLDatabase:
         status: str,
         time_diff_minutes: float,
         fine_amount: int = 0,
+        shift: str = "day",
         shift: str = None
     ):
         """
@@ -2148,19 +2154,20 @@ class PostgreSQLDatabase:
                     INSERT INTO work_records
                     (chat_id, user_id, record_date, checkin_type,
                      checkin_time, status, time_diff_minutes,
-                     fine_amount, shift)
-                    VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)
+                     fine_amount, shift, shift_detail)
+                    VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)
                     ON CONFLICT (chat_id, user_id, record_date, checkin_type, shift)
                     DO UPDATE SET
                         checkin_time = EXCLUDED.checkin_time,
                         status = EXCLUDED.status,
                         time_diff_minutes = EXCLUDED.time_diff_minutes,
                         fine_amount = EXCLUDED.fine_amount,
+                        shift_detail = EXCLUDED.shift_detail,
                         created_at = CURRENT_TIMESTAMP
                     """,
-                    chat_id, user_id, business_date, checkin_type,
+                    chat_id, user_id, record_date, checkin_type,
                     checkin_time, status, time_diff_minutes,
-                    fine_amount, shift
+                    fine_amount, shift, shift_detail
                 )
 
                 # ========= 4. 更新 daily_statistics =========
