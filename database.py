@@ -3,6 +3,7 @@ import asyncio
 import time
 import json
 from datetime import datetime, timedelta, date
+from config import beijing_tz
 from typing import Dict, Any, List, Optional, Union
 from config import Config, beijing_tz
 import asyncpg
@@ -1035,9 +1036,6 @@ class PostgreSQLDatabase:
     ):
         """更新用户活动状态 - 确保时间格式正确（完整融合稳定版）"""
         try:
-            from datetime import datetime
-            from config import beijing_tz
-
             original_type = type(start_time).__name__
 
             # 🎯 统一转换为标准 ISO 时间字符串（带时区）
@@ -1231,8 +1229,8 @@ class PostgreSQLDatabase:
 
                 # 自动插入软重置记录
                 if should_be_soft_reset:
-                    await self.execute_with_retry(
-                        conn,
+                # 直接使用 conn.execute 避免死循环或递归调用
+                    await conn.execute(
                         """
                         INSERT INTO daily_statistics
                         (chat_id, user_id, record_date, activity_name, activity_count, accumulated_time, is_soft_reset, shift)
@@ -1246,11 +1244,11 @@ class PostgreSQLDatabase:
                         shift,
                     )
 
+
                 logger.debug(f"软重置状态: {current_soft_reset}")
 
                 # ===== 2. users 表 =====
-                await self.execute_with_retry(
-                    conn,
+                await conn.execute(
                     """
                     INSERT INTO users (chat_id, user_id, last_updated)
                     VALUES ($1, $2, $3)
@@ -1263,8 +1261,7 @@ class PostgreSQLDatabase:
                 )
 
                 # ===== 3. user_activities 表 =====
-                await self.execute_with_retry(
-                    conn,
+                await conn.execute(
                     """
                     INSERT INTO user_activities
                     (chat_id, user_id, activity_date, activity_name, activity_count, accumulated_time, shift)
@@ -1285,8 +1282,7 @@ class PostgreSQLDatabase:
 
                 # ===== 4. daily_statistics 表 =====
                 # 主活动记录
-                await self.execute_with_retry(
-                    conn,
+                await conn.execute(
                     """
                     INSERT INTO daily_statistics
                     (chat_id, user_id, record_date, activity_name, activity_count, accumulated_time, is_soft_reset, shift)
@@ -1308,8 +1304,7 @@ class PostgreSQLDatabase:
 
                 # 超时次数 & 时间
                 if is_overtime:
-                    await self.execute_with_retry(
-                        conn,
+                    await conn.execute(
                         """
                         INSERT INTO daily_statistics
                         (chat_id, user_id, record_date, activity_name, activity_count, is_soft_reset, shift)
@@ -1325,8 +1320,7 @@ class PostgreSQLDatabase:
                         current_soft_reset,
                         shift,
                     )
-                    await self.execute_with_retry(
-                        conn,
+                    await conn.execute(
                         """
                         INSERT INTO daily_statistics
                         (chat_id, user_id, record_date, activity_name, accumulated_time, is_soft_reset, shift)
@@ -1346,8 +1340,7 @@ class PostgreSQLDatabase:
 
                 # 罚款统计
                 if fine_amount > 0:
-                    await self.execute_with_retry(
-                        conn,
+                    await conn.execute(
                         """
                         INSERT INTO daily_statistics
                         (chat_id, user_id, record_date, activity_name, accumulated_time, is_soft_reset, shift)
@@ -1366,8 +1359,7 @@ class PostgreSQLDatabase:
                     )
 
                 # ===== 5. monthly_statistics 表 =====
-                await self.execute_with_retry(
-                    conn,
+                await conn.execute(
                     """
                     INSERT INTO monthly_statistics
                     (chat_id, user_id, statistic_date, activity_name, activity_count, accumulated_time, shift)
@@ -1387,8 +1379,7 @@ class PostgreSQLDatabase:
                 )
 
                 if fine_amount > 0:
-                    await self.execute_with_retry(
-                        conn,
+                    await conn.execute(
                         """
                         INSERT INTO monthly_statistics
                         (chat_id, user_id, statistic_date, activity_name, accumulated_time, shift)
@@ -1406,8 +1397,7 @@ class PostgreSQLDatabase:
                     )
 
                 if is_overtime and overtime_seconds > 0:
-                    await self.execute_with_retry(
-                        conn,
+                    await conn.execute(
                         """
                         INSERT INTO monthly_statistics
                         (chat_id, user_id, statistic_date, activity_name, activity_count, shift)
@@ -1422,8 +1412,7 @@ class PostgreSQLDatabase:
                         statistic_date,
                         shift,
                     )
-                    await self.execute_with_retry(
-                        conn,
+                    await conn.execute(
                         """
                         INSERT INTO monthly_statistics
                         (chat_id, user_id, statistic_date, activity_name, accumulated_time, shift)
@@ -1469,7 +1458,7 @@ class PostgreSQLDatabase:
                     UPDATE users SET {", ".join(update_fields)}
                     WHERE chat_id = ${len(params)-1} AND user_id = ${len(params)}
                 """
-                await self.execute_with_retry(conn, query, *params)
+                await conn.execute(query, *params)
 
         # ===== 7. 清理缓存 =====
         self._cache.pop(f"user:{chat_id}:{user_id}", None)
@@ -3339,82 +3328,6 @@ class PostgreSQLDatabase:
         }
 
 
-    # def calculate_shift_window(
-    #     self,
-    #     shift_config: Dict,
-    #     checkin_type: str = None,
-    #     now: Optional[datetime] = None
-    # ) -> Dict:
-    #     if now is None:
-    #         now = self.get_beijing_time()
-        
-    #     # 确保 now 是有时区的，方便后续比较
-    #     if now.tzinfo is None:
-    #         now = self.beijing_tz.localize(now)
-            
-    #     today = now.date()
-
-    #     try:
-    #         # 解析白班基础时间
-    #         day_start_time = datetime.strptime(shift_config['day_start'], "%H:%M").time()
-    #         day_end_time = datetime.strptime(shift_config['day_end'], "%H:%M").time()
-    #     except (KeyError, ValueError):
-    #         # 如果配置格式错误，返回兜底
-    #         return {'day_window': {}, 'night_window': {}, 'current_shift': None}
-
-    #     # 使用 localize 构建 aware datetime 更加稳妥
-    #     day_start_dt = self.beijing_tz.localize(datetime.combine(today, day_start_time))
-    #     day_end_dt = self.beijing_tz.localize(datetime.combine(today, day_end_time))
-
-    #     grace_before = shift_config.get("grace_before", 0)
-    #     grace_after = shift_config.get("grace_after", 0)
-
-    #     # 1. 白班窗口
-    #     day_shift_window = {
-    #         "work_start": {
-    #             "start": day_start_dt - timedelta(minutes=grace_before),
-    #             "end": day_start_dt + timedelta(minutes=grace_after)
-    #         },
-    #         "work_end": {
-    #             "start": day_end_dt - timedelta(minutes=grace_before),
-    #             "end": day_end_dt + timedelta(minutes=grace_after)
-    #         }
-    #     }
-
-    #     # 2. 夜班窗口（今晚到次日晨）
-    #     night_shift_window = {
-    #         "work_start": {
-    #             "start": day_end_dt - timedelta(minutes=grace_before),
-    #             "end": day_end_dt + timedelta(minutes=grace_after)
-    #         },
-    #         "work_end": {
-    #             "start": day_start_dt + timedelta(days=1) - timedelta(minutes=grace_before),
-    #             "end": day_start_dt + timedelta(days=1) + timedelta(minutes=grace_after)
-    #         }
-    #     }
-
-    #     # 判定当前班次
-    #     current_shift = None
-    #     if checkin_type:
-    #         # 检查今日白班
-    #         if day_shift_window[checkin_type]["start"] <= now <= day_shift_window[checkin_type]["end"]:
-    #             current_shift = "day"
-    #         # 检查今晚/明晨窗口
-    #         elif night_shift_window[checkin_type]["start"] <= now <= night_shift_window[checkin_type]["end"]:
-    #             current_shift = "night"
-    #         # 昨晚夜班跨天结束（凌晨下班判定补丁）
-    #         elif checkin_type == "work_end":
-    #             yesterday_night_end_start = day_start_dt - timedelta(minutes=grace_before)
-    #             yesterday_night_end_end = day_start_dt + timedelta(minutes=grace_after)
-    #             if yesterday_night_end_start <= now <= yesterday_night_end_end:
-    #                 current_shift = "night"
-
-    #     return {
-    #         "day_window": day_shift_window,
-    #         "night_window": night_shift_window,
-    #         "current_shift": current_shift
-    #     }
-
 
     def calculate_shift_window(
         self,
@@ -3424,39 +3337,30 @@ class PostgreSQLDatabase:
     ) -> Dict[str, Any]:
         """
         计算班次时间窗口并判定当前班次
-
-        返回:
-            {
-                "day_window": { "work_start": {...}, "work_end": {...} },
-                "night_window": {
-                    "last_night": { "work_start": {...}, "work_end": {...} },
-                    "tonight": { "work_start": {...}, "work_end": {...} }
-                },
-                "current_shift": "day" | "night_last" | "night_tonight" | None
-            }
         """
+        # 1. 初始化当前时间
         if now is None:
             now = self.get_beijing_time()
 
-        # 确保 now 是 aware datetime
-        if now.tzinfo is None:
-            now = self.beijing_tz.localize(now)
-
+        # 2. 获取基准日期和时区（优先使用传入时间的时区，增强鲁棒性）
         today = now.date()
+        tz = now.tzinfo
 
+        # 3. 解析配置中的时间点
         try:
             day_start_time = datetime.strptime(shift_config['day_start'], "%H:%M").time()
             day_end_time = datetime.strptime(shift_config['day_end'], "%H:%M").time()
-        except (KeyError, ValueError):
+        except (KeyError, ValueError, TypeError):
             return {'day_window': {}, 'night_window': {}, 'current_shift': None}
 
-        # 转换成当天的完整 datetime 对象
-        day_start_dt = self.beijing_tz.localize(datetime.combine(today, day_start_time))
-        day_end_dt = self.beijing_tz.localize(datetime.combine(today, day_end_time))
+        # 4. 转换成当天的完整 datetime 对象并对齐时区
+        day_start_dt = datetime.combine(today, day_start_time).replace(tzinfo=tz)
+        day_end_dt = datetime.combine(today, day_end_time).replace(tzinfo=tz)
 
         grace_before = shift_config.get("grace_before", 0)
         grace_after = shift_config.get("grace_after", 0)
 
+        # 5. 计算三个核心窗口
         # 1️⃣ 白班窗口（今天）
         day_window = {
             "work_start": {
@@ -3469,8 +3373,7 @@ class PostgreSQLDatabase:
             }
         }
 
-        # 2️⃣ 夜班窗口（跨天处理）
-        # 昨晚夜班（昨晚开始，今天早晨结束）
+        # 2️⃣ 昨晚夜班（昨晚开始，今天早晨结束）
         last_night_window = {
             "work_start": {
                 "start": day_end_dt - timedelta(days=1) - timedelta(minutes=grace_before),
@@ -3482,7 +3385,7 @@ class PostgreSQLDatabase:
             }
         }
 
-        # 今晚夜班（今晚开始，明天早晨结束）
+        # 3️⃣ 今晚夜班（今晚开始，明天早晨结束）
         tonight_window = {
             "work_start": {
                 "start": day_end_dt - timedelta(minutes=grace_before),
@@ -3494,16 +3397,14 @@ class PostgreSQLDatabase:
             }
         }
 
-        # 3️⃣ 判定当前班次
+        # 6. 判定当前班次
         current_shift = None
-        if checkin_type and checkin_type in ["work_start", "work_end"]:
-            # 白班
+        if checkin_type in ["work_start", "work_end"]:
+            # 依次匹配：白班 -> 昨晚夜班 -> 今晚夜班
             if day_window[checkin_type]["start"] <= now <= day_window[checkin_type]["end"]:
                 current_shift = "day"
-            # 昨晚夜班
             elif last_night_window[checkin_type]["start"] <= now <= last_night_window[checkin_type]["end"]:
                 current_shift = "night_last"
-            # 今晚夜班
             elif tonight_window[checkin_type]["start"] <= now <= tonight_window[checkin_type]["end"]:
                 current_shift = "night_tonight"
 
@@ -3551,7 +3452,7 @@ class PostgreSQLDatabase:
             'day' 或 'night'
         """
         # 1. 获取班次配置
-        shift_config = await self.db.get_shift_config(chat_id)
+        shift_config = await self.get_shift_config(chat_id)
         
         # 2. 单班模式或配置缺失，默认白班
         if not shift_config or not shift_config.get("dual_mode", False):
