@@ -620,8 +620,8 @@ async def check_activity_limit_by_shift(
     - 单班模式：不区分班次
     - 双班模式：按班次统计
     """
-    await self.init_group(chat_id)
-    await self.init_user(chat_id, user_id)
+    await init_group(chat_id)
+    await init_user(chat_id, user_id)
 
     shift_config = await self.get_shift_config(chat_id)
 
