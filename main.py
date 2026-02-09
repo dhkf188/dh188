@@ -1106,7 +1106,7 @@ async def start_activity(message: types.Message, act: str):
             return
 
         # ================== 更新用户活动状态（包含班次） ==================
-        await db.update_user_activity_with_shift(
+        await db.update_user_activity(
             chat_id, uid, act, str(now), name, current_shift
         )
 
