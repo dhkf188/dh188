@@ -73,6 +73,14 @@ class Config:
     # 默认上下班时间
     DEFAULT_WORK_HOURS = {"work_start": "09:00", "work_end": "18:00"}
 
+    # 双班模式默认配置
+    DEFAULT_GRACE_BEFORE = 120  # 上班前允许2小时
+    DEFAULT_GRACE_AFTER = 360   # 下班后允许6小时
+
+    # 班次类型
+    SHIFT_DAY = 'day'
+    SHIFT_NIGHT = 'night'
+
     # 默认活动时间限制（分钟）
     DEFAULT_ACTIVITY_LIMIT_MINUTES = 120
 
