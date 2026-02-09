@@ -592,7 +592,7 @@ class PostgreSQLDatabase:
                     work_hours INTEGER DEFAULT 0,
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                    UNIQUE(chat_id, user_id, statistic_date, activity_name)
+                    UNIQUE(chat_id, user_id, statistic_date, activity_name, shift)
                 )
                 """,
                 # 10. activity_user_limits表
