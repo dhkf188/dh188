@@ -985,7 +985,7 @@ class PostgreSQLDatabase:
             return result
         return None
 
-    async def get_activity_count(
+    async def get_user_activity_count(
         self, chat_id: int, user_id: int, activity: str
     ) -> int:
         today = await self.get_business_date(chat_id)
@@ -2049,22 +2049,6 @@ class PostgreSQLDatabase:
         except Exception as e:
             logger.error(f"❌ 软重置失败 {chat_id}-{user_id}: {e}")
             return False
-
-    async def get_user_activity_count(
-        self, chat_id: int, user_id: int, activity: str
-    ) -> int:
-        """获取用户今日活动次数"""
-        today = await self.get_business_date(chat_id)
-        self._ensure_pool_initialized()
-        async with self.pool.acquire() as conn:
-            row = await conn.fetchrow(
-                "SELECT activity_count FROM user_activities WHERE chat_id = $1 AND user_id = $2 AND activity_date = $3 AND activity_name = $4",
-                chat_id,
-                user_id,
-                today,
-                activity,
-            )
-            return row["activity_count"] if row else 0
 
     async def get_user_all_activities(
         self, chat_id: int, user_id: int
