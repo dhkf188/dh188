@@ -1038,6 +1038,7 @@ class PostgreSQLDatabase:
         activity: str,
         start_time: str,
         nickname: str = None,
+        shift: str = "day"
     ):
         """更新用户活动状态 - 确保时间格式正确（完整融合稳定版）"""
         try:
@@ -1046,6 +1047,7 @@ class PostgreSQLDatabase:
             # 🎯 统一转换为标准 ISO 时间字符串（带时区）
             if hasattr(start_time, "isoformat"):
                 if start_time.tzinfo is None:
+                    # 注意：确保 beijing_tz 在类外部或作为成员变量 self.beijing_tz 可用
                     start_time = beijing_tz.localize(start_time)
                 start_time_str = start_time.isoformat()
 
@@ -1074,7 +1076,7 @@ class PostgreSQLDatabase:
                 )
 
             logger.info(
-                f"💾 保存活动时间: 用户{user_id}, 活动{activity}, 标准化时间: {start_time_str}"
+                f"💾 保存活动时间: 用户{user_id}, 活动{activity}, 标准化时间: {start_time_str}, 班次: {shift}"
             )
 
             if nickname:
@@ -1082,12 +1084,13 @@ class PostgreSQLDatabase:
                     "更新用户活动",
                     """
                     UPDATE users 
-                    SET current_activity = $1, activity_start_time = $2, nickname = $3, updated_at = CURRENT_TIMESTAMP 
-                    WHERE chat_id = $4 AND user_id = $5
+                    SET current_activity = $1, activity_start_time = $2, nickname = $3, shift = $4, updated_at = CURRENT_TIMESTAMP 
+                    WHERE chat_id = $5 AND user_id = $6
                     """,
                     activity,
                     start_time_str,
                     nickname,
+                    shift,
                     chat_id,
                     user_id,
                 )
@@ -1096,23 +1099,25 @@ class PostgreSQLDatabase:
                     "更新用户活动",
                     """
                     UPDATE users 
-                    SET current_activity = $1, activity_start_time = $2, updated_at = CURRENT_TIMESTAMP 
-                    WHERE chat_id = $3 AND user_id = $4
+                    SET current_activity = $1, activity_start_time = $2, shift = $3, updated_at = CURRENT_TIMESTAMP 
+                    WHERE chat_id = $4 AND user_id = $5
                     """,
                     activity,
                     start_time_str,
+                    shift,
                     chat_id,
                     user_id,
                 )
 
+            # 清理缓存
             self._cache.pop(f"user:{chat_id}:{user_id}", None)
 
-            logger.debug(f"✅ 用户活动更新成功: {chat_id}-{user_id} -> {activity}")
+            logger.debug(f"✅ 用户活动更新成功: {chat_id}-{user_id} -> {activity}（班次: {shift}）")
 
         except Exception as e:
             logger.error(f"❌ 更新用户活动失败 {chat_id}-{user_id}: {e}")
             logger.error(
-                f"❌ 失败时的参数 - activity: {activity}, start_time: {start_time}, nickname: {nickname}"
+                f"❌ 失败时的参数 - activity: {activity}, start_time: {start_time}, nickname: {nickname}, shift: {shift}"
             )
             raise
 
