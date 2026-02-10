@@ -635,7 +635,7 @@ async def check_activity_limit_by_shift(
         )
     else:
         # 暂时先使用总次数，或者实现按班次计数
-        current_count = await db.get_user_activity_count(chat_id, user_id, activity)
+        current_count = await db.get_user_activity_count_by_shift(chat_id, user_id, activity,shift)
         
 
     max_times = await db.get_activity_max_times(activity)
@@ -1181,18 +1181,16 @@ async def start_activity(message: types.Message, act: str):
 
             if act == "吃饭":
                 notification_text = (
-                    f"🍽️ <b>吃饭通知</b>\n"
+                    f"🍽️ <b>吃饭通知</b> <code>{shift_text}</code>\n"
                     f" {MessageFormatter.format_user_link(uid, name)} 去吃饭了\n"
                     f"⏰ 时间：<code>{now.strftime('%H:%M:%S')}</code>\n"
-                    f"📊 班次：<code>{shift_text}</code>\n"
                 )
             elif act in ["上班", "下班"]:
                 icon = "🟢" if act == "上班" else "🔴"
                 notification_text = (
-                    f"{icon} <b>{act}通知</b>\n"
-                    f" {MessageFormatter.format_user_link(uid, name)} 已打卡\n"
+                    f"{icon} <b>{act}通知</b> <code>{shift_text}</code>\n"
+                    f" {MessageFormatter.format_user_link(uid, name)} 已上班\n"
                     f"⏰ 时间：<code>{now.strftime('%H:%M:%S')}</code>\n"
-                    f"📊 班次：<code>{shift_text}</code>\n"
                 )
 
             if notification_text:
@@ -5479,7 +5477,6 @@ async def export_and_push_csv(
 
 # ========== 定时任务 ==========
 
-
 async def daily_reset_task():
     """每日自动重置任务 - 性能优化与高可用版"""
     logger.info("🚀 每日重置监控任务已启动")
@@ -5985,56 +5982,6 @@ async def external_keepalive():
             logger.debug(f"保活请求失败 {url}: {e}")
 
 
-# async def keepalive_loop():
-#     """Render 专用保活循环 - 防止免费服务休眠"""
-#     while True:
-#         try:
-#             # 🆕 每5分钟执行一次保活（Render 免费版15分钟不活动会休眠）
-#             await asyncio.sleep(300)
-
-#             current_time = get_beijing_time()
-#             logger.debug(
-#                 f"🔵 Render 保活检查: {current_time.strftime('%Y-%m-%d %H:%M:%S')}"
-#             )
-
-#             # 1. 调用自己的健康检查端点
-#             try:
-
-#                 port = int(os.environ.get("PORT", 8080))
-#                 async with aiohttp.ClientSession(
-#                     timeout=aiohttp.ClientTimeout(total=10)
-#                 ) as session:
-#                     async with session.get(f"http://localhost:{port}/health") as resp:
-#                         if resp.status == 200:
-#                             logger.debug("✅ 内部健康检查保活成功")
-#             except Exception as e:
-#                 logger.warning(f"内部保活检查失败: {e}")
-
-#             # 2. 数据库连接保活
-#             try:
-#                 await db.connection_health_check()
-#                 logger.debug("✅ 数据库连接保活成功")
-#             except Exception as e:
-#                 logger.warning(f"数据库保活失败: {e}")
-
-#             # 3. 内存清理
-#             try:
-#                 await performance_optimizer.memory_cleanup()
-#                 # 🆕 强制垃圾回收
-
-#                 collected = gc.collect()
-#                 if collected > 0:
-#                     logger.debug(f"🧹 保活期间GC回收 {collected} 个对象")
-#             except Exception as e:
-#                 logger.debug(f"保活期间内存清理失败: {e}")
-
-#         except asyncio.CancelledError:
-#             break
-#         except Exception as e:
-#             logger.error(f"Render 保活循环异常: {e}")
-#             await asyncio.sleep(60)  # 异常后等待1分钟
-
-
 async def keepalive_loop():
     """完整的保活循环: 外部保活 + 内部检查 + 数据库保活 + 内存回收"""
     external_url = os.environ.get("RENDER_EXTERNAL_URL") or getattr(
@@ -6187,105 +6134,6 @@ async def on_shutdown():
     except Exception as e:
         logger.error(f"关闭清理过程中出错: {e}")
 
-
-# async def main():
-#     """主函数 - Render 适配版"""
-#     # Render 环境检测
-#     is_render = os.environ.get("RENDER", False) or "RENDER" in os.environ
-
-#     if is_render:
-#         logger.info("🎯 检测到 Render 环境，应用优化配置")
-#         # 应用 Render 特定配置
-#         Config.DB_MAX_CONNECTIONS = 3
-#         Config.ENABLE_FILE_LOGGING = False
-
-#     try:
-#         logger.info("🚀 启动打卡机器人系统...")
-
-#         # 初始化服务
-#         await initialize_services()
-
-#         # 启动健康检查服务器（Render 必需）
-#         await start_health_server()
-
-#         # 🆕 Render 必需：更频繁的保活
-#         keepalive_task = asyncio.create_task(keepalive_loop(), name="render_keepalive")
-
-#         # 启动定时任务
-#         asyncio.create_task(daily_reset_task(), name="daily_reset")
-#         asyncio.create_task(soft_reset_task(), name="soft_reset")
-#         asyncio.create_task(memory_cleanup_task(), name="memory_cleanup")
-#         asyncio.create_task(health_monitoring_task(), name="health_monitoring")
-
-#         # 启动机器人
-#         logger.info("🤖 启动机器人（带自动重连机制）...")
-#         await on_startup()
-
-#         # 开始轮询
-#         await bot_manager.start_polling_with_retry()
-
-#     except KeyboardInterrupt:
-#         logger.info("🛑 机器人被用户中断")
-#     except Exception as e:
-#         logger.error(f"❌ 机器人启动失败: {e}")
-#         # 🆕 Render 环境下需要正常退出码
-#         if is_render:
-#             sys.exit(1)
-#         raise
-#     finally:
-#         # 🆕 确保保活任务被正确取消
-#         if "keepalive_task" in locals():
-#             keepalive_task.cancel()
-#             try:
-#                 await keepalive_task
-#             except asyncio.CancelledError:
-#                 pass
-
-#         await on_shutdown()
-
-
-# async def main():
-#     """Render-safe 主函数（Polling 版）"""
-
-#     is_render = "RENDER" in os.environ
-
-#     if is_render:
-#         logger.info("🎯 Render 环境检测成功，启用安全模式")
-#         Config.DB_MAX_CONNECTIONS = 3
-#         Config.ENABLE_FILE_LOGGING = False
-
-#     logger.info("🚀 启动打卡机器人系统（Render-safe polling 模式）")
-
-#     # 1️⃣ 初始化
-#     await initialize_services()
-
-#     # 2️⃣ 启动健康检查服务器（必须最先）
-#     await start_health_server()
-
-#     # 3️⃣ 启动后台周期任务（允许失败，不影响主循环）
-#     asyncio.create_task(daily_reset_task(), name="daily_reset")
-#     asyncio.create_task(soft_reset_task(), name="soft_reset")
-#     asyncio.create_task(memory_cleanup_task(), name="memory_cleanup")
-#     asyncio.create_task(health_monitoring_task(), name="health_monitor")
-
-#     # 4️⃣ 启动机器人（初始化）
-#     await on_startup()
-
-#     # 5️⃣ ⚠️ 关键：Polling 必须作为独立 Task
-#     polling_task = asyncio.create_task(
-#         bot_manager.start_polling_with_retry(), name="telegram_polling"
-#     )
-
-#     logger.info("🤖 Telegram polling 已启动（Render-safe）")
-
-#     # 6️⃣ ⚠️ Render-safe 核心：主协程永远阻塞
-#     # Render 只关心 HTTP 是否活着
-#     try:
-#         await asyncio.Event().wait()
-#     finally:
-#         logger.info("🛑 Render 正在关闭实例，开始清理...")
-#         polling_task.cancel()
-#         await on_shutdown()
 
 
 async def main():
