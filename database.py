@@ -311,7 +311,7 @@ class PostgreSQLDatabase:
 
     # ========== 核心业务日期逻辑(管理员设定的周器时间-统一) ==========
     async def get_business_date(
-        self, chat_id: int, current_dt: datetime.datetime = None
+        self, chat_id: int, current_dt: datetime = None
     ) -> date:
         """
         获取当前的'业务日期' - 智能版
