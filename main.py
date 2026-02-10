@@ -1616,137 +1616,137 @@ async def process_work_checkin(message: types.Message, checkin_type: str):
     user_lock = get_user_lock(chat_id, uid)
     async with user_lock:
         # ========== 1️⃣ 并行优化：预计算所有必要数据 ==========
-   
-                work_hours_task = asyncio.create_task(db.get_group_work_time(chat_id))
-                shift_config_task = asyncio.create_task(db.get_shift_config(chat_id))
-                is_admin_task = asyncio.create_task(is_admin(uid))
 
-                # 🛡️ 时间范围检查
-                try:
-                    # 获取班次配置来计算时间窗口
-                    shift_config = await shift_config_task
-                    window_info = await calculate_shift_window_for_checkin(chat_id, now, shift_config, checkin_type)
-                    current_shift_detail = window_info.get("current_shift_detail")  # day/night_last/night_tonight
-                    current_shift_simple = window_info.get("current_shift")  # day/night
-                    
-                    # 🎯 关键修复：如果不在窗口内，使用智能判断
-                    if current_shift_simple is None:
-                        # 尝试智能判断当前班次
-                        current_shift_simple = await db.determine_shift_for_time(chat_id, now, checkin_type)
-                        current_shift_detail = current_shift_simple
-                        
-                        if current_shift_simple is None:
-                            await message.answer(
-                                f"❌ 当前时间不在任何打卡时间窗口内！\n\n"
-                                f"⏰ 当前时间：<code>{current_time}</code>\n"
-                                f"💡 请等待班次时间或联系管理员调整设置",
-                                reply_markup=await get_main_keyboard(chat_id, await is_admin(uid)),
-                                reply_to_message_id=message.message_id,
-                                parse_mode="HTML"
-                            )
-                            logger.info(f"[{trace_id}] ⏰ {action_text}打卡时间不在窗口内")
-                            return
-                    
-                    day_window = window_info.get("day_window", {})
-                    night_window = window_info.get("night_window", {})
-                    
-                    # 获取期望时间
-                    if current_shift_simple == 'day':
-                        shift_window = day_window
-                    else:
-                        # 夜班：优先今晚，其次昨晚
-                        shift_window = night_window.get("tonight", night_window.get("last_night", {}))
-                    
-                    checkin_window = shift_window.get(checkin_type, {})
-                    if checkin_window:
-                        start = checkin_window.get("start")
-                        end = checkin_window.get("end")
-                        if start and end:
-                            expected_dt = start + (end - start) / 2
-                        else:
-                            expected_dt = now
-                    else:
-                        expected_dt = now
+        work_hours_task = asyncio.create_task(db.get_group_work_time(chat_id))
+        shift_config_task = asyncio.create_task(db.get_shift_config(chat_id))
+        is_admin_task = asyncio.create_task(is_admin(uid))
 
-                except Exception as e:
-                    logger.error(f"[{trace_id}] ❌ 时间窗口检查失败: {e}")
-                    logger.error(traceback.format_exc())
-                    # 🎯 默认值：使用智能判断
-                    try:
-                        current_shift_simple = await db.determine_shift_for_time(chat_id, now, checkin_type) or "day"
-                    except:
-                        current_shift_simple = "day"
-                    
-                    current_shift_detail = current_shift_simple
-                    expected_dt = now
-                    day_window = {}
-                    night_window = {}
-
-                # ========== 2️⃣ 初始化用户数据 ==========
-                try:
-                    await db.init_group(chat_id)
-                    await db.init_user(chat_id, uid)
-                    
-                    # 🎯 重要：重置检查（根据新的业务日期逻辑）
-                    await reset_daily_data_if_needed(chat_id, uid)
-                    
-                    user_data = await db.get_user_cached(chat_id, uid)
-                except Exception as e:
-                    logger.error(f"[{trace_id}] ❌ 初始化用户/群组失败: {e}")
+        # 🛡️ 时间范围检查
+        try:
+            # 获取班次配置来计算时间窗口
+            shift_config = await shift_config_task
+            window_info = await calculate_shift_window_for_checkin(chat_id, now, shift_config, checkin_type)
+            current_shift_detail = window_info.get("current_shift_detail")  # day/night_last/night_tonight
+            current_shift_simple = window_info.get("current_shift")  # day/night
+            
+            # 🎯 关键修复：如果不在窗口内，使用智能判断
+            if current_shift_simple is None:
+                # 尝试智能判断当前班次
+                current_shift_simple = await db.determine_shift_for_time(chat_id, now, checkin_type)
+                current_shift_detail = current_shift_simple
+                
+                if current_shift_simple is None:
                     await message.answer(
-                        "⚠️ 数据初始化失败，请稍后再试。", 
+                        f"❌ 当前时间不在任何打卡时间窗口内！\n\n"
+                        f"⏰ 当前时间：<code>{current_time}</code>\n"
+                        f"💡 请等待班次时间或联系管理员调整设置",
+                        reply_markup=await get_main_keyboard(chat_id, await is_admin(uid)),
                         reply_to_message_id=message.message_id,
-                        reply_markup=await get_main_keyboard(chat_id, await is_admin_task)
+                        parse_mode="HTML"
                     )
+                    logger.info(f"[{trace_id}] ⏰ {action_text}打卡时间不在窗口内")
                     return
-
-                # ========== 3️⃣ 获取并行计算结果 ==========
-                # 🎯 关键：获取业务日期（需要特殊处理7:00-9:00时段）
-                try:
-                    # 获取重置时间
-                    group_data = await db.get_group_cached(chat_id)
-                    reset_hour = group_data.get("reset_hour", Config.DAILY_RESET_HOUR)
-                    reset_minute = group_data.get("reset_minute", Config.DAILY_RESET_MINUTE)
-                    
-                    # 7:00切换时间
-                    switch_hour = reset_hour - 2 if reset_hour >= 2 else 0
-                    
-                    # 🎯 特殊逻辑：7:00-9:00时段，业务日期算作昨天（为了数据归属）
-                    if switch_hour <= now.hour < reset_hour:
-                        # 7:00-9:00：数据应该归属到昨天
-                        business_date = now.date() - timedelta(days=1)
-                        logger.info(f"[{trace_id}] 🕗 7:00-9:00时段，业务日期设为昨天: {business_date}")
-                    else:
-                        # 其他时间：使用正常逻辑
-                        business_date = await db.get_business_date(chat_id, now)
-                        
-                except Exception as e:
-                    logger.error(f"[{trace_id}] ❌ 获取业务日期失败: {e}")
-                    # 回退到正常逻辑
-                    business_date = await db.get_business_date(chat_id, now)
-
-                # 获取工作时间配置
-                work_hours = await work_hours_task
-
-                # 获取管理员状态
-                is_admin_user = await is_admin_task
-
-                is_dual_mode = shift_config.get('dual_mode', False) if shift_config else False
-
-                if is_dual_mode:
-                    logger.info(f"🔄[{trace_id}] 双班模式运行，业务日期: {business_date}")
+            
+            day_window = window_info.get("day_window", {})
+            night_window = window_info.get("night_window", {})
+            
+            # 获取期望时间
+            if current_shift_simple == 'day':
+                shift_window = day_window
+            else:
+                # 夜班：优先今晚，其次昨晚
+                shift_window = night_window.get("tonight", night_window.get("last_night", {}))
+            
+            checkin_window = shift_window.get(checkin_type, {})
+            if checkin_window:
+                start = checkin_window.get("start")
+                end = checkin_window.get("end")
+                if start and end:
+                    expected_dt = start + (end - start) / 2
                 else:
-                    logger.info(f"🔄[{trace_id}] 单班模式运行，业务日期: {business_date}")
+                    expected_dt = now
+            else:
+                expected_dt = now
 
-                # 班次文本映射
-                shift_text_map = {
-                    "day": "白班",
-                    "night": "夜班",
-                    "night_last": "昨晚夜班",
-                    "night_tonight": "今晚夜班"
-                }
-                shift_text = shift_text_map.get(current_shift_detail, "白班")
-                shift_text_simple = shift_text_map.get(current_shift_simple, "白班")
+        except Exception as e:
+            logger.error(f"[{trace_id}] ❌ 时间窗口检查失败: {e}")
+            logger.error(traceback.format_exc())
+            # 🎯 默认值：使用智能判断
+            try:
+                current_shift_simple = await db.determine_shift_for_time(chat_id, now, checkin_type) or "day"
+            except:
+                current_shift_simple = "day"
+            
+            current_shift_detail = current_shift_simple
+            expected_dt = now
+            day_window = {}
+            night_window = {}
+
+        # ========== 2️⃣ 初始化用户数据 ==========
+        try:
+            await db.init_group(chat_id)
+            await db.init_user(chat_id, uid)
+            
+            # 🎯 重要：重置检查（根据新的业务日期逻辑）
+            await reset_daily_data_if_needed(chat_id, uid)
+            
+            user_data = await db.get_user_cached(chat_id, uid)
+        except Exception as e:
+            logger.error(f"[{trace_id}] ❌ 初始化用户/群组失败: {e}")
+            await message.answer(
+                "⚠️ 数据初始化失败，请稍后再试。", 
+                reply_to_message_id=message.message_id,
+                reply_markup=await get_main_keyboard(chat_id, await is_admin_task)
+            )
+            return
+
+        # ========== 3️⃣ 获取并行计算结果 ==========
+        # 🎯 关键修复：直接调用智能的业务日期函数
+        business_date = await db.get_business_date(chat_id, now)
+
+        # 获取工作时间配置
+        work_hours = await work_hours_task
+
+        # 获取管理员状态
+        is_admin_user = await is_admin_task
+
+        # 🎯 记录详细的业务日期信息（用于调试）
+        try:
+            group_data = await db.get_group_cached(chat_id)
+            reset_hour = group_data.get("reset_hour", Config.DAILY_RESET_HOUR)
+            reset_minute = group_data.get("reset_minute", Config.DAILY_RESET_MINUTE)
+            
+            switch_hour = reset_hour - 2 if reset_hour >= 2 else 0
+            current_hour = now.hour
+            
+            if current_hour < switch_hour:
+                time_range = f"7:00之前 ({current_hour}:{now.minute:02d})"
+            elif current_hour < reset_hour:
+                time_range = f"7:00-9:00之间 ({current_hour}:{now.minute:02d})"
+            else:
+                time_range = f"9:00之后 ({current_hour}:{now.minute:02d})"
+                
+            logger.info(f"[{trace_id}] ⏰ 当前时间范围: {time_range}, 业务日期: {business_date}")
+            
+        except Exception as e:
+            logger.warning(f"[{trace_id}] ⚠️ 无法获取重置时间用于日志: {e}")
+
+        is_dual_mode = shift_config.get('dual_mode', False) if shift_config else False
+
+        if is_dual_mode:
+            logger.info(f"🔄[{trace_id}] 双班模式运行，业务日期: {business_date}")
+        else:
+            logger.info(f"🔄[{trace_id}] 单班模式运行，业务日期: {business_date}")
+
+        # 班次文本映射
+        shift_text_map = {
+            "day": "白班",
+            "night": "夜班",
+            "night_last": "昨晚夜班",
+            "night_tonight": "今晚夜班"
+        }
+        shift_text = shift_text_map.get(current_shift_detail, "白班")
+        shift_text_simple = shift_text_map.get(current_shift_simple, "白班")
 
         
         # ========== 4️⃣ 个人记录检查（所有人独立打卡） ==========
