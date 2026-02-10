@@ -1204,11 +1204,7 @@ async def start_activity(message: types.Message, act: str):
         except Exception as e:
             logger.error(f"❌ {act} 推送失败: {e}")
 
-        # ================== 活动统计（按班次） ==================
-        if current_shift:
-            await db.record_activity_statistics(
-                chat_id, uid, act, 'start', now, current_shift
-            )
+
 
 
 
