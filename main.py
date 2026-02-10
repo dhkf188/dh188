@@ -1709,7 +1709,7 @@ async def process_work_checkin(message: types.Message, checkin_type: str):
             # 上班：已在班中，拒绝（第一个版本的详细展示）
             if checkin_type == 'work_start':
                 shift_state_text = '白班' if shift_state_current == 'day' else '夜班'
-                started_by_name = await db.get_user_name(chat_id, started_by) or str(started_by)
+                started_by_name = await db.get_user_cached(chat_id, started_by) or str(started_by)
                 
                 # 详细重复打卡展示（第一个版本的完整样式）
                 await message.answer(
