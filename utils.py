@@ -93,6 +93,7 @@ class MessageFormatter:
         """格式化可复制文本"""
         return f"<code>{text}</code>"
 
+
     @staticmethod
     def format_activity_message(
         user_id: int,
@@ -102,22 +103,37 @@ class MessageFormatter:
         count: int,
         max_times: int,
         time_limit: int,
+        shift: str = None  # 新增：可选班次参数
     ) -> str:
-        """格式化打卡消息 - 改为新模板"""
+        """格式化打卡消息 - 改为新模板（支持班次）"""
+        
+        # 1. 基础信息准备
         first_line = f"👤 用户：{MessageFormatter.format_user_link(user_id, user_name)}"
         dashed_line = MessageFormatter.create_dashed_line()
 
+        # 2. 构建消息主体
         message = (
             f"{first_line}\n"
             f"✅ 打卡成功：{MessageFormatter.format_copyable_text(activity)} - {MessageFormatter.format_copyable_text(time_str)}\n"
+        )
+        
+        # 3. 如果有班次信息，添加班次行
+        if shift:
+            shift_text = "白班" if shift == "day" else "夜班"
+            message += f"📊 班次：{MessageFormatter.format_copyable_text(shift_text)}\n"
+        
+        # 4. 详情与统计
+        message += (
             f"▫️ 本次活动类型：{MessageFormatter.format_copyable_text(activity)}\n"
             f"⏰ 单次时长限制：{MessageFormatter.format_copyable_text(str(time_limit))}分钟 \n"
             f"📈 今日{MessageFormatter.format_copyable_text(activity)}次数：第 {MessageFormatter.format_copyable_text(str(count))} 次（上限 {MessageFormatter.format_copyable_text(str(max_times))} 次）\n"
         )
 
+        # 5. 次数上限警告
         if count >= max_times:
             message += f"🚨 警告：本次结束后，您今日的{MessageFormatter.format_copyable_text(activity)}次数将达到上限，请留意！"
 
+        # 6. 页脚与提示
         message += (
             f"{dashed_line}\n"
             f"💡 操作提示\n"
@@ -125,6 +141,7 @@ class MessageFormatter:
         )
 
         return message
+
 
     @staticmethod
     def format_back_message(
