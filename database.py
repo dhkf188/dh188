@@ -651,31 +651,77 @@ class PostgreSQLDatabase:
             
             logger.info("🚀 数据库所有表及字段初始化完成")
 
+    # async def _create_indexes(self):
+    #     """创建性能索引"""
+    #     async with self.pool.acquire() as conn:
+    #         indexes = [
+    #             "CREATE INDEX IF NOT EXISTS idx_user_activities_main ON user_activities (chat_id, user_id, activity_date)",
+    #             "CREATE INDEX IF NOT EXISTS idx_work_records_main ON work_records (chat_id, user_id, record_date)",
+    #             "CREATE INDEX IF NOT EXISTS idx_users_main ON users (chat_id, user_id)",
+    #             "CREATE INDEX IF NOT EXISTS idx_monthly_stats_main ON monthly_statistics (chat_id, user_id, statistic_date)",
+    #             "CREATE INDEX IF NOT EXISTS idx_daily_stats_main ON daily_statistics (chat_id, user_id, record_date, activity_name, is_soft_reset)",
+    #             "CREATE INDEX IF NOT EXISTS idx_work_records_group_date ON work_records (chat_id, record_date)",
+    #             "CREATE INDEX IF NOT EXISTS idx_daily_stats_group_date ON daily_statistics (chat_id, record_date)",
+    #             "CREATE INDEX IF NOT EXISTS idx_activities_created_at ON user_activities (created_at)",
+    #             "CREATE INDEX IF NOT EXISTS idx_records_created_at ON work_records (created_at)",
+    #             "CREATE INDEX IF NOT EXISTS idx_users_activity_status ON users (chat_id, current_activity) WHERE current_activity IS NOT NULL",
+    #         ]
+
+    #         for index_sql in indexes:
+    #             try:
+    #                 await conn.execute(index_sql)
+    #                 index_name = index_sql.split()[5]  # 获取索引名
+    #                 logger.info(f"✅ 创建索引: {index_name}")
+    #             except Exception as e:
+    #                 logger.warning(f"创建索引失败: {e}")
+    #                 # 索引创建失败不阻止程序启动
+    #         logger.info("数据库索引创建完成")
+
     async def _create_indexes(self):
-        """创建性能索引"""
+        """精简直击核心性能瓶颈的索引方案 - 修正版"""
         async with self.pool.acquire() as conn:
             indexes = [
-                "CREATE INDEX IF NOT EXISTS idx_user_activities_main ON user_activities (chat_id, user_id, activity_date)",
-                "CREATE INDEX IF NOT EXISTS idx_work_records_main ON work_records (chat_id, user_id, record_date)",
-                "CREATE INDEX IF NOT EXISTS idx_users_main ON users (chat_id, user_id)",
-                "CREATE INDEX IF NOT EXISTS idx_monthly_stats_main ON monthly_statistics (chat_id, user_id, statistic_date)",
-                "CREATE INDEX IF NOT EXISTS idx_daily_stats_main ON daily_statistics (chat_id, user_id, record_date, activity_name, is_soft_reset)",
-                "CREATE INDEX IF NOT EXISTS idx_work_records_group_date ON work_records (chat_id, record_date)",
-                "CREATE INDEX IF NOT EXISTS idx_daily_stats_group_date ON daily_statistics (chat_id, record_date)",
-                "CREATE INDEX IF NOT EXISTS idx_activities_created_at ON user_activities (created_at)",
-                "CREATE INDEX IF NOT EXISTS idx_records_created_at ON work_records (created_at)",
-                "CREATE INDEX IF NOT EXISTS idx_users_activity_status ON users (chat_id, current_activity) WHERE current_activity IS NOT NULL",
+                # ========== 1. 核心高频查询 ==========
+                # 1.1 用户表基础索引
+                "CREATE INDEX IF NOT EXISTS idx_users_primary ON users (chat_id, user_id)",
+                
+                # 1.2 实时活动监控（关键！）
+                "CREATE INDEX IF NOT EXISTS idx_users_current_activity ON users (chat_id, current_activity) WHERE current_activity IS NOT NULL",
+                
+                # ========== 2. 活动记录表 ==========
+                # 2.1 日常查询（复合索引，覆盖大部分查询）
+                "CREATE INDEX IF NOT EXISTS idx_user_activities_main ON user_activities (chat_id, user_id, activity_date, shift)",
+                
+                # ========== 3. 上下班记录表 ==========
+                # 3.1 主要业务查询
+                "CREATE INDEX IF NOT EXISTS idx_work_records_main ON work_records (chat_id, user_id, record_date, shift)",
+                
+                # ========== 4. 日常统计表 ==========
+                # 4.1 统计查询
+                "CREATE INDEX IF NOT EXISTS idx_daily_stats_main ON daily_statistics (chat_id, record_date, user_id)",
+                
+                # ========== 5. 清理优化（可选） ==========
+                # 5.1 时间索引（用于定期清理旧数据）
+                "CREATE INDEX IF NOT EXISTS idx_user_activities_created_at ON user_activities (created_at)",
+                "CREATE INDEX IF NOT EXISTS idx_work_records_created_at ON work_records (created_at)",
             ]
-
+            
+            created_count = 0
             for index_sql in indexes:
                 try:
                     await conn.execute(index_sql)
-                    index_name = index_sql.split()[5]  # 获取索引名
-                    logger.info(f"✅ 创建索引: {index_name}")
+                    created_count += 1
+                    # 安全的索引名提取
+                    parts = index_sql.split()
+                    if len(parts) > 5 and parts[0].upper() == "CREATE":
+                        index_name = parts[5]
+                        logger.debug(f"✅ 创建索引: {index_name}")
+                    else:
+                        logger.debug(f"✅ 创建索引完成")
                 except Exception as e:
                     logger.warning(f"创建索引失败: {e}")
-                    # 索引创建失败不阻止程序启动
-            logger.info("数据库索引创建完成")
+            
+            logger.info(f"数据库索引创建完成，共 {created_count} 个索引")
 
     async def _initialize_default_data(self):
         """初始化默认数据"""
