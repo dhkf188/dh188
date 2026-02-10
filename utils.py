@@ -667,23 +667,29 @@ class ActivityTimerManager:
                     pass
             logger.info(f"🗑️ 定时器已取消: {timer_key}")
 
+
     async def _activity_timer_wrapper(self, chat_id: int, uid: int, act: str, limit: int, shift: str):
-        """定时器包装器：在等待指定时间后触发回调"""
+        """正确：直接运行 activity_timer 监控循环"""
+        timer_key = f"{chat_id}-{uid}-{shift}"
         try:
-            # 假设 limit 是秒数
-            await asyncio.sleep(limit)
+            # 导入真正的 activity_timer 函数
+            from main import activity_timer
             
-            # 触发回调逻辑
-            if self.activity_timer_callback:
-                await self.activity_timer_callback(chat_id, uid, act, shift)
-                
+            # 直接运行它！它会自己循环监控
+            await activity_timer(chat_id, uid, act, limit, shift)
+            
         except asyncio.CancelledError:
-            # 任务被正常取消，不执行回调
-            raise
+            logger.info(f"定时器 {timer_key} 被取消")
+            # 在异步任务中，通常建议重新抛出 CancelledError，
+            # 但如果你确定这是任务链的顶端，直接退出也是可以的。
+        except Exception as e:
+            logger.error(f"定时器异常 {timer_key}: {e}")
+            import traceback
+            logger.error(traceback.format_exc())  # 打印完整堆栈
         finally:
-            # 执行结束后清理自己
-            timer_key = f"{chat_id}-{uid}-{shift}"
+            # 清理任务：无论正常结束、被取消还是报错，都会执行
             self.active_timers.pop(timer_key, None)
+            logger.debug(f"已清理定时器: {timer_key}")
 
     async def cancel_timer(self, key: str):
         """取消定时器"""
