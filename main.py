@@ -902,7 +902,19 @@ async def activity_timer(chat_id: int, uid: int, act: str, limit: int, shift: st
                 start_time = datetime.fromisoformat(user_data["activity_start_time"])
                 now = get_beijing_time()
                 elapsed = int((now - start_time).total_seconds())
-                remaining = limit * 60 - elapsed
+                
+                # 修复：确保 limit 是整数类型，避免字符串减整数的错误
+                try:
+                    # 安全地将 limit 转换为整数
+                    if isinstance(limit, str):
+                        limit_int = int(limit)
+                    else:
+                        limit_int = int(limit)
+                except (ValueError, TypeError):
+                    logger.error(f"时间限制格式错误: {limit}，使用默认值30分钟")
+                    limit_int = 30
+                
+                remaining = limit_int * 60 - elapsed
                 nickname = user_data.get("nickname", str(uid))
 
                 # ===== 强制回座 2 小时 =====
