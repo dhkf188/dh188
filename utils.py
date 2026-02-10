@@ -590,6 +590,7 @@ class ActivityTimerManager:
 
     def __init__(self):
         self._timers = {}
+        self.active_timers = {}
         self._cleanup_interval = 300
         self._last_cleanup = time.time()
         self.activity_timer_callback = None  # 回调函数
