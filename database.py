@@ -1051,6 +1051,29 @@ class PostgreSQLDatabase:
         )
         return count if count else 0
 
+    # ========== 按照班次活动查询 =========
+    async def get_user_activity_count_by_shift(
+        self, chat_id: int, user_id: int, activity: str, shift: str
+    ) -> int:
+        """按班次获取用户活动次数"""
+        # 获取当前业务日期
+        today = await self.get_business_date(chat_id)
+        
+        # 执行数据库查询
+        count = await self.execute_with_retry(
+            "按班次获取活动次数",
+            """
+            SELECT activity_count FROM user_activities 
+            WHERE chat_id = $1 AND user_id = $2 
+            AND activity_date = $3 AND activity_name = $4 AND shift = $5
+            """,
+            chat_id, user_id, today, activity, shift,
+            fetchval=True
+        )
+        
+        # 如果 count 为 None 则返回 0
+        return count if count else 0
+
     async def get_user_cached(self, chat_id: int, user_id: int) -> Optional[Dict]:
         """带缓存的获取用户数据 - 优化版"""
         cache_key = f"user:{chat_id}:{user_id}"
@@ -3437,29 +3460,6 @@ class PostgreSQLDatabase:
             },
             "current_shift": current_shift
         }
-
-
-    # async def determine_shift_for_time(
-    #     self,
-    #     chat_id: int,
-    #     current_time: Optional[datetime] = None,
-    #     checkin_type: str = None
-    # ) -> str:
-    #     shift_config = await self.db.get_shift_config(chat_id)
-        
-    #     # 兜底
-    #     if not shift_config or not shift_config.get("dual_mode", False):
-    #         return "day"
-        
-    #     # 默认当前时间
-    #     now = current_time or datetime.now()
-        
-    #     window_info = self.calculate_shift_window(
-    #         shift_config, checkin_type, now=now
-    #     )
-        
-    #     # 增加兜底，确保返回 'day' 或 'night'
-    #     return window_info.get("current_shift", "day")
 
     async def determine_shift_for_time(
         self,
