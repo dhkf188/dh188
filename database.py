@@ -623,7 +623,7 @@ class PostgreSQLDatabase:
                     is_soft_reset BOOLEAN DEFAULT FALSE,
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                    UNIQUE(chat_id, user_id, record_date, activity_name, is_soft_reset)
+                    UNIQUE(chat_id, user_id, record_date, activity_name, is_soft_reset, shift)
                 )
                 """,
                 # 12. group_shift_state表 (新增表)
