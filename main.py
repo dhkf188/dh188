@@ -1676,8 +1676,31 @@ async def process_work_checkin(message: types.Message, checkin_type: str):
             return
         
         # ========== 3️⃣ 获取并行计算结果 ==========
-        business_date = await db.get_business_date(chat_id, now)
+
+        db_handler = DatabaseHandler()
+        reset_hour, reset_minute = await db_handler.get_business_settings(chat_id)
+
+        # 7:00 切换时间
+        switch_hour = reset_hour - 2 if reset_hour >= 2 else 0
+        switch_time = now.replace(hour=switch_hour, minute=reset_minute, second=0, microsecond=0)
+
+        # 判断业务日期
+        if now < switch_time:
+            # 7:00 之前，打昨天的卡
+            business_date = (now - timedelta(days=1)).date()
+            logger.info(f"⏰ 7:00之前，业务日期: {business_date}")
+        elif now < now.replace(hour=reset_hour, minute=reset_minute, second=0, microsecond=0):
+            # 7:00-9:00：特殊处理，打今天的卡（数据逻辑仍可归昨天）
+            business_date = now.date()
+            logger.info(f"⏰ 7:00-9:00特殊打卡，业务日期: {business_date}")
+        else:
+            # 9:00 之后：打今天的卡
+            business_date = await db.get_business_date(chat_id, now)
+            logger.info(f"⏰ 9:00之后，业务日期: {business_date}")
+
+        # 并行获取工作时间
         work_hours = await work_hours_task
+        return business_date, work_hours
         
         is_dual_mode = shift_config.get('dual_mode', False) if shift_config else False
         
@@ -5478,85 +5501,308 @@ async def export_and_push_csv(
 # ========== 定时任务 ==========
 
 async def daily_reset_task():
-    """每日自动重置任务 - 性能优化与高可用版"""
-    logger.info("🚀 每日重置监控任务已启动")
-
-    # 限制同时处理的群组数量，防止 IO 阻塞
-    sem = asyncio.Semaphore(10)
-
-    async def process_single_group(chat_id, now):
-        async with sem:
-            try:
-                group_data = await db.get_group_cached(chat_id)
-                # 允许每个群组自定义重置小时，默认为配置值
-                reset_hour = group_data.get("reset_hour", Config.DAILY_RESET_HOUR)
-
-                # 1. 幂等性检查 (Key 包含日期和小时)
-                reset_flag_key = f"last_reset:{chat_id}:{now.strftime('%Y%m%d')}"
-                if global_cache.get(reset_flag_key) == now.hour:
-                    return
-
-                # 2. 触发判断
-                if now.hour != reset_hour:
-                    return
-
-                logger.info(f"⏰ 群组 {chat_id} 开始重置...")
-
-                # 3. 计算业务日期
-                # 凌晨重置通常是为了结算昨天的账单/数据
-                business_date = (
-                    now.date() if now.hour >= 12 else (now - timedelta(days=1)).date()
+    """每日重置任务 - 三阶段处理版"""
+    logger.info("🚀 三阶段重置任务已启动")
+    
+    async def process_group_reset(chat_id, now):
+        """处理单个群组的重置"""
+        try:
+            # 获取群组配置
+            group_data = await db.get_group_cached(chat_id)
+            if not group_data:
+                return
+            
+            reset_hour = group_data.get("reset_hour", Config.DAILY_RESET_HOUR)
+            reset_minute = group_data.get("reset_minute", Config.DAILY_RESET_MINUTE)
+            
+            # 1️⃣ 第一阶段：7:00 班次切换（重置时间前2小时）
+            shift_switch_hour = reset_hour - 2 if reset_hour >= 2 else 0
+            if now.hour == shift_switch_hour and now.minute == reset_minute:
+                await handle_shift_switch(chat_id, now)
+            
+            # 2️⃣ 第二阶段：9:00 重置触发（只做标记，不清理）
+            if now.hour == reset_hour and now.minute == reset_minute:
+                await handle_reset_trigger(chat_id, now)
+            
+            # 3️⃣ 第三阶段：11:00 数据导出和清理
+            if now.hour == 11 and now.minute == 0:
+                await handle_data_export_and_cleanup(chat_id, now)
+                
+        except Exception as e:
+            logger.error(f"❌ 处理群组 {chat_id} 重置失败: {e}")
+    
+    async def handle_shift_switch(chat_id: int, now: datetime):
+        """7:00 班次切换 - 切换到今天的班次"""
+        try:
+            logger.info(f"🔄 群组 {chat_id} 开始班次切换（7:00）...")
+            
+            # 获取班次配置
+            shift_config = await db.get_shift_config(chat_id)
+            is_dual_mode = shift_config.get("dual_mode", False)
+            
+            if not is_dual_mode:
+                logger.info(f"📅 单班模式无需特殊切换")
+                return
+            
+            # 🎯 关键：更新业务日期的计算方式
+            # 7:00之后，让系统认为"今天"已经开始了
+            # 但实际上数据还是算作昨天的，直到11:00清理
+            
+            # 1. 强制更新所有用户的 last_updated 为今天
+            # 这样他们可以打今天的上班卡
+            today_date = now.date()
+            async with db.pool.acquire() as conn:
+                await conn.execute(
+                    """
+                    UPDATE users 
+                    SET last_updated = $1, updated_at = CURRENT_TIMESTAMP
+                    WHERE chat_id = $2
+                    AND last_updated < $1
+                    """,
+                    today_date, chat_id
                 )
-                file_name = f"backup_{chat_id}_{business_date.strftime('%Y%m%d')}.csv"
-
-                # 4. 执行核心任务流
-                # 导出备份
+            
+            # 2. 清理班次状态，开始新的班次
+            await db.clear_shift_state(chat_id)
+            
+            # 3. 发送通知（可选）
+            try:
+                notification = (
+                    f"🔄 <b>班次切换通知</b>\n"
+                    f"🏢 群组: {chat_id}\n"
+                    f"⏰ 切换时间: {now.strftime('%H:%M')}\n"
+                    f"📅 已切换到今日班次，可以开始打上班卡\n"
+                    f"💡 昨日数据将在11:00导出后清理"
+                )
+                await bot.send_message(chat_id, notification, parse_mode="HTML")
+            except Exception as e:
+                logger.debug(f"班次切换通知发送失败: {e}")
+            
+            logger.info(f"✅ 群组 {chat_id} 班次切换完成")
+            
+        except Exception as e:
+            logger.error(f"❌ 班次切换失败 {chat_id}: {e}")
+    
+    async def handle_reset_trigger(chat_id: int, now: datetime):
+        """9:00 重置触发 - 只做标记和处理，不清理数据"""
+        try:
+            logger.info(f"⏰ 群组 {chat_id} 重置触发（9:00）...")
+            
+            # 获取班次配置
+            shift_config = await db.get_shift_config(chat_id)
+            is_dual_mode = shift_config.get("dual_mode", False)
+            
+            # 计算昨天日期
+            yesterday = now.date() - timedelta(days=1)
+            
+            if not is_dual_mode:
+                # 单班模式：直接处理
+                await handle_single_shift_reset(chat_id, yesterday, now)
+                return
+            
+            # 双班模式：处理未完成的班次
+            # 1. 强制完成昨天未下班的班次
+            await force_complete_yesterday_shifts(chat_id, yesterday, now, shift_config)
+            
+            # 2. 标记重置状态（但不清理数据）
+            await mark_reset_status(chat_id, now)
+            
+            # 3. 发送重置通知
+            try:
+                notification = (
+                    f"⏰ <b>重置时间已到</b>\n"
+                    f"🏢 群组: {chat_id}\n"
+                    f"🕘 重置时间: {now.strftime('%H:%M')}\n"
+                    f"📊 昨日数据将在11:00导出后清理\n"
+                    f"💡 今日数据不受影响，继续正常打卡"
+                )
+                await bot.send_message(chat_id, notification, parse_mode="HTML")
+            except Exception as e:
+                logger.debug(f"重置通知发送失败: {e}")
+            
+            logger.info(f"✅ 群组 {chat_id} 重置触发完成")
+            
+        except Exception as e:
+            logger.error(f"❌ 重置触发失败 {chat_id}: {e}")
+    
+    async def handle_data_export_and_cleanup(chat_id: int, now: datetime):
+        """11:00 数据导出和清理"""
+        try:
+            logger.info(f"📤 群组 {chat_id} 开始数据导出和清理（11:00）...")
+            
+            # 获取班次配置
+            shift_config = await db.get_shift_config(chat_id)
+            is_dual_mode = shift_config.get("dual_mode", False)
+            
+            # 计算昨天日期
+            yesterday = now.date() - timedelta(days=1)
+            
+            if not is_dual_mode:
+                # 单班模式：直接导出清理
+                await export_and_cleanup_single_shift(chat_id, yesterday, now)
+                return
+            
+            # 双班模式：三步骤处理
+            # 🎯 步骤1：导出昨天所有数据（白班+夜班）
+            await export_yesterday_all_data(chat_id, yesterday, now)
+            
+            # 🎯 步骤2：清理昨天的数据
+            await cleanup_yesterday_data(chat_id, yesterday)
+            
+            # 🎯 步骤3：今天的数据完全保留
+            
+            logger.info(f"✅ 群组 {chat_id} 数据导出和清理完成")
+            
+        except Exception as e:
+            logger.error(f"❌ 数据导出清理失败 {chat_id}: {e}")
+    
+    async def export_yesterday_all_data(chat_id: int, yesterday: date, now: datetime):
+        """导出昨天所有数据（白班+夜班）"""
+        try:
+            logger.info(f"📤 导出昨天所有数据: 群组 {chat_id}, 日期 {yesterday}")
+            
+            # 生成文件名
+            file_name = f"daily_export_{chat_id}_{yesterday.strftime('%Y%m%d')}.csv"
+            
+            # 使用现有导出函数
+            success = await export_and_push_csv(
+                chat_id=chat_id,
+                target_date=yesterday,
+                file_name=file_name,
+                is_daily_reset=True
+            )
+            
+            if success:
+                logger.info(f"✅ 昨天数据导出成功: {file_name}")
+                
+                # 发送导出成功通知
                 try:
-                    await export_and_push_csv(
-                        chat_id, target_date=business_date, file_name=file_name
+                    await bot.send_message(
+                        chat_id,
+                        f"📤 昨日数据已导出: {file_name}\n"
+                        f"⏰ 导出时间: {now.strftime('%H:%M')}\n"
+                        f"📊 包含白班和夜班所有数据",
+                        parse_mode="HTML"
                     )
                 except Exception as e:
-                    logger.error(f"群组 {chat_id} 备份失败(跳过备份继续重置): {e}")
-
-                # 业务数据操作 (建议封装成事务)
-                completion_result = (
-                    await db.complete_all_pending_activities_before_reset(chat_id, now)
-                )
-                await db.force_reset_all_users_in_group(
-                    chat_id, target_date=business_date
-                )
-
-                # 清理定时器
-                if hasattr(timer_manager, "cancel_all_timers_for_group"):
-                    await timer_manager.cancel_all_timers_for_group(chat_id)
-
-                # 5. 发送通知
-                try:
-
-                    await send_reset_notification(chat_id, completion_result, now)
-                except Exception as e:
-                    logger.error(f"群组 {chat_id} 通知发送失败: {e}")
-
-                # 6. 成功后标记 (TTL 设为 24 小时更安全)
-                global_cache.set(reset_flag_key, now.hour, ttl=86400)
-                logger.info(f"✅ 群组 {chat_id} 重置完成")
-
-            except Exception as e:
-                logger.error(f"❌ 处理群组 {chat_id} 严重失败: {e}")
-
+                    logger.debug(f"导出通知发送失败: {e}")
+            else:
+                logger.error(f"❌ 昨天数据导出失败: {file_name}")
+                
+        except Exception as e:
+            logger.error(f"❌ 导出昨天数据失败 {chat_id}: {e}")
+    
+    async def cleanup_yesterday_data(chat_id: int, yesterday: date):
+        """清理昨天的数据（保留今天的数据）"""
+        try:
+            logger.info(f"🧹 清理昨天数据: 群组 {chat_id}, 日期 {yesterday}")
+            
+            async with db.pool.acquire() as conn:
+                async with conn.transaction():
+                    # 重要：只清理昨天的数据
+                    # 今天的数据（7:00之后的）完全保留
+                    
+                    # 1. 清理昨天的 user_activities
+                    deleted_activities = await conn.execute(
+                        """
+                        DELETE FROM user_activities 
+                        WHERE chat_id = $1 
+                        AND activity_date = $2
+                        """,
+                        chat_id, yesterday
+                    )
+                    
+                    # 2. 清理昨天的 work_records
+                    deleted_work = await conn.execute(
+                        """
+                        DELETE FROM work_records 
+                        WHERE chat_id = $1 
+                        AND record_date = $2
+                        """,
+                        chat_id, yesterday
+                    )
+                    
+                    # 3. 清理昨天的 daily_statistics
+                    deleted_daily = await conn.execute(
+                        """
+                        DELETE FROM daily_statistics 
+                        WHERE chat_id = $1 
+                        AND record_date = $2
+                        """,
+                        chat_id, yesterday
+                    )
+                    
+                    # 4. 特别注意：不要清理今天的数据
+                    # 今天的数据已经在正确的表中，不要动
+                    
+                    # 5. 清理用户状态（只清理昨天的）
+                    await conn.execute(
+                        """
+                        UPDATE users 
+                        SET 
+                            current_activity = NULL,
+                            activity_start_time = NULL,
+                            checkin_message_id = NULL,
+                            updated_at = CURRENT_TIMESTAMP
+                        WHERE chat_id = $1
+                        AND EXISTS (
+                            SELECT 1 FROM work_records wr
+                            WHERE wr.chat_id = users.chat_id
+                            AND wr.user_id = users.user_id
+                            AND wr.record_date = $2
+                        )
+                        """,
+                        chat_id, yesterday
+                    )
+                    
+                    logger.info(
+                        f"✅ 昨天数据清理完成: "
+                        f"活动记录 {parse_sql_count(deleted_activities)} 条, "
+                        f"工作记录 {parse_sql_count(deleted_work)} 条, "
+                        f"日常统计 {parse_sql_count(deleted_daily)} 条"
+                    )
+                    
+                    # 发送清理完成通知
+                    try:
+                        await bot.send_message(
+                            chat_id,
+                            f"🧹 昨日数据清理完成\n"
+                            f"🗑️ 已清理昨日记录\n"
+                            f"💾 今日数据已保留",
+                            parse_mode="HTML"
+                        )
+                    except Exception as e:
+                        logger.debug(f"清理通知发送失败: {e}")
+                    
+        except Exception as e:
+            logger.error(f"❌ 清理昨天数据失败 {chat_id}: {e}")
+    
+    async def mark_reset_status(chat_id: int, now: datetime):
+        """标记重置状态"""
+        try:
+            today_date = now.date()
+            cache_key = f"reset_done:{chat_id}:{today_date}"
+            global_cache.set(cache_key, True, ttl=86400)
+            logger.info(f"✅ 重置状态已标记: 群组 {chat_id}")
+        except Exception as e:
+            logger.error(f"❌ 标记重置状态失败 {chat_id}: {e}")
+    
+    # 主循环
     while True:
         try:
             now = get_beijing_time()
+            
+            # 获取所有群组
             all_groups = await db.get_all_groups()
-
-            # 并发处理所有群组，但受 Semaphore 控制
-            tasks = [process_single_group(cid, now) for cid in all_groups]
-            await asyncio.gather(*tasks)
-
+            
+            # 并发处理所有群组
+            tasks = [process_group_reset(cid, now) for cid in all_groups]
+            await asyncio.gather(*tasks, return_exceptions=True)
+            
         except Exception as e:
-            logger.error(f"❌ daily_reset_task 循环主逻辑出错: {e}")
-
-        # 建议检查频率：如果重置任务很多，30-60秒是合理的
+            logger.error(f"❌ 重置任务主循环出错: {e}")
+        
+        # 每分钟检查一次
         await asyncio.sleep(60)
 
 
