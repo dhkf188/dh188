@@ -648,7 +648,7 @@ class PostgreSQLDatabase:
                     logger.error(f"❌ 创建表失败: {e}")
                     logger.error(f"失败的SQL: {table_sql[:100]}...")
                     raise
-            
+
             logger.info("🚀 数据库所有表及字段初始化完成")
 
     # async def _create_indexes(self):
@@ -684,28 +684,23 @@ class PostgreSQLDatabase:
                 # ========== 1. 核心高频查询 ==========
                 # 1.1 用户表基础索引
                 "CREATE INDEX IF NOT EXISTS idx_users_primary ON users (chat_id, user_id)",
-                
                 # 1.2 实时活动监控（关键！）
                 "CREATE INDEX IF NOT EXISTS idx_users_current_activity ON users (chat_id, current_activity) WHERE current_activity IS NOT NULL",
-                
                 # ========== 2. 活动记录表 ==========
                 # 2.1 日常查询（复合索引，覆盖大部分查询）
                 "CREATE INDEX IF NOT EXISTS idx_user_activities_main ON user_activities (chat_id, user_id, activity_date, shift)",
-                
                 # ========== 3. 上下班记录表 ==========
                 # 3.1 主要业务查询
                 "CREATE INDEX IF NOT EXISTS idx_work_records_main ON work_records (chat_id, user_id, record_date, shift)",
-                
                 # ========== 4. 日常统计表 ==========
                 # 4.1 统计查询
                 "CREATE INDEX IF NOT EXISTS idx_daily_stats_main ON daily_statistics (chat_id, record_date, user_id)",
-                
                 # ========== 5. 清理优化（可选） ==========
                 # 5.1 时间索引（用于定期清理旧数据）
                 "CREATE INDEX IF NOT EXISTS idx_user_activities_created_at ON user_activities (created_at)",
                 "CREATE INDEX IF NOT EXISTS idx_work_records_created_at ON work_records (created_at)",
             ]
-            
+
             created_count = 0
             for index_sql in indexes:
                 try:
@@ -720,7 +715,7 @@ class PostgreSQLDatabase:
                         logger.debug(f"✅ 创建索引完成")
                 except Exception as e:
                     logger.warning(f"创建索引失败: {e}")
-            
+
             logger.info(f"数据库索引创建完成，共 {created_count} 个索引")
 
     async def _initialize_default_data(self):
@@ -1058,7 +1053,7 @@ class PostgreSQLDatabase:
         """按班次获取用户活动次数"""
         # 获取当前业务日期
         today = await self.get_business_date(chat_id)
-        
+
         # 执行数据库查询
         count = await self.execute_with_retry(
             "按班次获取活动次数",
@@ -1067,10 +1062,14 @@ class PostgreSQLDatabase:
             WHERE chat_id = $1 AND user_id = $2 
             AND activity_date = $3 AND activity_name = $4 AND shift = $5
             """,
-            chat_id, user_id, today, activity, shift,
-            fetchval=True
+            chat_id,
+            user_id,
+            today,
+            activity,
+            shift,
+            fetchval=True,
         )
-        
+
         # 如果 count 为 None 则返回 0
         return count if count else 0
 
@@ -1108,7 +1107,7 @@ class PostgreSQLDatabase:
         activity: str,
         start_time: str,
         nickname: str = None,
-        shift: str = "day"
+        shift: str = "day",
     ):
         """更新用户活动状态 - 确保时间格式正确（完整融合稳定版）"""
         try:
@@ -1182,7 +1181,9 @@ class PostgreSQLDatabase:
             # 清理缓存
             self._cache.pop(f"user:{chat_id}:{user_id}", None)
 
-            logger.debug(f"✅ 用户活动更新成功: {chat_id}-{user_id} -> {activity}（班次: {shift}）")
+            logger.debug(
+                f"✅ 用户活动更新成功: {chat_id}-{user_id} -> {activity}（班次: {shift}）"
+            )
 
         except Exception as e:
             logger.error(f"❌ 更新用户活动失败 {chat_id}-{user_id}: {e}")
@@ -1285,7 +1286,10 @@ class PostgreSQLDatabase:
                           AND shift = $4
                     )
                     """,
-                    chat_id, user_id, today, shift,
+                    chat_id,
+                    user_id,
+                    today,
+                    shift,
                 )
 
                 should_be_soft_reset = False
@@ -1311,7 +1315,10 @@ class PostgreSQLDatabase:
                                      activity_name, is_soft_reset, shift)
                         DO NOTHING
                         """,
-                        chat_id, user_id, today, shift,
+                        chat_id,
+                        user_id,
+                        today,
+                        shift,
                     )
 
                 # ===== 4️⃣ users 基础行 =====
@@ -1322,7 +1329,9 @@ class PostgreSQLDatabase:
                     ON CONFLICT (chat_id, user_id)
                     DO UPDATE SET last_updated = EXCLUDED.last_updated
                     """,
-                    chat_id, user_id, today,
+                    chat_id,
+                    user_id,
+                    today,
                 )
 
                 # ===== 5️⃣ user_activities =====
@@ -1340,7 +1349,12 @@ class PostgreSQLDatabase:
                                            + EXCLUDED.accumulated_time,
                         updated_at = CURRENT_TIMESTAMP
                     """,
-                    chat_id, user_id, today, activity, elapsed_time, shift,
+                    chat_id,
+                    user_id,
+                    today,
+                    activity,
+                    elapsed_time,
+                    shift,
                 )
 
                 # ===== 6️⃣ daily_statistics =====
@@ -1358,8 +1372,13 @@ class PostgreSQLDatabase:
                                            + EXCLUDED.accumulated_time,
                         updated_at = CURRENT_TIMESTAMP
                     """,
-                    chat_id, user_id, today,
-                    activity, elapsed_time, current_soft_reset, shift,
+                    chat_id,
+                    user_id,
+                    today,
+                    activity,
+                    elapsed_time,
+                    current_soft_reset,
+                    shift,
                 )
 
                 if is_overtime:
@@ -1375,7 +1394,11 @@ class PostgreSQLDatabase:
                             activity_count = daily_statistics.activity_count + 1,
                             updated_at = CURRENT_TIMESTAMP
                         """,
-                        chat_id, user_id, today, current_soft_reset, shift,
+                        chat_id,
+                        user_id,
+                        today,
+                        current_soft_reset,
+                        shift,
                     )
 
                     await conn.execute(
@@ -1391,8 +1414,12 @@ class PostgreSQLDatabase:
                                                + EXCLUDED.accumulated_time,
                             updated_at = CURRENT_TIMESTAMP
                         """,
-                        chat_id, user_id, today,
-                        overtime_seconds, current_soft_reset, shift,
+                        chat_id,
+                        user_id,
+                        today,
+                        overtime_seconds,
+                        current_soft_reset,
+                        shift,
                     )
 
                 if fine_amount > 0:
@@ -1409,8 +1436,12 @@ class PostgreSQLDatabase:
                                                + EXCLUDED.accumulated_time,
                             updated_at = CURRENT_TIMESTAMP
                         """,
-                        chat_id, user_id, today,
-                        fine_amount, current_soft_reset, shift,
+                        chat_id,
+                        user_id,
+                        today,
+                        fine_amount,
+                        current_soft_reset,
+                        shift,
                     )
 
                 # ===== 7️⃣ monthly_statistics =====
@@ -1428,8 +1459,12 @@ class PostgreSQLDatabase:
                                            + EXCLUDED.accumulated_time,
                         updated_at = CURRENT_TIMESTAMP
                     """,
-                    chat_id, user_id,
-                    statistic_date, activity, elapsed_time, shift,
+                    chat_id,
+                    user_id,
+                    statistic_date,
+                    activity,
+                    elapsed_time,
+                    shift,
                 )
 
                 if fine_amount > 0:
@@ -1446,8 +1481,11 @@ class PostgreSQLDatabase:
                                                + EXCLUDED.accumulated_time,
                             updated_at = CURRENT_TIMESTAMP
                         """,
-                        chat_id, user_id,
-                        statistic_date, fine_amount, shift,
+                        chat_id,
+                        user_id,
+                        statistic_date,
+                        fine_amount,
+                        shift,
                     )
 
                 if is_overtime and overtime_seconds > 0:
@@ -1463,7 +1501,10 @@ class PostgreSQLDatabase:
                             activity_count = monthly_statistics.activity_count + 1,
                             updated_at = CURRENT_TIMESTAMP
                         """,
-                        chat_id, user_id, statistic_date, shift,
+                        chat_id,
+                        user_id,
+                        statistic_date,
+                        shift,
                     )
 
                     await conn.execute(
@@ -1479,8 +1520,11 @@ class PostgreSQLDatabase:
                                                + EXCLUDED.accumulated_time,
                             updated_at = CURRENT_TIMESTAMP
                         """,
-                        chat_id, user_id,
-                        statistic_date, overtime_seconds, shift,
+                        chat_id,
+                        user_id,
+                        statistic_date,
+                        overtime_seconds,
+                        shift,
                     )
 
                 # ===== 8️⃣ users 总账（动态安全参数）=====
@@ -2138,7 +2182,7 @@ class PostgreSQLDatabase:
         time_diff_minutes: float,
         fine_amount: int = 0,
         shift: str = "day",
-        shift_detail: str = None
+        shift_detail: str = None,
     ):
         """
         添加上下班记录 - 完整同步版
@@ -2159,9 +2203,12 @@ class PostgreSQLDatabase:
                 checkin_time_obj = datetime.strptime(checkin_time, "%H:%M").time()
                 # 班次判定基于业务日期，不依赖当前北京时间
                 full_datetime = datetime.combine(business_date, checkin_time_obj)
-                shift = await self.determine_shift_for_time(
-                    chat_id, full_datetime, checkin_type
-                ) or "day"
+                shift = (
+                    await self.determine_shift_for_time(
+                        chat_id, full_datetime, checkin_type
+                    )
+                    or "day"
+                )
             except Exception as e:
                 logger.error(f"班次判定失败: {e}")
                 shift = "day"
@@ -2180,7 +2227,10 @@ class PostgreSQLDatabase:
                       AND record_date = $3 AND shift = $4
                     LIMIT 1
                     """,
-                    chat_id, user_id, business_date, shift
+                    chat_id,
+                    user_id,
+                    business_date,
+                    shift,
                 )
                 if soft_reset_row:
                     current_soft_reset = soft_reset_row["is_soft_reset"]
@@ -2202,19 +2252,30 @@ class PostgreSQLDatabase:
                         shift_detail = EXCLUDED.shift_detail,
                         created_at = CURRENT_TIMESTAMP
                     """,
-                    chat_id, user_id, record_date, checkin_type,
-                    checkin_time, status, time_diff_minutes,
-                    fine_amount, shift, shift_detail
+                    chat_id,
+                    user_id,
+                    record_date,
+                    checkin_type,
+                    checkin_time,
+                    status,
+                    time_diff_minutes,
+                    fine_amount,
+                    shift,
+                    shift_detail,
                 )
 
                 # ========= 4. 更新 daily_statistics =========
                 # 4.1 日罚款
-                activity_name = "work_fines" # 默认值
+                activity_name = "work_fines"  # 默认值
                 if fine_amount > 0:
                     activity_name = (
-                        "work_start_fines" if checkin_type == "work_start"
-                        else "work_end_fines" if checkin_type == "work_end"
-                        else "work_fines"
+                        "work_start_fines"
+                        if checkin_type == "work_start"
+                        else (
+                            "work_end_fines"
+                            if checkin_type == "work_end"
+                            else "work_fines"
+                        )
                     )
 
                     await conn.execute(
@@ -2229,9 +2290,13 @@ class PostgreSQLDatabase:
                             accumulated_time = daily_statistics.accumulated_time + EXCLUDED.accumulated_time,
                             updated_at = CURRENT_TIMESTAMP
                         """,
-                        chat_id, user_id, business_date,
-                        activity_name, fine_amount,
-                        current_soft_reset, shift
+                        chat_id,
+                        user_id,
+                        business_date,
+                        activity_name,
+                        fine_amount,
+                        current_soft_reset,
+                        shift,
                     )
 
                 # 4.2 下班逻辑：记录工作天数 + 工时
@@ -2250,8 +2315,11 @@ class PostgreSQLDatabase:
                             activity_count = daily_statistics.activity_count + 1,
                             updated_at = CURRENT_TIMESTAMP
                         """,
-                        chat_id, user_id, business_date,
-                        current_soft_reset, shift
+                        chat_id,
+                        user_id,
+                        business_date,
+                        current_soft_reset,
+                        shift,
                     )
 
                     # 查询上班时间
@@ -2263,12 +2331,17 @@ class PostgreSQLDatabase:
                           AND checkin_type='work_start'
                           AND shift=$4
                         """,
-                        chat_id, user_id, business_date, shift
+                        chat_id,
+                        user_id,
+                        business_date,
+                        shift,
                     )
 
                     if start_row:
                         try:
-                            start_dt = datetime.strptime(start_row["checkin_time"], "%H:%M")
+                            start_dt = datetime.strptime(
+                                start_row["checkin_time"], "%H:%M"
+                            )
                             end_dt = datetime.strptime(checkin_time, "%H:%M")
                             diff_minutes = (end_dt - start_dt).total_seconds() / 60
                             if diff_minutes < 0:
@@ -2289,9 +2362,12 @@ class PostgreSQLDatabase:
                                     accumulated_time = daily_statistics.accumulated_time + EXCLUDED.accumulated_time,
                                     updated_at = CURRENT_TIMESTAMP
                                 """,
-                                chat_id, user_id, business_date,
+                                chat_id,
+                                user_id,
+                                business_date,
                                 work_duration_seconds,
-                                current_soft_reset, shift
+                                current_soft_reset,
+                                shift,
                             )
                         except Exception as e:
                             logger.error(f"工时计算失败: {e}")
@@ -2310,7 +2386,10 @@ class PostgreSQLDatabase:
                             activity_count = monthly_statistics.activity_count + 1,
                             updated_at = CURRENT_TIMESTAMP
                         """,
-                        chat_id, user_id, statistic_date, shift
+                        chat_id,
+                        user_id,
+                        statistic_date,
+                        shift,
                     )
 
                     # 月工时
@@ -2326,8 +2405,11 @@ class PostgreSQLDatabase:
                                 accumulated_time = monthly_statistics.accumulated_time + EXCLUDED.accumulated_time,
                                 updated_at = CURRENT_TIMESTAMP
                             """,
-                            chat_id, user_id, statistic_date,
-                            work_duration_seconds, shift
+                            chat_id,
+                            user_id,
+                            statistic_date,
+                            work_duration_seconds,
+                            shift,
                         )
 
                 # 月度罚款
@@ -2343,8 +2425,12 @@ class PostgreSQLDatabase:
                             accumulated_time = monthly_statistics.accumulated_time + EXCLUDED.accumulated_time,
                             updated_at = CURRENT_TIMESTAMP
                         """,
-                        chat_id, user_id, statistic_date,
-                        activity_name, fine_amount, shift
+                        chat_id,
+                        user_id,
+                        statistic_date,
+                        activity_name,
+                        fine_amount,
+                        shift,
                     )
 
                 # ========= 6. 更新 users 表罚款总计 =========
@@ -2355,7 +2441,9 @@ class PostgreSQLDatabase:
                         SET total_fines = total_fines + $1
                         WHERE chat_id = $2 AND user_id = $3
                         """,
-                        fine_amount, chat_id, user_id
+                        fine_amount,
+                        chat_id,
+                        user_id,
                     )
 
         # ========= 7. 清理缓存 =========
@@ -2366,13 +2454,12 @@ class PostgreSQLDatabase:
             f"班次:{shift} | 罚款:{fine_amount} | 工时:{work_duration_seconds}s"
         )
 
-
     async def get_work_count_by_shift(
         self, chat_id: int, user_id: int, checkin_type: str, shift: str = None
     ) -> int:
         """获取指定班次的上下班次数"""
         today = await self.get_business_date(chat_id)
-        
+
         query = """
             SELECT COUNT(*) as count 
             FROM work_records 
@@ -2380,16 +2467,13 @@ class PostgreSQLDatabase:
             AND checkin_type = $4
         """
         params = [chat_id, user_id, today, checkin_type]
-        
+
         if shift:
             query += " AND shift = $5"
             params.append(shift)
-        
+
         count = await self.execute_with_retry(
-            "按班次获取工作次数",
-            query,
-            *params,
-            fetchval=True
+            "按班次获取工作次数", query, *params, fetchval=True
         )
         return count if count else 0
 
@@ -2398,7 +2482,7 @@ class PostgreSQLDatabase:
     ) -> Dict[str, List[Dict[str, Any]]]:
         """获取用户上下班记录（支持按班次过滤）"""
         today = await self.get_business_date(chat_id)
-        
+
         query = """
             SELECT checkin_type, checkin_time, status, time_diff_minutes, 
                    fine_amount, shift, created_at
@@ -2406,20 +2490,17 @@ class PostgreSQLDatabase:
             WHERE chat_id = $1 AND user_id = $2 AND record_date = $3
         """
         params = [chat_id, user_id, today]
-        
+
         if shift:
             query += " AND shift = $4"
             params.append(shift)
-        
+
         query += " ORDER BY created_at DESC"
-        
+
         rows = await self.execute_with_retry(
-            "按班次获取工作记录",
-            query,
-            *params,
-            fetch=True
+            "按班次获取工作记录", query, *params, fetch=True
         )
-        
+
         records = {}
         if rows:
             for row in rows:
@@ -2427,11 +2508,10 @@ class PostgreSQLDatabase:
                 if checkin_type not in records:
                     records[checkin_type] = []
                 records[checkin_type].append(dict(row))
-        
+
         return records
 
     # 注意：确保类中已实现 get_business_date 和 execute_with_retry 方法
-
 
     async def has_work_record_today(
         self, chat_id: int, user_id: int, checkin_type: str
@@ -2799,10 +2879,11 @@ class PostgreSQLDatabase:
         self._cache.pop("push_settings", None)
 
     # ========== 统计和导出相关 ==========
+
     async def get_group_statistics(
         self, chat_id: int, target_date: Optional[date] = None
     ) -> List[Dict]:
-        """获取群组统计信息 - 修复版：正确使用 is_soft_reset 字段"""
+        """获取群组统计信息 - 修复版：添加班次字段"""
 
         if target_date is None:
             target_date = await self.get_business_date(chat_id)
@@ -2814,48 +2895,50 @@ class PostgreSQLDatabase:
                 WITH user_stats AS (
                     SELECT 
                         ds.user_id,
-                        ds.is_soft_reset,  -- 🟢 使用现有的布尔字段
+                        ds.shift,  -- ✅ 1. 添加班次字段
+                        ds.is_soft_reset,
                         MAX(u.nickname) as nickname,
-
-                        -- 1. 活动统计（排除特殊统计行，但保留软重置标记的 activity_name）
+                        
+                        -- 活动统计
                         SUM(CASE WHEN ds.activity_name NOT IN (
                             'work_days','work_hours',
                             'work_fines','work_start_fines','work_end_fines',
                             'overtime_count','overtime_time','total_fines'
                         ) THEN ds.activity_count ELSE 0 END) AS total_activity_count,
-
+                        
                         SUM(CASE WHEN ds.activity_name NOT IN (
                             'work_days','work_hours',
                             'work_fines','work_start_fines','work_end_fines',
                             'overtime_count','overtime_time','total_fines'
                         ) THEN ds.accumulated_time ELSE 0 END) AS total_accumulated_time,
-
-                        -- 2. 罚款统计
+                        
+                        -- 罚款统计
                         SUM(CASE WHEN ds.activity_name IN (
                             'total_fines', 
                             'work_fines', 
                             'work_start_fines', 
                             'work_end_fines'
                         ) THEN ds.accumulated_time ELSE 0 END) AS total_fines,
-
-                        -- 3. 超时统计
+                        
+                        -- 超时统计
                         SUM(CASE WHEN ds.activity_name = 'overtime_count'
                                  THEN ds.activity_count ELSE 0 END) AS overtime_count,
                         SUM(CASE WHEN ds.activity_name = 'overtime_time'
                                  THEN ds.accumulated_time ELSE 0 END) AS total_overtime_time
-
+                        
                     FROM daily_statistics ds
                     LEFT JOIN users u 
                         ON ds.chat_id = u.chat_id 
-                       AND ds.user_id = u.user_id
+                        AND ds.user_id = u.user_id
                     WHERE ds.chat_id = $1 
                       AND ds.record_date = $2
-                    GROUP BY ds.user_id, ds.is_soft_reset
+                    GROUP BY ds.user_id, ds.shift, ds.is_soft_reset  -- ✅ 2. GROUP BY添加shift
                 ),
-
+                
                 activity_details AS (
                     SELECT
                         ds.user_id,
+                        ds.shift,  -- ✅ 3. 添加班次字段
                         ds.is_soft_reset,
                         ds.activity_name,
                         SUM(ds.activity_count) AS total_count,
@@ -2868,12 +2951,13 @@ class PostgreSQLDatabase:
                             'work_fines','work_start_fines','work_end_fines',
                             'overtime_count','overtime_time','total_fines'
                       )
-                    GROUP BY ds.user_id, ds.is_soft_reset, ds.activity_name
+                    GROUP BY ds.user_id, ds.shift, ds.is_soft_reset, ds.activity_name  -- ✅ 4. GROUP BY添加shift
                 ),
-
+                
                 work_stats AS (
                     SELECT
                         ds.user_id,
+                        ds.shift,  -- ✅ 5. 添加班次字段
                         ds.is_soft_reset,
                         MAX(CASE WHEN ds.activity_name = 'work_days'
                                  THEN ds.activity_count ELSE 0 END) AS work_days,
@@ -2883,14 +2967,14 @@ class PostgreSQLDatabase:
                     WHERE ds.chat_id = $1 
                       AND ds.record_date = $2
                       AND ds.activity_name IN ('work_days','work_hours')
-                    GROUP BY ds.user_id, ds.is_soft_reset
+                    GROUP BY ds.user_id, ds.shift, ds.is_soft_reset  -- ✅ 6. GROUP BY添加shift
                 )
-
+                
                 SELECT 
                     us.*,
                     COALESCE(ws.work_days, 0) AS final_work_days,
                     COALESCE(ws.work_hours, 0) AS final_work_hours,
-
+                    
                     jsonb_object_agg(
                         ad.activity_name,
                         jsonb_build_object(
@@ -2898,21 +2982,23 @@ class PostgreSQLDatabase:
                             'time', ad.total_time
                         )
                     ) FILTER (WHERE ad.activity_name IS NOT NULL) AS activities
-
+                    
                 FROM user_stats us
                 LEFT JOIN activity_details ad
                     ON us.user_id = ad.user_id
-                   AND us.is_soft_reset = ad.is_soft_reset
+                    AND us.shift = ad.shift  -- ✅ 7. JOIN条件添加shift
+                    AND us.is_soft_reset = ad.is_soft_reset
                 LEFT JOIN work_stats ws
                     ON us.user_id = ws.user_id
-                   AND us.is_soft_reset = ws.is_soft_reset
-
-                GROUP BY us.user_id, us.is_soft_reset, us.nickname,
+                    AND us.shift = ws.shift  -- ✅ 8. JOIN条件添加shift
+                    AND us.is_soft_reset = ws.is_soft_reset
+                    
+                GROUP BY us.user_id, us.shift, us.is_soft_reset, us.nickname,  -- ✅ 9. GROUP BY添加shift
                          us.total_activity_count, us.total_accumulated_time,
                          us.total_fines, us.overtime_count, us.total_overtime_time,
                          ws.work_days, ws.work_hours
-
-                ORDER BY us.user_id ASC, us.is_soft_reset ASC
+                         
+                ORDER BY us.user_id ASC, us.shift ASC, us.is_soft_reset ASC  -- ✅ 10. ORDER BY添加shift
                 """,
                 chat_id,
                 target_date,
@@ -2924,6 +3010,10 @@ class PostgreSQLDatabase:
 
                 data["work_days"] = data.pop("final_work_days", 0)
                 data["work_hours"] = data.pop("final_work_hours", 0)
+
+                # ✅ 11. 确保班次字段存在
+                if "shift" not in data or data["shift"] is None:
+                    data["shift"] = "day"
 
                 # 确保布尔值转换
                 is_soft_reset = data.get("is_soft_reset", False)
@@ -2952,16 +3042,9 @@ class PostgreSQLDatabase:
 
                 data["activities"] = parsed_activities
 
-                # 🟢 调试日志
-                logger.debug(
-                    f"用户 {data['user_id']} 重置状态: {data['is_soft_reset']}, "
-                    f"活动数: {data['total_activity_count']}, "
-                    f"时长: {data['total_accumulated_time']}"
-                )
-
                 result.append(data)
 
-            logger.info(f"数据库查询返回 {len(result)} 条记录（含软硬重置区分）")
+            logger.info(f"数据库查询返回 {len(result)} 条记录（含班次信息）")
             return result
 
     async def get_all_groups(self) -> List[int]:
@@ -3250,8 +3333,6 @@ class PostgreSQLDatabase:
             )
 
             return {"late_count": late_count, "early_count": early_count}
-        
-
 
     # ========== 班次状态管理 ==========
     async def get_current_shift_state(self, chat_id: int) -> Optional[Dict]:
@@ -3260,20 +3341,22 @@ class PostgreSQLDatabase:
         cached = self._get_cached(cache_key)
         if cached is not None:
             return cached
-        
+
         row = await self.fetchrow_with_retry(
             "获取班次状态",
             "SELECT * FROM group_shift_state WHERE chat_id = $1",
-            chat_id
+            chat_id,
         )
-        
+
         if row:
             result = dict(row)
             self._set_cached(cache_key, result, 30)
             return result
         return None
 
-    async def create_shift_state(self, chat_id: int, shift: str, started_by_user_id: int):
+    async def create_shift_state(
+        self, chat_id: int, shift: str, started_by_user_id: int
+    ):
         """创建班次状态"""
         now = self.get_beijing_time()
         await self.execute_with_retry(
@@ -3288,24 +3371,27 @@ class PostgreSQLDatabase:
                 started_by_user_id = EXCLUDED.started_by_user_id,
                 updated_at = CURRENT_TIMESTAMP
             """,
-            chat_id, shift, now, started_by_user_id
+            chat_id,
+            shift,
+            now,
+            started_by_user_id,
         )
         self._cache.pop(f"shift_state:{chat_id}", None)
 
     async def clear_shift_state(self, chat_id: int):
         """清除班次状态"""
         await self.execute_with_retry(
-            "清除班次状态",
-            "DELETE FROM group_shift_state WHERE chat_id = $1",
-            chat_id
+            "清除班次状态", "DELETE FROM group_shift_state WHERE chat_id = $1", chat_id
         )
         self._cache.pop(f"shift_state:{chat_id}", None)
 
-    async def update_group_dual_mode(self, chat_id: int, enabled: bool, day_start: str = None, day_end: str = None):
+    async def update_group_dual_mode(
+        self, chat_id: int, enabled: bool, day_start: str = None, day_end: str = None
+    ):
         """更新双班模式配置"""
         if enabled and (day_start is None or day_end is None):
             raise ValueError("开启双班模式必须提供白班开始和结束时间")
-        
+
         await self.execute_with_retry(
             "更新双班模式",
             """
@@ -3316,11 +3402,16 @@ class PostgreSQLDatabase:
                 updated_at = CURRENT_TIMESTAMP
             WHERE chat_id = $4
             """,
-            enabled, day_start if enabled else None, day_end if enabled else None, chat_id
+            enabled,
+            day_start if enabled else None,
+            day_end if enabled else None,
+            chat_id,
         )
         self._cache.pop(f"group:{chat_id}", None)
 
-    async def update_shift_grace_window(self, chat_id: int, grace_before: int, grace_after: int):
+    async def update_shift_grace_window(
+        self, chat_id: int, grace_before: int, grace_after: int
+    ):
         """更新时间宽容窗口"""
         await self.execute_with_retry(
             "更新时间宽容窗口",
@@ -3331,7 +3422,9 @@ class PostgreSQLDatabase:
                 updated_at = CURRENT_TIMESTAMP
             WHERE chat_id = $3
             """,
-            grace_before, grace_after, chat_id
+            grace_before,
+            grace_after,
+            chat_id,
         )
         self._cache.pop(f"group:{chat_id}", None)
 
@@ -3340,44 +3433,42 @@ class PostgreSQLDatabase:
         group_data = await self.get_group_cached(chat_id)
         if not group_data:
             return {
-                'dual_mode': False,
-                'day_start': '09:00',
-                'day_end': '21:00',
-                'grace_before': 120,
-                'grace_after': 360
+                "dual_mode": False,
+                "day_start": "09:00",
+                "day_end": "21:00",
+                "grace_before": 120,
+                "grace_after": 360,
             }
-        
+
         # 优先级1: /setworktime 设置
         work_hours = await self.get_group_work_time(chat_id)
         has_work_time = await self.has_work_hours_enabled(chat_id)
-        
+
         if has_work_time:
-            day_start = work_hours['work_start']
-            day_end = work_hours['work_end']
+            day_start = work_hours["work_start"]
+            day_end = work_hours["work_end"]
         # 优先级2: /setdualmode 设置
-        elif group_data.get('dual_mode'):
-            day_start = group_data.get('dual_day_start', '09:00')
-            day_end = group_data.get('dual_day_end', '21:00')
+        elif group_data.get("dual_mode"):
+            day_start = group_data.get("dual_day_start", "09:00")
+            day_end = group_data.get("dual_day_end", "21:00")
         # 优先级3: 默认值
         else:
-            day_start = '09:00'
-            day_end = '21:00'
-        
+            day_start = "09:00"
+            day_end = "21:00"
+
         return {
-            'dual_mode': bool(group_data.get('dual_mode', False)),
-            'day_start': day_start,
-            'day_end': day_end,
-            'grace_before': group_data.get('shift_grace_before', 120),
-            'grace_after': group_data.get('shift_grace_after', 360)
+            "dual_mode": bool(group_data.get("dual_mode", False)),
+            "day_start": day_start,
+            "day_end": day_end,
+            "grace_before": group_data.get("shift_grace_before", 120),
+            "grace_after": group_data.get("shift_grace_after", 360),
         }
-
-
 
     def calculate_shift_window(
         self,
         shift_config: Dict[str, Any],
         checkin_type: str = None,
-        now: Optional[datetime] = None
+        now: Optional[datetime] = None,
     ) -> Dict[str, Any]:
         """
         计算班次时间窗口并判定当前班次
@@ -3392,10 +3483,12 @@ class PostgreSQLDatabase:
 
         # 3. 解析配置中的时间点
         try:
-            day_start_time = datetime.strptime(shift_config['day_start'], "%H:%M").time()
-            day_end_time = datetime.strptime(shift_config['day_end'], "%H:%M").time()
+            day_start_time = datetime.strptime(
+                shift_config["day_start"], "%H:%M"
+            ).time()
+            day_end_time = datetime.strptime(shift_config["day_end"], "%H:%M").time()
         except (KeyError, ValueError, TypeError):
-            return {'day_window': {}, 'night_window': {}, 'current_shift': None}
+            return {"day_window": {}, "night_window": {}, "current_shift": None}
 
         # 4. 转换成当天的完整 datetime 对象并对齐时区
         day_start_dt = datetime.combine(today, day_start_time).replace(tzinfo=tz)
@@ -3409,63 +3502,81 @@ class PostgreSQLDatabase:
         day_window = {
             "work_start": {
                 "start": day_start_dt - timedelta(minutes=grace_before),
-                "end": day_start_dt + timedelta(minutes=grace_after)
+                "end": day_start_dt + timedelta(minutes=grace_after),
             },
             "work_end": {
                 "start": day_end_dt - timedelta(minutes=grace_before),
-                "end": day_end_dt + timedelta(minutes=grace_after)
-            }
+                "end": day_end_dt + timedelta(minutes=grace_after),
+            },
         }
 
         # 2️⃣ 昨晚夜班（昨晚开始，今天早晨结束）
         last_night_window = {
             "work_start": {
-                "start": day_end_dt - timedelta(days=1) - timedelta(minutes=grace_before),
-                "end": day_end_dt - timedelta(days=1) + timedelta(minutes=grace_after)
+                "start": day_end_dt
+                - timedelta(days=1)
+                - timedelta(minutes=grace_before),
+                "end": day_end_dt - timedelta(days=1) + timedelta(minutes=grace_after),
             },
             "work_end": {
                 "start": day_start_dt - timedelta(minutes=grace_before),
-                "end": day_start_dt + timedelta(minutes=grace_after)
-            }
+                "end": day_start_dt + timedelta(minutes=grace_after),
+            },
         }
 
         # 3️⃣ 今晚夜班（今晚开始，明天早晨结束）
         tonight_window = {
             "work_start": {
                 "start": day_end_dt - timedelta(minutes=grace_before),
-                "end": day_end_dt + timedelta(minutes=grace_after)
+                "end": day_end_dt + timedelta(minutes=grace_after),
             },
             "work_end": {
-                "start": day_start_dt + timedelta(days=1) - timedelta(minutes=grace_before),
-                "end": day_start_dt + timedelta(days=1) + timedelta(minutes=grace_after)
-            }
+                "start": day_start_dt
+                + timedelta(days=1)
+                - timedelta(minutes=grace_before),
+                "end": day_start_dt
+                + timedelta(days=1)
+                + timedelta(minutes=grace_after),
+            },
         }
 
         # 6. 判定当前班次
         current_shift = None
         if checkin_type in ["work_start", "work_end"]:
             # 依次匹配：白班 -> 昨晚夜班 -> 今晚夜班
-            if day_window[checkin_type]["start"] <= now <= day_window[checkin_type]["end"]:
+            if (
+                day_window[checkin_type]["start"]
+                <= now
+                <= day_window[checkin_type]["end"]
+            ):
                 current_shift = "day"
-            elif last_night_window[checkin_type]["start"] <= now <= last_night_window[checkin_type]["end"]:
+            elif (
+                last_night_window[checkin_type]["start"]
+                <= now
+                <= last_night_window[checkin_type]["end"]
+            ):
                 current_shift = "night_last"
-            elif tonight_window[checkin_type]["start"] <= now <= tonight_window[checkin_type]["end"]:
+            elif (
+                tonight_window[checkin_type]["start"]
+                <= now
+                <= tonight_window[checkin_type]["end"]
+            ):
                 current_shift = "night_tonight"
 
         return {
             "day_window": day_window,
             "night_window": {
                 "last_night": last_night_window,
-                "tonight": tonight_window
+                "tonight": tonight_window,
             },
-            "current_shift": current_shift
+            "current_shift": current_shift,
         }
 
     async def determine_shift_for_time(
         self,
         chat_id: int,
         current_time: Optional[datetime] = None,
-        checkin_type: str = "work_start"
+        checkin_type: str = "work_start",
     ) -> str:
         """
         根据当前时间和班次配置判断当前班次
@@ -3474,7 +3585,7 @@ class PostgreSQLDatabase:
         """
         # 1. 获取班次配置
         shift_config = await self.get_shift_config(chat_id)
-        
+
         # 2. 单班模式或配置缺失，默认白班
         if not shift_config or not shift_config.get("dual_mode", False):
             return "day"
@@ -3484,9 +3595,7 @@ class PostgreSQLDatabase:
 
         # 4. 调用 calculate_shift_window 获取窗口信息
         window_info = self.calculate_shift_window(
-            shift_config,
-            checkin_type=checkin_type,
-            now=now
+            shift_config, checkin_type=checkin_type, now=now
         )
 
         # 5. 取当前班次
