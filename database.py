@@ -916,6 +916,38 @@ class PostgreSQLDatabase:
             )
             self._cache.pop(f"group:{chat_id}", None)
 
+    async def get_group_notification_target(self, chat_id: int) -> Optional[int]:
+        """
+        获取群组的下班推送目标群组ID
+        返回: 目标群组ID，如果没有设置则返回 None
+        """
+        group_data = await self.get_group_cached(chat_id)
+        return group_data.get("notification_group_id")  # 直接使用已存在的字段
+
+    async def update_group_notification_target(
+        self, chat_id: int, target_id: Optional[int]
+    ):
+        """
+        更新群组的下班推送目标群组ID
+        参数:
+            chat_id: 当前群组ID
+            target_id: 目标群组ID，传入 None 表示清除设置
+        """
+        await self.execute_with_retry(
+            "更新推送目标群组",
+            """
+            UPDATE groups 
+            SET notification_group_id = $1, 
+                updated_at = CURRENT_TIMESTAMP 
+            WHERE chat_id = $2
+            """,
+            target_id,
+            chat_id,
+        )
+        # 清除缓存
+        self._cache.pop(f"group:{chat_id}", None)
+        self._cache_ttl.pop(f"group:{chat_id}", None)
+
     async def update_group_reset_time(self, chat_id: int, hour: int, minute: int):
         """更新群组重置时间"""
         self._ensure_pool_initialized()
