@@ -1181,26 +1181,44 @@ async def start_activity(message: types.Message, act: str):
                 pass
 
             notification_text = None
+            target_id = chat_id  # 默认发送到当前群组
 
             if act == "吃饭":
                 notification_text = (
-                    f"🍽️ <b>吃饭通知</b> <code>{shift_text}</code>\n"
-                    f" {MessageFormatter.format_user_link(uid, name)} 去吃饭了\n"
-                    f"⏰ 时间：<code>{now.strftime('%H:%M:%S')}</code>\n"
+                    f"🍽️ <b>吃饭通知</b> <code>{shift_text}</code> <code>{now.strftime('%H:%M:%S')}</code>\n\n"
+                    f"{MessageFormatter.format_user_link(uid, name)} 去吃饭了\n"
                 )
+                # 吃饭通知发送到当前群组
+                target_id = chat_id
+
             elif act in ["上班", "下班"]:
+                # ✅ 获取上班/下班推送目标群组
+                work_notify_group = await db.get_group_notification_target(chat_id)
+                if work_notify_group:
+                    target_id = work_notify_group  # 发送到指定的通知群组
+                    logger.info(f"📢 上班/下班推送将发送到指定群组: {target_id}")
+
                 icon = "🟢" if act == "上班" else "🔴"
+                action_word = "已上班" if act == "上班" else "已下班"
+
                 notification_text = (
-                    f"{icon} <b>{act}通知</b> <code>{shift_text}</code>\n"
-                    f" {MessageFormatter.format_user_link(uid, name)} 已上班\n"
-                    f"⏰ 时间：<code>{now.strftime('%H:%M:%S')}</code>\n"
+                    f"{icon} <b>{act}通知</b> <code>{shift_text}</code> <code>{now.strftime('%H:%M:%S')}</code>\n\n"
+                    f"{MessageFormatter.format_user_link(uid, name)} {action_word}\n"
                 )
+
+                # 如果不是发送到当前群组，添加来源信息
+                if target_id != chat_id:
+                    notification_text += f"🏢 来源：<code>{chat_title}</code>\n"
 
             if notification_text:
                 asyncio.create_task(
-                    notification_service.send_notification(chat_id, notification_text)
+                    notification_service.send_notification(
+                        target_id, notification_text, notification_type="group"
+                    )
                 )
-                logger.info(f"📣 已触发用户 {uid}（{shift_text}）的 {act} 推送")
+                logger.info(
+                    f"📣 已触发用户 {uid}（{shift_text}）的 {act} 推送，目标: {target_id}"
+                )
 
         except Exception as e:
             logger.error(f"❌ {act} 推送失败: {e}")
@@ -1430,9 +1448,8 @@ async def _process_back_locked(message: types.Message, chat_id: int, uid: int):
                 # 2. 构建推送文案
                 # 使用已经计算好的 elapsed_time_str (例如 "15分30秒")
                 eat_end_notification_text = (
-                    f"🍽️ <b>吃饭结束通知</b>\n"
+                    f"🍽️ <b>吃饭结束通知</b> <code>{elapsed_time_str}</code>\n\n"
                     f"{MessageFormatter.format_user_link(uid, user_data.get('nickname', '用户'))} 回来了\n"
-                    f"⏱️ 吃饭耗时：<code>{elapsed_time_str}</code>\n"
                 )
 
                 # 如果有超时或罚款，也可以加进去
@@ -1843,7 +1860,7 @@ async def process_work_checkin(message: types.Message, checkin_type: str):
                 f"{emoji_status} <b>{shift_text}{action_text}完成</b>\n"
                 f"👤 用户：{MessageFormatter.format_user_link(uid, name)}\n"
                 f"⏰ {action_text}时间：<code>{current_time}</code>\n"
-                f"📅 期望时间：<code>{expected_dt.strftime('%m/%d %H:%M') if hasattr(expected_dt, 'strftime') else expected_dt_from_hours.strftime('%m/%d %H:%M')}</code>\n"
+                f"📅 上班时间：<code>{work_hours['work_start' if checkin_type == 'work_start' else 'work_end']}</code>\n"
                 f"📊 状态：{status}"
             )
 
@@ -2006,7 +2023,7 @@ async def process_work_checkin(message: types.Message, checkin_type: str):
                 f"{emoji_status} <b>{shift_text}{action_text}完成</b>\n"
                 f"👤 用户：{MessageFormatter.format_user_link(uid, name)}\n"
                 f"⏰ {action_text}时间：<code>{current_time}</code>\n"
-                f"📅 期望时间：<code>{expected_dt.strftime('%m/%d %H:%M') if hasattr(expected_dt, 'strftime') else expected_dt_from_hours.strftime('%m/%d %H:%M')}</code>\n"
+                f"📅 下班时间：<code>{expected_dt.strftime('%m/%d %H:%M') if hasattr(expected_dt, 'strftime') else expected_dt_from_hours.strftime('%m/%d %H:%M')}</code>\n"
                 f"📊 状态：{status}"
             )
 
@@ -2669,6 +2686,155 @@ async def cmd_setshiftgrace(message: types.Message):
         await message.answer(
             f"❌ 设置失败: {e}", reply_to_message_id=message.message_id
         )
+
+
+@admin_required
+@rate_limit(rate=3, per=30)
+async def cmd_set_work_notify_group(message: types.Message):
+    """设置上班/下班推送目标群组"""
+    args = message.text.split(maxsplit=1)
+    chat_id = message.chat.id
+
+    if len(args) < 2:
+        # 查看当前设置
+        current_target = await db.get_group_notification_target(chat_id)
+        if current_target:
+            # 尝试获取群组名称
+            try:
+                chat = await bot.get_chat(current_target)
+                chat_name = chat.title or f"群组 {current_target}"
+            except:
+                chat_name = f"群组 {current_target}"
+
+            await message.answer(
+                f"📢 <b>当前上班/下班推送设置</b>\n\n"
+                f"🎯 目标群组：<code>{chat_name}</code>\n"
+                f"🆔 群组ID：<code>{current_target}</code>\n\n"
+                f"💡 使用以下命令修改：\n"
+                f"• <code>/set_work_notify_group 群组ID</code> - 设置新目标\n"
+                f"• <code>/clear_work_notify_group</code> - 清除设置",
+                parse_mode="HTML",
+                reply_markup=await get_main_keyboard(chat_id, True),
+                reply_to_message_id=message.message_id,
+            )
+        else:
+            await message.answer(
+                f"📢 <b>当前上班/下班推送设置</b>\n\n"
+                f"🎯 目标群组：<code>未设置</code>\n"
+                f"📨 推送将发送到当前群组\n\n"
+                f"💡 使用以下命令设置：\n"
+                f"• <code>/set_work_notify_group 群组ID</code> - 设置推送目标群组",
+                parse_mode="HTML",
+                reply_markup=await get_main_keyboard(chat_id, True),
+                reply_to_message_id=message.message_id,
+            )
+        return
+
+    try:
+        target_id = int(args[1].strip())
+
+        if target_id == 0:
+            # 清除设置
+            await db.update_group_notification_target(chat_id, None)
+            await message.answer(
+                f"✅ <b>已清除推送目标群组设置</b>\n\n"
+                f"📨 上班/下班通知将发送到当前群组",
+                parse_mode="HTML",
+                reply_markup=await get_main_keyboard(chat_id, True),
+                reply_to_message_id=message.message_id,
+            )
+            return
+
+        # 验证机器人是否能访问目标群组
+        try:
+            chat = await bot.get_chat(target_id)
+            chat_name = chat.title or f"群组 {target_id}"
+
+            # 检查机器人是否是管理员
+            bot_member = await chat.get_member(bot.id)
+            if bot_member.status not in ["administrator", "creator"]:
+                await message.answer(
+                    f"⚠️ <b>警告：机器人在目标群组不是管理员</b>\n\n"
+                    f"群组：<code>{chat_name}</code>\n"
+                    f"状态：{bot_member.status}\n\n"
+                    f"💡 请先将机器人设为群组管理员，否则可能无法发送消息",
+                    parse_mode="HTML",
+                    reply_to_message_id=message.message_id,
+                )
+        except Exception as e:
+            await message.answer(
+                f"❌ <b>无法访问目标群组</b>\n\n"
+                f"群组ID：<code>{target_id}</code>\n"
+                f"错误：{str(e)[:100]}\n\n"
+                f"💡 请确保：\n"
+                f"• 机器人已加入该群组\n"
+                f"• 群组ID格式正确（负值）\n"
+                f"• 机器人是群组管理员",
+                parse_mode="HTML",
+                reply_to_message_id=message.message_id,
+            )
+            return
+
+        # 保存设置
+        await db.update_group_notification_target(chat_id, target_id)
+
+        await message.answer(
+            f"✅ <b>上班/下班推送目标群组设置成功</b>\n\n"
+            f"🎯 群组名称：<code>{chat_name}</code>\n"
+            f"🆔 群组ID：<code>{target_id}</code>\n\n"
+            f"📨 所有上班/下班打卡通知将发送到此群组\n"
+            f"💡 其他通知（吃饭、超时等）不受影响",
+            parse_mode="HTML",
+            reply_markup=await get_main_keyboard(chat_id, True),
+            reply_to_message_id=message.message_id,
+        )
+
+    except ValueError:
+        await message.answer(
+            f"❌ <b>群组ID格式错误</b>\n\n"
+            f"💡 群组ID必须是数字格式\n"
+            f"📝 示例：<code>/set_work_notify_group -1001234567890</code>",
+            parse_mode="HTML",
+            reply_to_message_id=message.message_id,
+        )
+    except Exception as e:
+        logger.error(f"设置上班/下班推送目标群组失败: {e}")
+        await message.answer(
+            f"❌ <b>设置失败</b>\n\n" f"错误：{str(e)[:100]}",
+            parse_mode="HTML",
+            reply_to_message_id=message.message_id,
+        )
+
+
+@admin_required
+@rate_limit(rate=3, per=30)
+async def cmd_clear_work_notify_group(message: types.Message):
+    """清除上班/下班推送目标群组设置"""
+    chat_id = message.chat.id
+
+    # 获取当前设置用于提示
+    current_target = await db.get_group_notification_target(chat_id)
+
+    if not current_target:
+        await message.answer(
+            f"ℹ️ <b>当前未设置推送目标群组</b>\n\n" f"📨 上班/下班通知已发送到当前群组",
+            parse_mode="HTML",
+            reply_markup=await get_main_keyboard(chat_id, True),
+            reply_to_message_id=message.message_id,
+        )
+        return
+
+    # 清除设置
+    await db.update_group_notification_target(chat_id, None)
+
+    await message.answer(
+        f"✅ <b>已清除推送目标群组设置</b>\n\n"
+        f"🆔 原目标群组：<code>{current_target}</code>\n"
+        f"📨 上班/下班通知将恢复发送到当前群组",
+        parse_mode="HTML",
+        reply_markup=await get_main_keyboard(chat_id, True),
+        reply_to_message_id=message.message_id,
+    )
 
 
 # ========== 修复消息引用 ==========
@@ -6066,6 +6232,8 @@ async def register_handlers():
     dp.message.register(cmd_setdualmode, Command("setdualmode"))
     dp.message.register(cmd_setshiftgrace, Command("setshiftgrace"))
     dp.message.register(handle_ranking_shift_command, Command("ranking"))
+    dp.message.register(cmd_set_work_notify_group, Command("set_work_notify_group"))
+    dp.message.register(cmd_clear_work_notify_group, Command("clear_work_notify_group"))
 
     # 按钮处理器
     dp.message.register(
