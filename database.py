@@ -314,45 +314,39 @@ class PostgreSQLDatabase:
         self, chat_id: int, current_dt: datetime = None
     ) -> date:
         """
-        获取当前的'业务日期' - 智能版
-        
-        特殊逻辑：7:00之后允许打今天的卡，但数据逻辑上还是昨天的
+        获取当前的'业务日期'。
+        如果当前时间还没到设置的重置时间，则业务日期算作昨天。
         """
         if current_dt is None:
             current_dt = self.get_beijing_time()
-        
-        # 获取重置时间
+
+        # 获取群组设置的重置时间
         group_data = await self.get_group_cached(chat_id)
-        reset_hour = group_data.get("reset_hour", Config.DAILY_RESET_HOUR)
-        reset_minute = group_data.get("reset_minute", Config.DAILY_RESET_MINUTE)
-        
-        # 构建重置时间点
+        if group_data:
+            reset_hour = group_data.get("reset_hour", Config.DAILY_RESET_HOUR)
+            reset_minute = group_data.get("reset_minute", Config.DAILY_RESET_MINUTE)
+        else:
+            reset_hour = Config.DAILY_RESET_HOUR
+            reset_minute = Config.DAILY_RESET_MINUTE
+
+        # 构建今天的重置时间点
         reset_time_today = current_dt.replace(
             hour=reset_hour, minute=reset_minute, second=0, microsecond=0
         )
-        
-        # 7:00切换时间点
-        switch_hour = reset_hour - 2 if reset_hour >= 2 else 0
-        switch_time = current_dt.replace(
-            hour=switch_hour, minute=reset_minute, second=0, microsecond=0
+
+        # 如果当前时间小于重置时间，说明还在上一天的业务周期内
+        business_date = (
+            (current_dt - timedelta(days=1)).date()
+            if current_dt < reset_time_today
+            else current_dt.date()
         )
-        
-        # 🎯 新逻辑：
-        # 1. 7:00之前：昨天的业务周期
-        # 2. 7:00-9:00：允许打今天的卡，但数据算昨天的
-        # 3. 9:00之后：今天的业务周期
-        
-        if current_dt < switch_time:
-            # 7:00之前：昨天的业务
-            return (current_dt - timedelta(days=1)).date()
-        elif current_dt < reset_time_today:
-            # 7:00-9:00：特殊时段
-            # 为了打卡：返回今天（让用户可以打卡）
-            # 为了数据：实际数据会记录到昨天的表中
-            return current_dt.date()
-        else:
-            # 9:00之后：今天的业务
-            return current_dt.date()
+
+        logger.debug(
+            f"📅 业务日期计算: chat_id={chat_id}, 当前时间={current_dt}, "
+            f"重置时间={reset_time_today}, 业务日期={business_date}"
+        )
+
+        return business_date
 
     # ========== 初始化方法 ==========
     async def initialize(self):
@@ -2156,55 +2150,26 @@ class PostgreSQLDatabase:
         """
 
         # ========= 0. 统一业务日期与月份统计点 =========
+        business_date = await self.get_business_date(chat_id)
+        statistic_date = business_date.replace(day=1)
 
-        now = self.get_beijing_time()
-
-        # 获取群组重置时间
-        group_data = await self.get_group_cached(chat_id)
-        reset_hour = group_data.get("reset_hour", Config.DAILY_RESET_HOUR)
-        reset_minute = group_data.get("reset_minute", Config.DAILY_RESET_MINUTE)
-
-        # 构建切换时间
-        switch_hour = reset_hour - 2 if reset_hour >= 2 else 0
-        switch_time = now.replace(hour=switch_hour, minute=reset_minute, second=0, microsecond=0)
-        reset_time_today = now.replace(hour=reset_hour, minute=reset_minute, second=0, microsecond=0)
-
-        # 🎯 核心逻辑：判断实际记录日期
-        if now < switch_time:
-            # 7:00之前 → 记录昨天
-            actual_record_date = (now - timedelta(days=1)).date()
-            logger.info(f"⏰ 7:00之前，记录昨天: {actual_record_date}")
-        elif now < reset_time_today:
-            # 7:00-9:00 → 用户可以打今天的卡，但数据归昨天
-            actual_record_date = (now - timedelta(days=1)).date()
-            logger.info(f"⏰ 7:00-9:00特殊处理，记录昨天: {actual_record_date}")
-        else:
-            # 9:00之后 → 记录今天
-            actual_record_date = record_date
-            logger.info(f"⏰ 9:00之后，记录今天: {actual_record_date}")
-
-        # 月统计时间
-        statistic_date = actual_record_date.replace(day=1)
-
-        # ========= 1️⃣ 自动判定班次 =========
+        # ========= 1. 自动判定班次 =========
         if shift is None:
             try:
                 checkin_time_obj = datetime.strptime(checkin_time, "%H:%M").time()
-                # 班次判定基于实际业务日期，不依赖当前北京时间
-                full_datetime = datetime.combine(actual_record_date, checkin_time_obj)
+                # 班次判定基于业务日期，不依赖当前北京时间
+                full_datetime = datetime.combine(business_date, checkin_time_obj)
                 shift = await self.determine_shift_for_time(
                     chat_id, full_datetime, checkin_type
                 ) or "day"
             except Exception as e:
                 logger.error(f"班次判定失败: {e}")
                 shift = "day"
-        
 
         self._ensure_pool_initialized()
 
         async with self.pool.acquire() as conn:
             async with conn.transaction():
-
 
                 # ========= 2. 读取当前 soft reset 状态 =========
                 current_soft_reset = False
