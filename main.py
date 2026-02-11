@@ -3545,9 +3545,9 @@ async def cmd_setresettime(message: types.Message):
 
             # 🎯【唯一修改】在这里触发双班硬重置调度
             # 注意：这里不是执行重置，而是为今天的重置做准备
-            from dual_shift_reset import prepare_daily_reset
+            from dual_shift_reset import handle_hard_reset
 
-            await prepare_daily_reset(chat_id, message.from_user.id)
+            await handle_hard_reset(chat_id, message.from_user.id)
 
             await message.answer(
                 f"✅ 每日重置时间已设置为：<code>{hour:02d}:{minute:02d}</code>\n\n"
