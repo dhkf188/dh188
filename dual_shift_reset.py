@@ -59,14 +59,14 @@ async def handle_hard_reset(chat_id: int, operator_id: Optional[int] = None) -> 
 
 
 # ========== 2. 双班硬重置核心流程 ==========
+
+
 async def _dual_shift_hard_reset(
     chat_id: int, operator_id: Optional[int] = None
 ) -> bool:
     """
-    双班硬重置主流程 - 严格按照规范顺序执行（增强版）
+    双班硬重置主流程 - 严格按照规范顺序执行
     """
-    from main import notification_service
-
     try:
         logger.info(f"🚀 [双班硬重置] 开始处理群组 {chat_id}")
 
@@ -78,49 +78,36 @@ async def _dual_shift_hard_reset(
         # 重置时间
         reset_hour = group_data.get("reset_hour", 0)
         reset_minute = group_data.get("reset_minute", 0)
-
-        # 昨天日期（用于导出和清理）
-        yesterday = (now - timedelta(days=1)).date()
-        today_date = now.date()
-
-        logger.info(
-            f"📅 [时间计算] 群组{chat_id}: "
-            f"重置时间={reset_hour:02d}:{reset_minute:02d}, "
-            f"昨天={yesterday}, 今天={today_date}"
-        )
-
-        # ===== 1. 强制结束白班未下班（昨天） =====
-        white_force_count = await _force_end_white_shift(chat_id, now, yesterday)
-
-        # ===== 2. 强制结束夜班未下班 =====
-        # 计算强制结束时间（重置时间+2小时）
         reset_time_today = now.replace(
             hour=reset_hour, minute=reset_minute, second=0, microsecond=0
         )
+
+        # 计算今天起点（白班上班允许窗口）
+        today_start = await _calculate_today_start(chat_id, shift_config, now)
+        today_date = today_start.date()
+
+        # 昨天日期（用于导出和清理）
+        yesterday = (now - timedelta(days=1)).date()
+
+        logger.info(
+            f"📅 [时间计算] 群组{chat_id}: "
+            f"重置时间={reset_time_today.strftime('%H:%M')}, "
+            f"今天起点={today_start.strftime('%m-%d %H:%M')}, "
+            f"昨天={yesterday}"
+        )
+
+        # ===== 1. 强制结束白班未下班 =====
+        white_force_count = await _force_end_white_shift(chat_id, now, yesterday)
+
+        # ===== 2. 强制结束夜班未下班（reset_time + 2h） =====
         night_force_count = await _force_end_night_shift(
             chat_id, now, reset_time_today, yesterday
         )
 
-        # ===== 3. 🚨【增强】导出昨天数据（白班+夜班） =====
+        # ===== 3. 导出昨天数据（白班+夜班） =====
         export_success = await _export_yesterday_data(chat_id, yesterday)
 
-        # 🚨【新增】导出失败必须中止
-        if not export_success:
-            logger.error(f"❌ [双班硬重置] 昨日数据导出失败，中止清理流程")
-            # 尝试发送失败通知（可选）
-            try:
-                await notification_service.send_notification(
-                    chat_id,
-                    f"❌ <b>双班日切失败</b>\n"
-                    f"📅 日期: {yesterday}\n"
-                    f"⚠️ 原因: 数据导出失败\n"
-                    f"💡 请管理员手动导出或检查日志",
-                )
-            except:
-                pass
-            return False
-
-        # ===== 4. 🚨【增强】清理旧数据（仅在导出成功后执行） =====
+        # ===== 4. 清理旧数据 =====
         cleanup_stats = await _cleanup_old_data(chat_id, yesterday, today_date)
 
         # ===== 5. 记录操作日志 =====
@@ -128,7 +115,7 @@ async def _dual_shift_hard_reset(
             f"📊 [双班硬重置完成] 群组{chat_id}\n"
             f"   • 强制结束白班: {white_force_count} 人\n"
             f"   • 强制结束夜班: {night_force_count} 人\n"
-            f"   • 数据导出: ✅成功\n"
+            f"   • 数据导出: {'✅成功' if export_success else '❌失败'}\n"
             f"   • 清理记录: {cleanup_stats}\n"
             f"   • 操作员: {operator_id or '系统'}"
         )
@@ -370,11 +357,13 @@ async def _export_yesterday_data(chat_id: int, yesterday: date) -> bool:
 
 
 # ========== 7. 数据清理 ==========
+
+
 async def _cleanup_old_data(
     chat_id: int, yesterday: date, today_date: date
 ) -> Dict[str, int]:
     """
-    清理旧数据，仅保留今天的数据（增强事务完整性）
+    清理旧数据，仅保留今天的数据
     规则：
     - 昨天之前的数据：直接删除
     - 昨天的数据：已导出，删除
@@ -391,41 +380,10 @@ async def _cleanup_old_data(
         async with db.pool.acquire() as conn:
             async with conn.transaction():
 
-                # 1. 🚨【增强】先清理用户活动状态（避免外键依赖问题）
-                await conn.execute(
-                    """
-                    UPDATE users 
-                    SET current_activity = NULL, 
-                        activity_start_time = NULL,
-                        last_updated = $2
-                    WHERE chat_id = $1 
-                      AND last_updated <= $3
-                    """,
-                    chat_id,
-                    today_date,
-                    yesterday,
-                )
-
-                # 2. 删除昨天之前的所有数据（按依赖顺序）
+                # 1. 删除昨天之前的所有数据
                 before_yesterday = yesterday - timedelta(days=1)
 
-                # daily_statistics 先删（无外键依赖）
-                result = await conn.execute(
-                    "DELETE FROM daily_statistics WHERE chat_id = $1 AND record_date <= $2",
-                    chat_id,
-                    before_yesterday,
-                )
-                stats["before_yesterday"] += _parse_delete_count(result)
-
-                # work_records 再删
-                result = await conn.execute(
-                    "DELETE FROM work_records WHERE chat_id = $1 AND record_date <= $2",
-                    chat_id,
-                    before_yesterday,
-                )
-                stats["before_yesterday"] += _parse_delete_count(result)
-
-                # user_activities 最后删
+                # user_activities
                 result = await conn.execute(
                     "DELETE FROM user_activities WHERE chat_id = $1 AND activity_date <= $2",
                     chat_id,
@@ -433,16 +391,30 @@ async def _cleanup_old_data(
                 )
                 stats["before_yesterday"] += _parse_delete_count(result)
 
-                # 3. 删除昨天的数据（已导出）
+                # work_records
+                result = await conn.execute(
+                    "DELETE FROM work_records WHERE chat_id = $1 AND record_date <= $2",
+                    chat_id,
+                    before_yesterday,
+                )
+                stats["before_yesterday"] += _parse_delete_count(result)
+
                 # daily_statistics
                 result = await conn.execute(
-                    "DELETE FROM daily_statistics WHERE chat_id = $1 AND record_date = $2",
+                    "DELETE FROM daily_statistics WHERE chat_id = $1 AND record_date <= $2",
+                    chat_id,
+                    before_yesterday,
+                )
+                stats["before_yesterday"] += _parse_delete_count(result)
+
+                # 2. 删除昨天的数据（已导出）
+                result = await conn.execute(
+                    "DELETE FROM user_activities WHERE chat_id = $1 AND activity_date = $2",
                     chat_id,
                     yesterday,
                 )
-                stats["daily_statistics"] = _parse_delete_count(result)
+                stats["user_activities"] = _parse_delete_count(result)
 
-                # work_records
                 result = await conn.execute(
                     "DELETE FROM work_records WHERE chat_id = $1 AND record_date = $2",
                     chat_id,
@@ -450,13 +422,28 @@ async def _cleanup_old_data(
                 )
                 stats["work_records"] = _parse_delete_count(result)
 
-                # user_activities
                 result = await conn.execute(
-                    "DELETE FROM user_activities WHERE chat_id = $1 AND activity_date = $2",
+                    "DELETE FROM daily_statistics WHERE chat_id = $1 AND record_date = $2",
                     chat_id,
                     yesterday,
                 )
-                stats["user_activities"] = _parse_delete_count(result)
+                stats["daily_statistics"] = _parse_delete_count(result)
+
+                # 3. 清理 users 表中的昨日活动状态
+                await conn.execute(
+                    """
+                    UPDATE users 
+                    SET current_activity = NULL, 
+                        activity_start_time = NULL,
+                        last_updated = $2
+                    WHERE chat_id = $1 
+                      AND (shift = 'day' OR shift = 'night')
+                      AND last_updated <= $3
+                    """,
+                    chat_id,
+                    today_date,
+                    yesterday,
+                )
 
         total_deleted = (
             stats["user_activities"]
@@ -473,13 +460,9 @@ async def _cleanup_old_data(
                 f"日统计{stats['daily_statistics']}条, "
                 f"更早数据{stats['before_yesterday']}条"
             )
-        else:
-            logger.info(f"🧹 [数据清理] 群组{chat_id}: 无数据需要清理")
 
     except Exception as e:
         logger.error(f"❌ [数据清理] 失败 {chat_id}: {e}")
-        # 🚨【增强】抛出异常，让上层知道清理失败
-        raise
 
     return stats
 
