@@ -16,7 +16,6 @@ from typing import Dict, Optional, List
 from contextlib import suppress
 from datetime import timedelta
 from aiogram.types import BotCommand, BotCommandScopeAllChatAdministrators
-from dual_shift_reset import handle_hard_reset, _force_end_and_cleanup
 
 
 # 配置日志
@@ -565,7 +564,7 @@ async def reset_daily_data_if_needed(chat_id: int, uid: int):
         now = get_beijing_time()
 
         # 🧠 获取业务日期（系统唯一的“今天”）
-        business_date = await db.get_business_date(chat_id, now, uid)
+        business_date = await db.get_business_date(chat_id, now)
 
         # 获取用户数据
         user_data = await db.get_user_cached(chat_id, uid)
@@ -797,19 +796,6 @@ async def activity_timer(
     (引用回复 + 自动降级 + 自动重试 + 每10分钟超时提醒 + 2小时强制回座)
     """
     try:
-        from bot_manager import bot_manager
-
-        bot = bot_manager.bot
-        if bot is None:
-            logger.error(f"❌ 定时器无法获取bot对象: {chat_id}-{uid}")
-            return
-
-        from utils import notification_service
-
-        if notification_service.bot is None:
-            notification_service.bot = bot
-        if notification_service.bot_manager is None:
-            notification_service.bot_manager = bot_manager
         # 添加班次文本
         shift_text = "白班" if shift == "day" else "夜班"
         logger.info(f"⏰ 定时器启动: {chat_id}-{uid} - {act}（{shift_text}）")
@@ -1718,23 +1704,9 @@ async def process_work_checkin(message: types.Message, checkin_type: str):
             return
 
         # ========== 3️⃣ 获取并行计算结果 ==========
-        shift_config = await shift_config_task  # 已在前面获取
-        grace_before = shift_config.get("grace_before", 120)
-        day_start_str = shift_config.get("day_start", "09:00")
-
-        try:
-            day_start_time = datetime.strptime(day_start_str, "%H:%M").time()
-            day_start_dt = datetime.combine(now.date(), day_start_time).replace(
-                tzinfo=now.tzinfo
-            )
-            work_window_start = day_start_dt - timedelta(minutes=grace_before)
-            business_date = work_window_start.date()
-        except Exception as e:
-            logger.error(f"计算业务日期失败: {e}")
-            business_date = now.date()
-
-        # 后续代码...
-
+        business_date = await db.get_business_date(
+            chat_id=chat_id, current_dt=now, user_id=uid, checkin_type=checkin_type
+        )
         work_hours = await work_hours_task
 
         is_dual_mode = shift_config.get("dual_mode", False) if shift_config else False
@@ -1935,7 +1907,35 @@ async def process_work_checkin(message: types.Message, checkin_type: str):
                 chat_id, uid, "work_end", determined_shift_simple, business_date
             )
             if has_record:
-                # ... 重复打卡处理代码（保持不变）...
+                # 详细重复打卡展示
+                existing_record = await _get_existing_work_record(
+                    chat_id, uid, "work_end", determined_shift_simple, business_date
+                )
+                if existing_record:
+                    existing_time = existing_record.get("checkin_time", "未知时间")
+                    existing_status = existing_record.get("status", "未知状态")
+                    await message.answer(
+                        f"🚫 您本班次已经打过{action_text}卡了！\n\n"
+                        f"📊 <b>已有记录详情：</b>\n"
+                        f"   • 打卡时间：<code>{existing_time}</code>\n"
+                        f"   • 打卡状态：{existing_status}\n"
+                        f"   • 班次类型：<code>{shift_text}</code>\n"
+                        f"   • 记录时间：<code>{existing_record.get('created_at', '未知').strftime('%m/%d %H:%M')}</code>",
+                        parse_mode="HTML",
+                        reply_to_message_id=message.message_id,
+                        reply_markup=await get_main_keyboard(
+                            chat_id, await is_admin_task
+                        ),
+                    )
+                else:
+                    await message.answer(
+                        f"❌ 您本班次已经打过{action_text}卡！",
+                        reply_to_message_id=message.message_id,
+                        reply_markup=await get_main_keyboard(
+                            chat_id, await is_admin_task
+                        ),
+                    )
+                logger.info(f"[{trace_id}] ⚠️ 用户本班次重复{action_text}")
                 return
 
             # 检查是否已打上班卡
@@ -1952,23 +1952,16 @@ async def process_work_checkin(message: types.Message, checkin_type: str):
                 logger.warning(f"[{trace_id}] ⚠️ 用户试图{action_text}打卡但未上班")
                 return
 
-            # ===== ✅【插入修复代码在这里】=====
-            # 获取设定的下班时间
-            expected_time_str = work_hours["work_end"]
-            expected_time = datetime.strptime(expected_time_str, "%H:%M").time()
-            expected_dt = datetime.combine(now.date(), expected_time).replace(
-                tzinfo=now.tzinfo
+            # 计算时间差和罚款
+            time_diff_minutes, time_diff_seconds, expected_dt_from_hours = (
+                calculate_cross_day_time_diff(now, work_hours["work_end"], "work_end")
             )
 
-            # 夜班跨天处理
-            if is_dual_mode and determined_shift_simple == "night" and now.hour < 12:
-                expected_dt = expected_dt.replace(day=now.day - 1)
+            # 使用更准确的时间差计算
+            if expected_dt and hasattr(expected_dt, "strftime"):
+                time_diff_seconds = (now - expected_dt).total_seconds()
+                time_diff_minutes = time_diff_seconds / 60
 
-            # 计算时间差
-            time_diff_seconds = (now - expected_dt).total_seconds()
-            time_diff_minutes = time_diff_seconds / 60
-
-            # 罚款计算
             fine_amount = 0
             status = "✅ 准时"
             is_late_early = False
@@ -1984,15 +1977,6 @@ async def process_work_checkin(message: types.Message, checkin_type: str):
                     status += f"（💰罚款 {fine_amount}元）"
                 is_late_early = True
                 emoji_status = "🏃"
-            elif time_diff_seconds > 0:  # 加班
-                fine_amount = await calculate_work_fine("work_end", time_diff_minutes)
-                duration = MessageFormatter.format_duration(time_diff_seconds)
-                status = f"⏰ 加班 {duration}"
-                if fine_amount:
-                    status += f"（💰罚款 {fine_amount}元）"
-                is_late_early = True
-                emoji_status = "🌙"
-            # ===== ✅【修复代码结束】=====
 
             # 自动结束活动
             activity_auto_ended = False
@@ -2005,14 +1989,14 @@ async def process_work_checkin(message: types.Message, checkin_type: str):
                     activity_auto_ended = True
                     logger.info(f"[{trace_id}] 🔄 已自动结束活动：{current_activity}")
 
-            # 写入数据库
+            # 写入数据库（带重试机制）
             for attempt in range(2):
                 try:
                     await db.add_work_record(
                         chat_id=chat_id,
                         user_id=uid,
                         record_date=business_date,
-                        checkin_type="work_end",
+                        checkin_type="work_end",  # 修复：应该是work_end不是work_start
                         checkin_time=current_time,
                         status=status,
                         time_diff_minutes=time_diff_minutes,
@@ -2026,7 +2010,13 @@ async def process_work_checkin(message: types.Message, checkin_type: str):
                         f"[{trace_id}] ❌ 数据写入失败，第{attempt+1}次尝试: {e}"
                     )
                     if attempt == 1:
-                        await message.answer("⚠️ 数据保存失败，请稍后再试。")
+                        await message.answer(
+                            "⚠️ 数据保存失败，请稍后再试。",
+                            reply_markup=await get_main_keyboard(
+                                chat_id, await is_admin_task
+                            ),
+                            reply_to_message_id=message.message_id,
+                        )
                         return
                     await asyncio.sleep(0.5)
 
@@ -2035,7 +2025,7 @@ async def process_work_checkin(message: types.Message, checkin_type: str):
                 f"{emoji_status} <b>{shift_text}{action_text}完成</b>\n"
                 f"👤 用户：{MessageFormatter.format_user_link(uid, name)}\n"
                 f"⏰ {action_text}时间：<code>{current_time}</code>\n"
-                f"📅 下班时间：<code>{expected_time_str}</code>\n"
+                f"📅 下班时间：<code>{expected_dt.strftime('%m/%d %H:%M') if hasattr(expected_dt, 'strftime') else expected_dt_from_hours.strftime('%m/%d %H:%M')}</code>\n"
                 f"📊 状态：{status}"
             )
 
@@ -5793,10 +5783,10 @@ async def export_and_push_csv(
 
 # ========== 定时任务 ==========
 async def daily_reset_task():
-    """每日自动重置任务 - 双班模式增强版"""
+    """每日自动重置任务 - 双班/单班统一调度版"""
     logger.info("🚀 每日重置监控任务已启动")
 
-    # 限制同时处理的群组数量，防止 IO 阻塞
+    # 限制同时处理的群组数量
     sem = asyncio.Semaphore(10)
 
     async def process_single_group(chat_id, now):
@@ -5806,170 +5796,220 @@ async def daily_reset_task():
                 reset_hour = group_data.get("reset_hour", Config.DAILY_RESET_HOUR)
                 reset_minute = group_data.get("reset_minute", Config.DAILY_RESET_MINUTE)
 
-                # 获取班次配置
+                # ========== 1. 获取班次配置 ==========
                 shift_config = await db.get_shift_config(chat_id)
                 is_dual_mode = shift_config.get("dual_mode", False)
 
-                # ===== 1. 09:00 - 重置时间 =====
-                if now.hour == reset_hour and now.minute == reset_minute:
+                # ========== 2. 🚨【重构】双班模式分流 ==========
+                if is_dual_mode:
+                    # ----------------------------------------
+                    # 🟢 场景A: 09:00 - 执行软重置
+                    # ----------------------------------------
+                    if now.hour == reset_hour and now.minute == reset_minute:
+                        # 幂等性检查
+                        soft_reset_key = (
+                            f"soft_reset:{chat_id}:{now.strftime('%Y%m%d')}"
+                        )
+                        if global_cache.get(soft_reset_key) == now.hour:
+                            return
+
+                        logger.info(f"🔄 [双班软重置] 群组 {chat_id} 开始执行...")
+
+                        # 1. 获取群组成员
+                        group_members = await db.get_group_members(chat_id)
+                        reset_count = 0
+
+                        # 2. 对每个用户执行软重置
+                        for user_data in group_members:
+                            user_id = user_data["user_id"]
+                            user_lock = user_lock_manager.get_lock(chat_id, user_id)
+                            async with user_lock:
+                                success = await db.reset_user_soft_daily_data(
+                                    chat_id, user_id
+                                )
+                                if success:
+                                    reset_count += 1
+
+                        # 3. 取消所有定时器（但不结束活动）
+                        cancelled_count = 0
+                        try:
+                            if hasattr(timer_manager, "cancel_all_timers_for_group"):
+                                cancelled_count = (
+                                    await timer_manager.cancel_all_timers_for_group(
+                                        chat_id
+                                    )
+                                )
+                        except Exception as e:
+                            logger.error(f"取消定时器失败 {chat_id}: {e}")
+
+                        # 4. 发送软重置通知
+                        notification_text = (
+                            f"🔄 <b>双班软重置完成</b>\n"
+                            f"🏢 群组: <code>{chat_id}</code>\n"
+                            f"⏰ 重置时间: <code>{reset_hour:02d}:{reset_minute:02d}</code>\n"
+                            f"👥 重置用户: <code>{reset_count}</code> 人\n"
+                            f"⏱️ 取消定时器: <code>{cancelled_count}</code> 个\n\n"
+                            f"💡 软重置说明：\n"
+                            f"• 只重置了打卡次数和累计时长显示\n"
+                            f"• 所有历史活动记录已安全保存\n"
+                            f"• 夜班用户将继续活动不受影响\n"
+                            f"• 今日11:00将执行日切（导出+清理）"
+                        )
+
+                        try:
+                            await notification_service.send_notification(
+                                chat_id, notification_text
+                            )
+                        except Exception as e:
+                            logger.error(f"发送双班软重置通知失败: {e}")
+
+                        # 标记已执行
+                        global_cache.set(soft_reset_key, now.hour, ttl=86400)
+                        logger.info(
+                            f"✅ [双班软重置] 群组 {chat_id} 完成，重置 {reset_count} 个用户"
+                        )
+                        return
+
+                    # ----------------------------------------
+                    # 🔴 场景B: 其他时间 - 不处理（日切由 dual_shift_cutover_task 处理）
+                    # ----------------------------------------
+                    else:
+                        return
+
+                # ========== 3. 单班模式（原有逻辑） ==========
+                else:
                     # 幂等性检查
                     reset_flag_key = f"last_reset:{chat_id}:{now.strftime('%Y%m%d')}"
                     if global_cache.get(reset_flag_key) == now.hour:
-                        logger.debug(f"⏭️ 群组 {chat_id} 今日已重置，跳过")
                         return
 
-                    logger.info(f"⏰ [重置时间] 群组 {chat_id} 开始处理...")
+                    # 触发判断
+                    if now.hour != reset_hour or now.minute != reset_minute:
+                        return
 
-                    if is_dual_mode:
-                        # 🎯 双班模式：只重置统计，不删数据
-                        await handle_hard_reset(chat_id, None)
-                        logger.info(f"✅ [双班模式] 群组 {chat_id} 重置统计完成")
-                    else:
-                        # 单班模式：执行原有的重置逻辑
-                        await _process_single_shift_reset(chat_id, now)
+                    logger.info(f"⏰ [单班重置] 群组 {chat_id} 开始重置...")
 
-                    # 标记已执行
+                    # 原有的单班重置逻辑
+                    business_date = (
+                        now.date()
+                        if now.hour >= 12
+                        else (now - timedelta(days=1)).date()
+                    )
+                    file_name = (
+                        f"backup_{chat_id}_{business_date.strftime('%Y%m%d')}.csv"
+                    )
+
+                    # 导出备份
+                    try:
+                        await export_and_push_csv(
+                            chat_id, target_date=business_date, file_name=file_name
+                        )
+                    except Exception as e:
+                        logger.error(f"群组 {chat_id} 备份失败: {e}")
+
+                    # 业务数据操作
+                    completion_result = (
+                        await db.complete_all_pending_activities_before_reset(
+                            chat_id, now
+                        )
+                    )
+                    await db.force_reset_all_users_in_group(
+                        chat_id, target_date=business_date
+                    )
+
+                    # 清理定时器
+                    if hasattr(timer_manager, "cancel_all_timers_for_group"):
+                        await timer_manager.cancel_all_timers_for_group(chat_id)
+
+                    # 发送通知
+                    try:
+                        await send_reset_notification(chat_id, completion_result, now)
+                    except Exception as e:
+                        logger.error(f"群组 {chat_id} 通知发送失败: {e}")
+
+                    # 标记成功
                     global_cache.set(reset_flag_key, now.hour, ttl=86400)
-
-            except Exception as e:
-                logger.error(f"处理群组 {chat_id} 失败: {e}", exc_info=True)
-
-                # ===== 2. 11:00 - 强制结束+清理（仅双班模式）=====
-                force_hour = (reset_hour + 2) % 24
-                if (
-                    is_dual_mode
-                    and now.hour == force_hour
-                    and now.minute == reset_minute
-                ):
-                    # 幂等性检查
-                    cleanup_flag_key = (
-                        f"last_cleanup:{chat_id}:{now.strftime('%Y%m%d')}"
-                    )
-                    if global_cache.get(cleanup_flag_key) == now.hour:
-                        logger.debug(f"⏭️ 群组 {chat_id} 今日已清理，跳过")
-                        return
-
-                    logger.info(f"⏰ [强制结束] 群组 {chat_id} 开始处理...")
-
-                    reset_time_today = now.replace(
-                        hour=reset_hour, minute=reset_minute, second=0, microsecond=0
-                    )
-                    yesterday = (now - timedelta(days=1)).date()
-
-                    # 执行强制结束+导出+清理
-                    cleanup_stats = await _force_end_and_cleanup(
-                        chat_id, now, reset_time_today, yesterday
-                    )
-
-                    logger.info(
-                        f"✅ [强制结束] 群组 {chat_id} 完成\n"
-                        f"   • 强制结束: {cleanup_stats.get('force_ended', 0)} 人\n"
-                        f"   • 导出成功: {cleanup_stats.get('export_success', False)}\n"
-                        f"   • 删除数据: {cleanup_stats.get('deleted', 0)} 条\n"
-                        f"   • 清理日期: {cleanup_stats.get('yesterday', yesterday)}"
-                    )
-
-                    # 标记已执行
-                    global_cache.set(cleanup_flag_key, now.hour, ttl=86400)
+                    logger.info(f"✅ [单班重置] 群组 {chat_id} 完成")
 
             except Exception as e:
                 logger.error(f"❌ 处理群组 {chat_id} 严重失败: {e}")
                 logger.exception(e)
 
-    # ===== 提取单班重置逻辑为独立函数 =====
-    async def _process_single_shift_reset(chat_id: int, now: datetime):
-        """处理单班模式重置"""
-        try:
-            # 计算业务日期
-            business_date = (
-                now.date() if now.hour >= 12 else (now - timedelta(days=1)).date()
-            )
-
-            # 生成文件名
-            file_name = f"backup_{chat_id}_{business_date.strftime('%Y%m%d')}.csv"
-
-            # 1. 导出备份
-            try:
-                await export_and_push_csv(
-                    chat_id,
-                    target_date=business_date,
-                    file_name=file_name,
-                    is_daily_reset=True,
-                    from_monthly_table=False,
-                )
-                logger.info(f"✅ [单班] 群组 {chat_id} 数据导出成功")
-            except Exception as e:
-                logger.error(f"❌ [单班] 群组 {chat_id} 备份失败: {e}")
-
-            # 2. 结束所有未完成活动
-            try:
-                completion_result = (
-                    await db.complete_all_pending_activities_before_reset(chat_id, now)
-                )
-                logger.info(
-                    f"✅ [单班] 群组 {chat_id} 结束活动: {completion_result.get('completed_count', 0)} 个"
-                )
-            except Exception as e:
-                logger.error(f"❌ [单班] 群组 {chat_id} 结束活动失败: {e}")
-                completion_result = {"completed_count": 0, "total_fines": 0}
-
-            # 3. 重置所有用户数据
-            try:
-                await db.force_reset_all_users_in_group(
-                    chat_id, target_date=business_date
-                )
-                logger.info(f"✅ [单班] 群组 {chat_id} 用户数据重置完成")
-            except Exception as e:
-                logger.error(f"❌ [单班] 群组 {chat_id} 重置用户失败: {e}")
-
-            # 4. 清理定时器
-            try:
-                if hasattr(timer_manager, "cancel_all_timers_for_group"):
-                    cancelled = await timer_manager.cancel_all_timers_for_group(chat_id)
-                    logger.info(f"✅ [单班] 群组 {chat_id} 取消 {cancelled} 个定时器")
-                else:
-                    logger.warning(
-                        f"⚠️ [单班] 群组 {chat_id} timer_manager 没有 cancel_all_timers_for_group 方法"
-                    )
-            except Exception as e:
-                logger.error(f"❌ [单班] 群组 {chat_id} 清理定时器失败: {e}")
-
-            # 5. 发送通知
-            try:
-                await send_reset_notification(chat_id, completion_result, now)
-                logger.info(f"✅ [单班] 群组 {chat_id} 重置通知发送成功")
-            except Exception as e:
-                logger.error(f"❌ [单班] 群组 {chat_id} 通知发送失败: {e}")
-
-            logger.info(f"✅ [单班模式] 群组 {chat_id} 重置完成")
-
-        except Exception as e:
-            logger.error(f"❌ [单班模式] 群组 {chat_id} 重置失败: {e}")
-            logger.exception(e)
-            raise
-
-    # ===== 主循环 =====
     while True:
         try:
             now = get_beijing_time()
-
-            # 获取所有群组
             all_groups = await db.get_all_groups()
-
-            # 并发处理所有群组
-            if all_groups:
-                tasks = [process_single_group(cid, now) for cid in all_groups]
-                await asyncio.gather(*tasks, return_exceptions=True)
-
-            # 每分钟检查一次
-            await asyncio.sleep(60)
-
-        except asyncio.CancelledError:
-            logger.info("🛑 每日重置任务被取消")
-            break
+            tasks = [process_single_group(cid, now) for cid in all_groups]
+            await asyncio.gather(*tasks)
         except Exception as e:
             logger.error(f"❌ daily_reset_task 循环主逻辑出错: {e}")
-            logger.exception(e)
+        await asyncio.sleep(60)
+
+
+async def dual_shift_cutover_task():
+    """
+    双班模式专用日切任务 - 每天11:00执行
+    功能：强制结束夜班、导出昨天数据、清理昨天记录
+    """
+    logger.info("🚀 双班日切监控任务已启动（执行时间：11:00）")
+
+    sem = asyncio.Semaphore(10)
+
+    async def process_dual_cutover(chat_id, now):
+        async with sem:
+            try:
+                # 1. 检查是否是双班模式
+                shift_config = await db.get_shift_config(chat_id)
+                if not shift_config.get("dual_mode", False):
+                    return
+
+                # 2. 获取重置时间
+                group_data = await db.get_group_cached(chat_id)
+                reset_hour = group_data.get("reset_hour", Config.DAILY_RESET_HOUR)
+                reset_minute = group_data.get("reset_minute", Config.DAILY_RESET_MINUTE)
+
+                # 3. 只在11:00执行（重置时间+2小时）
+                expected_hour = (reset_hour + 2) % 24
+                if now.hour != expected_hour or now.minute != reset_minute:
+                    return
+
+                # 4. 幂等性检查
+                cutover_key = f"dual_cutover:{chat_id}:{now.strftime('%Y%m%d')}"
+                if global_cache.get(cutover_key) == now.hour:
+                    return
+
+                logger.info(f"⏰ [双班日切] 群组 {chat_id} 开始执行日切流程...")
+
+                # 5. 导入并执行双班硬重置
+                from dual_shift_reset import handle_hard_reset
+
+                success = await handle_hard_reset(chat_id, None)
+
+                if success:
+                    global_cache.set(cutover_key, now.hour, ttl=86400)
+                    logger.info(f"✅ [双班日切] 群组 {chat_id} 完成")
+                else:
+                    logger.error(f"❌ [双班日切] 群组 {chat_id} 失败")
+
+            except Exception as e:
+                logger.error(f"❌ 双班日切处理失败 {chat_id}: {e}")
+                logger.exception(e)
+
+    while True:
+        try:
+            now = get_beijing_time()
+            # 只在11:00前后10分钟检查，减少无效循环
+            if 10 <= now.hour <= 12:
+                all_groups = await db.get_all_groups()
+                tasks = [process_dual_cutover(cid, now) for cid in all_groups]
+                await asyncio.gather(*tasks)
+
+            await asyncio.sleep(60)  # 每分钟检查一次
+        except asyncio.CancelledError:
+            logger.info("🛑 双班日切任务已取消")
+            break
+        except Exception as e:
+            logger.error(f"❌ dual_shift_cutover_task 主循环出错: {e}")
             await asyncio.sleep(60)
 
 
@@ -6578,6 +6618,7 @@ async def main():
             asyncio.create_task(soft_reset_task(), name="soft_reset"),
             asyncio.create_task(memory_cleanup_task(), name="memory_cleanup"),
             asyncio.create_task(health_monitoring_task(), name="health_monitor"),
+            asyncio.create_task(dual_shift_cutover_task(), name="dual_shift_cutover"),
         ]
 
         # 针对 Render 的保活任务
