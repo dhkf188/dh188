@@ -310,40 +310,64 @@ class PostgreSQLDatabase:
         return self.get_beijing_time().date()
 
     # ========== 核心业务日期逻辑(管理员设定的周器时间-统一) ==========
+
     async def get_business_date(
-        self, chat_id: int, current_dt: datetime = None
+        self,
+        chat_id: int,
+        current_dt: datetime = None,
+        user_id: int = None,
     ) -> date:
         """
-        获取当前的'业务日期'。
-        如果当前时间还没到设置的重置时间，则业务日期算作昨天。
+        获取业务日期 - 基于上班宽容窗口计算
+
+        规则：
+        1. 双班模式下，业务日期 = 白班上班宽容窗口开始的日期
+        2. 08:30打卡 → 宽容窗口开始 = 07:00 → 业务日期 = 当天 ✅
+        3. 上班卡决定业务日期，不受重置时间影响
         """
         if current_dt is None:
             current_dt = self.get_beijing_time()
 
-        # 获取群组设置的重置时间
+        # 获取群组配置
         group_data = await self.get_group_cached(chat_id)
-        if group_data:
-            reset_hour = group_data.get("reset_hour", Config.DAILY_RESET_HOUR)
-            reset_minute = group_data.get("reset_minute", Config.DAILY_RESET_MINUTE)
-        else:
-            reset_hour = Config.DAILY_RESET_HOUR
-            reset_minute = Config.DAILY_RESET_MINUTE
+        shift_config = await self.get_shift_config(chat_id)
 
-        # 构建今天的重置时间点
-        reset_time_today = current_dt.replace(
-            hour=reset_hour, minute=reset_minute, second=0, microsecond=0
+        # 获取白班上班时间和宽容窗口
+        day_start_str = shift_config.get("day_start", "09:00")
+        grace_before = shift_config.get("grace_before", 120)
+
+        try:
+            # 解析白班上班时间
+            day_start_time = datetime.strptime(day_start_str, "%H:%M").time()
+        except (ValueError, TypeError):
+            day_start_time = datetime.strptime("09:00", "%H:%M").time()
+
+        # 构建今天的上班时间点
+        today = current_dt.date()
+        day_start_dt = datetime.combine(today, day_start_time).replace(
+            tzinfo=current_dt.tzinfo
         )
 
-        # 如果当前时间小于重置时间，说明还在上一天的业务周期内
-        business_date = (
-            (current_dt - timedelta(days=1)).date()
-            if current_dt < reset_time_today
-            else current_dt.date()
-        )
+        # 计算上班宽容窗口的开始时间（例如：09:00 - 120分钟 = 07:00）
+        work_window_start = day_start_dt - timedelta(minutes=grace_before)
+
+        # 🎯 核心：业务日期 = 宽容窗口开始的日期
+        business_date = work_window_start.date()
+
+        # 如果是双班模式且用户已打上班卡，确认业务日期不变
+        if user_id and shift_config.get("dual_mode", False):
+            # 检查用户是否已在当前业务日期打过上班卡
+            has_work_start = await self._check_work_record(
+                chat_id, user_id, "work_start", business_date
+            )
+            if has_work_start:
+                logger.debug(f"✅ 用户{user_id}已在{business_date}打上班卡")
 
         logger.debug(
-            f"📅 业务日期计算: chat_id={chat_id}, 当前时间={current_dt}, "
-            f"重置时间={reset_time_today}, 业务日期={business_date}"
+            f"📅 业务日期计算: 当前时间={current_dt.strftime('%Y-%m-%d %H:%M')}, "
+            f"白班上班={day_start_str}, 宽容窗口={grace_before}分钟, "
+            f"窗口开始={work_window_start.strftime('%Y-%m-%d %H:%M')}, "
+            f"业务日期={business_date}"
         )
 
         return business_date
@@ -478,6 +502,7 @@ class PostgreSQLDatabase:
                     dual_day_end TEXT,
                     shift_grace_before INTEGER DEFAULT 120,
                     shift_grace_after INTEGER DEFAULT 360,
+                    force_cleanup_delay INTEGER DEFAULT 2,
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 )
@@ -1283,7 +1308,7 @@ class PostgreSQLDatabase:
         """完成用户活动 - 支持班次、软重置、统计、超时、罚款"""
 
         # ===== 1️⃣ 班次处理 =====
-        shift_state = await self.get_current_shift_state(chat_id)
+        shift_state = await self.get_current_shift_state(chat_id, now, user_id)
         if shift is None:
             if shift_state:
                 shift = shift_state.get("current_shift")
@@ -2207,7 +2232,7 @@ class PostgreSQLDatabase:
         self,
         chat_id: int,
         user_id: int,
-        record_date,
+        record_date: date,  # 🎯 明确类型，不再覆盖
         checkin_type: str,
         checkin_time: str,
         status: str,
@@ -2218,39 +2243,38 @@ class PostgreSQLDatabase:
     ):
         """
         添加上下班记录 - 完整同步版
-        支持：
-        - 多班次判定
-        - 四表实时同步
-        - 软重置(soft_reset)兼容
-        - 跨天时长计算
+        重要：record_date 由调用方计算并传入，函数内部不再重新计算
         """
-
-        # ========= 0. 统一业务日期与月份统计点 =========
-        business_date = await self.get_business_date(chat_id)
+        # ========= 1. 使用调用方传入的业务日期 =========
+        business_date = record_date
         statistic_date = business_date.replace(day=1)
 
-        # ========= 1. 自动判定班次 =========
-        if shift is None:
+        # ========= 2. 自动判定班次（如果未提供） =========
+        if shift is None or shift == "day" and shift_detail is None:
             try:
+                # 使用业务日期组合完整时间
                 checkin_time_obj = datetime.strptime(checkin_time, "%H:%M").time()
-                # 班次判定基于业务日期，不依赖当前北京时间
                 full_datetime = datetime.combine(business_date, checkin_time_obj)
-                shift = (
-                    await self.determine_shift_for_time(
+                if shift_detail is None:
+                    shift_detail = await self.determine_shift_for_time(
                         chat_id, full_datetime, checkin_type
                     )
-                    or "day"
-                )
+                # 转换详细班次为简单班次
+                if shift_detail in ("night_last", "night_tonight"):
+                    shift = "night"
+                else:
+                    shift = shift_detail or "day"
             except Exception as e:
                 logger.error(f"班次判定失败: {e}")
                 shift = "day"
+                shift_detail = "day"
 
         self._ensure_pool_initialized()
 
         async with self.pool.acquire() as conn:
             async with conn.transaction():
 
-                # ========= 2. 读取当前 soft reset 状态 =========
+                # ========= 3. 读取当前 soft reset 状态 =========
                 current_soft_reset = False
                 soft_reset_row = await conn.fetchrow(
                     """
@@ -2267,7 +2291,7 @@ class PostgreSQLDatabase:
                 if soft_reset_row:
                     current_soft_reset = soft_reset_row["is_soft_reset"]
 
-                # ========= 3. 更新 work_records =========
+                # ========= 4. 更新 work_records =========
                 await conn.execute(
                     """
                     INSERT INTO work_records
@@ -2296,9 +2320,7 @@ class PostgreSQLDatabase:
                     shift_detail,
                 )
 
-                # ========= 4. 更新 daily_statistics =========
-                # 4.1 日罚款
-                activity_name = "work_fines"  # 默认值
+                # ========= 5. 更新 daily_statistics（罚款） =========
                 if fine_amount > 0:
                     activity_name = (
                         "work_start_fines"
@@ -2331,10 +2353,10 @@ class PostgreSQLDatabase:
                         shift,
                     )
 
-                # 4.2 下班逻辑：记录工作天数 + 工时
+                # ========= 6. 下班逻辑：工作天数 + 工时 =========
                 work_duration_seconds = 0
                 if checkin_type == "work_end":
-                    # 工作天数
+                    # 6.1 工作天数
                     await conn.execute(
                         """
                         INSERT INTO daily_statistics
@@ -2354,7 +2376,7 @@ class PostgreSQLDatabase:
                         shift,
                     )
 
-                    # 查询上班时间
+                    # 6.2 查询上班时间计算工时
                     start_row = await conn.fetchrow(
                         """
                         SELECT checkin_time FROM work_records
@@ -2380,7 +2402,7 @@ class PostgreSQLDatabase:
                                 diff_minutes += 1440  # 跨夜处理
                             work_duration_seconds = int(diff_minutes * 60)
 
-                            # 更新工时
+                            # 6.3 更新工时
                             await conn.execute(
                                 """
                                 INSERT INTO daily_statistics
@@ -2404,9 +2426,9 @@ class PostgreSQLDatabase:
                         except Exception as e:
                             logger.error(f"工时计算失败: {e}")
 
-                # ========= 5. 更新 monthly_statistics =========
+                # ========= 7. 更新 monthly_statistics =========
                 if checkin_type == "work_end":
-                    # 月工作天数
+                    # 7.1 月工作天数
                     await conn.execute(
                         """
                         INSERT INTO monthly_statistics
@@ -2424,7 +2446,7 @@ class PostgreSQLDatabase:
                         shift,
                     )
 
-                    # 月工时
+                    # 7.2 月工时
                     if work_duration_seconds > 0:
                         await conn.execute(
                             """
@@ -2444,7 +2466,7 @@ class PostgreSQLDatabase:
                             shift,
                         )
 
-                # 月度罚款
+                # 7.3 月度罚款
                 if fine_amount > 0:
                     await conn.execute(
                         """
@@ -2465,7 +2487,7 @@ class PostgreSQLDatabase:
                         shift,
                     )
 
-                # ========= 6. 更新 users 表罚款总计 =========
+                # ========= 8. 更新 users 表罚款总计 =========
                 if fine_amount > 0:
                     await conn.execute(
                         """
@@ -2478,13 +2500,38 @@ class PostgreSQLDatabase:
                         user_id,
                     )
 
-        # ========= 7. 清理缓存 =========
+        # ========= 9. 清理缓存 =========
         self._cache.pop(f"user:{chat_id}:{user_id}", None)
 
         logger.debug(
-            f"✅ [四表同步完成] 用户:{user_id} | 业务日期:{business_date} | "
-            f"班次:{shift} | 罚款:{fine_amount} | 工时:{work_duration_seconds}s"
+            f"✅ [工作记录] 用户:{user_id} | 业务日期:{business_date} | "
+            f"班次:{shift} | 类型:{checkin_type} | 罚款:{fine_amount} | 工时:{work_duration_seconds}s"
         )
+
+    async def _check_work_record(
+        self, chat_id: int, user_id: int, checkin_type: str, record_date: date
+    ) -> bool:
+        """检查用户在某天是否有指定类型的打卡记录"""
+        try:
+            async with self.pool.acquire() as conn:
+                row = await conn.fetchrow(
+                    """
+                    SELECT 1 FROM work_records 
+                    WHERE chat_id = $1 
+                      AND user_id = $2 
+                      AND record_date = $3 
+                      AND checkin_type = $4
+                    LIMIT 1
+                    """,
+                    chat_id,
+                    user_id,
+                    record_date,
+                    checkin_type,
+                )
+                return row is not None
+        except Exception as e:
+            logger.error(f"检查工作记录失败: {e}")
+            return False
 
     async def get_work_count_by_shift(
         self, chat_id: int, user_id: int, checkin_type: str, shift: str = None
