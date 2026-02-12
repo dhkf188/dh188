@@ -6235,8 +6235,9 @@ async def initialize_services():
 
         # 🎯 关键：验证 bot 和 bot_manager 是否真的初始化了
         global notification_service
-        notification_service = NotificationService(bot_manager=bot_manager)
         notification_service.bot = bot
+        notification_service.bot_manager = bot_manager
+        logger.info("✅ NotificationService已立即绑定bot实例")
 
         # 5. 🎯 核心修复：双重设置 NotificationService
         notification_service.bot_manager = bot_manager
@@ -6594,7 +6595,7 @@ async def main():
     """全环境通用 - 工业级稳固版 (适配 Render/VPS/Docker)"""
     # 1. 环境检测
     is_render = "RENDER" in os.environ
-    health_server_site = None  # 用于存储健康服务器实例
+    health_server_site = None
 
     if is_render:
         logger.info("🎯 检测到 Render 环境，应用低功耗安全配置")
@@ -6607,38 +6608,67 @@ async def main():
         # 2. 初始化核心服务（数据库等）
         await initialize_services()
 
-        # 3. 启动健康检查服务器 (适配 Render 端口)
-        # 修改点：保存返回值 site，以便后续安全关闭
+        # 3. 启动健康检查服务器
         health_server_site = await start_health_server()
 
-        # 4. 启动周期性后台任务
-        # 使用 list 存储任务引用，防止被垃圾回收
-        background_tasks = [
-            asyncio.create_task(daily_reset_task(), name="daily_reset"),
-            asyncio.create_task(soft_reset_task(), name="soft_reset"),
-            asyncio.create_task(memory_cleanup_task(), name="memory_cleanup"),
-            asyncio.create_task(health_monitoring_task(), name="health_monitor"),
-            asyncio.create_task(dual_shift_cutover_task(), name="dual_shift_cutover"),
-        ]
+        # ========== ✨【修改1】不再立即启动后台任务 ==========
+        # 移到这里，改为延迟启动
+        # background_tasks = [...]  ❌ 删除这行
 
-        # 针对 Render 的保活任务
-        if is_render:
-            background_tasks.append(
-                asyncio.create_task(keepalive_loop(), name="render_keepalive")
-            )
-
-        # 5. 启动机器人逻辑
+        # 4. 启动机器人逻辑
         await on_startup()
 
-        # 将 Polling 放入后台独立任务
+        # 5. 将 Polling 放入后台独立任务
         polling_task = asyncio.create_task(
             bot_manager.start_polling_with_retry(), name="telegram_polling"
         )
 
+        # ========== ✨【修改2】延迟30秒启动所有后台任务 ==========
+        async def delayed_startup():
+            """延迟启动后台任务，确保bot完全就绪"""
+            logger.info("⏳ 等待30秒，让Bot和数据库完全就绪...")
+            await asyncio.sleep(30)
+            
+            # 双重保险：再次确保notification_service有bot
+            if notification_service.bot is None:
+                notification_service.bot = bot
+                notification_service.bot_manager = bot_manager
+                logger.info("✅ NotificationService已绑定bot实例")
+            
+            # 恢复过期活动
+            try:
+                recovered = await recover_expired_activities()
+                logger.info(f"✅ 恢复 {recovered} 个过期活动")
+            except Exception as e:
+                logger.error(f"❌ 恢复过期活动失败: {e}")
+            
+            # 启动所有定时任务
+            background_tasks = [
+                asyncio.create_task(daily_reset_task(), name="daily_reset"),
+                asyncio.create_task(soft_reset_task(), name="soft_reset"),
+                asyncio.create_task(memory_cleanup_task(), name="memory_cleanup"),
+                asyncio.create_task(health_monitoring_task(), name="health_monitor"),
+                asyncio.create_task(dual_shift_cutover_task(), name="dual_shift_cutover"),
+            ]
+            
+            # 针对 Render 的保活任务
+            if is_render:
+                background_tasks.append(
+                    asyncio.create_task(keepalive_loop(), name="render_keepalive")
+                )
+            
+            # 保存到全局，方便finally中清理
+            global _background_tasks
+            _background_tasks = background_tasks
+            
+            logger.info(f"✅ 已启动 {len(background_tasks)} 个后台定时任务")
+        
+        # 启动延迟初始化
+        asyncio.create_task(delayed_startup())
+
         logger.info("🤖 机器人系统全功能已就绪")
 
         # 6. 核心：钉死进程，不让程序退出
-        # 这样即便 Polling 崩溃重启，主程序和 Web Server 依然活着
         await asyncio.Event().wait()
 
     except asyncio.CancelledError:
@@ -6646,7 +6676,7 @@ async def main():
     except Exception as e:
         logger.error(f"❌ 系统运行异常: {e}")
         if is_render:
-            sys.exit(1)  # 告诉 Render 启动失败，触发自动重启
+            sys.exit(1)
     finally:
         logger.info("🛑 开始清理并优雅关闭...")
 
@@ -6656,20 +6686,25 @@ async def main():
             with suppress(asyncio.CancelledError):
                 await polling_task
 
-        # B. 关闭健康服务器（关键：防止重启时端口占用）
+        # B. 关闭健康服务器
         if health_server_site:
             with suppress(Exception):
                 await health_server_site.stop()
                 logger.info("✅ 健康检查服务器已释放端口")
 
+        # ========== ✨【修改3】清理延迟启动的后台任务 ==========
         # C. 停止所有后台任务
-        if "background_tasks" in locals():
-            for task in background_tasks:
+        if "_background_tasks" in globals() and _background_tasks:
+            for task in _background_tasks:
                 task.cancel()
+            logger.info(f"✅ 已取消 {len(_background_tasks)} 个后台任务")
 
-        # D. 执行统一的清理逻辑（关闭数据库等）
+        # D. 执行统一的清理逻辑
         await on_shutdown()
         logger.info("🎉 进程已安全结束")
+
+# ========== 全局变量，用于finally清理 ==========
+_background_tasks = []
 
 
 if __name__ == "__main__":
