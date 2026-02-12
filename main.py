@@ -796,6 +796,18 @@ async def activity_timer(
     (引用回复 + 自动降级 + 自动重试 + 每10分钟超时提醒 + 2小时强制回座)
     """
     try:
+        from bot_manager import bot_manager
+
+        bot = bot_manager.bot
+        if bot is None:
+            logger.error(f"❌ 定时器无法获取bot对象: {chat_id}-{uid}")
+            return
+        
+        from utils import notification_service
+        if notification_service.bot is None:
+            notification_service.bot = bot
+        if notification_service.bot_manager is None:
+            notification_service.bot_manager = bot_manager
         # 添加班次文本
         shift_text = "白班" if shift == "day" else "夜班"
         logger.info(f"⏰ 定时器启动: {chat_id}-{uid} - {act}（{shift_text}）")
@@ -4678,6 +4690,7 @@ async def handle_admin_panel_button(message: types.Message):
         "━━━━━━━━━━━━━━━━\n\n"
         "📢 *频道与推送*\n"
         "├ `/setchannel` \\[ID\\]\n"
+        "├ `/set_notify_group ` \\[ID\\]\n"
         "├ `/setgroup` \\[ID\\]\n"
         "├ `/setpush` \\[目标\\] \\[开关\\]\n"
         "├ `/showpush`\n"
@@ -4698,7 +4711,8 @@ async def handle_admin_panel_button(message: types.Message):
         "├ `/setresettime` \\[时\\] \\[分\\]\n"
         "├ `/setsoftresettime` \\[时\\] \\[分\\]\n"
         "├ `/resetuser` \\[用户ID\\]\n"
-        "└ `/resettime`\n\n"
+        "└ `/resettime`\n"
+        "└ `/setdualmode`\\[on\\] \\[时\\]\\[分\\]\n"
         "⏰ *上下班管理*\n"
         "├ `/setworktime` \\[上\\] \\[下\\]\n"
         "├ `/worktime`\n"
@@ -6232,8 +6246,8 @@ async def register_handlers():
     dp.message.register(cmd_setdualmode, Command("setdualmode"))
     dp.message.register(cmd_setshiftgrace, Command("setshiftgrace"))
     dp.message.register(handle_ranking_shift_command, Command("ranking"))
-    dp.message.register(cmd_set_work_notify_group, Command("set_work_notify_group"))
-    dp.message.register(cmd_clear_work_notify_group, Command("clear_work_notify_group"))
+    dp.message.register(cmd_set_work_notify_group, Command("set_notify_group"))
+    dp.message.register(cmd_clear_work_notify_group, Command("clear_notify_group"))
 
     # 按钮处理器
     dp.message.register(
