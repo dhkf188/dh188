@@ -1103,31 +1103,119 @@ class PostgreSQLDatabase:
         return count if count else 0
 
     # ========== 按照班次活动查询 =========
+
     async def get_user_activity_count_by_shift(
-        self, chat_id: int, user_id: int, activity: str, shift: str
+        self,
+        chat_id: int,
+        user_id: int,
+        activity: str,
+        shift: str,  # ✅ 明确要求字符串
     ) -> int:
-        """按班次获取用户活动次数"""
-        # 获取当前业务日期
+        """
+        按班次获取用户活动次数（严格版）
+
+        特性：
+        - 强制参数类型正确
+        - 如果传入错误类型，抛出明确异常
+        - 帮助开发者快速定位问题
+        """
+
+        # ========= 1️⃣ 严格的参数类型检查 =========
+
+        if not isinstance(chat_id, int):
+            raise TypeError(
+                f"❌ chat_id 必须是 int，但收到了 {type(chat_id)}: {chat_id}"
+            )
+
+        if not isinstance(user_id, int):
+            raise TypeError(
+                f"❌ user_id 必须是 int，但收到了 {type(user_id)}: {user_id}"
+            )
+
+        if not isinstance(activity, str):
+            raise TypeError(
+                f"❌ activity 必须是 str，但收到了 {type(activity)}: {activity}"
+            )
+
+        # ✅ 关键检查：shift 必须是字符串
+        if not isinstance(shift, str):
+            # 如果是字典，给出明确的错误信息和修复建议
+            if isinstance(shift, dict):
+                error_msg = (
+                    f"❌ shift 参数错误：传入了字典，但期望字符串\n"
+                    f"   收到的字典: {shift}\n"
+                    f"   你应该从字典中提取 'shift' 字段，例如：shift_info.get('shift')\n"
+                    f"   调用堆栈：\n"
+                )
+                # 记录调用堆栈，帮助定位问题
+                import traceback
+
+                error_msg += "".join(traceback.format_stack()[:-1])
+                logger.error(error_msg)
+                raise TypeError("shift 参数必须是字符串，不能是字典")
+            else:
+                raise TypeError(f"❌ shift 必须是 str，但收到了 {type(shift)}: {shift}")
+
+        # ========= 2️⃣ 班次值验证 =========
+
+        shift = shift.strip()
+
+        # 数据库实际存储的值是 "day" 和 "night"
+        # 注意：不是 "night_last" 或 "night_tonight"，这些是业务逻辑层的概念
+        VALID_SHIFTS = {"day", "night"}
+
+        if shift not in VALID_SHIFTS:
+            # 如果是 "night_last" 或 "night_tonight"，给出明确的转换建议
+            if shift in {"night_last", "night_tonight"}:
+                error_msg = (
+                    f"❌ 无效的班次值: '{shift}'\n"
+                    f"   数据库只存储 'day' 或 'night'\n"
+                    f"   你应该在调用前将 '{shift}' 转换为 'night'\n"
+                    f"   例如：if shift_detail in ('night_last', 'night_tonight'): shift = 'night'"
+                )
+                logger.error(error_msg)
+                raise ValueError(error_msg)
+            else:
+                raise ValueError(f"❌ 无效的班次值: '{shift}'，必须是 'day' 或 'night'")
+
+        # ========= 3️⃣ 获取业务日期 =========
+
         today = await self.get_business_date(chat_id)
 
-        # 执行数据库查询
-        count = await self.execute_with_retry(
-            "按班次获取活动次数",
-            """
-            SELECT activity_count FROM user_activities 
-            WHERE chat_id = $1 AND user_id = $2 
-            AND activity_date = $3 AND activity_name = $4 AND shift = $5
-            """,
-            chat_id,
-            user_id,
-            today,
-            activity,
-            shift,
-            fetchval=True,
+        logger.debug(
+            f"🔎 查询活动次数: chat_id={chat_id}, "
+            f"user_id={user_id}, date={today}, "
+            f"activity={activity}, shift={shift}"
         )
 
-        # 如果 count 为 None 则返回 0
-        return count if count else 0
+        # ========= 4️⃣ 执行查询 =========
+
+        try:
+            count = await self.execute_with_retry(
+                "按班次获取活动次数",
+                """
+                SELECT activity_count
+                FROM user_activities
+                WHERE chat_id = $1
+                  AND user_id = $2
+                  AND activity_date = $3
+                  AND activity_name = $4
+                  AND shift = $5
+                """,
+                chat_id,
+                user_id,
+                today,
+                activity,
+                shift,
+                fetchval=True,
+            )
+        except Exception as e:
+            logger.error(f"❌ 数据库查询失败: {e}")
+            raise  # ✅ 不掩盖数据库错误
+
+        # ========= 5️⃣ 返回结果 =========
+
+        return count if count is not None else 0
 
     async def get_user_cached(self, chat_id: int, user_id: int) -> Optional[Dict]:
         """带缓存的获取用户数据 - 优化版"""
@@ -2510,29 +2598,6 @@ class PostgreSQLDatabase:
             f"班次:{shift} | 罚款:{fine_amount} | 工时:{work_duration_seconds}s"
         )
 
-    async def get_work_count_by_shift(
-        self, chat_id: int, user_id: int, checkin_type: str, shift: str = None
-    ) -> int:
-        """获取指定班次的上下班次数"""
-        today = await self.get_business_date(chat_id)
-
-        query = """
-            SELECT COUNT(*) as count 
-            FROM work_records 
-            WHERE chat_id = $1 AND user_id = $2 AND record_date = $3
-            AND checkin_type = $4
-        """
-        params = [chat_id, user_id, today, checkin_type]
-
-        if shift:
-            query += " AND shift = $5"
-            params.append(shift)
-
-        count = await self.execute_with_retry(
-            "按班次获取工作次数", query, *params, fetchval=True
-        )
-        return count if count else 0
-
     async def get_work_records_by_shift(
         self, chat_id: int, user_id: int, shift: str = None
     ) -> Dict[str, List[Dict[str, Any]]]:
@@ -2566,41 +2631,6 @@ class PostgreSQLDatabase:
                 records[checkin_type].append(dict(row))
 
         return records
-
-    async def has_work_record_today(
-        self, chat_id: int, user_id: int, checkin_type: str
-    ) -> bool:
-        """检查今天是否有上下班记录 - 每个群组独立重置时间"""
-        try:
-            # 每个群组独立的重置时间计算
-            group_data = await self.get_group_cached(chat_id)
-            reset_hour = group_data.get("reset_hour", Config.DAILY_RESET_HOUR)
-            reset_minute = group_data.get("reset_minute", Config.DAILY_RESET_MINUTE)
-
-            now = self.get_beijing_time()
-            reset_time_today = now.replace(
-                hour=reset_hour, minute=reset_minute, second=0, microsecond=0
-            )
-
-            # 计算当前重置周期开始时间
-            if now < reset_time_today:
-                period_start = reset_time_today - timedelta(days=1)
-            else:
-                period_start = reset_time_today
-
-            self._ensure_pool_initialized()
-            async with self.pool.acquire() as conn:
-                row = await conn.fetchrow(
-                    "SELECT 1 FROM work_records WHERE chat_id = $1 AND user_id = $2 AND checkin_type = $3 AND record_date >= $4",
-                    chat_id,
-                    user_id,
-                    checkin_type,
-                    period_start.date(),
-                )
-                return row is not None
-        except Exception as e:
-            logger.error(f"检查工作记录失败 {chat_id}-{user_id}: {e}")
-            return False
 
     # 在 database.py 中添加修复后的函数
     async def get_today_work_records_fixed(
@@ -3517,7 +3547,6 @@ class PostgreSQLDatabase:
             "grace_before": group_data.get("shift_grace_before", 120),
             "grace_after": group_data.get("shift_grace_after", 360),
         }
-    
 
     def calculate_shift_window(
         self,
@@ -3532,11 +3561,11 @@ class PostgreSQLDatabase:
         # 1. 初始化当前时间
         if now is None:
             now = self.get_beijing_time()
-        
+
         # 2. 获取基准日期和时区
         today = now.date()
         tz = now.tzinfo
-        
+
         # 3. 解析配置中的时间点
         try:
             day_start_time = datetime.strptime(
@@ -3545,73 +3574,97 @@ class PostgreSQLDatabase:
             day_end_time = datetime.strptime(shift_config["day_end"], "%H:%M").time()
         except (KeyError, ValueError, TypeError):
             return {"day_window": {}, "night_window": {}, "current_shift": None}
-        
+
         # 4. 转换成当天的完整 datetime 对象并对齐时区
         day_start_dt = datetime.combine(today, day_start_time).replace(tzinfo=tz)
         day_end_dt = datetime.combine(today, day_end_time).replace(tzinfo=tz)
-        
+
         grace_before = shift_config.get("grace_before", 120)
         grace_after = shift_config.get("grace_after", 360)
-        
+
         # 5. 计算三个核心窗口
         # 1️⃣ 白班窗口（今天）
         day_window = {
             "work_start": {
                 "start": day_start_dt - timedelta(minutes=grace_before),  # 07:00
-                "end": day_start_dt + timedelta(minutes=grace_after),     # 15:00
+                "end": day_start_dt + timedelta(minutes=grace_after),  # 15:00
             },
             "work_end": {
-                "start": day_end_dt - timedelta(minutes=grace_before),    # 19:00
-                "end": day_end_dt + timedelta(minutes=grace_after),       # 次日03:00
+                "start": day_end_dt - timedelta(minutes=grace_before),  # 19:00
+                "end": day_end_dt + timedelta(minutes=grace_after),  # 次日03:00
             },
         }
-        
+
         # 2️⃣ 昨晚夜班（昨晚开始，今天早晨结束）
         last_night_window = {
             "work_start": {
-                "start": day_end_dt - timedelta(days=1) - timedelta(minutes=grace_before),  # 前一天的19:00
-                "end": day_end_dt - timedelta(days=1) + timedelta(minutes=grace_after),   # 前一天的次日03:00
+                "start": day_end_dt
+                - timedelta(days=1)
+                - timedelta(minutes=grace_before),  # 前一天的19:00
+                "end": day_end_dt
+                - timedelta(days=1)
+                + timedelta(minutes=grace_after),  # 前一天的次日03:00
             },
             "work_end": {
                 "start": day_start_dt - timedelta(minutes=grace_before),  # 07:00
-                "end": day_start_dt + timedelta(minutes=grace_after),     # 15:00
+                "end": day_start_dt + timedelta(minutes=grace_after),  # 15:00
             },
         }
-        
+
         # 3️⃣ 今晚夜班（今晚开始，明天早晨结束）
         tonight_window = {
             "work_start": {
-                "start": day_end_dt - timedelta(minutes=grace_before),    # 19:00
-                "end": day_end_dt + timedelta(minutes=grace_after),       # 次日03:00
+                "start": day_end_dt - timedelta(minutes=grace_before),  # 19:00
+                "end": day_end_dt + timedelta(minutes=grace_after),  # 次日03:00
             },
             "work_end": {
-                "start": day_start_dt + timedelta(days=1) - timedelta(minutes=grace_before),  # 明天的07:00
-                "end": day_start_dt + timedelta(days=1) + timedelta(minutes=grace_after),   # 明天的15:00
+                "start": day_start_dt
+                + timedelta(days=1)
+                - timedelta(minutes=grace_before),  # 明天的07:00
+                "end": day_start_dt
+                + timedelta(days=1)
+                + timedelta(minutes=grace_after),  # 明天的15:00
             },
         }
-        
+
         # 6. 判定当前班次
         current_shift = None
         if checkin_type in ["work_start", "work_end"]:
             # 依次匹配：白班 -> 昨晚夜班 -> 今晚夜班
-            if day_window[checkin_type]["start"] <= now <= day_window[checkin_type]["end"]:
+            if (
+                day_window[checkin_type]["start"]
+                <= now
+                <= day_window[checkin_type]["end"]
+            ):
                 current_shift = "day"
-            elif last_night_window[checkin_type]["start"] <= now <= last_night_window[checkin_type]["end"]:
+            elif (
+                last_night_window[checkin_type]["start"]
+                <= now
+                <= last_night_window[checkin_type]["end"]
+            ):
                 current_shift = "night_last"
-            elif tonight_window[checkin_type]["start"] <= now <= tonight_window[checkin_type]["end"]:
+            elif (
+                tonight_window[checkin_type]["start"]
+                <= now
+                <= tonight_window[checkin_type]["end"]
+            ):
                 current_shift = "night_tonight"
-            
+
             # ✅ 核心修复：下午提前打卡今晚夜班
             elif checkin_type == "work_start":
                 # 白班上班窗口结束后，今晚夜班上班窗口开始前
                 # 时间段：15:01 - 18:59
                 afternoon_start = day_window["work_start"]["end"] + timedelta(minutes=1)
-                afternoon_end = tonight_window["work_start"]["start"] - timedelta(minutes=1)
-                
+                afternoon_end = tonight_window["work_start"]["start"] - timedelta(
+                    minutes=1
+                )
+
                 if afternoon_start <= now <= afternoon_end:
                     current_shift = "night_tonight"
-                    logger.debug(f"🌆 下午时段 ({now.strftime('%H:%M')}) 判定为今晚夜班")
-        
+                    logger.debug(
+                        f"🌆 下午时段 ({now.strftime('%H:%M')}) 判定为今晚夜班"
+                    )
+
         return {
             "day_window": day_window,
             "night_window": {
@@ -3620,7 +3673,6 @@ class PostgreSQLDatabase:
             },
             "current_shift": current_shift,
         }
-
 
     async def get_business_date(
         self,
