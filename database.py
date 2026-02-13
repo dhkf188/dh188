@@ -3553,80 +3553,87 @@ class PostgreSQLDatabase:
         """
         计算班次时间窗口并判定当前班次
         支持：白班、昨晚夜班、今晚夜班，以及下午提前打卡今晚夜班
+        增强版：确保永远返回有效字典
         """
         # 1. 初始化当前时间
         if now is None:
             now = self.get_beijing_time()
 
-        # 2. 获取基准日期和时区
+        # 2. 基础返回结构
+        default_return = {"day_window": {}, "night_window": {}, "current_shift": None}
+
+        # 3. 获取基准日期和时区
         today = now.date()
         tz = now.tzinfo
 
-        # 3. 解析配置中的时间点
-        try:
-            day_start_time = datetime.strptime(
-                shift_config["day_start"], "%H:%M"
-            ).time()
-            day_end_time = datetime.strptime(shift_config["day_end"], "%H:%M").time()
-        except (KeyError, ValueError, TypeError):
-            return {"day_window": {}, "night_window": {}, "current_shift": None}
+        # 4. 验证配置
+        if not shift_config:
+            logger.warning("shift_config 为空，返回默认窗口")
+            return default_return
 
-        # 4. 转换成当天的完整 datetime 对象并对齐时区
+        # 5. 解析配置中的时间点
+        try:
+            day_start = shift_config.get("day_start", "09:00")
+            day_end = shift_config.get("day_end", "21:00")
+
+            day_start_time = datetime.strptime(day_start, "%H:%M").time()
+            day_end_time = datetime.strptime(day_end, "%H:%M").time()
+        except (ValueError, TypeError) as e:
+            logger.error(f"解析班次时间失败: {e}")
+            return default_return
+
+        # 6. 转换成当天的完整 datetime 对象并对齐时区
         day_start_dt = datetime.combine(today, day_start_time).replace(tzinfo=tz)
         day_end_dt = datetime.combine(today, day_end_time).replace(tzinfo=tz)
 
         grace_before = shift_config.get("grace_before", 120)
         grace_after = shift_config.get("grace_after", 360)
 
-        # 5. 计算三个核心窗口
-        # 1️⃣ 白班窗口（今天）
+        # 7. 计算三个核心窗口（原有代码保持不变）
+        # [这里保留原有的窗口计算代码]
         day_window = {
             "work_start": {
-                "start": day_start_dt - timedelta(minutes=grace_before),  # 07:00
-                "end": day_start_dt + timedelta(minutes=grace_after),  # 15:00
+                "start": day_start_dt - timedelta(minutes=grace_before),
+                "end": day_start_dt + timedelta(minutes=grace_after),
             },
             "work_end": {
-                "start": day_end_dt - timedelta(minutes=grace_before),  # 19:00
-                "end": day_end_dt + timedelta(minutes=grace_after),  # 次日03:00
+                "start": day_end_dt - timedelta(minutes=grace_before),
+                "end": day_end_dt + timedelta(minutes=grace_after),
             },
         }
 
-        # 2️⃣ 昨晚夜班（昨晚开始，今天早晨结束）
         last_night_window = {
             "work_start": {
                 "start": day_end_dt
                 - timedelta(days=1)
-                - timedelta(minutes=grace_before),  # 前一天的19:00
-                "end": day_end_dt
-                - timedelta(days=1)
-                + timedelta(minutes=grace_after),  # 前一天的次日03:00
+                - timedelta(minutes=grace_before),
+                "end": day_end_dt - timedelta(days=1) + timedelta(minutes=grace_after),
             },
             "work_end": {
-                "start": day_start_dt - timedelta(minutes=grace_before),  # 07:00
-                "end": day_start_dt + timedelta(minutes=grace_after),  # 15:00
+                "start": day_start_dt - timedelta(minutes=grace_before),
+                "end": day_start_dt + timedelta(minutes=grace_after),
             },
         }
 
-        # 3️⃣ 今晚夜班（今晚开始，明天早晨结束）
         tonight_window = {
             "work_start": {
-                "start": day_end_dt - timedelta(minutes=grace_before),  # 19:00
-                "end": day_end_dt + timedelta(minutes=grace_after),  # 次日03:00
+                "start": day_end_dt - timedelta(minutes=grace_before),
+                "end": day_end_dt + timedelta(minutes=grace_after),
             },
             "work_end": {
                 "start": day_start_dt
                 + timedelta(days=1)
-                - timedelta(minutes=grace_before),  # 明天的07:00
+                - timedelta(minutes=grace_before),
                 "end": day_start_dt
                 + timedelta(days=1)
-                + timedelta(minutes=grace_after),  # 明天的15:00
+                + timedelta(minutes=grace_after),
             },
         }
 
-        # 6. 判定当前班次
+        # 8. 判定当前班次
         current_shift = None
         if checkin_type in ["work_start", "work_end"]:
-            # 依次匹配：白班 -> 昨晚夜班 -> 今晚夜班
+            # 依次匹配
             if (
                 day_window[checkin_type]["start"]
                 <= now
@@ -3645,21 +3652,14 @@ class PostgreSQLDatabase:
                 <= tonight_window[checkin_type]["end"]
             ):
                 current_shift = "night_tonight"
-
-            # ✅ 核心修复：下午提前打卡今晚夜班
+            # 下午提前打卡今晚夜班
             elif checkin_type == "work_start":
-                # 白班上班窗口结束后，今晚夜班上班窗口开始前
-                # 时间段：15:01 - 18:59
                 afternoon_start = day_window["work_start"]["end"] + timedelta(minutes=1)
                 afternoon_end = tonight_window["work_start"]["start"] - timedelta(
                     minutes=1
                 )
-
                 if afternoon_start <= now <= afternoon_end:
                     current_shift = "night_tonight"
-                    logger.debug(
-                        f"🌆 下午时段 ({now.strftime('%H:%M')}) 判定为今晚夜班"
-                    )
 
         return {
             "day_window": day_window,
@@ -3667,7 +3667,7 @@ class PostgreSQLDatabase:
                 "last_night": last_night_window,
                 "tonight": tonight_window,
             },
-            "current_shift": current_shift,
+            "current_shift": current_shift,  # 允许为 None，外层处理
         }
 
     async def get_business_date(
@@ -3775,7 +3775,9 @@ class PostgreSQLDatabase:
         current_time: Optional[datetime] = None,
         checkin_type: str = "work_start",
     ) -> Dict[str, object]:
-
+        """
+        确定当前时间所属的班次 - 增强版，确保不返回 None
+        """
         # ========= 当前时间 =========
         now = current_time or self.get_beijing_time()
 
@@ -3787,7 +3789,6 @@ class PostgreSQLDatabase:
         # 单班模式
         # =====================================================
         if not is_dual:
-
             business_date = await self.get_business_date(
                 chat_id=chat_id, current_dt=now
             )
@@ -3802,7 +3803,7 @@ class PostgreSQLDatabase:
                 "shift": "day",
                 "shift_detail": "day",
                 "business_date": business_date,
-                "record_date": business_date,  # ✅ 统一为业务日期
+                "record_date": business_date,
             }
 
         # =====================================================
@@ -3818,13 +3819,37 @@ class PostgreSQLDatabase:
             or {}
         )
 
-        current_shift_detail = window_info.get("current_shift", "day")
+        current_shift_detail = window_info.get("current_shift")
+
+        # 🛡️ 关键修复：如果无法确定班次，使用默认值
+        if current_shift_detail is None:
+            logger.warning(
+                f"⚠️ 无法确定班次，使用默认班次 day。"
+                f"chat_id={chat_id}, time={now.strftime('%H:%M')}"
+            )
+            current_shift_detail = "day"
 
         # 转换为简化班次
         if current_shift_detail in ("night_last", "night_tonight"):
             shift = "night"
         else:
             shift = "day"
+
+        # 获取业务日期
+        business_date = await self.get_business_date(
+            chat_id=chat_id,
+            current_dt=now,
+            shift=shift,
+            checkin_type=checkin_type,
+            shift_detail=current_shift_detail,
+        )
+
+        return {
+            "shift": shift,
+            "shift_detail": current_shift_detail,
+            "business_date": business_date,
+            "record_date": business_date,
+        }
 
     # ========== 数据清理 ==========
     async def cleanup_old_data(self, days: int = 30):
