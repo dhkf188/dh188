@@ -1006,7 +1006,7 @@ async def activity_timer(
                         "should_break": True,
                         "fine_amount": fine_amount,
                         "elapsed": elapsed,
-                        "nickname": nickname
+                        "nickname": nickname,
                     }
                 else:
                     break_data = {"should_break": False}
@@ -1082,7 +1082,9 @@ async def activity_timer(
                 # 推送通知（最多3次重试）
                 for attempt in range(3):
                     if await push_force_back_notification(
-                        break_data['nickname'], break_data['elapsed'], break_data['fine_amount']
+                        break_data["nickname"],
+                        break_data["elapsed"],
+                        break_data["fine_amount"],
                     ):
                         break
                     logger.warning(f"⚠️ 强制回座通知发送失败，重试 {attempt + 1}/3")
@@ -1134,28 +1136,36 @@ async def start_activity(message: types.Message, act: str):
 
         # ================== 🆕 班次判定 ==================
         # 初始化班次变量
-        current_shift = None
+        current_shift = "day"  # 默认值
+        shift_detail = "day"  # 详细班次信息
+
         shift_state = await db.get_current_shift_state(chat_id)
 
         if shift_state:
             # ✅ 从状态中取字符串
-            current_shift = shift_state.get("current_shift", "day")
-            if not isinstance(current_shift, str):
-                logger.error(
-                    f"❌ shift_state.current_shift 不是字符串: {current_shift}"
+            temp_shift = shift_state.get("current_shift")
+            if isinstance(temp_shift, str):
+                current_shift = temp_shift
+                # 从状态中获取详细班次（如果有）
+                shift_detail = shift_state.get("shift_detail", current_shift)
+                logger.info(
+                    f"🔄 从班次状态获取: {current_shift} (detail: {shift_detail})"
                 )
-                current_shift = "day"
+            else:
+                logger.error(f"❌ shift_state.current_shift 不是字符串: {temp_shift}")
+                # 保持默认值 "day"
         else:
             shift_config = await db.get_shift_config(chat_id)
             if shift_config.get("dual_mode", False):
                 # ✅ 双班模式：根据时间判定
+                # 🎯 活动统一使用 "work_start" 作为班次判定依据
                 shift_info = await db.determine_shift_for_time(
-                    chat_id=chat_id, 
-                    current_time=now, 
-                    checkin_type=act  # 注意：这里用 act 作为 checkin_type
+                    chat_id=chat_id,
+                    current_time=now,
+                    checkin_type="work_start",  # 活动跟随上班班次
                 )
-                
-                # 🎯 保留原始功能：如果无法确定班次，提示用户
+
+                # 🎯 如果无法确定班次，提示用户
                 if not shift_info:
                     await message.answer(
                         "❌ 当前时间不在任何班次的活动窗口内\n\n"
@@ -1165,23 +1175,33 @@ async def start_activity(message: types.Message, act: str):
                     return
 
                 # ✅ 从字典中取 shift 字段
-                current_shift = shift_info.get("shift", "day")
-                if not isinstance(current_shift, str):
-                    logger.error(f"❌ shift_info.shift 不是字符串: {current_shift}")
-                    current_shift = "day"
+                temp_shift = shift_info.get("shift")
+                if isinstance(temp_shift, str):
+                    current_shift = temp_shift
+                    # 保存详细班次信息
+                    shift_detail = shift_info.get("shift_detail", current_shift)
+                    logger.info(
+                        f"🔄 从时间判定获取: {current_shift} (detail: {shift_detail})"
+                    )
+                else:
+                    logger.error(f"❌ shift_info.shift 不是字符串: {temp_shift}")
+                    # 保持默认值 "day"
             else:
                 # 单班模式：默认白班
-                current_shift = "day"
+                logger.info("🔄 单班模式，使用默认班次: day")
+                # current_shift 已经是 "day"
 
-        # ✅ 最终确保是字符串
-        if current_shift is None:
-            logger.error("❌ current_shift 为 None，使用默认值 day")
-            current_shift = "day"
-        elif not isinstance(current_shift, str):
-            logger.error(f"❌ current_shift 不是字符串: {current_shift}")
+        # ✅ 最终安全检查
+        if not isinstance(current_shift, str):
+            logger.error(
+                f"❌ current_shift 最终不是字符串: {current_shift}，强制设为 day"
+            )
             current_shift = "day"
 
-        logger.info(f"🔄 当前班次判定：{current_shift}")
+        if not isinstance(shift_detail, str):
+            shift_detail = current_shift
+
+        logger.info(f"🔄 最终班次判定：{current_shift} (detail: {shift_detail})")
 
         # ================== 活动人数限制 ==================
         user_limit = await db.get_activity_user_limit(act)
@@ -1240,6 +1260,7 @@ async def start_activity(message: types.Message, act: str):
             return
 
         # ================== 更新用户活动状态（包含班次） ==================
+        # 这里只传 current_shift，因为数据库只存 "day"/"night"
         await db.update_user_activity(chat_id, uid, act, str(now), name, current_shift)
 
         # ================== 活动时长限制 ==================
