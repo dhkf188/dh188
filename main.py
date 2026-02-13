@@ -1786,10 +1786,39 @@ async def process_work_checkin(message: types.Message, checkin_type: str):
             chat_id=chat_id, current_time=now, checkin_type=checkin_type
         )
 
-        # 🎯 解包权威数据 - 以下所有变量都来自 shift_info，统一使用
-        shift = shift_info["shift"]  # day/night
-        shift_detail = shift_info["shift_detail"]  # day/night_last/night_tonight
-        record_date = shift_info["record_date"]  # 记录日期 = 业务日期
+        # 🛡️ 添加健壮性检查 - 你的方案是正确的！
+        if shift_info is None:
+            logger.warning(f"[{trace_id}] ⚠️ 无法确定班次信息，使用默认班次")
+            
+            # 获取默认班次配置
+            shift_config = await db.get_shift_config(chat_id)
+            is_dual_mode = shift_config.get("dual_mode", False) if shift_config else False
+            
+            if is_dual_mode:
+                # 双班模式下，如果没有班次信息，提示用户
+                await message.answer(
+                    f"❌ 当前时间不在任何班次的{action_text}窗口内\n\n"
+                    "💡 请等待对班时间窗口或联系管理员调整时间设置",
+                    reply_to_message_id=message.message_id,
+                    reply_markup=await get_main_keyboard(chat_id, await is_admin(uid)),
+                )
+                return
+            else:
+                # 单班模式，使用默认值
+                business_date = await db.get_business_date(chat_id)
+                shift_info = {  # ✅ 现在 shift_info 在整个函数作用域都存在
+                    "shift": "day",
+                    "shift_detail": "day",
+                    "record_date": business_date
+                }
+                logger.info(f"[{trace_id}] ℹ️ 单班模式使用默认班次: day")
+        
+        # 🎯 现在可以安全使用了
+        shift = shift_info["shift"]
+        shift_detail = shift_info["shift_detail"]
+        record_date = shift_info["record_date"]
+
+
 
         logger.info(
             f"[{trace_id}] 🕒 权威班次判定: {shift_detail} | "
