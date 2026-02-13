@@ -1346,7 +1346,12 @@ async def process_back(message: types.Message):
         await _process_back_locked(message, chat_id, uid)
 
 
-async def _process_back_locked(message: types.Message, chat_id: int, uid: int):
+async def _process_back_locked(
+    message: types.Message,
+    chat_id: int,
+    uid: int,
+    shift: str = None,  # ✅ 添加可选班次参数
+):
     """线程安全的回座逻辑 - 带引用回复优先 + 调试日志"""
     start_time = time.time()
     key = f"{chat_id}:{uid}"
@@ -1379,6 +1384,11 @@ async def _process_back_locked(message: types.Message, chat_id: int, uid: int):
         act = user_data["current_activity"]
         activity_start_time_str = user_data["activity_start_time"]
         nickname = user_data.get("nickname", "未知用户")
+
+        # ✅ 如果没有传入班次，从数据库获取
+        if shift is None:
+            shift = user_data.get("shift", "day")
+        logger.info(f"📝 回座班次: {shift}")
 
         # 获取打卡消息ID
         checkin_message_id = await db.get_user_checkin_message_id(chat_id, uid)
@@ -1449,9 +1459,9 @@ async def _process_back_locked(message: types.Message, chat_id: int, uid: int):
         time_str = now.strftime("%m/%d %H:%M:%S")
         activity_start_time_for_notification = activity_start_time_str
 
-        # 完成活动
+        # ✅ 完成活动 - 使用传入的班次
         await db.complete_user_activity(
-            chat_id, uid, act, int(elapsed), fine_amount, is_overtime
+            chat_id, uid, act, int(elapsed), fine_amount, is_overtime, shift
         )
 
         # 取消计时器
@@ -1532,10 +1542,22 @@ async def _process_back_locked(message: types.Message, chat_id: int, uid: int):
             )
             logger.info(f"ℹ️ 降级发送回座消息，没有引用打卡消息")
 
-        # ==================== ✨ 吃饭回座推送 (优化版) ✨ ====================
+        # 异步发送超时通知
+        # if is_overtime and fine_amount > 0:
+        #     notification_user_data = user_data.copy() if user_data else {}
+        #     notification_user_data["activity_start_time"] = (
+        #         activity_start_time_for_notification
+        #     )
+        #     notification_user_data["nickname"] = nickname
+        #     asyncio.create_task(
+        #         send_overtime_notification_async(
+        #             chat_id, uid, notification_user_data, act, fine_amount, now
+        #         )
+        #     )
+
+        # ==================== ✨ 吃饭回座推送 ====================
         if act == "吃饭":
             try:
-                # 1. 获取群名
                 chat_title = str(chat_id)
                 try:
                     chat_info = await message.bot.get_chat(chat_id)
@@ -1543,23 +1565,12 @@ async def _process_back_locked(message: types.Message, chat_id: int, uid: int):
                 except Exception:
                     pass
 
-                # 2. 构建推送文案
-                # 使用已经计算好的 elapsed_time_str (例如 "15分30秒")
                 eat_end_notification_text = (
                     f"🍽️ <b>吃饭结束通知</b>\n"
                     f"{MessageFormatter.format_user_link(uid, user_data.get('nickname', '用户'))} 回来了\n"
                     f"⏱️ 吃饭耗时：<code>{elapsed_time_str}</code>\n"
                 )
 
-                # 如果有超时或罚款，也可以加进去
-                # if is_overtime:
-                #     eat_end_notification_text += (
-                #         f"⚠️ 状态：超时 (罚款 {fine_amount}元)\n"
-                #     )
-                # else:
-                #     eat_end_notification_text += f"✅ 状态：正常\n"
-
-                # 3. 异步发送
                 asyncio.create_task(
                     notification_service.send_notification(
                         chat_id, eat_end_notification_text
@@ -5084,7 +5095,7 @@ async def handle_quick_back(callback_query: types.CallbackQuery):
     try:
         data_parts = callback_query.data.split(":")
 
-        # ✅ 修复：检查参数数量
+        # 检查参数数量
         if len(data_parts) < 4:
             logger.warning(f"⚠️ 快速回座数据格式错误: {callback_query.data}")
             await callback_query.answer("❌ 按钮数据格式错误", show_alert=True)
@@ -5092,7 +5103,7 @@ async def handle_quick_back(callback_query: types.CallbackQuery):
 
         chat_id = int(data_parts[1])
         uid = int(data_parts[2])
-        shift = data_parts[3] if len(data_parts) > 3 else "day"  # ✅ 解析班次
+        shift = data_parts[3] if len(data_parts) > 3 else "day"  # 解析班次
 
         # 检查消息是否过期（10分钟）
         msg_ts = callback_query.message.date.timestamp()
@@ -5118,10 +5129,8 @@ async def handle_quick_back(callback_query: types.CallbackQuery):
                 await callback_query.answer("❌ 您当前没有活动在进行", show_alert=True)
                 return
 
-            # ✅ 关键修复：传递班次给回座函数
-            await _process_back_locked_with_shift(
-                callback_query.message, chat_id, uid, shift
-            )
+            # ✅ 调用修改后的 _process_back_locked，传入班次
+            await _process_back_locked(callback_query.message, chat_id, uid, shift)
 
         # 更新按钮状态
         try:
