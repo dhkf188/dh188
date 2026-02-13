@@ -811,7 +811,7 @@ async def activity_timer(
         if waited > 0:
             logger.info(f"✅ bot 已就绪，继续执行定时器 (等待 {waited}s)")
 
-            
+
         # 添加班次文本
         shift_text = "白班" if shift == "day" else "夜班"
         logger.info(f"⏰ 定时器启动: {chat_id}-{uid} - {act}（{shift_text}）")
@@ -1085,25 +1085,44 @@ async def start_activity(message: types.Message, act: str):
 
         # ================== 🆕 班次判定 ==================
         shift_state = await db.get_current_shift_state(chat_id)
-        current_shift = shift_state["current_shift"] if shift_state else None
 
-        if not shift_state:
+        if shift_state:
+            # ✅ 从状态中取字符串
+            current_shift = shift_state.get("current_shift", "day")
+            if not isinstance(current_shift, str):
+                logger.error(f"❌ shift_state.current_shift 不是字符串: {current_shift}")
+                current_shift = "day"
+        else:
             shift_config = await db.get_shift_config(chat_id)
             if shift_config.get("dual_mode", False):
-                # 双班模式：根据时间判定
-                current_shift = await db.determine_shift_for_time(chat_id, now)
-                if current_shift is None:
+                # ✅ 双班模式：根据时间判定 - 正确取 shift 字段
+                shift_info = await db.determine_shift_for_time(chat_id, now)
+                if not shift_info:
                     await message.answer(
                         "❌ 当前时间不在任何班次的活动窗口内\n\n"
                         "💡 请先开始班次或联系管理员",
                         reply_to_message_id=message.message_id,
                     )
                     return
+                
+                # ✅ 关键修复：从字典中取 shift 字段
+                current_shift = shift_info.get("shift", "day")
+                shift_detail = shift_info.get("shift_detail")  # 如果需要可以保存
+                
+                if not isinstance(current_shift, str):
+                    logger.error(f"❌ shift_info.shift 不是字符串: {current_shift}")
+                    current_shift = "day"
             else:
                 # 单班模式：默认白班
                 current_shift = "day"
 
+        # ✅ 最终确保是字符串
+        if not isinstance(current_shift, str):
+            logger.error(f"❌ current_shift 最终不是字符串: {current_shift}")
+            current_shift = "day"
+
         logger.info(f"🔄 当前班次判定：{current_shift}")
+
 
         # ================== 活动人数限制 ==================
         user_limit = await db.get_activity_user_limit(act)
