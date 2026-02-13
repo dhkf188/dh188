@@ -1498,7 +1498,14 @@ async def _process_back_locked(
 
         # ✅ 完成活动 - 使用传入的班次
         await db.complete_user_activity(
-            chat_id, uid, act, int(elapsed), fine_amount, is_overtime, shift
+            chat_id,
+            uid,
+            act,
+            int(elapsed),
+            fine_amount,
+            is_overtime,
+            shift,
+            forced_date=now.date(),
         )
 
         # 取消计时器
