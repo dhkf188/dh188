@@ -492,8 +492,9 @@ async def handle_expired_activity(
             fine_amount = await calculate_fine(activity, overtime_minutes)
 
         # 完成活动
+        shift = user_data.get("shift", "day")
         await db.complete_user_activity(
-            chat_id, user_id, activity, elapsed, fine_amount, is_overtime
+            chat_id, user_id, activity, elapsed, fine_amount, is_overtime, shift
         )
 
         # 发送恢复通知
