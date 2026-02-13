@@ -422,139 +422,251 @@ async def _force_complete_activity_to_yesterday(
 
 
 # ========== 4. 独立白班强制结束 ==========
+# dual_shift_reset.py - 修改 _force_end_white_shift_independent
+
+
 async def _force_end_white_shift_independent(
     chat_id: int, now: datetime, yesterday: date
 ) -> Dict[str, Any]:
     """
     独立版：强制结束昨天白班未下班用户
-    完全不依赖 main.auto_end_current_activity
+    现在使用修改后的 complete_user_activity 并传入 forced_date
     """
     stats = {"total": 0, "success": 0, "failed": 0, "details": []}
 
     try:
         async with db.pool.acquire() as conn:
-            async with conn.transaction():
-                # 查找昨天白班上班、未下班、有进行中活动的用户
-                rows = await conn.fetch(
-                    """
-                    SELECT u.user_id, u.nickname, u.current_activity, 
-                           u.activity_start_time, u.shift
-                    FROM users u
-                    LEFT JOIN work_records wr 
-                        ON u.chat_id = wr.chat_id 
-                        AND u.user_id = wr.user_id 
-                        AND wr.record_date = $2 
-                        AND wr.checkin_type = 'work_end'
-                        AND wr.shift = 'day'
-                    WHERE u.chat_id = $1
-                      AND u.current_activity IS NOT NULL
-                      AND (u.shift = 'day' OR u.shift IS NULL)
-                      AND wr.id IS NULL
-                    """,
-                    chat_id,
-                    yesterday,
-                )
+            # 查找昨天白班上班、未下班、有进行中活动的用户
+            rows = await conn.fetch(
+                """
+                SELECT u.user_id, u.nickname, u.current_activity, 
+                       u.activity_start_time, u.shift
+                FROM users u
+                LEFT JOIN work_records wr 
+                    ON u.chat_id = wr.chat_id 
+                    AND u.user_id = wr.user_id 
+                    AND wr.record_date = $2 
+                    AND wr.checkin_type = 'work_end'
+                    AND wr.shift = 'day'
+                WHERE u.chat_id = $1
+                  AND u.current_activity IS NOT NULL
+                  AND (u.shift = 'day' OR u.shift IS NULL)
+                  AND wr.id IS NULL
+                """,
+                chat_id,
+                yesterday,
+            )
 
-                stats["total"] = len(rows)
+            stats["total"] = len(rows)
 
-                for row in rows:
-                    result = await _force_complete_activity_to_yesterday(
-                        conn=conn,
+            for row in rows:
+                try:
+                    user_id = row["user_id"]
+                    activity = row["current_activity"]
+                    start_time_str = row["activity_start_time"]
+
+                    # 解析开始时间
+                    start_time = datetime.fromisoformat(start_time_str)
+
+                    # 计算时长
+                    elapsed = int((now - start_time).total_seconds())
+
+                    # 计算罚款
+                    time_limit = await db.get_activity_time_limit(activity)
+                    time_limit_seconds = time_limit * 60
+                    is_overtime = elapsed > time_limit_seconds
+                    overtime_seconds = max(0, elapsed - time_limit_seconds)
+                    overtime_minutes = overtime_seconds / 60
+
+                    fine_amount = 0
+                    if is_overtime and overtime_seconds > 0:
+                        fine_rates = await db.get_fine_rates_for_activity(activity)
+                        if fine_rates:
+                            segments = []
+                            for k in fine_rates.keys():
+                                try:
+                                    v = int(str(k).lower().replace("min", ""))
+                                    segments.append(v)
+                                except:
+                                    pass
+                            segments.sort()
+                            for s in segments:
+                                if overtime_minutes <= s:
+                                    fine_amount = fine_rates.get(
+                                        str(s), fine_rates.get(f"{s}min", 0)
+                                    )
+                                    break
+                            if fine_amount == 0 and segments:
+                                m = segments[-1]
+                                fine_amount = fine_rates.get(
+                                    str(m), fine_rates.get(f"{m}min", 0)
+                                )
+
+                    # 🎯 关键修改：使用修改后的 complete_user_activity，传入 forced_date=yesterday
+                    await db.complete_user_activity(
                         chat_id=chat_id,
-                        user_id=row["user_id"],
-                        nickname=row["nickname"],
-                        activity=row["current_activity"],
-                        start_time_str=row["activity_start_time"],
-                        yesterday=yesterday,
-                        now=now,
+                        user_id=user_id,
+                        activity=activity,
+                        elapsed_time=elapsed,
+                        fine_amount=fine_amount,
+                        is_overtime=is_overtime,
                         shift="day",
-                        shift_detail="day",
+                        forced_date=yesterday,  # ✅ 强制使用昨天
                     )
 
-                    if result["success"]:
-                        stats["success"] += 1
-                    else:
-                        stats["failed"] += 1
+                    stats["success"] += 1
+                    stats["details"].append(
+                        {
+                            "user_id": user_id,
+                            "activity": activity,
+                            "elapsed": elapsed,
+                            "fine": fine_amount,
+                            "success": True,
+                        }
+                    )
 
-                    stats["details"].append(result)
+                    logger.info(
+                        f"✅ [白班强制结束] 用户{user_id} | "
+                        f"活动:{activity} | 强制日期:{yesterday} | 时长:{elapsed}s"
+                    )
+
+                except Exception as e:
+                    stats["failed"] += 1
+                    logger.error(f"❌ [白班强制结束] 失败 用户{row['user_id']}: {e}")
 
         logger.info(
-            f"🟡 [独立白班强制结束] 群组{chat_id} | "
+            f"🟡 [白班强制结束完成] 群组{chat_id} | "
             f"昨日{yesterday} | 总计:{stats['total']} | "
             f"成功:{stats['success']} | 失败:{stats['failed']}"
         )
 
     except Exception as e:
-        logger.error(f"❌ [独立白班强制结束] 失败 {chat_id}: {e}")
+        logger.error(f"❌ [白班强制结束] 失败 {chat_id}: {e}")
 
     return stats
 
 
 # ========== 5. 独立夜班强制结束 ==========
+# dual_shift_reset.py - 修改 _force_end_night_shift_independent
+
+
 async def _force_end_night_shift_independent(
     chat_id: int, now: datetime, yesterday: date
 ) -> Dict[str, Any]:
     """
     独立版：强制结束昨晚夜班未下班用户
-    完全不依赖 main.auto_end_current_activity
+    现在使用修改后的 complete_user_activity 并传入 forced_date
     """
     stats = {"total": 0, "success": 0, "failed": 0, "details": []}
 
     try:
         async with db.pool.acquire() as conn:
-            async with conn.transaction():
-                # 查找昨晚夜班上班、未下班、有进行中活动的用户
-                rows = await conn.fetch(
-                    """
-                    SELECT u.user_id, u.nickname, u.current_activity, 
-                           u.activity_start_time, u.shift
-                    FROM users u
-                    LEFT JOIN work_records wr 
-                        ON u.chat_id = wr.chat_id 
-                        AND u.user_id = wr.user_id 
-                        AND wr.record_date = $2 
-                        AND wr.checkin_type = 'work_end'
-                        AND wr.shift_detail IN ('night_last', 'night')
-                    WHERE u.chat_id = $1
-                      AND u.current_activity IS NOT NULL
-                      AND u.shift = 'night'
-                      AND wr.id IS NULL
-                    """,
-                    chat_id,
-                    yesterday,
-                )
+            # 查找昨晚夜班上班、未下班、有进行中活动的用户
+            rows = await conn.fetch(
+                """
+                SELECT u.user_id, u.nickname, u.current_activity, 
+                       u.activity_start_time, u.shift
+                FROM users u
+                LEFT JOIN work_records wr 
+                    ON u.chat_id = wr.chat_id 
+                    AND u.user_id = wr.user_id 
+                    AND wr.record_date = $2 
+                    AND wr.checkin_type = 'work_end'
+                    AND wr.shift_detail IN ('night_last', 'night')
+                WHERE u.chat_id = $1
+                  AND u.current_activity IS NOT NULL
+                  AND u.shift = 'night'
+                  AND wr.id IS NULL
+                """,
+                chat_id,
+                yesterday,
+            )
 
-                stats["total"] = len(rows)
+            stats["total"] = len(rows)
 
-                for row in rows:
-                    result = await _force_complete_activity_to_yesterday(
-                        conn=conn,
+            for row in rows:
+                try:
+                    user_id = row["user_id"]
+                    activity = row["current_activity"]
+                    start_time_str = row["activity_start_time"]
+
+                    # 解析开始时间
+                    start_time = datetime.fromisoformat(start_time_str)
+
+                    # 计算时长
+                    elapsed = int((now - start_time).total_seconds())
+
+                    # 计算罚款（同上）
+                    time_limit = await db.get_activity_time_limit(activity)
+                    time_limit_seconds = time_limit * 60
+                    is_overtime = elapsed > time_limit_seconds
+                    overtime_seconds = max(0, elapsed - time_limit_seconds)
+                    overtime_minutes = overtime_seconds / 60
+
+                    fine_amount = 0
+                    if is_overtime and overtime_seconds > 0:
+                        fine_rates = await db.get_fine_rates_for_activity(activity)
+                        if fine_rates:
+                            segments = []
+                            for k in fine_rates.keys():
+                                try:
+                                    v = int(str(k).lower().replace("min", ""))
+                                    segments.append(v)
+                                except:
+                                    pass
+                            segments.sort()
+                            for s in segments:
+                                if overtime_minutes <= s:
+                                    fine_amount = fine_rates.get(
+                                        str(s), fine_rates.get(f"{s}min", 0)
+                                    )
+                                    break
+                            if fine_amount == 0 and segments:
+                                m = segments[-1]
+                                fine_amount = fine_rates.get(
+                                    str(m), fine_rates.get(f"{m}min", 0)
+                                )
+
+                    # 🎯 关键修改：使用修改后的 complete_user_activity，传入 forced_date=yesterday
+                    await db.complete_user_activity(
                         chat_id=chat_id,
-                        user_id=row["user_id"],
-                        nickname=row["nickname"],
-                        activity=row["current_activity"],
-                        start_time_str=row["activity_start_time"],
-                        yesterday=yesterday,
-                        now=now,
+                        user_id=user_id,
+                        activity=activity,
+                        elapsed_time=elapsed,
+                        fine_amount=fine_amount,
+                        is_overtime=is_overtime,
                         shift="night",
-                        shift_detail="night_last",
+                        forced_date=yesterday,  # ✅ 强制使用昨天
                     )
 
-                    if result["success"]:
-                        stats["success"] += 1
-                    else:
-                        stats["failed"] += 1
+                    stats["success"] += 1
+                    stats["details"].append(
+                        {
+                            "user_id": user_id,
+                            "activity": activity,
+                            "elapsed": elapsed,
+                            "fine": fine_amount,
+                            "success": True,
+                        }
+                    )
 
-                    stats["details"].append(result)
+                    logger.info(
+                        f"✅ [夜班强制结束] 用户{user_id} | "
+                        f"活动:{activity} | 强制日期:{yesterday} | 时长:{elapsed}s"
+                    )
+
+                except Exception as e:
+                    stats["failed"] += 1
+                    logger.error(f"❌ [夜班强制结束] 失败 用户{row['user_id']}: {e}")
 
         logger.info(
-            f"🌙 [独立夜班强制结束] 群组{chat_id} | "
+            f"🌙 [夜班强制结束完成] 群组{chat_id} | "
             f"昨日{yesterday} | 总计:{stats['total']} | "
             f"成功:{stats['success']} | 失败:{stats['failed']}"
         )
 
     except Exception as e:
-        logger.error(f"❌ [独立夜班强制结束] 失败 {chat_id}: {e}")
+        logger.error(f"❌ [夜班强制结束] 失败 {chat_id}: {e}")
 
     return stats
 
