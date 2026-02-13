@@ -1083,25 +1083,6 @@ class PostgreSQLDatabase:
             return result
         return None
 
-    async def get_user_activity_count(
-        self, chat_id: int, user_id: int, activity: str
-    ) -> int:
-        today = await self.get_business_date(chat_id)
-        count = await self.execute_with_retry(
-            "获取活动次数",
-            """
-            SELECT activity_count FROM user_activities 
-            WHERE chat_id = $1 AND user_id = $2 AND activity_date = $3 AND activity_name = $4
-            """,
-            chat_id,
-            user_id,
-            today,
-            activity,
-            fetchval=True,  # 🎯 只需要单个值
-            timeout=5,  # 🎯 简单查询设置短超时
-        )
-        return count if count else 0
-
     # ========== 按照班次活动查询 =========
 
     async def get_user_activity_count_by_shift(
@@ -3829,30 +3810,6 @@ class PostgreSQLDatabase:
             shift = "night"
         else:
             shift = "day"
-
-        # ========= 获取业务日期 =========
-        business_date = await self.get_business_date(
-            chat_id=chat_id,
-            current_dt=now,
-            shift=shift,
-            checkin_type=checkin_type,
-            shift_detail=current_shift_detail,
-        )
-
-        logger.debug(
-            f"🕘 双班模式: chat_id={chat_id}, "
-            f"时间={now.strftime('%Y-%m-%d %H:%M')}, "
-            f"shift={shift}, "
-            f"shift_detail={current_shift_detail}, "
-            f"业务日期={business_date}"
-        )
-
-        return {
-            "shift": shift,
-            "shift_detail": current_shift_detail,
-            "business_date": business_date,
-            "record_date": business_date,  # 🎯 记录日期统一使用业务日期
-        }
 
     # ========== 数据清理 ==========
     async def cleanup_old_data(self, days: int = 30):
