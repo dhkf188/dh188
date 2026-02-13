@@ -57,7 +57,6 @@ from utils import (
     NotificationService,
     get_beijing_time,
     calculate_cross_day_time_diff,
-    # is_valid_checkin_time,
     rate_limit,
     send_reset_notification,
 )
@@ -793,10 +792,26 @@ def get_admin_keyboard() -> ReplyKeyboardMarkup:
 async def activity_timer(
     chat_id: int, uid: int, act: str, limit: int, shift: str = "day"
 ):
-    """最终无遗漏 + 稳健可用版活动定时器（支持班次）
-    (引用回复 + 自动降级 + 自动重试 + 每10分钟超时提醒 + 2小时强制回座)
-    """
+
     try:
+        max_wait = 30
+        wait_interval = 1
+        waited = 0
+
+        while not bot_manager or not bot_manager.bot and waited < max_wait:
+            if waited == 0:
+                logger.info(f"⏳ 等待 bot 初始化... (chat={chat_id}, uid={uid})")
+            await asyncio.sleep(wait_interval)
+            waited += wait_interval
+
+        if not bot_manager or not bot_manager.bot:
+            logger.error(f"❌ bot 未能在 {max_wait} 秒内初始化，定时器终止")
+            return
+        
+        if waited > 0:
+            logger.info(f"✅ bot 已就绪，继续执行定时器 (等待 {waited}s)")
+
+            
         # 添加班次文本
         shift_text = "白班" if shift == "day" else "夜班"
         logger.info(f"⏰ 定时器启动: {chat_id}-{uid} - {act}（{shift_text}）")
@@ -810,10 +825,16 @@ async def activity_timer(
 
         # ===== 群消息发送封装（引用 + 自动降级 + 自动重试） =====
         async def send_group_message(text: str, kb=None):
+            # ✅ 获取 bot 实例
+            current_bot = bot_manager.bot
+            if not current_bot:
+                logger.error(f"❌ bot_manager.bot 为 None，无法发送消息")
+                return None
+
             checkin_message_id = await db.get_user_checkin_message_id(chat_id, uid)
             if checkin_message_id:
                 try:
-                    return await bot.send_message(
+                    return await current_bot.send_message(
                         chat_id=chat_id,
                         text=text,
                         parse_mode="HTML",
@@ -824,7 +845,7 @@ async def activity_timer(
                     logger.warning(f"⚠️ 引用发送失败，重试一次: {e}")
                     await asyncio.sleep(1)
                     try:
-                        return await bot.send_message(
+                        return await current_bot.send_message(
                             chat_id=chat_id,
                             text=text,
                             parse_mode="HTML",
@@ -833,8 +854,9 @@ async def activity_timer(
                         )
                     except Exception as e2:
                         logger.warning(f"⚠️ 引用发送重试失败，降级普通发送: {e2}")
+
             # 没有 message_id 或引用失败则普通发送
-            return await bot.send_message(
+            return await current_bot.send_message(
                 chat_id=chat_id,
                 text=text,
                 parse_mode="HTML",
@@ -856,44 +878,51 @@ async def activity_timer(
 
         # ===== 强制回座通知封装 =====
         async def push_force_back_notification(nickname, elapsed, fine_amount):
-            try:
-                chat_title = str(chat_id)
                 try:
-                    info = await bot.get_chat(chat_id)
-                    chat_title = info.title or chat_title
-                except:
-                    pass
+                        # ✅ 关键修复：使用 bot_manager.bot
+                        current_bot = bot_manager.bot
+                        if not current_bot:
+                                logger.error(f"❌ bot_manager.bot 为 None，无法获取聊天信息")
+                                return False
+                                
+                        chat_title = str(chat_id)
+                        try:
+                                info = await current_bot.get_chat(chat_id)
+                                chat_title = info.title or chat_title
+                        except Exception as e:
+                                logger.debug(f"获取聊天信息失败: {e}")
 
-                notification_text = (
-                    f"🚨 <b>超时强制回座通知</b>\n"
-                    f"🏢 群组：<code>{chat_title}</code>\n"
-                    f"{MessageFormatter.create_dashed_line()}\n"
-                    f"👤 用户：{MessageFormatter.format_user_link(uid, nickname)}\n"
-                    f"📝 活动：<code>{act}</code>\n"
-                    f"📊 班次：<code>{shift_text}</code>\n"  # 添加班次信息
-                    f"⏰ 自动回座时间：<code>{get_beijing_time().strftime('%m/%d %H:%M:%S')}</code>\n"
-                    f"⏱️ 总活动时长：<code>{MessageFormatter.format_time(elapsed)}</code>\n"
-                    f"⚠️ 系统自动回座原因：超时超过2小时\n"
-                    f"💰 本次罚款：<code>{fine_amount}</code> 元"
-                )
+                        notification_text = (
+                                f"🚨 <b>超时强制回座通知</b>\n"
+                                f"🏢 群组：<code>{chat_title}</code>\n"
+                                f"{MessageFormatter.create_dashed_line()}\n"
+                                f"👤 用户：{MessageFormatter.format_user_link(uid, nickname)}\n"
+                                f"📝 活动：<code>{act}</code>\n"
+                                f"📊 班次：<code>{shift_text}</code>\n"
+                                f"⏰ 自动回座时间：<code>{get_beijing_time().strftime('%m/%d %H:%M:%S')}</code>\n"
+                                f"⏱️ 总活动时长：<code>{MessageFormatter.format_time(elapsed)}</code>\n"
+                                f"⚠️ 系统自动回座原因：超时超过2小时\n"
+                                f"💰 本次罚款：<code>{fine_amount}</code> 元"
+                        )
 
-                if not notification_service.bot_manager and bot_manager:
-                    notification_service.bot_manager = bot_manager
-                if not notification_service.bot and bot:
-                    notification_service.bot = bot
+                        # ✅ 确保 notification_service 已配置
+                        if not notification_service.bot and bot_manager.bot:
+                                notification_service.bot = bot_manager.bot
+                        if not notification_service.bot_manager and bot_manager:
+                                notification_service.bot_manager = bot_manager
 
-                await notification_service.send_notification(
-                    chat_id,
-                    notification_text,
-                    notification_type="channel",
-                )
-                logger.info(
-                    f"✅ 强制回座通知推送成功: chat={chat_id}, uid={uid}（班次: {shift}）"
-                )
-                return True
-            except Exception as e:
-                logger.error(f"❌ 强制回座通知推送失败: {e}")
-                return False
+                        await notification_service.send_notification(
+                                chat_id,
+                                notification_text,
+                                notification_type="channel",
+                        )
+                        logger.info(
+                                f"✅ 强制回座通知推送成功: chat={chat_id}, uid={uid}（班次: {shift}）"
+                        )
+                        return True
+                except Exception as e:
+                        logger.error(f"❌ 强制回座通知推送失败: {e}")
+                        return False
 
         # ===== 主循环 =====
         while True:
@@ -2127,49 +2156,6 @@ async def process_work_checkin(message: types.Message, checkin_type: str):
 
             logger.info(f"✅[{trace_id}] {shift_text}{action_text}打卡流程完成")
             return
-
-
-# ========== 辅助函数 ==========
-async def calculate_shift_window_for_checkin(
-    chat_id: int, now: datetime, shift_config: dict, checkin_type: str
-) -> dict:
-    """
-    为打卡计算时间窗口的辅助函数
-    返回包含详细班次信息的字典
-    """
-    try:
-        if not shift_config or not shift_config.get("dual_mode", False):
-            return {
-                "current_shift": "day",
-                "current_shift_detail": "day",
-                "day_window": {},
-                "night_window": {},
-            }
-
-        # 调用数据库的calculate_shift_window方法
-        window_info = db.calculate_shift_window(
-            shift_config=shift_config, checkin_type=checkin_type, now=now
-        )
-
-        return {
-            "current_shift": (
-                "night"
-                if window_info.get("current_shift") in ["night_last", "night_tonight"]
-                else window_info.get("current_shift")
-            ),
-            "current_shift_detail": window_info.get("current_shift"),
-            "day_window": window_info.get("day_window", {}),
-            "night_window": window_info.get("night_window", {}),
-        }
-
-    except Exception as e:
-        logger.error(f"计算班次窗口失败: {e}")
-        return {
-            "current_shift": "day",
-            "current_shift_detail": "day",
-            "day_window": {},
-            "night_window": {},
-        }
 
 
 async def _check_shift_work_record(
@@ -6209,21 +6195,6 @@ async def register_handlers():
     )
 
     logger.info("✅ 所有消息处理器注册完成")
-
-
-# ========= render部署用的代码 ========
-async def external_keepalive():
-    """外部保活服务调用 - 防止 Render 休眠"""
-    keepalive_urls = [
-        # 可以添加 UptimeRobot 或其他免费监控服务
-    ]
-
-    for url in keepalive_urls:
-        try:
-            # 使用 aiohttp 发起请求
-            pass
-        except Exception as e:
-            logger.debug(f"保活请求失败 {url}: {e}")
 
 
 async def keepalive_loop():
