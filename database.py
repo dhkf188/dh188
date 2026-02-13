@@ -1362,7 +1362,6 @@ class PostgreSQLDatabase:
         self._cache.pop(f"user:{chat_id}:{user_id}", None)
 
     # ====== 核心业务方法 ======
-
     async def complete_user_activity(
         self,
         chat_id: int,
@@ -1372,6 +1371,7 @@ class PostgreSQLDatabase:
         fine_amount: int = 0,
         is_overtime: bool = False,
         shift: Optional[str] = None,
+        forced_date: Optional[date] = None,  # 🆕 新增参数
     ) -> None:
         """完成用户活动 - 支持班次、软重置、统计、超时、罚款"""
 
@@ -1385,8 +1385,15 @@ class PostgreSQLDatabase:
                 shift = await self.determine_shift_for_time(chat_id, now) or "day"
 
         # ===== 2️⃣ 时间计算 =====
-        today = await self.get_business_date(chat_id)
-        statistic_date = today.replace(day=1)
+        # 🎯 确定目标日期
+        if forced_date:
+            target_date = forced_date
+            logger.debug(f"📅 使用强制日期: {target_date}")
+        else:
+            target_date = await self.get_business_date(chat_id)
+            logger.debug(f"📅 使用业务日期: {target_date}")
+
+        statistic_date = target_date.replace(day=1)
         now = self.get_beijing_time()
 
         overtime_seconds = 0
@@ -1399,52 +1406,56 @@ class PostgreSQLDatabase:
         async with self.pool.acquire() as conn:
             async with conn.transaction():
 
-                # ===== 3️⃣ 软重置判断 =====
-                has_soft_reset_record = await conn.fetchval(
-                    """
-                    SELECT EXISTS (
-                        SELECT 1 FROM daily_statistics
-                        WHERE chat_id = $1
-                          AND user_id = $2
-                          AND record_date = $3
-                          AND is_soft_reset = TRUE
-                          AND shift = $4
-                    )
-                    """,
-                    chat_id,
-                    user_id,
-                    today,
-                    shift,
-                )
-
-                should_be_soft_reset = False
-                if not has_soft_reset_record:
-                    hour, minute = await self.get_group_soft_reset_time(chat_id)
-                    if hour > 0 or minute > 0:
-                        reset_time = now.replace(
-                            hour=hour, minute=minute, second=0, microsecond=0
-                        )
-                        if now >= reset_time:
-                            should_be_soft_reset = True
-
-                current_soft_reset = bool(has_soft_reset_record or should_be_soft_reset)
-
-                if should_be_soft_reset:
-                    await conn.execute(
+                # ===== 3️⃣ 软重置判断（只有非强制日期才检查）=====
+                current_soft_reset = False
+                if not forced_date:  # 🆕 只有非强制日期才检查软重置
+                    has_soft_reset_record = await conn.fetchval(
                         """
-                        INSERT INTO daily_statistics
-                        (chat_id, user_id, record_date, activity_name,
-                         activity_count, accumulated_time, is_soft_reset, shift)
-                        VALUES ($1, $2, $3, 'soft_reset', 0, 0, TRUE, $4)
-                        ON CONFLICT (chat_id, user_id, record_date,
-                                     activity_name, is_soft_reset, shift)
-                        DO NOTHING
+                        SELECT EXISTS (
+                            SELECT 1 FROM daily_statistics
+                            WHERE chat_id = $1
+                              AND user_id = $2
+                              AND record_date = $3
+                              AND is_soft_reset = TRUE
+                              AND shift = $4
+                        )
                         """,
                         chat_id,
                         user_id,
-                        today,
+                        target_date,
                         shift,
                     )
+
+                    should_be_soft_reset = False
+                    if not has_soft_reset_record:
+                        hour, minute = await self.get_group_soft_reset_time(chat_id)
+                        if hour > 0 or minute > 0:
+                            reset_time = now.replace(
+                                hour=hour, minute=minute, second=0, microsecond=0
+                            )
+                            if now >= reset_time:
+                                should_be_soft_reset = True
+
+                    current_soft_reset = bool(
+                        has_soft_reset_record or should_be_soft_reset
+                    )
+
+                    if should_be_soft_reset:
+                        await conn.execute(
+                            """
+                            INSERT INTO daily_statistics
+                            (chat_id, user_id, record_date, activity_name,
+                             activity_count, accumulated_time, is_soft_reset, shift)
+                            VALUES ($1, $2, $3, 'soft_reset', 0, 0, TRUE, $4)
+                            ON CONFLICT (chat_id, user_id, record_date,
+                                         activity_name, is_soft_reset, shift)
+                            DO NOTHING
+                            """,
+                            chat_id,
+                            user_id,
+                            target_date,
+                            shift,
+                        )
 
                 # ===== 4️⃣ users 基础行 =====
                 await conn.execute(
@@ -1456,7 +1467,7 @@ class PostgreSQLDatabase:
                     """,
                     chat_id,
                     user_id,
-                    today,
+                    target_date,
                 )
 
                 # ===== 5️⃣ user_activities =====
@@ -1476,13 +1487,16 @@ class PostgreSQLDatabase:
                     """,
                     chat_id,
                     user_id,
-                    today,
+                    target_date,
                     activity,
                     elapsed_time,
                     shift,
                 )
 
                 # ===== 6️⃣ daily_statistics =====
+                # 强制日期时，软重置标志始终为 False
+                soft_reset_flag = current_soft_reset if not forced_date else False
+
                 await conn.execute(
                     """
                     INSERT INTO daily_statistics
@@ -1499,10 +1513,10 @@ class PostgreSQLDatabase:
                     """,
                     chat_id,
                     user_id,
-                    today,
+                    target_date,
                     activity,
                     elapsed_time,
-                    current_soft_reset,
+                    soft_reset_flag,
                     shift,
                 )
 
@@ -1521,8 +1535,8 @@ class PostgreSQLDatabase:
                         """,
                         chat_id,
                         user_id,
-                        today,
-                        current_soft_reset,
+                        target_date,
+                        soft_reset_flag,
                         shift,
                     )
 
@@ -1541,9 +1555,9 @@ class PostgreSQLDatabase:
                         """,
                         chat_id,
                         user_id,
-                        today,
+                        target_date,
                         overtime_seconds,
-                        current_soft_reset,
+                        soft_reset_flag,
                         shift,
                     )
 
@@ -1563,9 +1577,9 @@ class PostgreSQLDatabase:
                         """,
                         chat_id,
                         user_id,
-                        today,
+                        target_date,
                         fine_amount,
-                        current_soft_reset,
+                        soft_reset_flag,
                         shift,
                     )
 
@@ -1661,7 +1675,7 @@ class PostgreSQLDatabase:
                     "checkin_message_id = NULL",
                     "last_updated = $2",
                 ]
-                params = [elapsed_time, today]
+                params = [elapsed_time, target_date]
 
                 if fine_amount > 0:
                     idx = len(params) + 1
@@ -1691,10 +1705,11 @@ class PostgreSQLDatabase:
         self._cache.pop(f"user:{chat_id}:{user_id}", None)
         self._cache_ttl.pop(f"user:{chat_id}:{user_id}", None)
 
+        date_source = "强制日期" if forced_date else "业务日期"
         logger.info(
             f"✅ 四表同步完成: {chat_id}-{user_id} - {activity} "
-            f"(时长: {elapsed_time}s, 罚款: {fine_amount}, "
-            f"超时: {is_overtime} {overtime_seconds}s, "
+            f"(日期: {target_date} [{date_source}], 时长: {elapsed_time}s, "
+            f"罚款: {fine_amount}, 超时: {is_overtime} {overtime_seconds}s, "
             f"软重置: {current_soft_reset}, 班次: {shift})"
         )
 
