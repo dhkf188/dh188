@@ -117,22 +117,35 @@ def get_user_lock(chat_id: int, uid: int):
     return user_lock_manager.get_lock(chat_id, uid)
 
 
+# main.py - 修改 auto_end_current_activity
+
+
 async def auto_end_current_activity(
     chat_id: int, uid: int, user_data: dict, now: datetime, message: types.Message
 ):
-    """自动结束当前活动"""
+    """自动结束当前活动 - 日常使用，使用业务日期"""
     try:
         act = user_data["current_activity"]
         start_time_dt = datetime.fromisoformat(user_data["activity_start_time"])
+        shift = user_data.get("shift", "day")
         elapsed = int((now - start_time_dt).total_seconds())
 
-        # 完成活动（不计算罚款，因为是自动结束）
-        await db.complete_user_activity(chat_id, uid, act, elapsed, 0, False)
+        # 完成活动 - 不传入 forced_date，使用业务日期
+        await db.complete_user_activity(
+            chat_id=chat_id,
+            user_id=uid,
+            activity=act,
+            elapsed_time=elapsed,
+            fine_amount=0,
+            is_overtime=False,
+            shift=shift,
+            # forced_date=None，使用业务日期
+        )
 
         # 取消定时器
         await timer_manager.cancel_timer(f"{chat_id}-{uid}")
 
-        logger.info(f"自动结束活动: {chat_id}-{uid} - {act}")
+        logger.info(f"自动结束活动: {chat_id}-{uid} - {act}（使用业务日期）")
 
     except Exception as e:
         logger.error(f"自动结束活动失败 {chat_id}-{uid}: {e}")
@@ -479,6 +492,23 @@ async def handle_expired_activity(
         if user_data:
             nickname = user_data.get("nickname", str(user_id))
 
+        # 🎯 确定活动的归属日期
+        group_data = await db.get_group_cached(chat_id)
+        reset_hour = group_data.get("reset_hour", Config.DAILY_RESET_HOUR)
+        reset_minute = group_data.get("reset_minute", Config.DAILY_RESET_MINUTE)
+
+        reset_time_today = now.replace(
+            hour=reset_hour, minute=reset_minute, second=0, microsecond=0
+        )
+
+        forced_date = None
+        if start_time < reset_time_today:
+            # 活动开始时间在今天的重置时间之前，说明是昨天的活动
+            forced_date = (now - timedelta(days=1)).date()
+            logger.info(
+                f"🔄 恢复过期活动: 开始时间早于今天重置，强制归到 {forced_date}"
+            )
+
         # 计算罚款
         time_limit = await db.get_activity_time_limit(activity)
         time_limit_seconds = time_limit * 60
@@ -490,15 +520,23 @@ async def handle_expired_activity(
         if is_overtime and overtime_seconds > 0:
             fine_amount = await calculate_fine(activity, overtime_minutes)
 
-        # 完成活动
+        # 完成活动 - 传入可能为 None 的 forced_date
         shift = user_data.get("shift", "day")
         await db.complete_user_activity(
-            chat_id, user_id, activity, elapsed, fine_amount, is_overtime, shift
+            chat_id=chat_id,
+            user_id=user_id,
+            activity=activity,
+            elapsed_time=elapsed,
+            fine_amount=fine_amount,
+            is_overtime=is_overtime,
+            shift=shift,
+            forced_date=forced_date,  # 🎯 关键：可能为 None，也可能有值
         )
 
         # 发送恢复通知
+        date_desc = "（归到昨天）" if forced_date else ""
         timeout_msg = (
-            f"🔄 <b>系统恢复通知</b>\n"
+            f"🔄 <b>系统恢复通知</b>{date_desc}\n"
             f"👤 用户：{MessageFormatter.format_user_link(user_id, nickname)}\n"
             f"📝 检测到未结束的活动：<code>{activity}</code>\n"
             f"⏰ 活动开始时间：<code>{start_time.strftime('%m/%d %H:%M:%S')}</code>\n"
@@ -510,7 +548,9 @@ async def handle_expired_activity(
             timeout_msg += f"\n💰 超时罚款：<code>{fine_amount}</code> 元"
 
         await bot.send_message(chat_id, timeout_msg, parse_mode="HTML")
-        logger.info(f"已处理过期活动: {chat_id}-{user_id} - {activity}")
+
+        date_log = f"强制日期: {forced_date}" if forced_date else "使用业务日期"
+        logger.info(f"已处理过期活动: {chat_id}-{user_id} - {activity} [{date_log}]")
 
     except Exception as e:
         logger.error(f"处理过期活动失败 {chat_id}-{user_id}: {e}")
@@ -953,14 +993,22 @@ async def activity_timer(
                 nickname = user_data.get("nickname", str(uid))
 
                 # ===== 强制回座 2 小时 =====
-                break_force = False
                 if elapsed >= 120 * 60 and not force_back_sent:
                     force_back_sent = True
                     fine_amount = await calculate_fine(act, 120)
-                    # 在 complete_user_activity 中传递 shift 参数
+
+                    # ✅ 日常超时强制回座 - 使用业务日期
                     await db.complete_user_activity(
-                        chat_id, uid, act, elapsed, fine_amount, True, shift
+                        chat_id=chat_id,
+                        user_id=uid,
+                        activity=act,
+                        elapsed_time=elapsed,
+                        fine_amount=fine_amount,
+                        is_overtime=True,
+                        shift=shift,
+                        # forced_date=None，使用业务日期
                     )
+
                     break_force = True
 
             # ===== 锁外处理 =====
