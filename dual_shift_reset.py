@@ -70,11 +70,16 @@ async def _dual_shift_hard_reset(
     4. 删除昨天及之前数据
     """
     try:
+        await db.init_group(chat_id)
         now = db.get_beijing_time()
         today = now.date()
         yesterday = today - timedelta(days=1)
 
         group_data = await db.get_group_cached(chat_id)
+        if not group_data:
+            logger.warning(f"群组 {chat_id} 没有配置数据，跳过重置")
+            return False
+
         reset_hour = group_data.get("reset_hour", 0)
         reset_minute = group_data.get("reset_minute", 0)
         reset_time_today = now.replace(
