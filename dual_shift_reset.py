@@ -11,6 +11,8 @@
 
 import logging
 import asyncio
+import time
+import traceback
 from datetime import datetime, timedelta, date
 from typing import Dict, Optional, Any
 
@@ -62,12 +64,9 @@ async def _dual_shift_hard_reset(
     chat_id: int, operator_id: Optional[int] = None
 ) -> bool:
     """
-    双班硬重置主流程 - 使用独立强制结束函数
-    严格遵循：
-    1. 09:00 - 强制结束昨天白班未下班
-    2. 11:00 - 强制结束昨晚夜班未下班
-    3. 导出昨天数据
-    4. 删除昨天及之前数据
+    双班硬重置主流程
+    6:00 - 设定的重置时间（不操作）
+    8:00 - +2h后执行所有操作
     """
     try:
         await db.init_group(chat_id)
@@ -77,7 +76,7 @@ async def _dual_shift_hard_reset(
 
         group_data = await db.get_group_cached(chat_id)
         if not group_data:
-            logger.warning(f"群组 {chat_id} 没有配置数据，跳过重置")
+            logger.warning(f"⚠️ [双班硬重置] 群组 {chat_id} 没有配置数据，跳过重置")
             return False
 
         reset_hour = group_data.get("reset_hour", 0)
@@ -86,102 +85,186 @@ async def _dual_shift_hard_reset(
             hour=reset_hour, minute=reset_minute, second=0, microsecond=0
         )
 
+        # ========== 只在 +2h 后执行 ==========
+        execute_time = reset_time_today + timedelta(hours=2)
+
+        if now < execute_time:
+            logger.debug(
+                f"⏳ [双班硬重置] 群组 {chat_id} 未到执行时间\n"
+                f"   • 当前时间: {now.strftime('%H:%M')}\n"
+                f"   • 执行时间: {execute_time.strftime('%H:%M')}\n"
+                f"   • 剩余时间: {int((execute_time - now).total_seconds() / 60)} 分钟"
+            )
+            return True
+
+        # ========== 开始执行重置 ==========
         logger.info(
-            f"🚀 [双班硬重置] 群组{chat_id}\n"
-            f"   • 当前时间: {now.strftime('%Y-%m-%d %H:%M')}\n"
-            f"   • 重置时间: {reset_time_today.strftime('%H:%M')}\n"
-            f"   • 昨天: {yesterday}\n"
-            f"   • 今天: {today}"
+            f"🚀 [双班硬重置] 开始执行\n"
+            f"   ┌─────────────────────────────────\n"
+            f"   ├─ 群组ID: {chat_id}\n"
+            f"   ├─ 当前时间: {now.strftime('%Y-%m-%d %H:%M:%S')}\n"
+            f"   ├─ 重置时间: {reset_time_today.strftime('%H:%M')}\n"
+            f"   ├─ 执行时间: {execute_time.strftime('%H:%M')}\n"
+            f"   ├─ 昨天日期: {yesterday}\n"
+            f"   ├─ 今天日期: {today}\n"
+            f"   └─ 操作员: {operator_id or '系统'}"
         )
 
-        # ========== 🟡 第1步：09:00 强制结束昨天白班未下班 ==========
-        if now >= reset_time_today:
-            white_stats = await _force_end_white_shift_independent(
-                chat_id, now, yesterday
-            )
-            logger.info(f"🟡 [白班强制结束] 成功:{white_stats['success']} 人")
-        else:
-            logger.debug("⏳ 未到白班强制结束时间")
-            white_stats = {"success": 0, "failed": 0, "total": 0}
+        # ========== 1. 强制结束所有进行中活动 ==========
+        logger.info(f"📊 [步骤1/4] 强制结束所有进行中活动...")
+        all_stats = await _force_end_all_activities(chat_id, now, yesterday)
+        logger.info(
+            f"   ✅ 强制结束完成\n"
+            f"      ├─ 总计: {all_stats.get('total', 0)} 人\n"
+            f"      ├─ 成功: {all_stats.get('success', 0)} 人\n"
+            f"      └─ 失败: {all_stats.get('failed', 0)} 人"
+        )
 
-        # ========== 🌙 第2步：11:00 强制结束昨晚夜班未下班 ==========
-        night_force_time = reset_time_today + timedelta(hours=2)
-        if now >= night_force_time:
-            night_stats = await _force_end_night_shift_independent(
-                chat_id, now, yesterday
-            )
-            logger.info(f"🌙 [夜班强制结束] 成功:{night_stats['success']} 人")
-        else:
-            logger.debug(
-                f"⏳ 未到夜班强制结束时间: {night_force_time.strftime('%H:%M')}"
-            )
-            night_stats = {"success": 0, "failed": 0, "total": 0}
+        # ========== 2. 强制结束昨晚夜班未下班 ==========
+        logger.info(f"📊 [步骤2/4] 强制结束昨晚夜班未下班...")
+        night_stats = await _force_end_night_shift_independent(chat_id, now, yesterday)
+        logger.info(
+            f"   ✅ 夜班强制结束完成\n"
+            f"      ├─ 总计: {night_stats.get('total', 0)} 人\n"
+            f"      ├─ 成功: {night_stats.get('success', 0)} 人\n"
+            f"      └─ 失败: {night_stats.get('failed', 0)} 人"
+        )
 
-        # ========== 📤 第3步：导出昨天数据 ==========
+        # ========== 3. 导出昨天所有数据 ==========
+        logger.info(f"📊 [步骤3/4] 导出昨天数据 (白班+夜班)...")
+        export_start = time.time()
         export_success = await _export_yesterday_data(chat_id, yesterday)
-        logger.info(f"📤 [数据导出] {'✅成功' if export_success else '❌失败'}")
+        export_time = time.time() - export_start
 
-        # 🆕 新增：导出失败时的处理
-        if not export_success:
-            logger.warning(f"⚠️ [数据导出] 失败，但仍继续执行清理（数据可能已丢失）")
-            # 可以添加重试机制
+        if export_success:
+            logger.info(f"   ✅ 数据导出成功 (耗时: {export_time:.2f}秒)")
+        else:
+            logger.warning(f"   ⚠️ 数据导出失败 (耗时: {export_time:.2f}秒)")
+            # 重试机制
             for attempt in range(2):
-                logger.info(f"🔄 第{attempt+2}次尝试导出...")
+                logger.info(f"   🔄 第{attempt+2}次尝试导出...")
+                retry_start = time.time()
                 export_success = await _export_yesterday_data(chat_id, yesterday)
                 if export_success:
-                    logger.info(f"✅ 第{attempt+2}次导出成功")
+                    logger.info(
+                        f"   ✅ 第{attempt+2}次导出成功 (耗时: {time.time()-retry_start:.2f}秒)"
+                    )
                     break
-                await asyncio.sleep(5)
+                await asyncio.sleep(3)
 
-        # ========== 🧹 第4步：删除昨天及之前数据 ==========
+        # ========== 4. 清除昨天所有数据 ==========
+        logger.info(f"📊 [步骤4/4] 清除昨天数据...")
+        cleanup_start = time.time()
         cleanup_stats = await _cleanup_old_data(chat_id, yesterday, today)
+        cleanup_time = time.time() - cleanup_start
 
-        # 🆕 新增：清除班次状态
-        try:
-            await db.clear_shift_state(chat_id)
-            logger.info(f"🧹 [班次状态] 群组{chat_id} 硬重置后已清除")
-            state_cleared = True
-        except Exception as e:
-            logger.error(f"❌ [班次状态] 清除失败 {chat_id}: {e}")
-            state_cleared = False
+        logger.info(
+            f"   ✅ 数据清理完成 (耗时: {cleanup_time:.2f}秒)\n"
+            f"      ├─ 删除用户活动: {cleanup_stats.get('user_activities', 0)} 条\n"
+            f"      ├─ 删除工作记录: {cleanup_stats.get('work_records', 0)} 条\n"
+            f"      ├─ 删除日统计: {cleanup_stats.get('daily_statistics', 0)} 条\n"
+            f"      └─ 重置用户状态: {cleanup_stats.get('users_reset', 0)} 人"
+        )
 
-        # 🆕 新增：发送重置通知
+        # ========== 5. 清除班次状态 ==========
+        await db.clear_shift_state(chat_id)
+        logger.info(f"   ✅ 班次状态已清除")
+
+        # ========== 6. 发送通知 ==========
         try:
             from main import send_reset_notification
 
             await send_reset_notification(
                 chat_id,
                 {
-                    "white": white_stats,
+                    "all_activities": all_stats,
                     "night": night_stats,
                     "export": export_success,
                     "cleanup": cleanup_stats,
-                    "state_cleared": state_cleared,
+                    "export_time": f"{export_time:.2f}秒",
+                    "cleanup_time": f"{cleanup_time:.2f}秒",
                 },
                 now,
             )
-            logger.info(f"📢 [重置通知] 群组{chat_id} 已发送")
+            logger.info(f"   ✅ 重置通知已发送")
         except Exception as e:
-            logger.error(f"❌ [重置通知] 发送失败 {chat_id}: {e}")
+            logger.warning(f"   ⚠️ 发送重置通知失败: {e}")
 
-        # ========== ✅ 完成日志 ==========
+        # ========== 最终汇总 ==========
+        total_time = time.time() - now.timestamp()
         logger.info(
-            f"✅ [双班硬重置完成] 群组{chat_id}\n"
-            f"   • 白班强制结束: {white_stats['success']}/{white_stats.get('total', 0)} 人\n"
-            f"   • 夜班强制结束: {night_stats['success']}/{night_stats.get('total', 0)} 人\n"
-            f"   • 数据导出: {'✅成功' if export_success else '❌失败'}\n"
-            f"   • 清理昨天数据: 完成 (删除{cleanup_stats.get('total_deleted', 0)}条)\n"
-            f"   • 班次状态: {'✅已清除' if state_cleared else '❌清除失败'}\n"
-            f"   • 今天数据: ✅ 完整保留\n"
-            f"   • 操作员: {operator_id or '系统'}"
+            f"🎉 [双班硬重置完成] 群组 {chat_id}\n"
+            f"   ┌─────────────────────────────────\n"
+            f"   ├─ 执行结果汇总:\n"
+            f"   │  ├─ 强制结束活动: {all_stats.get('success', 0)}/{all_stats.get('total', 0)} 人\n"
+            f"   │  ├─ 夜班强制结束: {night_stats.get('success', 0)}/{night_stats.get('total', 0)} 人\n"
+            f"   │  ├─ 数据导出: {'✅成功' if export_success else '❌失败'}\n"
+            f"   │  ├─ 清理昨天数据: {cleanup_stats.get('user_activities', 0)} 条活动\n"
+            f"   │  ├─ 班次状态: ✅已清除\n"
+            f"   │  └─ 今天数据: ✅ 完整保留\n"
+            f"   ├─ 性能统计:\n"
+            f"   │  ├─ 导出耗时: {export_time:.2f}秒\n"
+            f"   │  ├─ 清理耗时: {cleanup_time:.2f}秒\n"
+            f"   │  └─ 总耗时: {total_time:.2f}秒\n"
+            f"   └─ 完成时间: {db.get_beijing_time().strftime('%Y-%m-%d %H:%M:%S')}"
         )
 
         return True
 
     except Exception as e:
-        logger.error(f"❌ [双班硬重置] 失败 {chat_id}: {e}")
-        logger.exception(e)
+        logger.error(
+            f"❌ [双班硬重置] 失败 {chat_id}\n"
+            f"   ├─ 错误类型: {type(e).__name__}\n"
+            f"   ├─ 错误信息: {e}\n"
+            f"   └─ 堆栈: {traceback.format_exc()}"
+        )
         return False
+
+
+async def _force_end_all_activities(
+    chat_id: int, now: datetime, yesterday: date
+) -> Dict[str, Any]:
+    """强制结束所有进行中的活动"""
+    stats = {"total": 0, "success": 0, "failed": 0}
+
+    try:
+        async with db.pool.acquire() as conn:
+            rows = await conn.fetch(
+                """
+                SELECT user_id, nickname, current_activity, activity_start_time, shift
+                FROM users 
+                WHERE chat_id = $1 AND current_activity IS NOT NULL
+                """,
+                chat_id,
+            )
+
+            stats["total"] = len(rows)
+
+            for row in rows:
+                try:
+                    await db.complete_user_activity(
+                        chat_id=chat_id,
+                        user_id=row["user_id"],
+                        activity=row["current_activity"],
+                        elapsed_time=int(
+                            (
+                                now - datetime.fromisoformat(row["activity_start_time"])
+                            ).total_seconds()
+                        ),
+                        fine_amount=0,  # 或计算实际罚款
+                        is_overtime=True,
+                        shift=row["shift"],
+                        forced_date=yesterday,
+                    )
+                    stats["success"] += 1
+                except Exception as e:
+                    stats["failed"] += 1
+                    logger.error(f"强制结束活动失败: {e}")
+
+    except Exception as e:
+        logger.error(f"强制结束所有活动失败: {e}")
+
+    return stats
 
 
 # ========== 3. 独立强制结束核心函数（100%归因昨天）==========
