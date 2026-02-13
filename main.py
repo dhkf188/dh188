@@ -1532,19 +1532,6 @@ async def _process_back_locked(message: types.Message, chat_id: int, uid: int):
             )
             logger.info(f"ℹ️ 降级发送回座消息，没有引用打卡消息")
 
-        # 异步发送超时通知
-        if is_overtime and fine_amount > 0:
-            notification_user_data = user_data.copy() if user_data else {}
-            notification_user_data["activity_start_time"] = (
-                activity_start_time_for_notification
-            )
-            notification_user_data["nickname"] = nickname
-            asyncio.create_task(
-                send_overtime_notification_async(
-                    chat_id, uid, notification_user_data, act, fine_amount, now
-                )
-            )
-
         # ==================== ✨ 吃饭回座推送 (优化版) ✨ ====================
         if act == "吃饭":
             try:
@@ -1669,112 +1656,6 @@ async def _process_back_locked_with_shift(
     except Exception as e:
         logger.error(f"❌ 快速回座处理失败 {chat_id}-{uid}: {e}")
         raise
-
-
-# 🎯 【新增】异步发送超时通知函数
-async def send_overtime_notification_async(
-    chat_id: int, uid: int, user_data: dict, act: str, fine_amount: int, now: datetime
-):
-    """异步发送超时通知 - 优化版本"""
-    try:
-        chat_title = str(chat_id)
-        try:
-            chat_info = await bot.get_chat(chat_id)
-            chat_title = chat_info.title or chat_title
-        except Exception:
-            pass
-
-        # 🎯 直接从传入的 user_data 获取开始时间
-        activity_start_time = user_data.get("activity_start_time")
-        nickname = user_data.get("nickname", "未知用户")
-
-        overtime_str = "未知时长"
-
-        if activity_start_time:
-            try:
-                # 内联时间解析
-                start_time = None
-                clean_str = str(activity_start_time).strip()
-
-                if clean_str.endswith("Z"):
-                    clean_str = clean_str.replace("Z", "+00:00")
-
-                # 尝试ISO格式
-                try:
-                    start_time = datetime.fromisoformat(clean_str)
-                    if start_time.tzinfo is None:
-                        start_time = beijing_tz.localize(start_time)
-                except ValueError:
-                    # 尝试常见格式
-                    formats = [
-                        "%Y-%m-%d %H:%M:%S.%f",
-                        "%Y-%m-%d %H:%M:%S",
-                        "%Y-%m-%d %H:%M",
-                        "%m/%d %H:%M:%S",
-                        "%m/%d %H:%M",
-                    ]
-
-                    for fmt in formats:
-                        try:
-                            start_time = datetime.strptime(clean_str, fmt)
-                            if fmt.startswith("%m/%d"):
-                                start_time = start_time.replace(year=now.year)
-                            if start_time.tzinfo is None:
-                                start_time = beijing_tz.localize(start_time)
-                            break
-                        except ValueError:
-                            continue
-
-                if start_time:
-                    # 获取活动时间限制
-                    time_limit_minutes = await db.get_activity_time_limit(act)
-                    time_limit_seconds = time_limit_minutes * 60
-
-                    # 计算总时长
-                    total_elapsed = int((now - start_time).total_seconds())
-
-                    # 计算超时时长
-                    if total_elapsed > time_limit_seconds:
-                        overtime_seconds = total_elapsed - time_limit_seconds
-                        overtime_str = MessageFormatter.format_time(overtime_seconds)
-                        logger.info(
-                            f"✅ 超时计算: {overtime_seconds}秒 ({overtime_str})"
-                        )
-                    else:
-                        overtime_str = "未超时"
-                else:
-                    overtime_str = "时间解析失败"
-
-            except Exception as e:
-                logger.error(f"时间计算失败: {e}")
-                overtime_str = "计算失败"
-        else:
-            logger.warning(f"开始时间为空")
-            overtime_str = "开始时间缺失"
-
-        # 格式化通知消息
-        notif_text = (
-            f"🚨 <b>超时回座通知</b>\n"
-            f"🏢 群组：<code>{chat_title}</code>\n"
-            f"{MessageFormatter.create_dashed_line()}\n"
-            f"👤 用户：{MessageFormatter.format_user_link(uid, nickname)}\n"
-            f"📝 活动：<code>{act}</code>\n"
-            f"⏰ 回座时间：<code>{now.strftime('%m/%d %H:%M:%S')}</code>\n"
-            f"⏱️ 超时时长：<code>{overtime_str}</code>\n"
-            f"💰 绩效分数：<code>{fine_amount}</code> 元"
-        )
-
-        # 添加调试信息（管理员可见）
-        # if await is_admin(uid):
-        #     notif_text += f"\n\n🔍 调试信息：\n开始时间：{activity_start_time}"
-
-        await notification_service.send_notification(chat_id, notif_text)
-        logger.info(f"✅ 超时通知发送成功: {chat_id} - 用户{uid} - {act}")
-
-    except Exception as e:
-        logger.error(f"❌ 超时通知推送异常: {e}")
-
-        logger.error(f"完整堆栈：{traceback.format_exc()}")
 
 
 # ========== 上下班打卡功能 ==========
