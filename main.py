@@ -1587,17 +1587,17 @@ async def _process_back_locked(
             logger.info(f"ℹ️ 降级发送回座消息，没有引用打卡消息")
 
         # 异步发送超时通知
-        # if is_overtime and fine_amount > 0:
-        #     notification_user_data = user_data.copy() if user_data else {}
-        #     notification_user_data["activity_start_time"] = (
-        #         activity_start_time_for_notification
-        #     )
-        #     notification_user_data["nickname"] = nickname
-        #     asyncio.create_task(
-        #         send_overtime_notification_async(
-        #             chat_id, uid, notification_user_data, act, fine_amount, now
-        #         )
-        #     )
+        if is_overtime and fine_amount > 0:
+            notification_user_data = user_data.copy() if user_data else {}
+            notification_user_data["activity_start_time"] = (
+                activity_start_time_for_notification
+            )
+            notification_user_data["nickname"] = nickname
+            asyncio.create_task(
+                send_overtime_notification_async(
+                    chat_id, uid, notification_user_data, act, fine_amount, now
+                )
+            )
 
         # ==================== ✨ 吃饭回座推送 ====================
         if act == "吃饭":
@@ -1643,6 +1643,66 @@ async def _process_back_locked(
         active_back_processing.pop(key, None)
         duration = round(time.time() - start_time, 2)
         logger.info(f"回座结束 chat_id={chat_id}, uid={uid}，耗时 {duration}s")
+
+async def send_overtime_notification_async(
+    chat_id: int, 
+    uid: int, 
+    user_data: dict, 
+    act: str, 
+    fine_amount: int, 
+    now: datetime,
+    elapsed_time: int = None,  # ✅ 可选参数
+    time_limit_minutes: int = None  # ✅ 可选参数
+):
+    """异步发送超时通知到频道"""
+    try:
+        # 检查是否绑定了频道
+        group_data = await db.get_group_cached(chat_id)
+        channel_id = group_data.get("channel_id")
+        if not channel_id:
+            logger.debug(f"⏱️ 群组 {chat_id} 未绑定频道，跳过推送")
+            return
+
+        chat_title = str(chat_id)
+        try:
+            chat_info = await bot.get_chat(chat_id)
+            chat_title = chat_info.title or chat_title
+        except Exception:
+            pass
+
+        nickname = user_data.get("nickname", "未知用户")
+        
+        # ✅ 如果传入了计算好的值，直接使用
+        if elapsed_time is not None and time_limit_minutes is not None:
+            time_limit_seconds = time_limit_minutes * 60
+            if elapsed_time > time_limit_seconds:
+                overtime_seconds = elapsed_time - time_limit_seconds
+                overtime_str = MessageFormatter.format_time(overtime_seconds)
+            else:
+                overtime_str = "未超时"
+        else:
+            # 兼容旧调用，重新计算（但尽量不用）
+            activity_start_time = user_data.get("activity_start_time")
+            overtime_str = "未知时长"
+            # ... 原来的计算逻辑 ...
+
+        notif_text = (
+            f"🚨 <b>超时回座通知</b>\n"
+            f"🏢 群组：<code>{chat_title}</code>\n"
+            f"{MessageFormatter.create_dashed_line()}\n"
+            f"👤 用户：{MessageFormatter.format_user_link(uid, nickname)}\n"
+            f"📝 活动：<code>{act}</code>\n"
+            f"⏰ 回座时间：<code>{now.strftime('%m/%d %H:%M:%S')}</code>\n"
+            f"⏱️ 超时时长：<code>{overtime_str}</code>\n"
+            f"💰 绩效分数：<code>{fine_amount}</code> 元"
+        )
+
+        # 发送到频道
+        await notification_service.send_notification(chat_id, notif_text)
+        logger.info(f"✅ 超时通知已推送到频道 {channel_id}: 用户{uid} - {act}")
+
+    except Exception as e:
+        logger.error(f"❌ 超时通知推送异常: {e}")
 
 
 async def _process_back_locked_with_shift(
