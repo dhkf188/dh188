@@ -1789,11 +1789,13 @@ async def process_work_checkin(message: types.Message, checkin_type: str):
         # 🛡️ 添加健壮性检查 - 你的方案是正确的！
         if shift_info is None:
             logger.warning(f"[{trace_id}] ⚠️ 无法确定班次信息，使用默认班次")
-            
+
             # 获取默认班次配置
             shift_config = await db.get_shift_config(chat_id)
-            is_dual_mode = shift_config.get("dual_mode", False) if shift_config else False
-            
+            is_dual_mode = (
+                shift_config.get("dual_mode", False) if shift_config else False
+            )
+
             if is_dual_mode:
                 # 双班模式下，如果没有班次信息，提示用户
                 await message.answer(
@@ -1809,16 +1811,14 @@ async def process_work_checkin(message: types.Message, checkin_type: str):
                 shift_info = {  # ✅ 现在 shift_info 在整个函数作用域都存在
                     "shift": "day",
                     "shift_detail": "day",
-                    "record_date": business_date
+                    "record_date": business_date,
                 }
                 logger.info(f"[{trace_id}] ℹ️ 单班模式使用默认班次: day")
-        
+
         # 🎯 现在可以安全使用了
         shift = shift_info["shift"]
         shift_detail = shift_info["shift_detail"]
         record_date = shift_info["record_date"]
-
-
 
         logger.info(
             f"[{trace_id}] 🕒 权威班次判定: {shift_detail} | "
@@ -5295,17 +5295,30 @@ async def export_and_push_csv(
     导出群组数据为 CSV 并推送 - 终极完整整合版
     返回: True/False 表示导出是否成功
     """
-    # ========== 0. 前置检查 ==========
+    # ========== 0. 前置检查 - 统一检查 ==========
     try:
+        # 检查 Bot 状态
+        if not bot_manager or not bot_manager.bot:
+            logger.error(f"❌ Bot管理器未初始化，无法导出 {chat_id}")
+            if is_daily_reset:
+                logger.warning("定时任务继续执行，跳过导出")
+                return True  # 返回 True 让任务继续
+            return False
+
+        # 检查数据库连接
         if not await db._ensure_healthy_connection():
             logger.error(f"❌ 数据库连接不健康，无法导出 {chat_id}")
+            if is_daily_reset:
+                logger.warning("定时任务继续执行，跳过导出")
+                return True
             return False
-        if not bot or not hasattr(bot, "send_document"):
-            logger.error(f"❌ Bot不可用，无法导出 {chat_id}")
-            return False
+
     except Exception as e:
         logger.error(f"❌ 前置检查失败 {chat_id}: {e}")
         logger.error(traceback.format_exc())
+        if is_daily_reset:
+            logger.warning("定时任务继续执行，跳过导出")
+            return True
         return False
 
     # ========== 1. 性能监控开始 ==========
