@@ -1133,6 +1133,8 @@ async def start_activity(message: types.Message, act: str):
         now = get_beijing_time()
 
         # ================== 🆕 班次判定 ==================
+        # 初始化班次变量
+        current_shift = None
         shift_state = await db.get_current_shift_state(chat_id)
 
         if shift_state:
@@ -1146,8 +1148,14 @@ async def start_activity(message: types.Message, act: str):
         else:
             shift_config = await db.get_shift_config(chat_id)
             if shift_config.get("dual_mode", False):
-                # ✅ 双班模式：根据时间判定 - 正确取 shift 字段
-                shift_info = await db.determine_shift_for_time(chat_id, now)
+                # ✅ 双班模式：根据时间判定
+                shift_info = await db.determine_shift_for_time(
+                    chat_id=chat_id, 
+                    current_time=now, 
+                    checkin_type=act  # 注意：这里用 act 作为 checkin_type
+                )
+                
+                # 🎯 保留原始功能：如果无法确定班次，提示用户
                 if not shift_info:
                     await message.answer(
                         "❌ 当前时间不在任何班次的活动窗口内\n\n"
@@ -1156,10 +1164,8 @@ async def start_activity(message: types.Message, act: str):
                     )
                     return
 
-                # ✅ 关键修复：从字典中取 shift 字段
+                # ✅ 从字典中取 shift 字段
                 current_shift = shift_info.get("shift", "day")
-                shift_detail = shift_info.get("shift_detail")  # 如果需要可以保存
-
                 if not isinstance(current_shift, str):
                     logger.error(f"❌ shift_info.shift 不是字符串: {current_shift}")
                     current_shift = "day"
@@ -1168,8 +1174,11 @@ async def start_activity(message: types.Message, act: str):
                 current_shift = "day"
 
         # ✅ 最终确保是字符串
-        if not isinstance(current_shift, str):
-            logger.error(f"❌ current_shift 最终不是字符串: {current_shift}")
+        if current_shift is None:
+            logger.error("❌ current_shift 为 None，使用默认值 day")
+            current_shift = "day"
+        elif not isinstance(current_shift, str):
+            logger.error(f"❌ current_shift 不是字符串: {current_shift}")
             current_shift = "day"
 
         logger.info(f"🔄 当前班次判定：{current_shift}")
