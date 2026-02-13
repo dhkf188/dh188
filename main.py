@@ -864,13 +864,44 @@ async def activity_timer(
         force_back_sent = False  # 防止重复强制回座
 
         # ===== 群消息发送封装（引用 + 自动降级 + 自动重试） =====
+        _message_sent_cache = {}  # key -> last sent timestamp
+        _cache_lock = asyncio.Lock()  # 并发安全锁
+
         async def send_group_message(text: str, kb=None):
-            # ✅ 获取 bot 实例
+
+            msg_key = f"{chat_id}:{uid}:{text}"
+            now = time.time()
+
+            # ==========================
+            # 防重复 & 并发安全
+            # ==========================
+            async with _cache_lock:
+                # 清理过期 key（超过5秒的就删掉）
+                expired_keys = [
+                    k for k, t in _message_sent_cache.items() if now - t > 5
+                ]
+                for k in expired_keys:
+                    _message_sent_cache.pop(k, None)
+
+                # 检查重复
+                if msg_key in _message_sent_cache:
+                    logger.debug(f"⏱️ 相同消息5秒内已发送，跳过: {text[:30]}...")
+                    return None
+
+                # 标记为已发送
+                _message_sent_cache[msg_key] = now
+
+            # ==========================
+            # 获取 bot 实例
+            # ==========================
             current_bot = bot_manager.bot
             if not current_bot:
-                logger.error(f"❌ bot_manager.bot 为 None，无法发送消息")
+                logger.error("❌ bot_manager.bot 为 None，无法发送消息")
                 return None
 
+            # ==========================
+            # 尝试引用发送
+            # ==========================
             checkin_message_id = await db.get_user_checkin_message_id(chat_id, uid)
             if checkin_message_id:
                 try:
@@ -895,13 +926,19 @@ async def activity_timer(
                     except Exception as e2:
                         logger.warning(f"⚠️ 引用发送重试失败，降级普通发送: {e2}")
 
-            # 没有 message_id 或引用失败则普通发送
-            return await current_bot.send_message(
-                chat_id=chat_id,
-                text=text,
-                parse_mode="HTML",
-                reply_markup=kb,
-            )
+            # ==========================
+            # 普通发送
+            # ==========================
+            try:
+                return await current_bot.send_message(
+                    chat_id=chat_id,
+                    text=text,
+                    parse_mode="HTML",
+                    reply_markup=kb,
+                )
+            except Exception as e:
+                logger.error(f"❌ 普通发送也失败: {e}")
+                return None
 
         # ===== 快速回座按钮 =====
         def build_quick_back_kb():
