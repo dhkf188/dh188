@@ -315,7 +315,6 @@ class PostgreSQLDatabase:
         return bool(group_data and group_data.get("dual_mode", False))
 
     # ========== 核心业务日期逻辑(管理员设定的周器时间-统一) ==========
-
     async def get_business_date(
         self,
         chat_id: int,
@@ -336,6 +335,31 @@ class PostgreSQLDatabase:
 
         # ========== 2. 双班模式 - 使用传入参数或窗口计算 ==========
         if is_dual:
+            # 🆕 提前上班判定 - 放在最前面
+            shift_config = await self.get_shift_config(chat_id)
+            day_start = shift_config.get("day_start", "09:00")
+            grace_before = shift_config.get("grace_before", 120)
+
+            # 解析白班开始时间
+            day_start_time = datetime.strptime(day_start, "%H:%M").time()
+            day_start_dt = datetime.combine(today, day_start_time).replace(
+                tzinfo=current_dt.tzinfo
+            )
+
+            # 计算白班最早允许时间
+            earliest_day_time = day_start_dt - timedelta(minutes=grace_before)
+
+            # 如果当前时间 >= 白班最早允许时间，就认为是今天
+            if current_dt >= earliest_day_time:
+                logger.info(
+                    f"📅 [提前上班判定] "
+                    f"chat={chat_id}, "
+                    f"time={current_dt.strftime('%H:%M')}, "
+                    f"earliest={earliest_day_time.strftime('%H:%M')}, "
+                    f"result={today}"
+                )
+                return today
+
             # 2.1 优先使用shift_detail直接判定
             if shift_detail in ("night_last", "night_tonight", "day"):
                 if shift_detail == "night_last":
@@ -343,6 +367,7 @@ class PostgreSQLDatabase:
                         f"📅 [双班-detail] chat={chat_id}, detail={shift_detail}, 日期={today - timedelta(days=1)}"
                     )
                     return today - timedelta(days=1)
+
                 logger.debug(
                     f"📅 [双班-detail] chat={chat_id}, detail={shift_detail}, 日期={today}"
                 )
@@ -389,7 +414,10 @@ class PostgreSQLDatabase:
             reset_minute = Config.DAILY_RESET_MINUTE
 
         reset_time_today = current_dt.replace(
-            hour=reset_hour, minute=reset_minute, second=0, microsecond=0
+            hour=reset_hour,
+            minute=reset_minute,
+            second=0,
+            microsecond=0,
         )
 
         if current_dt < reset_time_today:
@@ -3698,8 +3726,12 @@ class PostgreSQLDatabase:
                 business_date = today
 
             logger.debug(
-                f"📅 业务日期(双班-detail): chat_id={chat_id}, "
-                f"shift_detail={shift_detail}, 日期={business_date}"
+                f"📅 [业务日期-双班-detail] "
+                f"chat_id={chat_id}, "
+                f"time={current_dt.strftime('%H:%M:%S')}, "
+                f"shift_detail={shift_detail}, "
+                f"checkin_type={checkin_type}, "
+                f"result={business_date}"
             )
             return business_date
 
