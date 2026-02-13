@@ -630,8 +630,10 @@ async def check_activity_limit_by_shift(
 
     # 获取当前次数
     if shift is None:
-        current_count = await db.get_user_activity_count(  # ✅ 使用正确的函数名
-            chat_id, user_id, activity
+        current_count = (
+            await db.get_user_activity_count_by_shift(  # ✅ 使用正确的函数名
+                chat_id, user_id, activity, shift
+            )
         )
     else:
         # 暂时先使用总次数，或者实现按班次计数
@@ -807,10 +809,9 @@ async def activity_timer(
         if not bot_manager or not bot_manager.bot:
             logger.error(f"❌ bot 未能在 {max_wait} 秒内初始化，定时器终止")
             return
-        
+
         if waited > 0:
             logger.info(f"✅ bot 已就绪，继续执行定时器 (等待 {waited}s)")
-
 
         # 添加班次文本
         shift_text = "白班" if shift == "day" else "夜班"
@@ -878,51 +879,51 @@ async def activity_timer(
 
         # ===== 强制回座通知封装 =====
         async def push_force_back_notification(nickname, elapsed, fine_amount):
+            try:
+                # ✅ 关键修复：使用 bot_manager.bot
+                current_bot = bot_manager.bot
+                if not current_bot:
+                    logger.error(f"❌ bot_manager.bot 为 None，无法获取聊天信息")
+                    return False
+
+                chat_title = str(chat_id)
                 try:
-                        # ✅ 关键修复：使用 bot_manager.bot
-                        current_bot = bot_manager.bot
-                        if not current_bot:
-                                logger.error(f"❌ bot_manager.bot 为 None，无法获取聊天信息")
-                                return False
-                                
-                        chat_title = str(chat_id)
-                        try:
-                                info = await current_bot.get_chat(chat_id)
-                                chat_title = info.title or chat_title
-                        except Exception as e:
-                                logger.debug(f"获取聊天信息失败: {e}")
-
-                        notification_text = (
-                                f"🚨 <b>超时强制回座通知</b>\n"
-                                f"🏢 群组：<code>{chat_title}</code>\n"
-                                f"{MessageFormatter.create_dashed_line()}\n"
-                                f"👤 用户：{MessageFormatter.format_user_link(uid, nickname)}\n"
-                                f"📝 活动：<code>{act}</code>\n"
-                                f"📊 班次：<code>{shift_text}</code>\n"
-                                f"⏰ 自动回座时间：<code>{get_beijing_time().strftime('%m/%d %H:%M:%S')}</code>\n"
-                                f"⏱️ 总活动时长：<code>{MessageFormatter.format_time(elapsed)}</code>\n"
-                                f"⚠️ 系统自动回座原因：超时超过2小时\n"
-                                f"💰 本次罚款：<code>{fine_amount}</code> 元"
-                        )
-
-                        # ✅ 确保 notification_service 已配置
-                        if not notification_service.bot and bot_manager.bot:
-                                notification_service.bot = bot_manager.bot
-                        if not notification_service.bot_manager and bot_manager:
-                                notification_service.bot_manager = bot_manager
-
-                        await notification_service.send_notification(
-                                chat_id,
-                                notification_text,
-                                notification_type="channel",
-                        )
-                        logger.info(
-                                f"✅ 强制回座通知推送成功: chat={chat_id}, uid={uid}（班次: {shift}）"
-                        )
-                        return True
+                    info = await current_bot.get_chat(chat_id)
+                    chat_title = info.title or chat_title
                 except Exception as e:
-                        logger.error(f"❌ 强制回座通知推送失败: {e}")
-                        return False
+                    logger.debug(f"获取聊天信息失败: {e}")
+
+                notification_text = (
+                    f"🚨 <b>超时强制回座通知</b>\n"
+                    f"🏢 群组：<code>{chat_title}</code>\n"
+                    f"{MessageFormatter.create_dashed_line()}\n"
+                    f"👤 用户：{MessageFormatter.format_user_link(uid, nickname)}\n"
+                    f"📝 活动：<code>{act}</code>\n"
+                    f"📊 班次：<code>{shift_text}</code>\n"
+                    f"⏰ 自动回座时间：<code>{get_beijing_time().strftime('%m/%d %H:%M:%S')}</code>\n"
+                    f"⏱️ 总活动时长：<code>{MessageFormatter.format_time(elapsed)}</code>\n"
+                    f"⚠️ 系统自动回座原因：超时超过2小时\n"
+                    f"💰 本次罚款：<code>{fine_amount}</code> 元"
+                )
+
+                # ✅ 确保 notification_service 已配置
+                if not notification_service.bot and bot_manager.bot:
+                    notification_service.bot = bot_manager.bot
+                if not notification_service.bot_manager and bot_manager:
+                    notification_service.bot_manager = bot_manager
+
+                await notification_service.send_notification(
+                    chat_id,
+                    notification_text,
+                    notification_type="channel",
+                )
+                logger.info(
+                    f"✅ 强制回座通知推送成功: chat={chat_id}, uid={uid}（班次: {shift}）"
+                )
+                return True
+            except Exception as e:
+                logger.error(f"❌ 强制回座通知推送失败: {e}")
+                return False
 
         # ===== 主循环 =====
         while True:
@@ -1090,7 +1091,9 @@ async def start_activity(message: types.Message, act: str):
             # ✅ 从状态中取字符串
             current_shift = shift_state.get("current_shift", "day")
             if not isinstance(current_shift, str):
-                logger.error(f"❌ shift_state.current_shift 不是字符串: {current_shift}")
+                logger.error(
+                    f"❌ shift_state.current_shift 不是字符串: {current_shift}"
+                )
                 current_shift = "day"
         else:
             shift_config = await db.get_shift_config(chat_id)
@@ -1104,11 +1107,11 @@ async def start_activity(message: types.Message, act: str):
                         reply_to_message_id=message.message_id,
                     )
                     return
-                
+
                 # ✅ 关键修复：从字典中取 shift 字段
                 current_shift = shift_info.get("shift", "day")
                 shift_detail = shift_info.get("shift_detail")  # 如果需要可以保存
-                
+
                 if not isinstance(current_shift, str):
                     logger.error(f"❌ shift_info.shift 不是字符串: {current_shift}")
                     current_shift = "day"
@@ -1122,7 +1125,6 @@ async def start_activity(message: types.Message, act: str):
             current_shift = "day"
 
         logger.info(f"🔄 当前班次判定：{current_shift}")
-
 
         # ================== 活动人数限制 ==================
         user_limit = await db.get_activity_user_limit(act)
