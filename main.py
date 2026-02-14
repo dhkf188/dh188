@@ -1116,8 +1116,8 @@ async def activity_timer(
                         timeout_immediate_sent = True
                         msg = (
                             f"⚠️ <b>超时警告</b>\n"
-                            f"👤 {MessageFormatter.format_user_link(uid, nickname)} 已超时！\n"
-                            f"📊 班次：<code>{shift_text}</code>\n"
+                            f"👤 {MessageFormatter.format_user_link(uid, nickname)} <code>{shift_text}</code>\n"
+                            f"🕓 本次 {MessageFormatter.format_copyable_text(act)} 已超时\n"
                             f"🏃‍♂️ 请立即回座，避免产生更多罚款！"
                         )
                         last_reminder_minute = 0
@@ -1127,8 +1127,8 @@ async def activity_timer(
                         timeout_5min_sent = True
                         msg = (
                             f"🔔 <b>超时警告</b>\n"
-                            f"👤 {MessageFormatter.format_user_link(uid, nickname)} 已超时 <code>5</code> 分钟！\n"
-                            f"📊 班次：<code>{shift_text}</code>\n"
+                            f"👤 {MessageFormatter.format_user_link(uid, nickname)} <code>{shift_text}</code>\n"
+                            f"🕓 本次 {MessageFormatter.format_copyable_text(act)} 已超时 <code>{overtime_minutes}</code> 分钟！\n"
                             f"😤 罚款正在累积，请立即回座！"
                         )
                         last_reminder_minute = 5
@@ -1142,8 +1142,8 @@ async def activity_timer(
                         last_reminder_minute = overtime_minutes
                         msg = (
                             f"🚨 <b>超时警告</b>\n"
-                            f"👤 {MessageFormatter.format_user_link(uid, nickname)} 已超时 <code>{overtime_minutes}</code> 分钟！\n"
-                            f"📊 班次：<code>{shift_text}</code>\n"
+                            f"👤 {MessageFormatter.format_user_link(uid, nickname)} <code>{shift_text}</code>！\n"
+                            f"🕓 本次 {MessageFormatter.format_copyable_text(act)} 已超时 <code>{overtime_minutes}</code> 分钟！\n"
                             f"💢 请立刻回座，避免产生更多罚款！"
                         )
 
@@ -1757,7 +1757,7 @@ async def send_overtime_notification_async(
             f"📝 活动：<code>{act}</code>\n"
             f"⏰ 回座时间：<code>{now.strftime('%m/%d %H:%M:%S')}</code>\n"
             f"⏱️ 超时时长：<code>{overtime_str}</code>\n"
-            f"💰 绩效分数：<code>{fine_amount}</code> 分"
+            f"💰 扣除绩效：<code>{fine_amount}</code> 分"
         )
 
         # 发送到频道
