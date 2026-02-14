@@ -1644,15 +1644,16 @@ async def _process_back_locked(
         duration = round(time.time() - start_time, 2)
         logger.info(f"回座结束 chat_id={chat_id}, uid={uid}，耗时 {duration}s")
 
+
 async def send_overtime_notification_async(
-    chat_id: int, 
-    uid: int, 
-    user_data: dict, 
-    act: str, 
-    fine_amount: int, 
+    chat_id: int,
+    uid: int,
+    user_data: dict,
+    act: str,
+    fine_amount: int,
     now: datetime,
     elapsed_time: int = None,  # ✅ 可选参数
-    time_limit_minutes: int = None  # ✅ 可选参数
+    time_limit_minutes: int = None,  # ✅ 可选参数
 ):
     """异步发送超时通知到频道"""
     try:
@@ -1671,7 +1672,7 @@ async def send_overtime_notification_async(
             pass
 
         nickname = user_data.get("nickname", "未知用户")
-        
+
         # ✅ 如果传入了计算好的值，直接使用
         if elapsed_time is not None and time_limit_minutes is not None:
             time_limit_seconds = time_limit_minutes * 60
@@ -1703,74 +1704,6 @@ async def send_overtime_notification_async(
 
     except Exception as e:
         logger.error(f"❌ 超时通知推送异常: {e}")
-
-
-async def _process_back_locked_with_shift(
-    message: types.Message, chat_id: int, uid: int, shift: str = "day"
-):
-    """带班次参数的回座函数 - 供快速回座使用"""
-    try:
-        now = get_beijing_time()
-        user_data = await db.get_user_cached(chat_id, uid)
-
-        if not user_data or not user_data.get("current_activity"):
-            await message.answer(
-                Config.MESSAGES["no_activity"],
-                reply_markup=await get_main_keyboard(
-                    chat_id=chat_id, show_admin=await is_admin(uid)
-                ),
-                reply_to_message_id=message.message_id,
-            )
-            return
-
-        act = user_data["current_activity"]
-        activity_start_time_str = user_data["activity_start_time"]
-        nickname = user_data.get("nickname", "未知用户")
-
-        # 解析开始时间
-        start_time_dt = None
-        try:
-            clean_str = str(activity_start_time_str).strip()
-            if clean_str.endswith("Z"):
-                clean_str = clean_str.replace("Z", "+00:00")
-            start_time_dt = datetime.fromisoformat(clean_str)
-            if start_time_dt.tzinfo is None:
-                start_time_dt = beijing_tz.localize(start_time_dt)
-        except Exception:
-            start_time_dt = now
-
-        # 计算时长和罚款
-        elapsed = int((now - start_time_dt).total_seconds())
-        time_limit = await db.get_activity_time_limit(act)
-        time_limit_seconds = time_limit * 60
-
-        is_overtime = elapsed > time_limit_seconds
-        overtime_seconds = max(0, elapsed - time_limit_seconds)
-        overtime_minutes = overtime_seconds / 60
-
-        fine_amount = 0
-        if is_overtime and overtime_seconds > 0:
-            fine_amount = await calculate_fine(act, overtime_minutes)
-
-        # ✅ 关键：传递班次参数
-        await db.complete_user_activity(
-            chat_id, uid, act, elapsed, fine_amount, is_overtime, shift
-        )
-
-        # 取消计时器
-        await timer_manager.cancel_timer(f"{chat_id}-{uid}")
-
-        # 清理打卡消息ID
-        await db.clear_user_checkin_message(chat_id, uid)
-
-        logger.info(
-            f"✅ [快速回座] 用户{uid}, 活动{act}, "
-            f"时长{elapsed}s, 罚款{fine_amount}, 班次{shift}"
-        )
-
-    except Exception as e:
-        logger.error(f"❌ 快速回座处理失败 {chat_id}-{uid}: {e}")
-        raise
 
 
 # ========== 上下班打卡功能 ==========
@@ -1990,10 +1923,16 @@ async def process_work_checkin(message: types.Message, checkin_type: str):
                 return
 
             # ========== 🎯 计算迟到/罚款 ==========
+            # 根据班次选择期望的上班时间
+            if shift == "night":
+                # 夜班上班期望时间是 21:00（白班结束时间）
+                expected_time = shift_config.get("day_end", "21:00")
+            else:
+                # 白班上班期望时间是 09:00
+                expected_time = work_hours["work_start"]
+
             time_diff_minutes, time_diff_seconds, expected_dt = (
-                calculate_cross_day_time_diff(
-                    now, work_hours["work_start"], "work_start"
-                )
+                calculate_cross_day_time_diff(now, expected_time, "work_start")
             )
 
             fine_amount = 0
@@ -2145,8 +2084,16 @@ async def process_work_checkin(message: types.Message, checkin_type: str):
                 return
 
             # ========== 🎯 计算早退/罚款 ==========
+            # 根据班次选择期望的下班时间
+            if shift == "night":
+                # 夜班下班期望时间是 09:00（第二天早上）
+                expected_time = work_hours["work_start"]  # 第二天早上9点
+            else:
+                # 白班下班期望时间是 18:00
+                expected_time = work_hours["work_end"]
+
             time_diff_minutes, time_diff_seconds, expected_dt = (
-                calculate_cross_day_time_diff(now, work_hours["work_end"], "work_end")
+                calculate_cross_day_time_diff(now, expected_time, "work_end")
             )
 
             fine_amount = 0
