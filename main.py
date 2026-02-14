@@ -1097,9 +1097,8 @@ async def activity_timer(
                 # ===== 即将超时 1 分钟提醒 =====
                 if 0 < remaining <= 60 and not one_minute_warning_sent:
                     msg = (
-                        f"⏳ <b>即将超时警告</b>\n"
-                        f"👤 {MessageFormatter.format_user_link(uid, nickname)}\n"
-                        f"📊 班次：<code>{shift_text}</code>\n"
+                        f"⏳ <b>即将超时警告</b>  <code>{shift_text}</code>\n"
+                        f"👤 {MessageFormatter.format_user_link(uid, nickname)} \n"
                         f"🕓 本次 {MessageFormatter.format_copyable_text(act)} 还有 <code>1</code> 分钟！\n"
                         f"💡 请及时回座，避免超时罚款"
                     )
@@ -1115,8 +1114,8 @@ async def activity_timer(
                     if overtime_minutes == 0 and not timeout_immediate_sent:
                         timeout_immediate_sent = True
                         msg = (
-                            f"⚠️ <b>超时警告</b>\n"
-                            f"👤 {MessageFormatter.format_user_link(uid, nickname)} <code>{shift_text}</code>\n"
+                            f"⚠️ <b>超时警告</b> <code>{shift_text}</code>\n"
+                            f"👤 {MessageFormatter.format_user_link(uid, nickname)} \n"
                             f"🕓 本次 {MessageFormatter.format_copyable_text(act)} 已超时\n"
                             f"🏃‍♂️ 请立即回座，避免产生更多罚款！"
                         )
@@ -1126,8 +1125,8 @@ async def activity_timer(
                     elif overtime_minutes == 5 and not timeout_5min_sent:
                         timeout_5min_sent = True
                         msg = (
-                            f"🔔 <b>超时警告</b>\n"
-                            f"👤 {MessageFormatter.format_user_link(uid, nickname)} <code>{shift_text}</code>\n"
+                            f"🔔 <b>超时警告</b> <code>{shift_text}</code>\n"
+                            f"👤 {MessageFormatter.format_user_link(uid, nickname)} \n"
                             f"🕓 本次 {MessageFormatter.format_copyable_text(act)} 已超时 <code>{overtime_minutes}</code> 分钟！\n"
                             f"😤 罚款正在累积，请立即回座！"
                         )
@@ -1141,8 +1140,8 @@ async def activity_timer(
                     ):
                         last_reminder_minute = overtime_minutes
                         msg = (
-                            f"🚨 <b>超时警告</b>\n"
-                            f"👤 {MessageFormatter.format_user_link(uid, nickname)} <code>{shift_text}</code>！\n"
+                            f"🚨 <b>超时警告</b>  <code>{shift_text}</code>\n"
+                            f"👤 {MessageFormatter.format_user_link(uid, nickname)} \n"
                             f"🕓 本次 {MessageFormatter.format_copyable_text(act)} 已超时 <code>{overtime_minutes}</code> 分钟！\n"
                             f"💢 请立刻回座，避免产生更多罚款！"
                         )
@@ -2612,6 +2611,50 @@ async def handle_myinfo_shift_command(message: types.Message):
 
 
 @rate_limit(rate=10, per=60)
+@track_performance("cmd_myinfo_day")
+async def handle_myinfo_day_command(message: types.Message):
+    """处理 /myinfoday 命令 - 查看白班记录"""
+    chat_id = message.chat.id
+    uid = message.from_user.id
+
+    # 检查双班模式是否启用
+    shift_config = await db.get_shift_config(chat_id)
+    if not shift_config.get("dual_mode", False):
+        await message.answer(
+            "❌ 当前群组未启用双班模式\n"
+            "💡 请联系管理员使用 /setdualmode 命令开启双班模式",
+            reply_to_message_id=message.message_id,
+        )
+        return
+
+    user_lock = user_lock_manager.get_lock(chat_id, uid)
+    async with user_lock:
+        await show_history(message, "day")  # 直接传入 "day"
+
+
+@rate_limit(rate=10, per=60)
+@track_performance("cmd_myinfo_night")
+async def handle_myinfo_night_command(message: types.Message):
+    """处理 /myinfonight 命令 - 查看夜班记录"""
+    chat_id = message.chat.id
+    uid = message.from_user.id
+
+    # 检查双班模式是否启用
+    shift_config = await db.get_shift_config(chat_id)
+    if not shift_config.get("dual_mode", False):
+        await message.answer(
+            "❌ 当前群组未启用双班模式\n"
+            "💡 请联系管理员使用 /setdualmode 命令开启双班模式",
+            reply_to_message_id=message.message_id,
+        )
+        return
+
+    user_lock = user_lock_manager.get_lock(chat_id, uid)
+    async with user_lock:
+        await show_history(message, "night")  # 直接传入 "night"
+
+
+@rate_limit(rate=10, per=60)
 @track_performance("cmd_ranking")
 async def handle_ranking_command(message: types.Message):
     """处理 /ranking 命令 - 显示排行榜"""
@@ -2656,6 +2699,30 @@ async def handle_ranking_shift_command(message: types.Message):
     user_lock = user_lock_manager.get_lock(chat_id, uid)
     async with user_lock:
         await show_rank(message, shift)
+
+
+@rate_limit(rate=10, per=60)
+@track_performance("cmd_ranking_day")
+async def handle_ranking_day_command(message: types.Message):
+    """处理 /rankingday 命令 - 查看白班排行榜"""
+    chat_id = message.chat.id
+    uid = message.from_user.id
+
+    user_lock = user_lock_manager.get_lock(chat_id, uid)
+    async with user_lock:
+        await show_rank(message, "day")  # 直接传入 "day"
+
+
+@rate_limit(rate=10, per=60)
+@track_performance("cmd_ranking_night")
+async def handle_ranking_night_command(message: types.Message):
+    """处理 /rankingnight 命令 - 查看夜班排行榜"""
+    chat_id = message.chat.id
+    uid = message.from_user.id
+
+    user_lock = user_lock_manager.get_lock(chat_id, uid)
+    async with user_lock:
+        await show_rank(message, "night")  # 直接传入 "night"
 
 
 @rate_limit(rate=10, per=60)
@@ -5032,8 +5099,8 @@ async def show_history(message: types.Message, shift: str = None):
     if is_dual_mode and not shift:
         text += (
             "\n📊 <b>按班次查看</b>\n"
-            "• /myinfo day - 查看白班记录\n"
-            "• /myinfo night - 查看夜班记录\n"
+            "• /myinfoday - 点击查看白班记录\n"
+            "• /myinfonight - 点击查看夜班记录\n"
         )
 
     if not has_records:
@@ -5190,8 +5257,8 @@ async def show_rank(message: types.Message, shift: str = None):
         if shift_config.get("dual_mode"):
             rank_text += (
                 "💡 按班次查看：\n"
-                "• /ranking day - 白班排行榜\n"
-                "• /ranking night - 夜班排行榜\n"
+                "• /rankingday - 白班排行榜\n"
+                "• /rankingnight - 夜班排行榜\n"
             )
 
     await message.answer(
