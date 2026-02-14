@@ -3188,7 +3188,7 @@ class PostgreSQLDatabase:
             return [dict(row) for row in rows]
 
     # ========== 月度统计 ==========
-        async def get_monthly_statistics(
+    async def get_monthly_statistics(
         self, chat_id: int, year: int = None, month: int = None
     ) -> List[Dict]:
         """修复版：获取月度统计 - 按班次分组显示"""
@@ -3312,7 +3312,6 @@ class PostgreSQLDatabase:
                 result.append(data)
 
             return result
-
 
     async def get_monthly_work_statistics(
         self, chat_id: int, year: int = None, month: int = None
@@ -4167,4 +4166,3 @@ class PostgreSQLDatabase:
 
 # 全局数据库实例
 db = PostgreSQLDatabase()
-
