@@ -93,7 +93,6 @@ class MessageFormatter:
         """格式化可复制文本"""
         return f"<code>{text}</code>"
 
-
     @staticmethod
     def format_activity_message(
         user_id: int,
@@ -103,10 +102,10 @@ class MessageFormatter:
         count: int,
         max_times: int,
         time_limit: int,
-        shift: str = None  # 新增：可选班次参数
+        shift: str = None,  # 新增：可选班次参数
     ) -> str:
         """格式化打卡消息 - 改为新模板（支持班次）"""
-        
+
         # 1. 基础信息准备
         first_line = f"👤 用户：{MessageFormatter.format_user_link(user_id, user_name)}"
         dashed_line = MessageFormatter.create_dashed_line()
@@ -116,12 +115,12 @@ class MessageFormatter:
             f"{first_line}\n"
             f"✅ 打卡成功：{MessageFormatter.format_copyable_text(activity)} - {MessageFormatter.format_copyable_text(time_str)}\n"
         )
-        
+
         # 3. 如果有班次信息，添加班次行
         if shift:
             shift_text = "白班" if shift == "day" else "夜班"
             message += f"📊 班次：{MessageFormatter.format_copyable_text(shift_text)}\n"
-        
+
         # 4. 详情与统计
         message += (
             f"▫️ 本次活动类型：{MessageFormatter.format_copyable_text(activity)}\n"
@@ -137,11 +136,10 @@ class MessageFormatter:
         message += (
             f"{dashed_line}\n"
             f"💡 操作提示\n"
-            f"活动结束后请及时点击 👉【✅ 回座打卡】👈按钮。"
+            f"活动结束后请及时点击 👉【✅ 回座】👈按钮。"
         )
 
         return message
-
 
     @staticmethod
     def format_back_message(
@@ -183,7 +181,7 @@ class MessageFormatter:
             message += f"\n⚠️ 超时提醒\n"
             message += f"▫️ 超时时长：{MessageFormatter.format_copyable_text(overtime_time)} 🚨\n"
             if fine_amount > 0:
-                message += f"▫️ 罚款金额：{MessageFormatter.format_copyable_text(str(fine_amount))}元 💸\n"
+                message += f"▫️ 扣除绩效：{MessageFormatter.format_copyable_text(str(fine_amount))} 分 💸\n"
 
         # 今日总计
         message += f"{dashed_line}\n"
@@ -616,7 +614,6 @@ class ActivityTimerManager:
         """设置活动定时器回调"""
         self.activity_timer_callback = callback
 
-
     async def start_timer(
         self,
         chat_id: int,
@@ -667,17 +664,18 @@ class ActivityTimerManager:
                     pass
             logger.info(f"🗑️ 定时器已取消: {timer_key}")
 
-
-    async def _activity_timer_wrapper(self, chat_id: int, uid: int, act: str, limit: int, shift: str):
+    async def _activity_timer_wrapper(
+        self, chat_id: int, uid: int, act: str, limit: int, shift: str
+    ):
         """正确：直接运行 activity_timer 监控循环"""
         timer_key = f"{chat_id}-{uid}-{shift}"
         try:
             # 导入真正的 activity_timer 函数
             from main import activity_timer
-            
+
             # 直接运行它！它会自己循环监控
             await activity_timer(chat_id, uid, act, limit, shift)
-            
+
         except asyncio.CancelledError:
             logger.info(f"定时器 {timer_key} 被取消")
             # 在异步任务中，通常建议重新抛出 CancelledError，
@@ -685,6 +683,7 @@ class ActivityTimerManager:
         except Exception as e:
             logger.error(f"定时器异常 {timer_key}: {e}")
             import traceback
+
             logger.error(traceback.format_exc())  # 打印完整堆栈
         finally:
             # 清理任务：无论正常结束、被取消还是报错，都会执行
@@ -1002,54 +1001,6 @@ def calculate_cross_day_time_diff(
     except Exception as e:
         logger.error(f"时间差计算出错: {e}")
         return 0, current_dt
-
-
-async def is_valid_checkin_time(
-    chat_id: int, checkin_type: str, current_time: datetime
-) -> Tuple[bool, datetime]:
-    """
-    检查是否在允许的打卡时间窗口内（前后 7 小时）
-    """
-    try:
-        work_hours = await db.get_group_work_time(chat_id)
-        if checkin_type == "work_start":
-            expected_time_str = work_hours["work_start"]
-        else:
-            expected_time_str = work_hours["work_end"]
-
-        exp_h, exp_m = map(int, expected_time_str.split(":"))
-
-        # 在 -1/0/+1 天范围内生成候选 expected_dt
-        candidates = []
-        for d in (-1, 0, 1):
-            candidate = current_time.replace(
-                hour=exp_h, minute=exp_m, second=0, microsecond=0
-            ) + timedelta(days=d)
-            candidates.append(candidate)
-
-        # 选择与 current_time 时间差绝对值最小的 candidate
-        expected_dt = min(
-            candidates, key=lambda t: abs((t - current_time).total_seconds())
-        )
-
-        # 允许前后窗口：7小时
-        earliest = expected_dt - timedelta(hours=7)
-        latest = expected_dt + timedelta(hours=7)
-
-        is_valid = earliest <= current_time <= latest
-
-        if not is_valid:
-            logger.warning(
-                f"打卡时间超出允许窗口: {checkin_type}, 当前: {current_time.strftime('%Y-%m-%d %H:%M')}, "
-                f"允许: {earliest.strftime('%Y-%m-%d %H:%M')} ~ {latest.strftime('%Y-%m-%d %H:%M')}"
-            )
-
-        return is_valid, expected_dt
-
-    except Exception as e:
-        logger.error(f"检查打卡时间范围失败: {e}")
-        fallback = current_time.replace(hour=9, minute=0, second=0, microsecond=0)
-        return True, fallback
 
 
 # ========== 装饰器和工具函数 ==========
