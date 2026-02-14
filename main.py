@@ -1097,8 +1097,9 @@ async def activity_timer(
                 # ===== 即将超时 1 分钟提醒 =====
                 if 0 < remaining <= 60 and not one_minute_warning_sent:
                     msg = (
-                        f"⏳ <b>即将超时警告</b>  <code>{shift_text}</code>\n"
+                        f"⏳ <b>即将超时警告</b>\n"
                         f"👤 {MessageFormatter.format_user_link(uid, nickname)} \n"
+                        f"📊 班次： <code>{shift_text}</code> \n"
                         f"🕓 本次 {MessageFormatter.format_copyable_text(act)} 还有 <code>1</code> 分钟！\n"
                         f"💡 请及时回座，避免超时罚款"
                     )
@@ -1114,8 +1115,9 @@ async def activity_timer(
                     if overtime_minutes == 0 and not timeout_immediate_sent:
                         timeout_immediate_sent = True
                         msg = (
-                            f"⚠️ <b>超时警告</b> <code>{shift_text}</code>\n"
+                            f"⚠️ <b>超时警告</b>\n"
                             f"👤 {MessageFormatter.format_user_link(uid, nickname)} \n"
+                            f"📊 班次： <code>{shift_text}</code> \n"
                             f"🕓 本次 {MessageFormatter.format_copyable_text(act)} 已超时\n"
                             f"🏃‍♂️ 请立即回座，避免产生更多罚款！"
                         )
@@ -1125,8 +1127,9 @@ async def activity_timer(
                     elif overtime_minutes == 5 and not timeout_5min_sent:
                         timeout_5min_sent = True
                         msg = (
-                            f"🔔 <b>超时警告</b> <code>{shift_text}</code>\n"
+                            f"🔔 <b>超时警告</b> \n"
                             f"👤 {MessageFormatter.format_user_link(uid, nickname)} \n"
+                            f"📊 班次： <code>{shift_text}</code> \n"
                             f"🕓 本次 {MessageFormatter.format_copyable_text(act)} 已超时 <code>{overtime_minutes}</code> 分钟！\n"
                             f"😤 罚款正在累积，请立即回座！"
                         )
@@ -1140,8 +1143,9 @@ async def activity_timer(
                     ):
                         last_reminder_minute = overtime_minutes
                         msg = (
-                            f"🚨 <b>超时警告</b>  <code>{shift_text}</code>\n"
+                            f"🚨 <b>超时警告</b>\n"
                             f"👤 {MessageFormatter.format_user_link(uid, nickname)} \n"
+                            f"📊 班次： <code>{shift_text}</code> \n"
                             f"🕓 本次 {MessageFormatter.format_copyable_text(act)} 已超时 <code>{overtime_minutes}</code> 分钟！\n"
                             f"💢 请立刻回座，避免产生更多罚款！"
                         )
