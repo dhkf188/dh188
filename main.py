@@ -6372,6 +6372,8 @@ async def register_handlers():
     dp.message.register(handle_ranking_shift_command, Command("ranking"))
     dp.message.register(handle_ranking_day_command, Command("rankingday"))
     dp.message.register(handle_ranking_night_command, Command("rankingnight"))
+    dp.message.register(handle_myinfo_day_command, Command("myinfoday"))
+    dp.message.register(handle_myinfo_night_command, Command("myinfonight"))
 
     # 按钮处理器
     dp.message.register(
