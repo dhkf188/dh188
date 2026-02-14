@@ -694,7 +694,9 @@ async def has_active_activity(chat_id: int, uid: int) -> tuple[bool, Optional[st
     return user_data["current_activity"] is not None, user_data["current_activity"]
 
 
-async def can_perform_activities(chat_id: int, uid: int, current_shift: str = None) -> tuple[bool, str]:
+async def can_perform_activities(
+    chat_id: int, uid: int, current_shift: str = None
+) -> tuple[bool, str]:
     """快速检查是否可以执行活动 - 根据班次检查"""
     if not await db.has_work_hours_enabled(chat_id):
         return True, ""
@@ -724,7 +726,10 @@ async def can_perform_activities(chat_id: int, uid: int, current_shift: str = No
               AND shift = $4
             LIMIT 1
             """,
-            chat_id, uid, today, current_shift
+            chat_id,
+            uid,
+            today,
+            current_shift,
         )
 
         if not has_work_start:
@@ -742,7 +747,10 @@ async def can_perform_activities(chat_id: int, uid: int, current_shift: str = No
               AND shift = $4
             LIMIT 1
             """,
-            chat_id, uid, today, current_shift
+            chat_id,
+            uid,
+            today,
+            current_shift,
         )
 
         if has_work_end:
@@ -1313,9 +1321,6 @@ async def start_activity(message: types.Message, act: str):
             )
             return
 
-        # 再次重置每日数据
-        await reset_daily_data_if_needed(chat_id, uid)
-
         # ================== 活动次数限制 ==================
         can_start, current_count, max_times = await check_activity_limit_by_shift(
             chat_id, uid, act, current_shift
@@ -1394,9 +1399,10 @@ async def start_activity(message: types.Message, act: str):
                 )
             elif act in ["上班", "下班"]:
                 icon = "🟢" if act == "上班" else "🔴"
+                action_text = "已上班" if act == "上班" else "已下班"
                 notification_text = (
                     f"{icon} <b>{act}通知</b> <code>{shift_text}</code>\n"
-                    f" {MessageFormatter.format_user_link(uid, name)} 已上班\n"
+                    f" {MessageFormatter.format_user_link(uid, name)} {action_text}\n"
                     f"⏰ 时间：<code>{now.strftime('%H:%M:%S')}</code>\n"
                 )
 
@@ -1626,16 +1632,25 @@ async def _process_back_locked(
 
         # 异步发送超时通知
         if is_overtime and fine_amount > 0:
-            notification_user_data = user_data.copy() if user_data else {}
-            notification_user_data["activity_start_time"] = (
-                activity_start_time_for_notification
-            )
-            notification_user_data["nickname"] = nickname
-            asyncio.create_task(
-                send_overtime_notification_async(
-                    chat_id, uid, notification_user_data, act, fine_amount, now
+            group_data = await db.get_group_cached(chat_id)
+            if group_data.get("channel_id"):
+                notification_user_data = user_data.copy() if user_data else {}
+                notification_user_data["activity_start_time"] = (
+                    activity_start_time_for_notification
                 )
-            )
+                notification_user_data["nickname"] = nickname
+                asyncio.create_task(
+                    send_overtime_notification_async(
+                        chat_id=chat_id,
+                        uid=uid,
+                        user_data=notification_user_data,
+                        act=act,
+                        fine_amount=fine_amount,
+                        now=now,
+                        elapsed_time=int(elapsed),  # ✅ 传入计算好的时长
+                        time_limit_minutes=time_limit_minutes,  # ✅ 传入时间限制
+                    )
+                )
 
         # ==================== ✨ 吃饭回座推送 ====================
         if act == "吃饭":
@@ -1720,10 +1735,19 @@ async def send_overtime_notification_async(
             else:
                 overtime_str = "未超时"
         else:
-            # 兼容旧调用，重新计算（但尽量不用）
             activity_start_time = user_data.get("activity_start_time")
-            overtime_str = "未知时长"
-            # ... 原来的计算逻辑 ...
+            if activity_start_time:
+                try:
+                    start_time = datetime.fromisoformat(activity_start_time)
+                    time_limit = await db.get_activity_time_limit(act)
+                    time_limit_seconds = time_limit * 60
+                    total_elapsed = int((now - start_time).total_seconds())
+                    
+                    if total_elapsed > time_limit_seconds:
+                        overtime_seconds = total_elapsed - time_limit_seconds
+                        overtime_str = MessageFormatter.format_time(overtime_seconds)
+                except Exception as e:
+                    logger.error(f"时间计算失败: {e}")
 
         notif_text = (
             f"🚨 <b>超时回座通知</b>\n"
