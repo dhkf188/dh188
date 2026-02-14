@@ -3503,7 +3503,7 @@ async def optimized_monthly_export(chat_id: int, year: int, month: int):
         writer = csv.writer(csv_buffer)
 
         # ===== 2. 构建表头 =====
-        headers = ["用户ID", "用户昵称"]
+        headers = ["用户ID", "用户昵称", "班次"]
         for act in activity_names:
             headers.extend([f"{act}次数", f"{act}总时长"])
 
@@ -3542,8 +3542,11 @@ async def optimized_monthly_export(chat_id: int, year: int, month: int):
 
             user_id = user_stat.get("user_id", "未知")
             nickname = user_stat.get("nickname", "未知用户")
+            shift = user_stat.get("shift", "day")
 
-            row = [user_id, nickname]
+            shift_display = "白班" if shift == "day" else "夜班"
+
+            row = [user_id, nickname,shift_display]
 
             # 活动数据安全解析
             user_activities = user_stat.get("activities", {})
@@ -5097,7 +5100,7 @@ async def show_history(message: types.Message, shift: str = None):
     # ==================== 4️⃣ 罚款统计 ====================
     total_fine = user_data.get("total_fines", 0)
     if total_fine > 0:
-        text += f"💰 累计罚款：<code>{total_fine}</code> 元\n"
+        text += f"💰 累计罚款：<code>{total_fine}</code> 分\n"
 
     # ==================== 5️⃣ 班次提示 ====================
     if is_dual_mode and not shift:
@@ -6512,7 +6515,7 @@ async def on_startup():
             BotCommand(command="worktime", description="⌚ 考勤时间设置"),
             BotCommand(command="export", description="📤 导出今日报表"),
             BotCommand(command="checkdb", description="🏥 数据库体检"),
-            BotCommand(command="adminhelp", description="🛠 管理员全指令指南"),
+            BotCommand(command="admin", description="🛠 管理员全指令指南"),
         ]
 
         # ✅ 打印你需要的注册日志
