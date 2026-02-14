@@ -6370,6 +6370,8 @@ async def register_handlers():
     dp.message.register(cmd_setdualmode, Command("setdualmode"))
     dp.message.register(cmd_setshiftgrace, Command("setshiftgrace"))
     dp.message.register(handle_ranking_shift_command, Command("ranking"))
+    dp.message.register(handle_ranking_day_command, Command("rankingday"))
+    dp.message.register(handle_ranking_night_command, Command("rankingnight"))
 
     # 按钮处理器
     dp.message.register(
