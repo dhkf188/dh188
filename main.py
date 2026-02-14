@@ -694,22 +694,60 @@ async def has_active_activity(chat_id: int, uid: int) -> tuple[bool, Optional[st
     return user_data["current_activity"] is not None, user_data["current_activity"]
 
 
-async def can_perform_activities(chat_id: int, uid: int) -> tuple[bool, str]:
-    """快速检查是否可以执行活动 - 修复版：使用重置周期"""
+async def can_perform_activities(chat_id: int, uid: int, current_shift: str = None) -> tuple[bool, str]:
+    """快速检查是否可以执行活动 - 根据班次检查"""
     if not await db.has_work_hours_enabled(chat_id):
         return True, ""
 
-    # 🆕 先执行重置检查，确保数据状态正确
-    await reset_daily_data_if_needed(chat_id, uid)
+    # 如果没有传入班次，获取当前班次
+    if current_shift is None:
+        shift_state = await db.get_current_shift_state(chat_id)
+        if shift_state:
+            current_shift = shift_state.get("current_shift", "day")
+        else:
+            # 没有活跃班次，允许活动（单班模式）
+            return True, ""
 
-    # 使用修复后的 get_today_work_records（现在基于重置周期）
-    today_records = await db.get_today_work_records_fixed(chat_id, uid)  # 使用修复版
+    # 获取今天的业务日期
+    today = await db.get_business_date(chat_id)
 
-    if "work_start" not in today_records:
-        return False, "❌ 请先打上班卡！"
+    # 查询用户在当前班次是否有上班记录
+    async with db.pool.acquire() as conn:
+        # 检查当前班次是否已上班
+        has_work_start = await conn.fetchval(
+            """
+            SELECT 1 FROM work_records 
+            WHERE chat_id = $1 
+              AND user_id = $2 
+              AND record_date = $3 
+              AND checkin_type = 'work_start'
+              AND shift = $4
+            LIMIT 1
+            """,
+            chat_id, uid, today, current_shift
+        )
 
-    if "work_end" in today_records:
-        return False, "❌ 已下班，无法进行活动！"
+        if not has_work_start:
+            shift_text = "白班" if current_shift == "day" else "夜班"
+            return False, f"❌ 请先打{shift_text}上班卡！"
+
+        # 检查当前班次是否已下班
+        has_work_end = await conn.fetchval(
+            """
+            SELECT 1 FROM work_records 
+            WHERE chat_id = $1 
+              AND user_id = $2 
+              AND record_date = $3 
+              AND checkin_type = 'work_end'
+              AND shift = $4
+            LIMIT 1
+            """,
+            chat_id, uid, today, current_shift
+        )
+
+        if has_work_end:
+            shift_text = "白班" if current_shift == "day" else "夜班"
+            return False, f"❌ 您本{shift_text}已下班，无法进行活动！"
 
     return True, ""
 
@@ -1162,7 +1200,7 @@ async def start_activity(message: types.Message, act: str):
             return
 
         # 检查活动限制（如被封禁等）
-        can_perform, reason = await can_perform_activities(chat_id, uid)
+        can_perform, reason = await can_perform_activities(chat_id, uid,current_shift)
         if not can_perform:
             await message.answer(reason)
             return
