@@ -314,7 +314,7 @@ async def generate_monthly_report(chat_id: int, year: int = None, month: int = N
         f"• 总活动次数：<code>{total_activity_count}</code> 次\n"
         f"• 总工作天数：<code>{total_work_days}</code> 天\n"
         f"• 总工作时长：<code>{MessageFormatter.format_time(int(total_work_hours))}</code>\n"
-        f"• 总罚款金额：<code>{total_fines}</code> 元\n\n"
+        f"• 总扣除绩效：<code>{total_fines}</code> 分\n\n"
     )
 
     # 上下班统计
@@ -545,7 +545,7 @@ async def handle_expired_activity(
         )
 
         if fine_amount > 0:
-            timeout_msg += f"\n💰 超时罚款：<code>{fine_amount}</code> 元"
+            timeout_msg += f"\n💰 超时扣除绩效：<code>{fine_amount}</code> 分"
 
         await bot.send_message(chat_id, timeout_msg, parse_mode="HTML")
 
@@ -1024,7 +1024,7 @@ async def activity_timer(
                     f"⏰ 自动回座时间：<code>{get_beijing_time().strftime('%m/%d %H:%M:%S')}</code>\n"
                     f"⏱️ 总活动时长：<code>{MessageFormatter.format_time(elapsed)}</code>\n"
                     f"⚠️ 系统自动回座原因：超时超过2小时\n"
-                    f"💰 本次罚款：<code>{fine_amount}</code> 元"
+                    f"💰 本次扣除绩效：<code>{fine_amount}</code> 分"
                 )
 
                 if not notification_service.bot and bot_manager.bot:
@@ -1144,7 +1144,7 @@ async def activity_timer(
                             f"🚨 <b>超时警告</b>\n"
                             f"👤 {MessageFormatter.format_user_link(uid, nickname)} 已超时 <code>{overtime_minutes}</code> 分钟！\n"
                             f"📊 班次：<code>{shift_text}</code>\n"
-                            f"💢 请立刻回座，系统将持续记录超时,避免产生更多罚款！"
+                            f"💢 请立刻回座，避免产生更多罚款！"
                         )
 
                     if msg:
@@ -1158,7 +1158,7 @@ async def activity_timer(
                     f"📝 活动：<code>{act}</code>\n"
                     f"📊 班次：<code>{shift_text}</code>\n"
                     f"⚠️ 超时超过2小时，系统已自动回座\n"
-                    f"💰 本次罚款：<code>{break_data['fine_amount']}</code> 元"
+                    f"💰 本次扣除绩效：<code>{break_data['fine_amount']}</code> 分数"
                 )
                 await send_group_message(msg)
 
@@ -1742,7 +1742,7 @@ async def send_overtime_notification_async(
                     time_limit = await db.get_activity_time_limit(act)
                     time_limit_seconds = time_limit * 60
                     total_elapsed = int((now - start_time).total_seconds())
-                    
+
                     if total_elapsed > time_limit_seconds:
                         overtime_seconds = total_elapsed - time_limit_seconds
                         overtime_str = MessageFormatter.format_time(overtime_seconds)
@@ -1757,7 +1757,7 @@ async def send_overtime_notification_async(
             f"📝 活动：<code>{act}</code>\n"
             f"⏰ 回座时间：<code>{now.strftime('%m/%d %H:%M:%S')}</code>\n"
             f"⏱️ 超时时长：<code>{overtime_str}</code>\n"
-            f"💰 绩效分数：<code>{fine_amount}</code> 元"
+            f"💰 绩效分数：<code>{fine_amount}</code> 分"
         )
 
         # 发送到频道
@@ -2007,7 +2007,7 @@ async def process_work_checkin(message: types.Message, checkin_type: str):
                 duration = MessageFormatter.format_duration(time_diff_seconds)
                 status = f"🚨 迟到 {duration}"
                 if fine_amount:
-                    status += f"（💰罚款 {fine_amount}元）"
+                    status += f"（💰扣除绩效 {fine_amount} 分）"
                 is_late_early = True
                 emoji_status = "😅"
 
@@ -2170,7 +2170,7 @@ async def process_work_checkin(message: types.Message, checkin_type: str):
                 duration = MessageFormatter.format_duration(abs(time_diff_seconds))
                 status = f"🚨 早退 {duration}"
                 if fine_amount:
-                    status += f"（💰罚款 {fine_amount}元）"
+                    status += f"（💰扣除绩效 {fine_amount} 分）"
                 is_late_early = True
                 emoji_status = "🏃"
 
@@ -2458,7 +2458,7 @@ async def send_work_notification(
         )
 
         if fine_amount > 0:
-            notif_text += f"\n💰 罚款金额：<code>{fine_amount}</code> 元"
+            notif_text += f"\n💰 扣除绩效：<code>{fine_amount}</code> 分"
 
         # 发送通知（异步）
         asyncio.create_task(notification_service.send_notification(chat_id, notif_text))
@@ -3440,7 +3440,7 @@ async def optimized_monthly_export(chat_id: int, year: int, month: int):
             [
                 "活动次数总计",
                 "活动用时总计",
-                "罚款总金额",
+                "罚款总分",
                 "超时次数",
                 "总超时时间",
                 "工作天数",
