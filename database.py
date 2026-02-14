@@ -3188,10 +3188,10 @@ class PostgreSQLDatabase:
             return [dict(row) for row in rows]
 
     # ========== 月度统计 ==========
-    async def get_monthly_statistics(
+        async def get_monthly_statistics(
         self, chat_id: int, year: int = None, month: int = None
     ) -> List[Dict]:
-        """修复版：获取月度统计 - 正确聚合统计字段"""
+        """修复版：获取月度统计 - 按班次分组显示"""
 
         if year is None or month is None:
             today = self.get_beijing_time()
@@ -3202,18 +3202,18 @@ class PostgreSQLDatabase:
         self._ensure_pool_initialized()
 
         async with self.pool.acquire() as conn:
-            # 🆕 修复：使用正确的聚合方式
             rows = await conn.fetch(
                 """
                 WITH user_base AS (
-                    -- 获取该月份有记录的所有用户
-                    SELECT DISTINCT user_id 
+                    -- 获取该月份有记录的所有用户和班次
+                    SELECT DISTINCT user_id, shift
                     FROM monthly_statistics 
                     WHERE chat_id = $1 AND statistic_date = $2
                 ),
                 user_totals AS (
                     SELECT
                         ub.user_id,
+                        ub.shift,  -- ✅ 保留班次字段
                         u.nickname,
                         -- 活动统计：SUM 聚合
                         COALESCE(SUM(CASE WHEN ms.activity_name NOT IN 
@@ -3224,55 +3224,41 @@ class PostgreSQLDatabase:
                             ('work_days','work_hours','total_fines','overtime_count','overtime_time')
                             THEN ms.accumulated_time ELSE 0 END), 0) AS total_accumulated_time,
                     
-                        -- 🆕 修复：罚款统计使用 SUM
+                        -- 罚款统计：SUM 聚合
                         COALESCE(SUM(CASE WHEN ms.activity_name = 'total_fines' 
                             THEN ms.accumulated_time ELSE 0 END), 0) AS total_fines,
                     
-                        -- 🆕 修复：超时和工作统计使用子查询（因为每个类型只有一条记录）
-                        COALESCE((
-                            SELECT ms2.activity_count 
-                            FROM monthly_statistics ms2 
-                            WHERE ms2.chat_id = $1 
-                            AND ms2.user_id = ub.user_id 
-                            AND ms2.statistic_date = $2 
-                            AND ms2.activity_name = 'overtime_count'
-                        ), 0) AS overtime_count,
+                        -- 超时次数：SUM 聚合（避免子查询多行问题）
+                        COALESCE(SUM(CASE WHEN ms.activity_name = 'overtime_count' 
+                            THEN ms.activity_count ELSE 0 END), 0) AS overtime_count,
                     
-                        COALESCE((
-                            SELECT ms2.accumulated_time 
-                            FROM monthly_statistics ms2 
-                            WHERE ms2.chat_id = $1 
-                            AND ms2.user_id = ub.user_id 
-                            AND ms2.statistic_date = $2 
-                            AND ms2.activity_name = 'overtime_time'
-                        ), 0) AS total_overtime_time,
+                        -- 超时时间：SUM 聚合
+                        COALESCE(SUM(CASE WHEN ms.activity_name = 'overtime_time' 
+                            THEN ms.accumulated_time ELSE 0 END), 0) AS total_overtime_time,
                     
-                        COALESCE((
-                            SELECT ms2.activity_count 
-                            FROM monthly_statistics ms2 
-                            WHERE ms2.chat_id = $1 
-                            AND ms2.user_id = ub.user_id 
-                            AND ms2.statistic_date = $2 
-                            AND ms2.activity_name = 'work_days'
-                        ), 0) AS work_days,
+                        -- 工作天数：SUM 聚合
+                        COALESCE(SUM(CASE WHEN ms.activity_name = 'work_days' 
+                            THEN ms.activity_count ELSE 0 END), 0) AS work_days,
                     
-                        COALESCE((
-                            SELECT ms2.accumulated_time 
-                            FROM monthly_statistics ms2 
-                            WHERE ms2.chat_id = $1 
-                            AND ms2.user_id = ub.user_id 
-                            AND ms2.statistic_date = $2 
-                            AND ms2.activity_name = 'work_hours'
-                        ), 0) AS work_hours
+                        -- 工作时长：SUM 聚合
+                        COALESCE(SUM(CASE WHEN ms.activity_name = 'work_hours' 
+                            THEN ms.accumulated_time ELSE 0 END), 0) AS work_hours
                     
                     FROM user_base ub
-                    LEFT JOIN monthly_statistics ms ON ms.chat_id = $1 AND ms.user_id = ub.user_id AND ms.statistic_date = $2
-                    LEFT JOIN users u ON u.chat_id = $1 AND u.user_id = ub.user_id
-                    GROUP BY ub.user_id, u.nickname
+                    LEFT JOIN monthly_statistics ms 
+                        ON ms.chat_id = $1 
+                        AND ms.user_id = ub.user_id 
+                        AND ms.statistic_date = $2
+                        AND ms.shift = ub.shift  -- ✅ 按班次匹配
+                    LEFT JOIN users u 
+                        ON u.chat_id = $1 
+                        AND u.user_id = ub.user_id
+                    GROUP BY ub.user_id, ub.shift, u.nickname  -- ✅ 按班次分组
                 ),
                 activity_details AS (
                     SELECT
                         ms.user_id,
+                        ms.shift,  -- ✅ 保留班次字段
                         jsonb_object_agg(
                             ms.activity_name, 
                             jsonb_build_object(
@@ -3285,14 +3271,16 @@ class PostgreSQLDatabase:
                     AND ms.statistic_date = $2
                     AND ms.activity_name NOT IN 
                         ('work_days','work_hours','total_fines','overtime_count','overtime_time')
-                    GROUP BY ms.user_id
+                    GROUP BY ms.user_id, ms.shift  -- ✅ 按班次分组
                 )
                 SELECT 
                     ut.*,
                     COALESCE(ad.activities, '{}'::jsonb) AS activities
                 FROM user_totals ut
-                LEFT JOIN activity_details ad ON ut.user_id = ad.user_id
-                ORDER BY ut.total_accumulated_time DESC
+                LEFT JOIN activity_details ad 
+                    ON ut.user_id = ad.user_id 
+                    AND ut.shift = ad.shift  -- ✅ 按班次关联
+                ORDER BY ut.user_id, ut.shift
                 """,
                 chat_id,
                 statistic_date,
@@ -3303,7 +3291,11 @@ class PostgreSQLDatabase:
             for row in rows:
                 data = dict(row)
 
-                # 🛠️ 统一稳定的 JSON 解析
+                # 确保班次字段存在
+                if "shift" not in data or data["shift"] is None:
+                    data["shift"] = "day"
+
+                # JSON 解析
                 raw_activities = data.get("activities")
                 parsed_activities = {}
 
@@ -3313,13 +3305,14 @@ class PostgreSQLDatabase:
                             parsed_activities = json.loads(raw_activities)
                         except Exception as e:
                             logger.error(f"JSON解析失败: {e}")
-                elif isinstance(raw_activities, dict):
-                    parsed_activities = raw_activities
+                    elif isinstance(raw_activities, dict):
+                        parsed_activities = raw_activities
 
                 data["activities"] = parsed_activities
                 result.append(data)
 
             return result
+
 
     async def get_monthly_work_statistics(
         self, chat_id: int, year: int = None, month: int = None
@@ -4174,3 +4167,4 @@ class PostgreSQLDatabase:
 
 # 全局数据库实例
 db = PostgreSQLDatabase()
+
