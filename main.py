@@ -1199,17 +1199,11 @@ async def start_activity(message: types.Message, act: str):
             )
             return
 
-        # 检查活动限制（如被封禁等）
-        can_perform, reason = await can_perform_activities(chat_id, uid,current_shift)
-        if not can_perform:
-            await message.answer(reason)
-            return
-
         # 开始活动逻辑
         name = message.from_user.full_name
         now = get_beijing_time()
 
-        # ================== 🆕 班次判定 ==================
+        # ================== 🆕 班次判定（移到前面）==================
         # 初始化班次变量
         current_shift = "day"  # 默认值
         shift_detail = "day"  # 详细班次信息
@@ -1278,6 +1272,13 @@ async def start_activity(message: types.Message, act: str):
 
         logger.info(f"🔄 最终班次判定：{current_shift} (detail: {shift_detail})")
 
+        # ================== ✅ 现在才使用 current_shift ==================
+        # 检查活动限制（如被封禁等）- 现在 current_shift 已经有值了
+        can_perform, reason = await can_perform_activities(chat_id, uid, current_shift)
+        if not can_perform:
+            await message.answer(reason)
+            return
+
         # ================== 活动人数限制 ==================
         user_limit = await db.get_activity_user_limit(act)
         if user_limit > 0:
@@ -1334,8 +1335,7 @@ async def start_activity(message: types.Message, act: str):
             )
             return
 
-        # ================== 更新用户活动状态（包含班次） ==================
-        # 这里只传 current_shift，因为数据库只存 "day"/"night"
+        # ================== 更新用户活动状态（包含班次）==================
         await db.update_user_activity(chat_id, uid, act, str(now), name, current_shift)
 
         # ================== 活动时长限制 ==================
@@ -1375,7 +1375,7 @@ async def start_activity(message: types.Message, act: str):
             f"📝 用户 {uid} 开始活动 {act}（{shift_text}），消息ID: {sent_message.message_id}"
         )
 
-        # ================== 上班/下班/吃饭推送 ==================
+        # ================== 推送通知 ==================
         try:
             chat_title = str(chat_id)
             try:
