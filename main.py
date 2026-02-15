@@ -698,6 +698,10 @@ async def can_perform_activities(
     chat_id: int, uid: int, current_shift: str = None
 ) -> tuple[bool, str]:
     """快速检查是否可以执行活动 - 根据班次检查"""
+    logger.info(
+        f"🔍 [活动检查] 用户={uid}, 班次={current_shift}, 时间={get_beijing_time().strftime('%H:%M')}"
+    )
+
     if not await db.has_work_hours_enabled(chat_id):
         return True, ""
 
@@ -707,13 +711,29 @@ async def can_perform_activities(
         if shift_state:
             current_shift = shift_state.get("current_shift", "day")
         else:
-            # 没有活跃班次，允许活动（单班模式）
+            shift_config = await db.get_shift_config(chat_id)
+            if shift_config.get("dual_mode", False):
+                # 双班模式下如果没有活跃班次，允许活动（还没人打上班卡）
+                return True, ""
             return True, ""
 
-    # 获取今天的业务日期
-    today = await db.get_business_date(chat_id)
+    # 🎯 关键修复：使用与上班打卡相同的日期判定逻辑
+    now = get_beijing_time()
+    shift_info = await db.determine_shift_for_time(
+        chat_id=chat_id,
+        current_time=now,
+        checkin_type="work_start",  # 活动跟随上班班次
+    )
 
-    # 查询用户在当前班次是否有上班记录
+    if not shift_info:
+        shift_text = "白班" if current_shift == "day" else "夜班"
+        return False, f"❌ 当前不在{shift_text}活动时段"
+
+    record_date = shift_info.get("record_date")
+    logger.info(
+        f"📅 [活动检查] 用户={uid}, 班次={current_shift}, 记录日期={record_date}"
+    )
+
     async with db.pool.acquire() as conn:
         # 检查当前班次是否已上班
         has_work_start = await conn.fetchval(
@@ -728,12 +748,15 @@ async def can_perform_activities(
             """,
             chat_id,
             uid,
-            today,
+            record_date,
             current_shift,
         )
 
         if not has_work_start:
             shift_text = "白班" if current_shift == "day" else "夜班"
+            logger.warning(
+                f"❌ [活动检查] 用户={uid} 未打{shift_text}上班卡，日期={record_date}"
+            )
             return False, f"❌ 请先打{shift_text}上班卡！"
 
         # 检查当前班次是否已下班
@@ -749,7 +772,7 @@ async def can_perform_activities(
             """,
             chat_id,
             uid,
-            today,
+            record_date,
             current_shift,
         )
 
@@ -757,6 +780,7 @@ async def can_perform_activities(
             shift_text = "白班" if current_shift == "day" else "夜班"
             return False, f"❌ 您本{shift_text}已下班，无法进行活动！"
 
+    logger.info(f"✅ [活动检查] 用户={uid} 允许执行活动")
     return True, ""
 
 
@@ -2058,19 +2082,18 @@ async def process_work_checkin(message: types.Message, checkin_type: str):
                 parse_mode="HTML",
             )
 
-            # 智能通知
-            if is_late_early:
-                await send_work_notification(
-                    chat_id,
-                    uid,
-                    name,
-                    current_time,
-                    expected_dt,
-                    action_text,
-                    status_type,
-                    fine_amount,
-                    trace_id,
-                )
+            # ✅ 发送通知（准时/迟到都发）
+            await send_work_notification(
+                chat_id,
+                uid,
+                name,
+                current_time,
+                expected_dt,
+                action_text,
+                status_type if is_late_early else "准时",  # 准时传入"准时"
+                fine_amount,
+                trace_id,
+            )
 
             logger.info(f"✅[{trace_id}] {shift_text}{action_text}打卡流程完成")
             return
@@ -2238,6 +2261,25 @@ async def process_work_checkin(message: types.Message, checkin_type: str):
                 parse_mode="HTML",
             )
 
+            # ========== 发送成功消息 ==========
+            result_msg = (
+                f"{emoji_status} <b>{shift_text}{action_text}完成</b>\n"
+                f"👤 用户：{MessageFormatter.format_user_link(uid, name)}\n"
+                f"⏰ {action_text}时间：<code>{current_time}</code>\n"
+                f"📅 期望时间：<code>{expected_dt.strftime('%m/%d %H:%M')}</code>\n"
+                f"📊 状态：{status}"
+            )
+
+            if activity_auto_ended and current_activity:
+                result_msg += f"\n\n🔄 检测到未结束活动 <code>{current_activity}</code>，已自动结束"
+
+            await message.answer(
+                result_msg,
+                reply_markup=await get_main_keyboard(chat_id, await is_admin_task),
+                reply_to_message_id=message.message_id,
+                parse_mode="HTML",
+            )
+
             # ========== 班次状态清理（仅双班模式）==========
             if is_dual_mode:
                 try:
@@ -2276,19 +2318,22 @@ async def process_work_checkin(message: types.Message, checkin_type: str):
                 except Exception as e:
                     logger.error(f"❌ [班次状态] 检查剩余用户失败 {chat_id}: {e}")
 
-            # 智能通知
-            if is_late_early:
-                await send_work_notification(
-                    chat_id,
-                    uid,
-                    name,
-                    current_time,
-                    expected_dt,
-                    action_text,
-                    status_type,
-                    fine_amount,
-                    trace_id,
-                )
+            # ✅ 发送通知（准时/早退/加班都发）
+            status_display = status_type if is_late_early else "准时"
+            if time_diff_seconds > 0 and action_text == "下班":  # 加班情况
+                status_display = "加班"
+
+            await send_work_notification(
+                chat_id,
+                uid,
+                name,
+                current_time,
+                expected_dt,
+                action_text,
+                status_display,
+                fine_amount,
+                trace_id,
+            )
 
             logger.info(f"✅[{trace_id}] {shift_text}{action_text}打卡流程完成")
             return
@@ -2299,48 +2344,28 @@ async def _check_shift_work_record(
 ) -> bool:
     """
     检查指定班次的打卡记录
-    支持夜班跨天查询
+    修复版：夜班也基于业务日期查询
     """
     try:
-        # ✅ 现在接受 business_date 参数，不需要再调用 db.get_business_date()
+        # ✅ 使用业务日期作为查询条件，无论是白班还是夜班
 
-        # 如果是夜班，考虑跨天情况
-        if shift == "night":
-            # 夜班可能跨天，查询最近24小时内的记录
-            async with db.pool.acquire() as conn:
-                row = await conn.fetchrow(
-                    """
-                    SELECT 1 FROM work_records 
-                    WHERE chat_id = $1 AND user_id = $2 
-                    AND checkin_type = $3 AND shift = $4
-                    AND created_at >= NOW() - INTERVAL '24 hours'
-                    AND created_at <= NOW()
-                    LIMIT 1
-                    """,
-                    chat_id,
-                    user_id,
-                    checkin_type,
-                    shift,
-                )
-                return row is not None
-        else:
-            # 白班：按业务日期检查
-            async with db.pool.acquire() as conn:
-                row = await conn.fetchrow(
-                    """
-                    SELECT 1 FROM work_records 
-                    WHERE chat_id = $1 AND user_id = $2 
-                    AND checkin_type = $3 AND shift = $4
-                    AND record_date = $5
-                    LIMIT 1
-                    """,
-                    chat_id,
-                    user_id,
-                    checkin_type,
-                    shift,
-                    business_date,
-                )
-                return row is not None
+        async with db.pool.acquire() as conn:
+            row = await conn.fetchrow(
+                """
+                SELECT 1 FROM work_records 
+                WHERE chat_id = $1 AND user_id = $2 
+                AND checkin_type = $3 AND shift = $4
+                AND record_date = $5
+                LIMIT 1
+                """,
+                chat_id,
+                user_id,
+                checkin_type,
+                shift,
+                business_date,  # 使用业务日期，而不是时间窗口
+            )
+            return row is not None
+
     except Exception as e:
         logger.error(
             f"检查班次打卡记录失败 - chat_id:{chat_id}, user_id:{user_id}, "
@@ -2355,49 +2380,26 @@ async def _get_existing_work_record(
 ) -> Optional[Dict]:
     """
     获取已存在的打卡记录详情
-    用于详细重复打卡展示
+    修复版：夜班也基于业务日期查询
     """
     try:
-        # ✅ 现在接受 business_date 参数
-
-        # 构建查询条件
         async with db.pool.acquire() as conn:
-            if shift == "night":
-                # 夜班：查询最近24小时
-                row = await conn.fetchrow(
-                    """
-                    SELECT checkin_time, status, created_at, record_date 
-                    FROM work_records 
-                    WHERE chat_id = $1 AND user_id = $2 
-                    AND checkin_type = $3 AND shift = $4
-                    AND created_at >= NOW() - INTERVAL '24 hours'
-                    AND created_at <= NOW()
-                    ORDER BY created_at DESC
-                    LIMIT 1
-                    """,
-                    chat_id,
-                    user_id,
-                    checkin_type,
-                    shift,
-                )
-            else:
-                # 白班：按业务日期
-                row = await conn.fetchrow(
-                    """
-                    SELECT checkin_time, status, created_at, record_date 
-                    FROM work_records 
-                    WHERE chat_id = $1 AND user_id = $2 
-                    AND checkin_type = $3 AND shift = $4
-                    AND record_date = $5
-                    ORDER BY created_at DESC
-                    LIMIT 1
-                    """,
-                    chat_id,
-                    user_id,
-                    checkin_type,
-                    shift,
-                    business_date,
-                )
+            row = await conn.fetchrow(
+                """
+                SELECT checkin_time, status, created_at, record_date 
+                FROM work_records 
+                WHERE chat_id = $1 AND user_id = $2 
+                AND checkin_type = $3 AND shift = $4
+                AND record_date = $5
+                ORDER BY created_at DESC
+                LIMIT 1
+                """,
+                chat_id,
+                user_id,
+                checkin_type,
+                shift,
+                business_date,
+            )
 
             if row:
                 return {
@@ -2407,6 +2409,7 @@ async def _get_existing_work_record(
                     "record_date": row["record_date"],
                 }
             return None
+
     except Exception as e:
         logger.error(
             f"获取现有记录失败 - chat_id:{chat_id}, user_id:{user_id}, "
@@ -2427,32 +2430,83 @@ async def send_work_notification(
     trace_id: str,
 ):
     """
-    发送工作打卡通知（迟到/早退）
-    3️⃣ 通知文案动态化：支持上班/下班，迟到/早退
+    生产级终极版本：
+    ✔ 群组通知
+    ✔ 频道通知
+    ✔ 跨天安全
+    ✔ 不丢消息（fallback）
+    ✔ 时区处理
+    ✔ 时间差计算修复
     """
+
     try:
+        # 获取群配置
+        group_data = await db.get_group_cached(chat_id)
+        channel_id = group_data.get("channel_id") if group_data else None
+
+        # 获取群信息
         chat_info = await bot.get_chat(chat_id)
         chat_title = getattr(chat_info, "title", str(chat_id))
 
-        # 动态构建通知文案
+        # ========= 🎯 修复1：安全时间差计算（支持跨天）=========
+        checkin_hour, checkin_min = map(int, checkin_time.split(":"))
+        checkin_dt = expected_dt.replace(
+            hour=checkin_hour, minute=checkin_min, second=0, microsecond=0
+        )
+
+        if (
+            checkin_dt < expected_dt
+            and (expected_dt - checkin_dt).total_seconds() > 43200
+        ):
+            checkin_dt += timedelta(days=1)
+            logger.debug(f"[{trace_id}] 🔄 检测到跨天，调整打卡时间: {checkin_dt}")
+
+        diff_seconds = int((checkin_dt - expected_dt).total_seconds())
+
+        # ========= 🎯 修复2：迟到/早退判定 ==========
         if action_text == "上班":
-            if status_type == "迟到":
-                title = f"⚠️ <b>上班迟到通知</b>"
-                status_line = f"⏱️ 迟到 {MessageFormatter.format_duration((datetime.strptime(checkin_time, '%H:%M') - datetime.strptime(expected_dt.strftime('%H:%M'), '%H:%M')).seconds)}"
+            if diff_seconds > 0:
+                actual_status = "迟到"
+                title = "⚠️ <b>上班迟到通知</b>"
+                status_line = f"⏱️ 迟到 {MessageFormatter.format_duration(diff_seconds)}"
+            elif diff_seconds < 0:
+                actual_status = "早到"
+                title = "✅ <b>上班早到通知</b>"
+                status_line = (
+                    f"⏱️ 早到 {MessageFormatter.format_duration(abs(diff_seconds))}"
+                )
             else:
-                title = f"✅ <b>上班准时通知</b>"
+                actual_status = "准时"
+                title = "✅ <b>上班准时通知</b>"
                 status_line = "⏱️ 准时到达"
         else:  # 下班
-            if status_type == "早退":
-                title = f"⚠️ <b>下班早退通知</b>"
-                status_line = f"⏱️ 早退 {MessageFormatter.format_duration((datetime.strptime(expected_dt.strftime('%H:%M'), '%H:%M') - datetime.strptime(checkin_time, '%H:%M')).seconds)}"
+            if diff_seconds < 0:
+                actual_status = "早退"
+                title = "⚠️ <b>下班早退通知</b>"
+                status_line = (
+                    f"⏱️ 早退 {MessageFormatter.format_duration(abs(diff_seconds))}"
+                )
+            elif diff_seconds > 0:
+                actual_status = "加班"
+                title = "✅ <b>下班加班通知</b>"
+                status_line = f"⏱️ 加班 {MessageFormatter.format_duration(diff_seconds)}"
             else:
-                title = f"✅ <b>下班准时通知</b>"
+                actual_status = "准时"
+                title = "✅ <b>下班准时通知</b>"
                 status_line = "⏱️ 准时下班"
 
+        # ========= 🎯 修复3：班次信息 ==========
+        shift_state = await db.get_current_shift_state(chat_id)
+        shift_text = "白班"
+        if shift_state:
+            current_shift = shift_state.get("current_shift", "day")
+            shift_text = "白班" if current_shift == "day" else "夜班"
+
+        # ========= 文案构建 ==========
         notif_text = (
             f"{title}\n"
             f"🏢 群组：<code>{chat_title}</code>\n"
+            f"📊 班次：<code>{shift_text}</code>\n"
             f"{MessageFormatter.create_dashed_line()}\n"
             f"👤 用户：{MessageFormatter.format_user_link(user_id, user_name)}\n"
             f"⏰ {action_text}时间：<code>{checkin_time}</code>\n"
@@ -2463,12 +2517,49 @@ async def send_work_notification(
         if fine_amount > 0:
             notif_text += f"\n💰 扣除绩效：<code>{fine_amount}</code> 分"
 
-        # 发送通知（异步）
-        asyncio.create_task(notification_service.send_notification(chat_id, notif_text))
+        # ========= 🎯 修复4：添加调试日志 ==========
+        logger.info(
+            f"[{trace_id}] 📊 通知详情:\n"
+            f"   • 用户: {user_name}({user_id})\n"
+            f"   • 动作: {action_text}\n"
+            f"   • 状态: {actual_status}\n"
+            f"   • 打卡时间: {checkin_time}\n"
+            f"   • 期望时间: {expected_dt.strftime('%H:%M')}\n"
+            f"   • 时间差: {diff_seconds}秒 ({MessageFormatter.format_duration(abs(diff_seconds))})\n"
+            f"   • 罚款: {fine_amount}\n"
+            f"   • 班次: {shift_text}"
+        )
 
-        logger.info(f"[{trace_id}] 📢 已发送{action_text}{status_type}通知")
+        # ========= 发送群 ==========
+        async def safe_send(target_id: int, text: str):
+            """安全发送：notification_service -> bot.send_message fallback"""
+            try:
+                await notification_service.send_notification(target_id, text)
+            except Exception as e:
+                logger.error(
+                    f"[{trace_id}] ❌ 通知发送失败({target_id})，尝试备用bot.send_message: {e}"
+                )
+                try:
+                    await bot.send_message(target_id, text)
+                    logger.info(
+                        f"[{trace_id}] ✅ fallback bot.send_message成功({target_id})"
+                    )
+                except Exception as e2:
+                    logger.error(
+                        f"[{trace_id}] ❌ fallback bot.send_message也失败({target_id}): {e2}"
+                    )
+
+        # 发送群组
+        await safe_send(chat_id, notif_text)
+
+        # 发送频道
+        if channel_id:
+            await safe_send(channel_id, notif_text)
+
     except Exception as e:
-        logger.error(f"[{trace_id}] ❌ 通知发送失败: {e}")
+        logger.error(
+            f"[{trace_id}] ❌ send_work_notification总异常: {e}", exc_info=True
+        )
 
 
 # ========== 管理员装饰器 ==========
@@ -3546,7 +3637,7 @@ async def optimized_monthly_export(chat_id: int, year: int, month: int):
 
             shift_display = "白班" if shift == "day" else "夜班"
 
-            row = [user_id, nickname,shift_display]
+            row = [user_id, nickname, shift_display]
 
             # 活动数据安全解析
             user_activities = user_stat.get("activities", {})
