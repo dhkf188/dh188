@@ -170,9 +170,6 @@ async def _dual_shift_hard_reset(
         await db.clear_shift_state(chat_id)
         logger.info(f"   ✅ 班次状态已清除")
 
-        await db.validate_shift_state(chat_id)
-        logger.info(f"   ✅ 班次状态验证完成")
-
         # ========== 6. 发送通知 ==========
         try:
             from main import send_reset_notification
