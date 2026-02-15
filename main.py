@@ -101,6 +101,31 @@ start_time = time.time()
 active_back_processing: Dict[str, bool] = {}
 
 
+# ========== 类型安全辅助函数 ==========
+def ensure_shift_string(shift_value, default="day"):
+    """
+    确保班次值是字符串，不是字典或其他类型
+    """
+    if shift_value is None:
+        return default
+
+    if isinstance(shift_value, str):
+        return shift_value
+
+    if isinstance(shift_value, dict):
+        # 如果是字典，尝试获取 'shift' 或 'current_shift' 字段
+        if "shift" in shift_value:
+            return ensure_shift_string(shift_value["shift"], default)
+        elif "current_shift" in shift_value:
+            return ensure_shift_string(shift_value["current_shift"], default)
+        else:
+            logger.warning(f"⚠️ 班次字典缺少有效字段: {shift_value}")
+            return default
+
+    logger.error(f"❌ 无法解析的班次类型 {type(shift_value)}: {shift_value}")
+    return default
+
+
 # ========== 日志中间件 ==========
 class LoggingMiddleware(BaseMiddleware):
     async def __call__(self, handler, event: types.Message, data):
@@ -1248,21 +1273,14 @@ async def start_activity(message: types.Message, act: str):
         if shift_state:
             # ✅ 从状态中取字符串
             temp_shift = shift_state.get("current_shift")
-            if isinstance(temp_shift, str):
-                current_shift = temp_shift
-                # 从状态中获取详细班次（如果有）
-                shift_detail = shift_state.get("shift_detail", current_shift)
-                logger.info(
-                    f"🔄 从班次状态获取: {current_shift} (detail: {shift_detail})"
-                )
-            else:
-                logger.error(f"❌ shift_state.current_shift 不是字符串: {temp_shift}")
-                # 保持默认值 "day"
+            current_shift = ensure_shift_string(temp_shift, "day")
+            # 从状态中获取详细班次（如果有）
+            shift_detail = shift_state.get("shift_detail", current_shift)
+            logger.info(f"🔄 从班次状态获取: {current_shift} (detail: {shift_detail})")
         else:
             shift_config = await db.get_shift_config(chat_id)
             if shift_config.get("dual_mode", False):
                 # ✅ 双班模式：根据时间判定
-                # 🎯 活动统一使用 "work_start" 作为班次判定依据
                 shift_info = await db.determine_shift_for_time(
                     chat_id=chat_id,
                     current_time=now,
@@ -1278,18 +1296,14 @@ async def start_activity(message: types.Message, act: str):
                     )
                     return
 
-                # ✅ 从字典中取 shift 字段
+                # ✅ 安全获取班次字符串
                 temp_shift = shift_info.get("shift")
-                if isinstance(temp_shift, str):
-                    current_shift = temp_shift
-                    # 保存详细班次信息
-                    shift_detail = shift_info.get("shift_detail", current_shift)
-                    logger.info(
-                        f"🔄 从时间判定获取: {current_shift} (detail: {shift_detail})"
-                    )
-                else:
-                    logger.error(f"❌ shift_info.shift 不是字符串: {temp_shift}")
-                    # 保持默认值 "day"
+                current_shift = ensure_shift_string(temp_shift, "day")
+                # 保存详细班次信息
+                shift_detail = shift_info.get("shift_detail", current_shift)
+                logger.info(
+                    f"🔄 从时间判定获取: {current_shift} (detail: {shift_detail})"
+                )
             else:
                 # 单班模式：默认白班
                 logger.info("🔄 单班模式，使用默认班次: day")
@@ -2054,6 +2068,9 @@ async def process_work_checkin(message: types.Message, checkin_type: str):
 
             # ========== 班次状态管理（仅双班模式）==========
             if is_dual_mode:
+                # 先验证现有状态是否有效
+                await db.validate_shift_state(chat_id)
+
                 current_state = await db.get_current_shift_state(chat_id)
                 if not current_state:
                     await db.create_shift_state(chat_id, shift, uid)
@@ -2061,8 +2078,8 @@ async def process_work_checkin(message: types.Message, checkin_type: str):
                         f"🏁 [班次状态] 群组{chat_id} 创建 {shift_text}，启动者={uid}"
                     )
                 elif current_state["current_shift"] != shift:
-                    logger.warning(
-                        f"⚠️ [班次状态] 群组{chat_id} 班次冲突: 当前={current_state['current_shift']}, 新={shift}"
+                    logger.info(
+                        f"🔄 [班次状态] 群组{chat_id} 从 {current_state['current_shift']} 切换到 {shift}，用户={uid}"
                     )
                     await db.create_shift_state(chat_id, shift, uid)
 
@@ -2296,6 +2313,10 @@ async def process_work_checkin(message: types.Message, checkin_type: str):
                             f"📢 <b>{shift_text}结束</b>\n所有用户已完成下班打卡，班次状态已清除",
                             parse_mode="HTML",
                         )
+                    else:
+                        # 即使还有人没下班，也验证一下状态有效性
+                        await db.validate_shift_state(chat_id)
+
                 except Exception as e:
                     logger.error(f"❌ [班次状态] 检查剩余用户失败 {chat_id}: {e}")
 
@@ -6028,9 +6049,6 @@ async def export_and_push_csv(
 
 
 # ========== 定时任务 ==========
-# ========== main.py - 修改 daily_reset_task ==========
-
-
 async def daily_reset_task():
     """每日自动重置任务 - 单班/双班分流"""
     logger.info("🚀 每日重置监控任务已启动")
@@ -6116,6 +6134,34 @@ async def daily_reset_task():
         except Exception as e:
             logger.error(f"❌ daily_reset_task 循环主逻辑出错: {e}")
         await asyncio.sleep(60)
+
+
+async def shift_state_validation_task():
+    """定期验证班次状态的有效性"""
+    logger.info("🚀 班次状态验证任务已启动")
+
+    while True:
+        try:
+            await asyncio.sleep(300)  # 每5分钟执行一次
+
+            all_groups = await db.get_all_groups()
+
+            for chat_id in all_groups:
+                try:
+                    # 只检查双班模式群组
+                    shift_config = await db.get_shift_config(chat_id)
+                    if not shift_config.get("dual_mode", False):
+                        continue
+
+                    # 验证并修复状态
+                    await db.validate_shift_state(chat_id)
+
+                except Exception as e:
+                    logger.error(f"验证群组 {chat_id} 状态失败: {e}")
+
+        except Exception as e:
+            logger.error(f"班次状态验证任务出错: {e}")
+            await asyncio.sleep(60)
 
 
 # ========== 软重置定时任务 ==========
@@ -6384,7 +6430,14 @@ async def initialize_services():
         shift_recovered = await recover_shift_states()
         logger.info(f"✅ 班次状态恢复完成: {shift_recovered} 个群组")
 
-        # 12. 🎯 最终健康检查
+        # 👇👇👇 在这里添加班次状态验证任务 👇👇👇
+        # 🆕 12. 启动班次状态验证任务
+        asyncio.create_task(shift_state_validation_task())
+        logger.info("✅ 班次状态验证任务已启动")
+
+        # 👆👆👆 添加结束 👆👆👆
+
+        # 13. 🎯 最终健康检查
         health_status = await check_services_health()
         if all(health_status.values()):
             logger.info("🎉 所有服务初始化完成且健康")
