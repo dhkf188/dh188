@@ -3444,7 +3444,7 @@ class PostgreSQLDatabase:
 
     # ========== 班次状态管理 ==========
     async def get_current_shift_state(self, chat_id: int) -> Optional[Dict]:
-        """获取当前班次状态"""
+        """获取当前班次状态 - 带缓存"""
         cache_key = f"shift_state:{chat_id}"
         cached = self._get_cached(cache_key)
         if cached is not None:
@@ -3458,9 +3458,111 @@ class PostgreSQLDatabase:
 
         if row:
             result = dict(row)
-            self._set_cached(cache_key, result, 30)
+            self._set_cached(cache_key, result, 30)  # 30秒缓存
             return result
         return None
+
+    async def validate_shift_state(self, chat_id: int) -> bool:
+        """验证班次状态是否有效，修复不一致"""
+
+        # 获取当前状态
+        state = await self.get_current_shift_state(chat_id)
+        if not state:
+            return True
+
+        now = self.get_beijing_time()
+        current_shift = state.get("current_shift")
+        shift_start = state.get("shift_start_time")
+
+        # 1. 检查状态是否过期（超过24小时）
+        if shift_start and (now - shift_start).total_seconds() > 24 * 3600:
+            logger.warning(f"群组 {chat_id} 班次状态过期，自动清除")
+            await self.clear_shift_state(chat_id)
+            return False
+
+        # 2. 检查是否有实际活跃用户
+        async with self.pool.acquire() as conn:
+            # 获取今天的业务日期
+            today = await self.get_business_date(chat_id)
+
+            # 查询今天该班次是否有未下班的用户
+            active_users = await conn.fetchval(
+                """
+                SELECT COUNT(*) FROM work_records wr
+                WHERE wr.chat_id = $1 
+                  AND wr.record_date = $2
+                  AND wr.shift = $3
+                  AND wr.checkin_type = 'work_start'
+                  AND NOT EXISTS (
+                      SELECT 1 FROM work_records wr2
+                      WHERE wr2.chat_id = wr.chat_id
+                        AND wr2.user_id = wr.user_id
+                        AND wr2.record_date = wr.record_date
+                        AND wr2.shift = wr.shift
+                        AND wr2.checkin_type = 'work_end'
+                  )
+                """,
+                chat_id,
+                today,
+                current_shift,
+            )
+
+            if active_users == 0:
+                # 没有活跃用户，清除状态
+                logger.info(f"群组 {chat_id} 无活跃用户，自动清除班次状态")
+                await self.clear_shift_state(chat_id)
+                return False
+
+        return True
+
+    async def repair_shift_state(self, chat_id: int) -> bool:
+        """修复不一致的班次状态"""
+
+        try:
+            # 获取当前状态
+            state = await self.get_current_shift_state(chat_id)
+            if not state:
+                return True
+
+            today = await self.get_business_date(chat_id)
+            current_shift = state.get("current_shift")
+
+            async with self.pool.acquire() as conn:
+                # 查询最早上班的用户
+                earliest_user = await conn.fetchrow(
+                    """
+                    SELECT user_id, created_at 
+                    FROM work_records 
+                    WHERE chat_id = $1 
+                      AND record_date = $2
+                      AND shift = $3
+                      AND checkin_type = 'work_start'
+                    ORDER BY created_at ASC
+                    LIMIT 1
+                    """,
+                    chat_id,
+                    today,
+                    current_shift,
+                )
+
+                if earliest_user:
+                    # 更新状态为最早的用户
+                    await self.create_shift_state(
+                        chat_id, current_shift, earliest_user["user_id"]
+                    )
+                    logger.info(
+                        f"✅ 修复群组 {chat_id} 班次状态，启动用户: {earliest_user['user_id']}"
+                    )
+                    return True
+                else:
+                    # 没有找到任何上班记录，清除状态
+                    await self.clear_shift_state(chat_id)
+                    logger.info(f"✅ 清除群组 {chat_id} 无效班次状态")
+                    return True
+
+        except Exception as e:
+            logger.error(f"修复班次状态失败 {chat_id}: {e}")
+            return False
 
     async def create_shift_state(
         self, chat_id: int, shift: str, started_by_user_id: int
@@ -3486,12 +3588,48 @@ class PostgreSQLDatabase:
         )
         self._cache.pop(f"shift_state:{chat_id}", None)
 
+    async def create_shift_state(
+        self, chat_id: int, shift: str, started_by_user_id: int
+    ):
+        """创建班次状态 - 统一入口"""
+        now = self.get_beijing_time()
+
+        # 先验证现有状态
+        existing = await self.get_current_shift_state(chat_id)
+        if existing:
+            logger.info(f"群组 {chat_id} 已有班次状态，将更新")
+
+        await self.execute_with_retry(
+            "创建班次状态",
+            """
+            INSERT INTO group_shift_state (chat_id, current_shift, shift_start_time, started_by_user_id)
+            VALUES ($1, $2, $3, $4)
+            ON CONFLICT (chat_id) 
+            DO UPDATE SET 
+                current_shift = EXCLUDED.current_shift,
+                shift_start_time = EXCLUDED.shift_start_time,
+                started_by_user_id = EXCLUDED.started_by_user_id,
+                updated_at = CURRENT_TIMESTAMP
+            """,
+            chat_id,
+            shift,
+            now,
+            started_by_user_id,
+        )
+        self._cache.pop(f"shift_state:{chat_id}", None)
+
+        # 记录状态变更日志
+        logger.info(
+            f"🏁 [班次状态] 群组 {chat_id} {shift} 班次启动，用户={started_by_user_id}"
+        )
+
     async def clear_shift_state(self, chat_id: int):
-        """清除班次状态"""
+        """清除班次状态 - 统一入口"""
         await self.execute_with_retry(
             "清除班次状态", "DELETE FROM group_shift_state WHERE chat_id = $1", chat_id
         )
         self._cache.pop(f"shift_state:{chat_id}", None)
+        logger.info(f"🏁 [班次状态] 群组 {chat_id} 班次已清除")
 
     async def update_group_dual_mode(
         self, chat_id: int, enabled: bool, day_start: str = None, day_end: str = None
