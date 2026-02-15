@@ -2261,25 +2261,6 @@ async def process_work_checkin(message: types.Message, checkin_type: str):
                 parse_mode="HTML",
             )
 
-            # ========== 发送成功消息 ==========
-            result_msg = (
-                f"{emoji_status} <b>{shift_text}{action_text}完成</b>\n"
-                f"👤 用户：{MessageFormatter.format_user_link(uid, name)}\n"
-                f"⏰ {action_text}时间：<code>{current_time}</code>\n"
-                f"📅 期望时间：<code>{expected_dt.strftime('%m/%d %H:%M')}</code>\n"
-                f"📊 状态：{status}"
-            )
-
-            if activity_auto_ended and current_activity:
-                result_msg += f"\n\n🔄 检测到未结束活动 <code>{current_activity}</code>，已自动结束"
-
-            await message.answer(
-                result_msg,
-                reply_markup=await get_main_keyboard(chat_id, await is_admin_task),
-                reply_to_message_id=message.message_id,
-                parse_mode="HTML",
-            )
-
             # ========== 班次状态清理（仅双班模式）==========
             if is_dual_mode:
                 try:
@@ -2344,28 +2325,48 @@ async def _check_shift_work_record(
 ) -> bool:
     """
     检查指定班次的打卡记录
-    修复版：夜班也基于业务日期查询
+    支持夜班跨天查询
     """
     try:
-        # ✅ 使用业务日期作为查询条件，无论是白班还是夜班
+        # ✅ 现在接受 business_date 参数，不需要再调用 db.get_business_date()
 
-        async with db.pool.acquire() as conn:
-            row = await conn.fetchrow(
-                """
-                SELECT 1 FROM work_records 
-                WHERE chat_id = $1 AND user_id = $2 
-                AND checkin_type = $3 AND shift = $4
-                AND record_date = $5
-                LIMIT 1
-                """,
-                chat_id,
-                user_id,
-                checkin_type,
-                shift,
-                business_date,  # 使用业务日期，而不是时间窗口
-            )
-            return row is not None
-
+        # 如果是夜班，考虑跨天情况
+        if shift == "night":
+            # 夜班可能跨天，查询最近24小时内的记录
+            async with db.pool.acquire() as conn:
+                row = await conn.fetchrow(
+                    """
+                    SELECT 1 FROM work_records 
+                    WHERE chat_id = $1 AND user_id = $2 
+                    AND checkin_type = $3 AND shift = $4
+                    AND created_at >= NOW() - INTERVAL '24 hours'
+                    AND created_at <= NOW()
+                    LIMIT 1
+                    """,
+                    chat_id,
+                    user_id,
+                    checkin_type,
+                    shift,
+                )
+                return row is not None
+        else:
+            # 白班：按业务日期检查
+            async with db.pool.acquire() as conn:
+                row = await conn.fetchrow(
+                    """
+                    SELECT 1 FROM work_records 
+                    WHERE chat_id = $1 AND user_id = $2 
+                    AND checkin_type = $3 AND shift = $4
+                    AND record_date = $5
+                    LIMIT 1
+                    """,
+                    chat_id,
+                    user_id,
+                    checkin_type,
+                    shift,
+                    business_date,
+                )
+                return row is not None
     except Exception as e:
         logger.error(
             f"检查班次打卡记录失败 - chat_id:{chat_id}, user_id:{user_id}, "
@@ -2380,26 +2381,49 @@ async def _get_existing_work_record(
 ) -> Optional[Dict]:
     """
     获取已存在的打卡记录详情
-    修复版：夜班也基于业务日期查询
+    用于详细重复打卡展示
     """
     try:
+        # ✅ 现在接受 business_date 参数
+
+        # 构建查询条件
         async with db.pool.acquire() as conn:
-            row = await conn.fetchrow(
-                """
-                SELECT checkin_time, status, created_at, record_date 
-                FROM work_records 
-                WHERE chat_id = $1 AND user_id = $2 
-                AND checkin_type = $3 AND shift = $4
-                AND record_date = $5
-                ORDER BY created_at DESC
-                LIMIT 1
-                """,
-                chat_id,
-                user_id,
-                checkin_type,
-                shift,
-                business_date,
-            )
+            if shift == "night":
+                # 夜班：查询最近24小时
+                row = await conn.fetchrow(
+                    """
+                    SELECT checkin_time, status, created_at, record_date 
+                    FROM work_records 
+                    WHERE chat_id = $1 AND user_id = $2 
+                    AND checkin_type = $3 AND shift = $4
+                    AND created_at >= NOW() - INTERVAL '24 hours'
+                    AND created_at <= NOW()
+                    ORDER BY created_at DESC
+                    LIMIT 1
+                    """,
+                    chat_id,
+                    user_id,
+                    checkin_type,
+                    shift,
+                )
+            else:
+                # 白班：按业务日期
+                row = await conn.fetchrow(
+                    """
+                    SELECT checkin_time, status, created_at, record_date 
+                    FROM work_records 
+                    WHERE chat_id = $1 AND user_id = $2 
+                    AND checkin_type = $3 AND shift = $4
+                    AND record_date = $5
+                    ORDER BY created_at DESC
+                    LIMIT 1
+                    """,
+                    chat_id,
+                    user_id,
+                    checkin_type,
+                    shift,
+                    business_date,
+                )
 
             if row:
                 return {
@@ -2409,7 +2433,6 @@ async def _get_existing_work_record(
                     "record_date": row["record_date"],
                 }
             return None
-
     except Exception as e:
         logger.error(
             f"获取现有记录失败 - chat_id:{chat_id}, user_id:{user_id}, "
@@ -2560,6 +2583,7 @@ async def send_work_notification(
         logger.error(
             f"[{trace_id}] ❌ send_work_notification总异常: {e}", exc_info=True
         )
+        # 不抛出异常，保证主流程安全
 
 
 # ========== 管理员装饰器 ==========
