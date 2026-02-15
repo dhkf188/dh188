@@ -971,36 +971,66 @@ def get_beijing_time() -> datetime:
 
 
 def calculate_cross_day_time_diff(
-    current_dt: datetime, expected_time: str, checkin_type: str
+    current_dt: datetime,
+    expected_time: str,
+    checkin_type: str,
+    record_date: Optional[date] = None,  # ✅ 新增参数
 ) -> Tuple[float, int, datetime]:
     """
     智能化的时间差计算（支持跨天和最近匹配）
+
+    Args:
+        current_dt: 当前时间
+        expected_time: 期望时间字符串 (HH:MM)
+        checkin_type: 打卡类型 (work_start/work_end)
+        record_date: 记录日期（由班次判定提供）
+
+    Returns:
+        (时间差分钟, 时间差秒, 期望的datetime对象)
     """
     try:
         expected_hour, expected_minute = map(int, expected_time.split(":"))
 
-        # 生成前一天、当天、后一天三个候选时间点
-        candidates = []
-        for d in (-1, 0, 1):
-            candidate = current_dt.replace(
-                hour=expected_hour, minute=expected_minute, second=0, microsecond=0
-            ) + timedelta(days=d)
-            candidates.append(candidate)
+        # ✅ 修复1：如果提供了 record_date，使用确定的日期
+        if record_date:
+            # 使用指定的记录日期
+            expected_dt = datetime.combine(
+                record_date, time(expected_hour, expected_minute)
+            ).replace(tzinfo=current_dt.tzinfo)
 
-        # 找到与当前时间最接近的 expected_dt
-        expected_dt = min(
-            candidates, key=lambda t: abs((t - current_dt).total_seconds())
-        )
+            logger.debug(
+                f"📅 使用指定日期: {record_date}, "
+                f"期望时间: {expected_dt.strftime('%Y-%m-%d %H:%M')}"
+            )
 
-        # 计算时间差（单位：分钟）
-        time_diff_minutes = (current_dt - expected_dt).total_seconds() / 60
+        # ✅ 修复2：如果没有 record_date，使用智能匹配（向后兼容）
+        else:
+            # 生成前一天、当天、后一天三个候选时间点
+            candidates = []
+            for d in (-1, 0, 1):
+                candidate = current_dt.replace(
+                    hour=expected_hour, minute=expected_minute, second=0, microsecond=0
+                ) + timedelta(days=d)
+                candidates.append(candidate)
 
+            # 找到与当前时间最接近的 expected_dt
+            expected_dt = min(
+                candidates, key=lambda t: abs((t - current_dt).total_seconds())
+            )
+
+            logger.debug(
+                f"📅 智能匹配日期, 选择: {expected_dt.strftime('%Y-%m-%d %H:%M')}"
+            )
+
+        # 计算时间差（单位：分钟和秒）
         time_diff_seconds = int((current_dt - expected_dt).total_seconds())
+        time_diff_minutes = time_diff_seconds / 60
+
         return time_diff_minutes, time_diff_seconds, expected_dt
 
     except Exception as e:
         logger.error(f"时间差计算出错: {e}")
-        return 0, current_dt
+        return 0.0, 0, current_dt
 
 
 # ========== 装饰器和工具函数 ==========
