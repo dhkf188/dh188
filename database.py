@@ -3806,42 +3806,29 @@ class PostgreSQLDatabase:
         chat_id: int,
         current_time: Optional[datetime] = None,
         checkin_type: str = "work_start",
-    ) -> Dict[str, object]:
+    ) -> Optional[Dict[str, object]]:
         """
-        确定当前时间所属的班次 - 增强版，确保不返回 None
+        统一的班次判定函数 - 所有地方都调用它
+        返回: None 表示无法确定班次
         """
-        # ========= 当前时间 =========
         now = current_time or self.get_beijing_time()
-
-        # ========= 获取班次配置 =========
         shift_config = await self.get_shift_config(chat_id) or {}
         is_dual = shift_config.get("dual_mode", False)
 
-        # =====================================================
         # 单班模式
-        # =====================================================
         if not is_dual:
             business_date = await self.get_business_date(
                 chat_id=chat_id, current_dt=now
             )
-
-            logger.debug(
-                f"🕘 单班模式: chat_id={chat_id}, "
-                f"时间={now.strftime('%Y-%m-%d %H:%M')}, "
-                f"业务日期={business_date}"
-            )
-
             return {
                 "shift": "day",
                 "shift_detail": "day",
                 "business_date": business_date,
                 "record_date": business_date,
+                "is_dual": False,
             }
 
-        # =====================================================
-        # 双班模式
-        # =====================================================
-
+        # 双班模式 - 计算时间窗口
         window_info = (
             self.calculate_shift_window(
                 shift_config=shift_config,
@@ -3853,13 +3840,12 @@ class PostgreSQLDatabase:
 
         current_shift_detail = window_info.get("current_shift")
 
-        # 🛡️ 关键修复：如果无法确定班次，使用默认值
+        # ✅ 无法确定时返回 None
         if current_shift_detail is None:
-            logger.warning(
-                f"⚠️ 无法确定班次，使用默认班次 day。"
-                f"chat_id={chat_id}, time={now.strftime('%H:%M')}"
+            logger.debug(
+                f"⏳ 无法确定班次: chat_id={chat_id}, time={now.strftime('%H:%M')}, type={checkin_type}"
             )
-            current_shift_detail = "day"
+            return None
 
         # 转换为简化班次
         if current_shift_detail in ("night_last", "night_tonight"):
@@ -3881,6 +3867,7 @@ class PostgreSQLDatabase:
             "shift_detail": current_shift_detail,
             "business_date": business_date,
             "record_date": business_date,
+            "is_dual": True,
         }
 
     # ========== 数据清理 ==========
