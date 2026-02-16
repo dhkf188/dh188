@@ -504,7 +504,7 @@ async def export_monthly_csv(
 async def handle_expired_activity(
     chat_id: int, user_id: int, activity: str, start_time: datetime
 ):
-    """处理已过期的活动（用于服务重启后的恢复）- 统一使用班次判定"""
+    """智能合并版：按活动开始时间归档，夜班/长活动使用班次判定修正"""
     try:
         now = get_beijing_time()
         elapsed = int((now - start_time).total_seconds())
@@ -515,39 +515,41 @@ async def handle_expired_activity(
         if user_data:
             nickname = user_data.get("nickname", str(user_id))
 
-        # 🎯 使用班次判定确定归属日期
-        shift_info = await db.determine_shift_for_time(
-            chat_id=chat_id,
-            current_time=now,
-            checkin_type="work_end",
-        )
+        # 🎯 默认使用活动开始时间来确定业务日期
+        business_date = await db.get_business_date(chat_id, start_time)
+        forced_date = business_date
 
-        forced_date = None
-        if shift_info:
-            # 使用班次判定的记录日期
-            forced_date = shift_info.get("record_date")
-            shift = shift_info.get("shift", user_data.get("shift", "day"))
-            logger.info(
-                f"🔄 恢复过期活动 - 班次判定: {shift_info.get('shift_detail')}, "
-                f"记录日期: {forced_date}"
+        # 获取班次信息（从用户数据或开始时间判定）
+        shift = user_data.get("shift", "day")
+        if not shift:
+            shift_info = await db.determine_shift_for_time(
+                chat_id=chat_id,
+                current_time=start_time,
+                checkin_type="work_start",
             )
-        else:
-            # 无法判定时使用用户数据的班次
-            shift = user_data.get("shift", "day")
-            # 降级使用重置时间判定
-            group_data = await db.get_group_cached(chat_id)
-            reset_hour = group_data.get("reset_hour", Config.DAILY_RESET_HOUR)
-            reset_minute = group_data.get("reset_minute", Config.DAILY_RESET_MINUTE)
+            if shift_info:
+                shift = shift_info.get("shift", "day")
 
-            reset_time_today = now.replace(
-                hour=reset_hour, minute=reset_minute, second=0, microsecond=0
+        # 智能修正：夜班或长活动 (>12小时) 使用班次判定
+        LONG_ACTIVITY_THRESHOLD = 12 * 3600  # 12小时
+        if shift == "night" or elapsed > LONG_ACTIVITY_THRESHOLD:
+            shift_info = await db.determine_shift_for_time(
+                chat_id=chat_id,
+                current_time=now,
+                checkin_type="work_end",
             )
-
-            if start_time < reset_time_today:
-                forced_date = (now - timedelta(days=1)).date()
+            if shift_info:
+                forced_date = shift_info.get("record_date")
+                shift = shift_info.get("shift", shift)
                 logger.info(
-                    f"🔄 恢复过期活动 - 重置时间判定: 开始时间早于今天重置，强制归到 {forced_date}"
+                    f"🔄 智能修正过期活动 - 夜班/长活动归档使用班次判定: "
+                    f"{shift_info.get('shift_detail')}, 归到 {forced_date}"
                 )
+
+        logger.info(
+            f"🔄 恢复过期活动 - 活动开始时间: {start_time.strftime('%m/%d %H:%M:%S')}, "
+            f"归档日期: {forced_date}, 班次: {shift}"
+        )
 
         # 计算罚款
         time_limit = await db.get_activity_time_limit(activity)
@@ -573,7 +575,7 @@ async def handle_expired_activity(
         )
 
         # 发送恢复通知
-        date_desc = f"（归到{forced_date}）" if forced_date else ""
+        date_desc = f"（归到{forced_date}）"
         timeout_msg = (
             f"🔄 <b>系统恢复通知</b>{date_desc}\n"
             f"👤 用户：{MessageFormatter.format_user_link(user_id, nickname)}\n"
@@ -588,13 +590,15 @@ async def handle_expired_activity(
 
         await bot.send_message(chat_id, timeout_msg, parse_mode="HTML")
 
-        date_log = f"强制日期: {forced_date}" if forced_date else "使用业务日期"
         logger.info(
-            f"已处理过期活动: {chat_id}-{user_id} - {activity} [{date_log}], 班次: {shift}"
+            f"已处理过期活动: {chat_id}-{user_id} - {activity} "
+            f"(开始时间: {start_time.strftime('%m/%d %H:%M:%S')}, "
+            f"归到: {forced_date}, 班次: {shift})"
         )
 
     except Exception as e:
         logger.error(f"处理过期活动失败 {chat_id}-{user_id}: {e}")
+
 
 
 async def recover_expired_activities():
