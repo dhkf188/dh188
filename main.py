@@ -2643,40 +2643,45 @@ async def send_work_notification(
         )
 
         # ========= 发送群 ==========
-        # ========= 发送群 ==========
         async def safe_send(target_id: int, text: str, description: str = ""):
             """安全发送：notification_service -> bot.send_message fallback"""
             try:
                 await notification_service.send_notification(target_id, text)
                 if description:
                     logger.info(f"[{trace_id}] ✅ {description}发送成功({target_id})")
+                else:
+                    logger.info(f"[{trace_id}] ✅ 发送成功({target_id})")
             except Exception as e:
                 logger.error(
                     f"[{trace_id}] ❌ 通知发送失败({target_id})，尝试备用bot.send_message: {e}"
                 )
                 try:
-                    await bot.send_message(target_id, text)
+                    # 添加 parse_mode="HTML" 保持格式
+                    await bot.send_message(target_id, text, parse_mode="HTML")
                     if description:
                         logger.info(
                             f"[{trace_id}] ✅ fallback {description}成功({target_id})"
                         )
+                    else:
+                        logger.info(f"[{trace_id}] ✅ fallback发送成功({target_id})")
                 except Exception as e2:
                     logger.error(
                         f"[{trace_id}] ❌ fallback bot.send_message也失败({target_id}): {e2}"
                     )
 
-        # 发送群组（原样）
-        await safe_send(chat_id, notif_text)
+        # ========= 发送逻辑 ==========
 
-        # 发送频道（原样）
+        # 1. 发送到当前群组（原有）
+        await safe_send(chat_id, notif_text, "当前群组")
+
+        # 2. 发送到频道（原有）
         if channel_id:
-            await safe_send(channel_id, notif_text)
+            await safe_send(channel_id, notif_text, "频道")
 
-        # 发送额外群组（带描述）
+        # 3. 发送到额外群组（新增）
         if extra_work_group_id:
-            extra_text = notif_text
-            await safe_send(extra_work_group_id, extra_text, "额外上下班群组")
-            logger.info(f"[{trace_id}] 📢 已额外推送到群组: {extra_work_group_id}")
+            await safe_send(extra_work_group_id, notif_text, "额外上下班群组")
+            # 这里的日志已经在 safe_send 中记录，不需要再额外记录
 
     except Exception as e:
         logger.error(
@@ -5192,6 +5197,7 @@ async def handle_admin_panel_button(message: types.Message):
         "📢 *频道与推送*\n"
         "├ `/setchannel` \\[ID\\]\n"
         "├ `/setgroup` \\[ID\\]\n"
+        "├ `/addextraworkgroup` \\[ID\\] - 添加上下班额外推送群组\n"
         "├ `/setpush` \\[目标\\] \\[开关\\]\n"
         "├ `/showpush`\n"
         "│ 目标: ch\\|gr\\|ad\n"
