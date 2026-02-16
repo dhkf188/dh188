@@ -563,6 +563,8 @@ class PostgreSQLDatabase:
                     dual_day_end TEXT,
                     shift_grace_before INTEGER DEFAULT 120,
                     shift_grace_after INTEGER DEFAULT 360,
+                    workend_grace_before INTEGER DEFAULT 120,
+                    workend_grace_after INTEGER DEFAULT 360,
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 )
@@ -735,32 +737,6 @@ class PostgreSQLDatabase:
                     raise
 
             logger.info("🚀 数据库所有表及字段初始化完成")
-
-    # async def _create_indexes(self):
-    #     """创建性能索引"""
-    #     async with self.pool.acquire() as conn:
-    #         indexes = [
-    #             "CREATE INDEX IF NOT EXISTS idx_user_activities_main ON user_activities (chat_id, user_id, activity_date)",
-    #             "CREATE INDEX IF NOT EXISTS idx_work_records_main ON work_records (chat_id, user_id, record_date)",
-    #             "CREATE INDEX IF NOT EXISTS idx_users_main ON users (chat_id, user_id)",
-    #             "CREATE INDEX IF NOT EXISTS idx_monthly_stats_main ON monthly_statistics (chat_id, user_id, statistic_date)",
-    #             "CREATE INDEX IF NOT EXISTS idx_daily_stats_main ON daily_statistics (chat_id, user_id, record_date, activity_name, is_soft_reset)",
-    #             "CREATE INDEX IF NOT EXISTS idx_work_records_group_date ON work_records (chat_id, record_date)",
-    #             "CREATE INDEX IF NOT EXISTS idx_daily_stats_group_date ON daily_statistics (chat_id, record_date)",
-    #             "CREATE INDEX IF NOT EXISTS idx_activities_created_at ON user_activities (created_at)",
-    #             "CREATE INDEX IF NOT EXISTS idx_records_created_at ON work_records (created_at)",
-    #             "CREATE INDEX IF NOT EXISTS idx_users_activity_status ON users (chat_id, current_activity) WHERE current_activity IS NOT NULL",
-    #         ]
-
-    #         for index_sql in indexes:
-    #             try:
-    #                 await conn.execute(index_sql)
-    #                 index_name = index_sql.split()[5]  # 获取索引名
-    #                 logger.info(f"✅ 创建索引: {index_name}")
-    #             except Exception as e:
-    #                 logger.warning(f"创建索引失败: {e}")
-    #                 # 索引创建失败不阻止程序启动
-    #         logger.info("数据库索引创建完成")
 
     async def _create_indexes(self):
         """精简直击核心性能瓶颈的索引方案 - 修正版"""
@@ -3577,15 +3553,17 @@ class PostgreSQLDatabase:
         self._cache.pop(f"group:{chat_id}", None)
 
     async def get_shift_config(self, chat_id: int) -> Dict:
-        """获取班次配置"""
+        """获取班次配置（包含分离的上下班时间窗口）"""
         group_data = await self.get_group_cached(chat_id)
         if not group_data:
             return {
                 "dual_mode": False,
                 "day_start": "09:00",
                 "day_end": "21:00",
-                "grace_before": 120,
-                "grace_after": 360,
+                "grace_before": Config.DEFAULT_GRACE_BEFORE,  # 上班前
+                "grace_after": Config.DEFAULT_GRACE_AFTER,  # 上班后
+                "workend_grace_before": Config.DEFAULT_WORKEND_GRACE_BEFORE,  # 下班前
+                "workend_grace_after": Config.DEFAULT_WORKEND_GRACE_AFTER,  # 下班后
             }
 
         # 优先级1: /setworktime 设置
@@ -3608,8 +3586,19 @@ class PostgreSQLDatabase:
             "dual_mode": bool(group_data.get("dual_mode", False)),
             "day_start": day_start,
             "day_end": day_end,
-            "grace_before": group_data.get("shift_grace_before", 120),
-            "grace_after": group_data.get("shift_grace_after", 360),
+            "grace_before": group_data.get(
+                "shift_grace_before", Config.DEFAULT_GRACE_BEFORE
+            ),
+            "grace_after": group_data.get(
+                "shift_grace_after", Config.DEFAULT_GRACE_AFTER
+            ),
+            # 🆕 新增下班专用时间窗口
+            "workend_grace_before": group_data.get(
+                "workend_grace_before", Config.DEFAULT_WORKEND_GRACE_BEFORE
+            ),
+            "workend_grace_after": group_data.get(
+                "workend_grace_after", Config.DEFAULT_WORKEND_GRACE_AFTER
+            ),
         }
 
     def calculate_shift_window(
@@ -3620,8 +3609,7 @@ class PostgreSQLDatabase:
     ) -> Dict[str, Any]:
         """
         计算班次时间窗口并判定当前班次
-        支持：白班、昨晚夜班、今晚夜班，以及下午提前打卡今晚夜班
-        增强版：确保永远返回有效字典
+        支持：上班/下班独立的时间窗口配置
         """
         # 1. 初始化当前时间
         if now is None:
@@ -3654,19 +3642,29 @@ class PostgreSQLDatabase:
         day_start_dt = datetime.combine(today, day_start_time).replace(tzinfo=tz)
         day_end_dt = datetime.combine(today, day_end_time).replace(tzinfo=tz)
 
-        grace_before = shift_config.get("grace_before", 120)
-        grace_after = shift_config.get("grace_after", 360)
+        # 7. 获取时间窗口配置（分离的上班/下班）
+        grace_before = shift_config.get("grace_before", Config.DEFAULT_GRACE_BEFORE)
+        grace_after = shift_config.get("grace_after", Config.DEFAULT_GRACE_AFTER)
+        workend_grace_before = shift_config.get(
+            "workend_grace_before", Config.DEFAULT_WORKEND_GRACE_BEFORE
+        )
+        workend_grace_after = shift_config.get(
+            "workend_grace_after", Config.DEFAULT_WORKEND_GRACE_AFTER
+        )
 
-        # 7. 计算三个核心窗口（原有代码保持不变）
-        # [这里保留原有的窗口计算代码]
+        # 8. 计算三个核心窗口（使用分离的配置）
         day_window = {
             "work_start": {
-                "start": day_start_dt - timedelta(minutes=grace_before),
-                "end": day_start_dt + timedelta(minutes=grace_after),
+                "start": day_start_dt
+                - timedelta(minutes=grace_before),  # 上班前（用上班前配置）
+                "end": day_start_dt
+                + timedelta(minutes=grace_after),  # 上班后（用上班后配置）
             },
             "work_end": {
-                "start": day_end_dt - timedelta(minutes=grace_before),
-                "end": day_end_dt + timedelta(minutes=grace_after),
+                "start": day_end_dt
+                - timedelta(minutes=workend_grace_before),  # 下班前（用下班前配置）
+                "end": day_end_dt
+                + timedelta(minutes=workend_grace_after),  # 下班后（用下班后配置）
             },
         }
 
@@ -3674,8 +3672,10 @@ class PostgreSQLDatabase:
             "work_start": {
                 "start": day_end_dt
                 - timedelta(days=1)
-                - timedelta(minutes=grace_before),
-                "end": day_end_dt - timedelta(days=1) + timedelta(minutes=grace_after),
+                - timedelta(minutes=workend_grace_before),
+                "end": day_end_dt
+                - timedelta(days=1)
+                + timedelta(minutes=workend_grace_after),
             },
             "work_end": {
                 "start": day_start_dt - timedelta(minutes=grace_before),
@@ -3685,8 +3685,8 @@ class PostgreSQLDatabase:
 
         tonight_window = {
             "work_start": {
-                "start": day_end_dt - timedelta(minutes=grace_before),
-                "end": day_end_dt + timedelta(minutes=grace_after),
+                "start": day_end_dt - timedelta(minutes=workend_grace_before),
+                "end": day_end_dt + timedelta(minutes=workend_grace_after),
             },
             "work_end": {
                 "start": day_start_dt
@@ -3698,7 +3698,7 @@ class PostgreSQLDatabase:
             },
         }
 
-        # 8. 判定当前班次
+        # 9. 判定当前班次（保持不变）
         current_shift = None
         if checkin_type in ["work_start", "work_end"]:
             # 依次匹配
@@ -3735,7 +3735,7 @@ class PostgreSQLDatabase:
                 "last_night": last_night_window,
                 "tonight": tonight_window,
             },
-            "current_shift": current_shift,  # 允许为 None，外层处理
+            "current_shift": current_shift,
         }
 
     async def get_business_date(
