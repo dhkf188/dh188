@@ -2624,22 +2624,25 @@ async def send_work_notification(
             current_shift = shift_state.get("current_shift", "day")
             shift_text = "白班" if current_shift == "day" else "夜班"
 
-        # ========= 文案构建 ==========
-        # notif_text = (
-        #     f"{title}\n"
-        #     f"🏢 群组/班次：<code>{chat_title}</code> <code>{shift_text}</code>\n"
-        #     f"{MessageFormatter.create_dashed_line()}\n"
-        #     f"👤 用户：{MessageFormatter.format_user_link(user_id, user_name)}\n"
-        #     f"⏰ 打卡时间：<code>{checkin_time}</code>\n"
-        #     f"📅 {action_text}时间：<code>{expected_dt.strftime('%m/%d %H:%M')}</code>\n"
-        #     f"{status_line}"
-        # )
-        notif_text = (
-            f"<code>{shift_text}</code>  {MessageFormatter.format_user_link(user_id, user_name)}  {action_text} 了!\n"
+        # ========= 频道文案（保持原有详细格式）==========
+        channel_notif_text = (
+            f"{title}\n"
+            f"🏢 群组/班次：<code>{chat_title}</code> <code>{shift_text}</code>\n"
+            f"{MessageFormatter.create_dashed_line()}\n"
+            f"👤 用户：{MessageFormatter.format_user_link(user_id, user_name)}\n"
+            f"⏰ 打卡时间：<code>{checkin_time}</code>\n"
+            f"📅 {action_text}时间：<code>{expected_dt.strftime('%m/%d %H:%M')}</code>\n"
+            f"{status_line}"
+        )
+
+        # ========= 额外群组文案（简洁版）==========
+        extra_notif_text = (
+            f"<code>{shift_text}</code> {MessageFormatter.format_user_link(user_id, user_name)} {action_text} 了！\n"
+            f"⏰ <code>{checkin_time}</code>"
         )
 
         if fine_amount > 0:
-            notif_text += f"\n💰 扣除绩效：<code>{fine_amount}</code> 分"
+            extra_notif_text += f"\n💰 扣除绩效：<code>{fine_amount}</code> 分"
 
         # ========= 修复4：添加调试日志 ==========
         logger.info(
@@ -2710,23 +2713,22 @@ async def send_work_notification(
 
         # ========= 发送逻辑（可配置）==========
 
-        # 1. 发送到当前群组（根据推送设置）
+        # 1. 发送到当前群组（根据推送设置）- 已禁用
         if enable_group_push:
-            # await safe_send(chat_id, notif_text, "当前群组")
             logger.info(f"[{trace_id}] ℹ️ 当前群组推送已禁用")
         else:
             logger.info(f"[{trace_id}] ℹ️ 推送设置已禁用当前群组通知")
 
-        # 2. 发送到频道（根据推送设置）
+        # 2. 发送到频道（根据推送设置）- 使用详细文案
         if channel_id and enable_channel_push:
-            await safe_send(channel_id, notif_text, "频道")
+            await safe_send(channel_id, channel_notif_text, "频道")
         elif channel_id:
             logger.info(f"[{trace_id}] ℹ️ 推送设置已禁用频道通知")
 
-        # 3. 发送到额外群组（这个不受推送设置影响，独立控制）
+        # 3. 发送到额外群组（这个不受推送设置影响，独立控制）- 使用简洁文案
         if extra_work_group_id:
             logger.info(f"[{trace_id}] 📤 发送到额外群组: {extra_work_group_id}")
-            await safe_send(extra_work_group_id, notif_text, "额外上下班群组")
+            await safe_send(extra_work_group_id, extra_notif_text, "额外上下班群组")
         else:
             logger.info(f"[{trace_id}] ℹ️ 没有配置额外群组")
 
