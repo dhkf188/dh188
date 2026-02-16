@@ -27,40 +27,49 @@ logger = logging.getLogger("GroupCheckInBot.DualShiftReset")
 
 
 # ========== 1. 调度入口（供cmd_setresettime调用） ==========
-async def handle_hard_reset(chat_id: int, operator_id: Optional[int] = None) -> bool:
+async def handle_hard_reset(
+    chat_id: int, operator_id: Optional[int] = None
+) -> Optional[bool]:
     """
     硬重置总调度入口 - 单班/双班分流
-    这是唯一需要从外部调用的函数
 
-    返回:
-        True - 双班模式已处理完成，调用方不应再执行原逻辑
-        False - 单班模式或出错，调用方应继续执行原逻辑
+    返回值:
+        True  - 双班模式执行成功
+        False - 双班模式执行失败
+        None  - 单班模式，调用方应继续执行原有逻辑
     """
     try:
         # 1. 获取班次配置，判断模式
         shift_config = await db.get_shift_config(chat_id)
         is_dual_mode = shift_config.get("dual_mode", False)
 
-        # 2. 单班模式 - 完全走原有逻辑
+        # 2. 单班模式 - 返回None表示未处理
         if not is_dual_mode:
-            logger.info(f"🔄 [单班模式] 群组 {chat_id} 继续执行原有硬重置逻辑")
-            return False
+            logger.info(f"🔄 [单班模式] 群组 {chat_id} 需继续执行原有硬重置逻辑")
+            return None
 
-        # 3. 双班模式 - 执行新的双班硬重置流程
+        # 3. 双班模式 - 执行双班硬重置
         logger.info(f"🔄 [双班模式] 群组 {chat_id} 执行双班硬重置")
-        success = await _dual_shift_hard_reset(chat_id, operator_id)
 
-        if success:
-            logger.info(f"✅ [双班硬重置] 群组 {chat_id} 完成")
-        else:
-            logger.error(f"❌ [双班硬重置] 群组 {chat_id} 失败")
+        try:
+            success = await _dual_shift_hard_reset(chat_id, operator_id)
 
-        return True
+            if success:
+                logger.info(f"✅ [双班硬重置] 群组 {chat_id} 执行成功")
+            else:
+                logger.error(f"❌ [双班硬重置] 群组 {chat_id} 执行失败")
+
+            return success  # 返回实际执行结果
+
+        except Exception as e:
+            logger.error(f"❌ [双班硬重置] 群组 {chat_id} 异常: {e}")
+            logger.error(traceback.format_exc())
+            return False  # 双班模式执行异常
 
     except Exception as e:
         logger.error(f"❌ 硬重置调度失败 {chat_id}: {e}")
         logger.error(traceback.format_exc())
-        return False
+        return None  # 调度失败，让调用方自行处理
 
 
 # ========== 2. 双班硬重置核心流程 ==========
@@ -69,8 +78,7 @@ async def _dual_shift_hard_reset(
 ) -> bool:
     """
     双班硬重置主流程
-    6:00 - 设定的重置时间（不操作）
-    8:00 - +2h后执行所有操作
+    在重置时间+2小时执行
     """
     try:
         await db.init_group(chat_id)
@@ -89,17 +97,19 @@ async def _dual_shift_hard_reset(
             hour=reset_hour, minute=reset_minute, second=0, microsecond=0
         )
 
-        # ========== 只在 +2h 后执行 ==========
+        # ========== 计算执行时间（重置时间+2小时） ==========
         execute_time = reset_time_today + timedelta(hours=2)
 
+        # ✅ 修复：时间未到返回 False，让调用方继续等待
         if now < execute_time:
-            logger.debug(
-                f"⏳ [双班硬重置] 群组 {chat_id} 未到执行时间\n"
+            minutes_left = int((execute_time - now).total_seconds() / 60)
+            logger.info(
+                f"⏳ [双班硬重置] 群组 {chat_id} 等待执行\n"
                 f"   • 当前时间: {now.strftime('%H:%M')}\n"
                 f"   • 执行时间: {execute_time.strftime('%H:%M')}\n"
-                f"   • 剩余时间: {int((execute_time - now).total_seconds() / 60)} 分钟"
+                f"   • 剩余时间: {minutes_left} 分钟"
             )
-            return True
+            return False  # ✅ 返回 False，表示还没执行
 
         # ========== 开始执行重置 ==========
         logger.info(
