@@ -2542,8 +2542,9 @@ async def send_work_notification(
 ):
     """
     生产级终极版本：
-    ✔ 群组通知
-    ✔ 频道通知
+    ✔ 群组通知（可选）
+    ✔ 频道通知（可选）
+    ✔ 额外群组通知（新增）
     ✔ 跨天安全
     ✔ 不丢消息（fallback）
     ✔ 时区处理
@@ -2554,14 +2555,22 @@ async def send_work_notification(
         # 获取群配置
         group_data = await db.get_group_cached(chat_id)
         channel_id = group_data.get("channel_id") if group_data else None
-
         extra_work_group_id = await db.get_extra_work_group(chat_id)
+
+        # 获取推送设置
+        push_settings = await db.get_push_settings()
+        enable_group_push = push_settings.get(
+            "enable_group_push", False
+        )  # 默认发送到当前群组
+        enable_channel_push = push_settings.get(
+            "enable_channel_push", True
+        )  # 默认发送到频道
 
         # 获取群信息
         chat_info = await bot.get_chat(chat_id)
         chat_title = getattr(chat_info, "title", str(chat_id))
 
-        # ========= 🎯 修复1：安全时间差计算（支持跨天）=========
+        # ========= 修复1：安全时间差计算（支持跨天）==========
         checkin_hour, checkin_min = map(int, checkin_time.split(":"))
         checkin_dt = expected_dt.replace(
             hour=checkin_hour, minute=checkin_min, second=0, microsecond=0
@@ -2576,7 +2585,7 @@ async def send_work_notification(
 
         diff_seconds = int((checkin_dt - expected_dt).total_seconds())
 
-        # ========= 🎯 修复2：迟到/早退判定 ==========
+        # ========= 修复2：迟到/早退判定 ==========
         if action_text == "上班":
             if diff_seconds > 0:
                 actual_status = "迟到"
@@ -2608,7 +2617,7 @@ async def send_work_notification(
                 title = "✅ <b>下班准时通知</b>"
                 status_line = "⏱️ 准时下班"
 
-        # ========= 🎯 修复3：班次信息 ==========
+        # ========= 修复3：班次信息 ==========
         shift_state = await db.get_current_shift_state(chat_id)
         shift_text = "白班"
         if shift_state:
@@ -2629,7 +2638,7 @@ async def send_work_notification(
         if fine_amount > 0:
             notif_text += f"\n💰 扣除绩效：<code>{fine_amount}</code> 分"
 
-        # ========= 🎯 修复4：添加调试日志 ==========
+        # ========= 修复4：添加调试日志 ==========
         logger.info(
             f"[{trace_id}] 📊 通知详情:\n"
             f"   • 用户: {user_name}({user_id})\n"
@@ -2650,9 +2659,9 @@ async def send_work_notification(
 
                 # 尝试获取聊天信息，确认机器人是否在群组中
                 try:
-                    chat_info = await bot.get_chat(target_id)
+                    target_info = await bot.get_chat(target_id)
                     logger.info(
-                        f"[{trace_id}] ℹ️ 目标群组信息: 标题='{chat_info.title}', 类型={chat_info.type}"
+                        f"[{trace_id}] ℹ️ 目标群组信息: 标题='{target_info.title}', 类型={target_info.type}"
                     )
                 except Exception as e:
                     logger.error(
@@ -2661,50 +2670,61 @@ async def send_work_notification(
                     # 如果获取不到聊天信息，说明机器人不在这个群组中，直接返回
                     return
 
-                # 🎯 直接使用 bot.send_message，不经过 notification_service
+                # 直接使用 bot.send_message
                 await bot.send_message(target_id, text, parse_mode="HTML")
-                
+
                 if target_desc:
                     logger.info(f"[{trace_id}] ✅ {target_desc}发送成功({target_id})")
                 else:
                     logger.info(f"[{trace_id}] ✅ 发送成功({target_id})")
-                    
+
             except Exception as e:
                 logger.error(f"[{trace_id}] ❌ 发送到 {target_desc} 失败: {e}")
-                
+
                 # 尝试使用 bot_manager 重试
                 try:
                     logger.info(f"[{trace_id}] 🔄 尝试使用 bot_manager 重试...")
-                    if bot_manager and hasattr(bot_manager, 'send_message_with_retry'):
+                    if bot_manager and hasattr(bot_manager, "send_message_with_retry"):
                         success = await bot_manager.send_message_with_retry(
                             target_id, text, parse_mode="HTML"
                         )
                         if success:
-                            logger.info(f"[{trace_id}] ✅ bot_manager {target_desc}发送成功({target_id})")
+                            logger.info(
+                                f"[{trace_id}] ✅ bot_manager {target_desc}发送成功({target_id})"
+                            )
                             return
                 except Exception as e2:
                     logger.error(f"[{trace_id}] ❌ bot_manager 重试也失败: {e2}")
-                
+
                 # 如果是403错误，说明机器人被踢出群组或没有权限
                 if "403" in str(e):
-                    logger.error(f"[{trace_id}] 🚫 机器人没有权限发送消息到 {target_id}，可能原因：")
+                    logger.error(
+                        f"[{trace_id}] 🚫 机器人没有权限发送消息到 {target_id}，可能原因："
+                    )
                     logger.error(f"[{trace_id}]   1. 机器人不在该群组中")
                     logger.error(f"[{trace_id}]   2. 机器人被禁言或没有发送消息权限")
                     logger.error(f"[{trace_id}]   3. 群组设置了限制")
 
-        # ========= 发送逻辑 ==========
+        # ========= 发送逻辑（可配置）==========
 
-        # 1. 发送到当前群组（原有）
-        await safe_send(chat_id, notif_text, "当前群组")
+        # 1. 发送到当前群组（根据推送设置）
+        if enable_group_push:
+            await safe_send(chat_id, notif_text, "当前群组")
+        else:
+            logger.info(f"[{trace_id}] ℹ️ 推送设置已禁用当前群组通知")
 
-        # 2. 发送到频道（原有）
-        if channel_id:
+        # 2. 发送到频道（根据推送设置）
+        if channel_id and enable_channel_push:
             await safe_send(channel_id, notif_text, "频道")
+        elif channel_id:
+            logger.info(f"[{trace_id}] ℹ️ 推送设置已禁用频道通知")
 
-        # 3. 发送到额外群组（新增）
+        # 3. 发送到额外群组（这个不受推送设置影响，独立控制）
         if extra_work_group_id:
+            logger.info(f"[{trace_id}] 📤 发送到额外群组: {extra_work_group_id}")
             await safe_send(extra_work_group_id, notif_text, "额外上下班群组")
-            # 这里的日志已经在 safe_send 中记录，不需要再额外记录
+        else:
+            logger.info(f"[{trace_id}] ℹ️ 没有配置额外群组")
 
     except Exception as e:
         logger.error(
