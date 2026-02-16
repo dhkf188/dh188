@@ -2709,7 +2709,8 @@ async def send_work_notification(
 
         # 1. 发送到当前群组（根据推送设置）
         if enable_group_push:
-            await safe_send(chat_id, notif_text, "当前群组")
+            # await safe_send(chat_id, notif_text, "当前群组")
+            logger.info(f"[{trace_id}] ℹ️ 当前群组推送已禁用")
         else:
             logger.info(f"[{trace_id}] ℹ️ 推送设置已禁用当前群组通知")
 
