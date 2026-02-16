@@ -2633,11 +2633,43 @@ async def send_work_notification(
                     work_duration = int((end_dt - start_dt).total_seconds())
                     work_duration_str = MessageFormatter.format_duration(work_duration)
 
+                    # 获取今日活动总时长
+                    business_date = await db.get_business_date(chat_id)
+                    async with db.pool.acquire() as conn:
+                        activity_total = (
+                            await conn.fetchval(
+                                """
+                            SELECT SUM(accumulated_time) 
+                            FROM user_activities 
+                            WHERE chat_id = $1 AND user_id = $2 AND activity_date = $3
+                            """,
+                                chat_id,
+                                user_id,
+                                business_date,
+                            )
+                            or 0
+                        )
+
+                    # 计算实际工作时间（总工时 - 活动时间）
+                    actual_work_duration = max(0, work_duration - activity_total)
+                    actual_work_str = MessageFormatter.format_duration(
+                        actual_work_duration
+                    )
+                    activity_total_str = MessageFormatter.format_duration(
+                        activity_total
+                    )
+
                     channel_notif_text += (
                         f"🕒 上班时间：<code>{work_start_time}</code>\n"
                     )
                     channel_notif_text += (
-                        f"⏱️ 工作时长：<code>{work_duration_str}</code>\n"
+                        f"⏱️ 总工作时长：<code>{work_duration_str}</code>\n"
+                    )
+                    channel_notif_text += (
+                        f"📊 活动总时长：<code>{activity_total_str}</code>\n"
+                    )
+                    channel_notif_text += (
+                        f"💪 实际工作时间：<code>{actual_work_str}</code>\n"
                     )
             except Exception as e:
                 logger.error(f"[{trace_id}] ❌ 计算工作时长失败: {e}")
