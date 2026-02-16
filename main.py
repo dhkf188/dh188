@@ -3256,6 +3256,70 @@ async def cmd_setshiftgrace(message: types.Message):
         )
 
 
+@admin_required
+@rate_limit(rate=3, per=30)
+async def cmd_setworkendgrace(message: types.Message):
+    """设置下班专用时间窗口"""
+    args = message.text.split()
+    chat_id = message.chat.id
+
+    if len(args) != 3:
+        await message.answer(
+            "❌ 用法: /setworkendgrace <下班前允许分钟> <下班后允许分钟>\n"
+            "💡 示例: /setworkendgrace 120 360\n\n"
+            "📊 默认值:\n"
+            "• 下班前: 120 分钟 (2小时)\n"
+            "• 下班后: 360 分钟 (6小时)",
+            reply_to_message_id=message.message_id,
+        )
+        return
+
+    try:
+        before = int(args[1])
+        after = int(args[2])
+
+        if before < 0 or after < 0:
+            await message.answer(
+                "❌ 时间窗口不能为负数", reply_to_message_id=message.message_id
+            )
+            return
+
+        # 更新数据库
+        async with db.pool.acquire() as conn:
+            await conn.execute(
+                """
+                UPDATE groups 
+                SET workend_grace_before = $1, 
+                    workend_grace_after = $2,
+                    updated_at = CURRENT_TIMESTAMP 
+                WHERE chat_id = $3
+                """,
+                before,
+                after,
+                chat_id,
+            )
+            db._cache.pop(f"group:{chat_id}", None)
+
+        await message.answer(
+            f"✅ 下班时间窗口已更新\n\n"
+            f"📊 新设置:\n"
+            f"• 下班前允许: <code>{before}</code> 分钟\n"
+            f"• 下班后允许: <code>{after}</code> 分钟",
+            parse_mode="HTML",
+            reply_to_message_id=message.message_id,
+        )
+
+    except ValueError:
+        await message.answer(
+            "❌ 请输入有效的数字", reply_to_message_id=message.message_id
+        )
+    except Exception as e:
+        logger.error(f"设置下班时间窗口失败: {e}")
+        await message.answer(
+            f"❌ 设置失败: {e}", reply_to_message_id=message.message_id
+        )
+
+
 # ========== 修复消息引用 ==========
 @admin_required
 @rate_limit(rate=2, per=60)
@@ -5454,56 +5518,57 @@ async def handle_admin_panel_button(message: types.Message):
         return
 
     admin_text = (
-        "👑 *管理员面板*\n"
+        "👑 <b>管理员面板</b>\n"
         "━━━━━━━━━━━━━━━━\n\n"
-        "📢 *频道与推送*\n"
-        "├ `/setchannel` \\[ID\\]\n"
-        "├ `/setgroup` \\[ID\\]\n"
-        "├ `/addextraworkgroup` \\[ID\\] - 添加上下班额外推送群组\n"
-        "├ `/setpush` \\[目标\\] \\[开关\\]\n"
-        "├ `/showpush`\n"
-        "│ 目标: ch\\|gr\\|ad\n"
-        "│ 开关: on\\|off\n\n"
-        "🎯 *活动管理*\n"
-        "├ `/addactivity` \\[名\\] \\[次\\] \\[分\\]\n"
-        "├ `/delactivity` \\[名\\]\n"
-        "├ `/actnum` \\[名\\] \\[人数\\]\n"
-        "└ `/actstatus`\n\n"
-        "💰 *罚款管理*\n"
-        "├ `/setfine` \\[名\\] \\[段\\] \\[元\\]\n"
-        "├ `/setfines\\_all` \\[段1\\] \\[元1\\] \\.\\.\\.\n"
-        "├ `/setworkfine` \\[类型\\] \\[分\\] \\[元\\]\n"
-        "└ `/finesstatus`\n"
-        "  类型: start\\|end\n\n"
-        "🔄 *重置设置*\n"
-        "├ `/setresettime` \\[时\\] \\[分\\]\n"
-        "├ `/setsoftresettime` \\[时\\] \\[分\\]\n"
-        "├ `/resetuser` \\[用户ID\\]\n"
-        "└ `/resettime`\n\n"
-        "⏰ *上下班管理*\n"
-        "├ `/setworktime` \\[上\\] \\[下\\]\n"
-        "├ `/worktime`\n"
-        "├ `/delwork`\n"
-        "└ `/delwork\\_clear`\n\n"
-        "📊 *数据管理*\n"
-        "├ `/export`\n"
-        "├ `/exportmonthly` \\[年\\] \\[月\\]\n"
-        "├ `/monthlyreport` \\[年\\] \\[月\\]\n"
-        "├ `/cleanup\\_monthly` \\[年\\] \\[月\\]\n"
-        "├ `/monthly\\_stats\\_status`\n"
-        "└ `/cleanup\\_inactive` \\[天\\]\n\n"
-        "💾 *数据显示*\n"
-        "└ `/showsettings`\n\n"
+        "📢 <b>频道与推送</b>\n"
+        "├ <code>/setchannel [ID]</code>\n"
+        "├ <code>/setgroup [ID]</code>\n"
+        "├ <code>/addextraworkgroup [ID]</code> - 添加上下班额外推送群组\n"
+        "├ <code>/setpush [目标] [开关]</code>\n"
+        "├ <code>/showpush</code>\n"
+        "│ 目标: ch|gr|ad\n"
+        "│ 开关: on|off\n\n"
+        "🎯 <b>活动管理</b>\n"
+        "├ <code>/addactivity [名] [次] [分]</code>\n"
+        "├ <code>/delactivity [名]</code>\n"
+        "├ <code>/actnum [名] [人数]</code>\n"
+        "└ <code>/actstatus</code>\n\n"
+        "💰 <b>罚款管理</b>\n"
+        "├ <code>/setfine [名] [段] [元]</code>\n"
+        "├ <code>/setfines_all [段1] [元1] ...</code>\n"
+        "├ <code>/setworkfine [类型] [分] [元]</code>\n"
+        "└ <code>/finesstatus</code>\n"
+        "  类型: start|end\n\n"
+        "🔄 <b>重置设置</b>\n"
+        "├ <code>/setresettime [时] [分]</code>\n"
+        "├ <code>/setsoftresettime [时] [分]</code>\n"
+        "├ <code>/resetuser [用户ID]</code>\n"
+        "└ <code>/resettime</code>\n\n"
+        "⏰ <b>上下班管理</b>\n"
+        "├ <code>/setworktime [上] [下]</code>\n"
+        "├ <code>/worktime</code>\n"
+        "├ <code>/delwork</code>\n"
+        "└ <code>/delwork_clear</code>\n\n"
+        "📊 <b>数据管理</b>\n"
+        "├ <code>/export</code>\n"
+        "├ <code>/exportmonthly [年] [月]</code>\n"
+        "├ <code>/monthlyreport [年] [月]</code>\n"
+        "├ <code>/cleanup_monthly [年] [月]</code>\n"
+        "├ <code>/monthly_stats_status</code>\n"
+        "└ <code>/cleanup_inactive [天]</code>\n\n"
+        "💾 <b>数据显示</b>\n"
+        "└ <code>/showsettings</code>\n\n"
         "━━━━━━━━━━━━━━━━\n"
-        "_💡 提示：发送 /help \\[命令\\] 查看详情_"
+        "<i>💡 提示：发送 /help [命令] 查看详情</i>"
     )
 
     await message.answer(
         admin_text,
         reply_markup=get_admin_keyboard(),
         reply_to_message_id=message.message_id,
-        parse_mode="MarkdownV2",
+        parse_mode="HTML",  # 👈 改为 HTML
     )
+
 
 
 # ========== 返回主菜单按钮处理 ==========
@@ -7163,6 +7228,7 @@ async def register_handlers():
     dp.message.register(cmd_checkdualsetup, Command("checkdual"))
     dp.message.register(cmd_testgroupaccess, Command("testgroupaccess"))
     dp.message.register(cmd_checkbotpermissions, Command("checkperms"))
+    dp.message.register(cmd_setworkendgrace, Command("setworkendgrace"))
 
     # 按钮处理器
     dp.message.register(
