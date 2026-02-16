@@ -600,7 +600,6 @@ async def handle_expired_activity(
         logger.error(f"处理过期活动失败 {chat_id}-{user_id}: {e}")
 
 
-
 async def recover_expired_activities():
     """恢复服务重启前的过期活动 - 添加返回值"""
     try:
@@ -1336,7 +1335,7 @@ async def start_activity(message: types.Message, act: str):
                     f"• 限制人数：<code>{user_limit}</code> 人\n"
                     f"• 当前进行：<code>{current_users}</code> 人\n"
                     f"• 剩余名额：<code>0</code> 人\n\n"
-                    f"💡 请等待其他用户回座后再打卡进行此活动",
+                    f"💡 请等待其他用户回座后再打卡进行此活动或选择其他活动",
                     reply_markup=await get_main_keyboard(
                         chat_id=chat_id,
                         show_admin=await is_admin(uid),
