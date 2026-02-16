@@ -153,6 +153,7 @@ async def _dual_shift_hard_reset(
 
         if isinstance(results[0], Exception):
             logger.error(f"❌ [强制结束活动] 失败: {results[0]}")
+            logger.error(traceback.format_exc())  # 添加堆栈信息
 
         complete_stats = (
             results[1]
@@ -168,29 +169,56 @@ async def _dual_shift_hard_reset(
 
         if isinstance(results[1], Exception):
             logger.error(f"❌ [补全下班记录] 失败: {results[1]}")
+            logger.error(traceback.format_exc())  # 添加堆栈信息
 
         # ========== 3. 导出昨天所有数据（使用并发重试） ==========
         logger.info(f"📊 [步骤3/5] 导出昨天数据 (白班+夜班)...")
         export_start = time.time()
-        export_success = await _export_yesterday_data_concurrent(chat_id, yesterday)
+        try:
+            export_success = await _export_yesterday_data_concurrent(chat_id, yesterday)
+        except Exception as e:
+            logger.error(f"❌ [数据导出] 失败: {e}")
+            logger.error(traceback.format_exc())
+            export_success = False
         export_time = time.time() - export_start
 
         # ========== 4. 清除昨天所有数据 ==========
         logger.info(f"📊 [步骤4/5] 清除昨天数据...")
         cleanup_start = time.time()
-        cleanup_stats = await _cleanup_old_data(chat_id, yesterday, today)
+        try:
+            cleanup_stats = await _cleanup_old_data(chat_id, yesterday, today)
+        except Exception as e:
+            logger.error(f"❌ [数据清理] 失败: {e}")
+            logger.error(traceback.format_exc())
+            cleanup_stats = {
+                "user_activities": 0,
+                "work_records": 0,
+                "daily_statistics": 0,
+                "users_reset": 0,
+            }
         cleanup_time = time.time() - cleanup_start
 
         # ========== 5. 清除班次状态 ==========
-        await db.clear_shift_state(chat_id)
-        logger.info(f"   ✅ 班次状态已清除")
+        try:
+            await db.clear_shift_state(chat_id)
+            logger.info(f"   ✅ 班次状态已清除")
+        except Exception as e:
+            logger.error(f"❌ [清除班次状态] 失败: {e}")
 
         # ========== 异步发送通知（不阻塞主流程） ==========
-        asyncio.create_task(
-            _send_reset_notification(
-                chat_id, force_stats, complete_stats, export_success, cleanup_stats, now
+        try:
+            asyncio.create_task(
+                _send_reset_notification(
+                    chat_id,
+                    force_stats,
+                    complete_stats,
+                    export_success,
+                    cleanup_stats,
+                    now,
+                )
             )
-        )
+        except Exception as e:
+            logger.error(f"❌ [发送通知] 失败: {e}")
 
         # ========== 最终汇总 ==========
         total_time = time.time() - total_start_time
@@ -292,18 +320,13 @@ async def _force_end_all_unfinished_shifts(
                     else:
                         stats["night_shift"]["failed"] += 1
                     logger.error(f"❌ 处理用户 {rows[i]['user_id']} 失败: {result}")
+                    logger.error(traceback.format_exc())  # 添加堆栈
                 else:
                     stats["success"] += 1
-                    stats["day_shift"]["total"] += 1 if result["shift"] == "day" else 0
-                    stats["night_shift"]["total"] += (
-                        1 if result["shift"] == "night" else 0
-                    )
-
                     if result["shift"] == "day":
                         stats["day_shift"]["success"] += 1
                     else:
                         stats["night_shift"]["success"] += 1
-
                     stats["details"].append(result)
 
             # 按班次统计总数
