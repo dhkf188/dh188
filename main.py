@@ -2625,6 +2625,7 @@ async def send_work_notification(
             shift_text = "白班" if current_shift == "day" else "夜班"
 
         # ========= 频道文案（保持原有详细格式）==========
+        # ========= 频道文案（保持原有详细格式）==========
         channel_notif_text = (
             f"{title}\n"
             f"🏢 群组/班次：<code>{chat_title}</code> <code>{shift_text}</code>\n"
@@ -2632,8 +2633,34 @@ async def send_work_notification(
             f"👤 用户：{MessageFormatter.format_user_link(user_id, user_name)}\n"
             f"⏰ 打卡时间：<code>{checkin_time}</code>\n"
             f"📅 {action_text}时间：<code>{expected_dt.strftime('%m/%d %H:%M')}</code>\n"
-            f"{status_line}"
         )
+
+        # 如果是下班通知，添加上班时间和工作时长
+        if action_text == "下班":
+            try:
+                # 获取今天的上班记录
+                work_records = await db.get_work_records_by_shift(chat_id, user_id, shift_text)
+                if work_records and work_records.get("work_start"):
+                    # 获取上班时间
+                    work_start_time = work_records["work_start"][0]["checkin_time"]
+                    
+                    # 计算工作时长
+                    start_dt = datetime.strptime(work_start_time, "%H:%M")
+                    end_dt = datetime.strptime(checkin_time, "%H:%M")
+                    
+                    # 处理跨天（如果下班时间小于上班时间，说明跨天了）
+                    if end_dt < start_dt:
+                        end_dt += timedelta(days=1)
+                    
+                    work_duration = int((end_dt - start_dt).total_seconds())
+                    work_duration_str = MessageFormatter.format_duration(work_duration)
+                    
+                    channel_notif_text += f"🕒 上班时间：<code>{work_start_time}</code>\n"
+                    channel_notif_text += f"⏱️ 工作时长：<code>{work_duration_str}</code>\n"
+            except Exception as e:
+                logger.error(f"[{trace_id}] ❌ 计算工作时长失败: {e}")
+
+        channel_notif_text += f"{status_line}"
 
         # ========= 额外群组文案（简洁版）==========
         extra_notif_text = (
