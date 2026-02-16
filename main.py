@@ -2625,14 +2625,17 @@ async def send_work_notification(
             shift_text = "白班" if current_shift == "day" else "夜班"
 
         # ========= 文案构建 ==========
+        # notif_text = (
+        #     f"{title}\n"
+        #     f"🏢 群组/班次：<code>{chat_title}</code> <code>{shift_text}</code>\n"
+        #     f"{MessageFormatter.create_dashed_line()}\n"
+        #     f"👤 用户：{MessageFormatter.format_user_link(user_id, user_name)}\n"
+        #     f"⏰ 打卡时间：<code>{checkin_time}</code>\n"
+        #     f"📅 {action_text}时间：<code>{expected_dt.strftime('%m/%d %H:%M')}</code>\n"
+        #     f"{status_line}"
+        # )
         notif_text = (
-            f"{title}\n"
-            f"🏢 群组/班次：<code>{chat_title}</code> <code>{shift_text}</code>\n"
-            f"{MessageFormatter.create_dashed_line()}\n"
-            f"👤 用户：{MessageFormatter.format_user_link(user_id, user_name)}\n"
-            f"⏰ 打卡时间：<code>{checkin_time}</code>\n"
-            f"📅 {action_text}时间：<code>{expected_dt.strftime('%m/%d %H:%M')}</code>\n"
-            f"{status_line}"
+            f"<code>{shift_text}</code>  {MessageFormatter.format_user_link(user_id, user_name)}  {action_text} 了!\n"
         )
 
         if fine_amount > 0:
