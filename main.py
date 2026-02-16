@@ -5546,6 +5546,8 @@ async def handle_admin_panel_button(message: types.Message):
         "└ <code>/resettime</code>\n\n"
         "⏰ <b>上下班管理</b>\n"
         "├ <code>/setworktime [上] [下]</code>\n"
+        "├ <code>/setshiftgrace</code>\n"
+        "├ <code>/setworkendgrace</code>\n"
         "├ <code>/worktime</code>\n"
         "├ <code>/delwork</code>\n"
         "└ <code>/delwork_clear</code>\n\n"
@@ -5568,7 +5570,6 @@ async def handle_admin_panel_button(message: types.Message):
         reply_to_message_id=message.message_id,
         parse_mode="HTML",  # 👈 改为 HTML
     )
-
 
 
 # ========== 返回主菜单按钮处理 ==========
