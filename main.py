@@ -2644,7 +2644,7 @@ async def send_work_notification(
 
         # ========= 发送群 ==========
         async def safe_send(target_id: int, text: str, target_desc: str = ""):
-            """安全发送：notification_service -> bot.send_message fallback"""
+            """安全发送：直接使用 bot.send_message 发送到指定目标"""
             try:
                 logger.info(f"[{trace_id}] 📤 尝试发送到 {target_desc} ID: {target_id}")
 
@@ -2658,39 +2658,39 @@ async def send_work_notification(
                     logger.error(
                         f"[{trace_id}] ❌ 无法获取目标群组信息，机器人可能不在群组中: {e}"
                     )
+                    # 如果获取不到聊天信息，说明机器人不在这个群组中，直接返回
+                    return
 
-                await notification_service.send_notification(target_id, text)
+                # 🎯 直接使用 bot.send_message，不经过 notification_service
+                await bot.send_message(target_id, text, parse_mode="HTML")
+                
                 if target_desc:
                     logger.info(f"[{trace_id}] ✅ {target_desc}发送成功({target_id})")
                 else:
                     logger.info(f"[{trace_id}] ✅ 发送成功({target_id})")
+                    
             except Exception as e:
-                logger.error(
-                    f"[{trace_id}] ❌ 通知发送失败({target_id})，尝试备用bot.send_message: {e}"
-                )
+                logger.error(f"[{trace_id}] ❌ 发送到 {target_desc} 失败: {e}")
+                
+                # 尝试使用 bot_manager 重试
                 try:
-                    # 使用 parse_mode="HTML" 保持格式一致
-                    await bot.send_message(target_id, text, parse_mode="HTML")
-                    if target_desc:
-                        logger.info(
-                            f"[{trace_id}] ✅ fallback {target_desc}成功({target_id})"
+                    logger.info(f"[{trace_id}] 🔄 尝试使用 bot_manager 重试...")
+                    if bot_manager and hasattr(bot_manager, 'send_message_with_retry'):
+                        success = await bot_manager.send_message_with_retry(
+                            target_id, text, parse_mode="HTML"
                         )
-                    else:
-                        logger.info(f"[{trace_id}] ✅ fallback发送成功({target_id})")
+                        if success:
+                            logger.info(f"[{trace_id}] ✅ bot_manager {target_desc}发送成功({target_id})")
+                            return
                 except Exception as e2:
-                    logger.error(
-                        f"[{trace_id}] ❌ fallback bot.send_message也失败({target_id}): {e2}"
-                    )
-                    # 如果是403错误，说明机器人被踢出群组或没有权限
-                    if "403" in str(e2):
-                        logger.error(
-                            f"[{trace_id}] 🚫 机器人没有权限发送消息到 {target_id}，可能原因："
-                        )
-                        logger.error(f"[{trace_id}]   1. 机器人不在该群组中")
-                        logger.error(
-                            f"[{trace_id}]   2. 机器人被禁言或没有发送消息权限"
-                        )
-                        logger.error(f"[{trace_id}]   3. 群组设置了限制")
+                    logger.error(f"[{trace_id}] ❌ bot_manager 重试也失败: {e2}")
+                
+                # 如果是403错误，说明机器人被踢出群组或没有权限
+                if "403" in str(e):
+                    logger.error(f"[{trace_id}] 🚫 机器人没有权限发送消息到 {target_id}，可能原因：")
+                    logger.error(f"[{trace_id}]   1. 机器人不在该群组中")
+                    logger.error(f"[{trace_id}]   2. 机器人被禁言或没有发送消息权限")
+                    logger.error(f"[{trace_id}]   3. 群组设置了限制")
 
         # ========= 发送逻辑 ==========
 
