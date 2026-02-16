@@ -504,7 +504,7 @@ async def export_monthly_csv(
 async def handle_expired_activity(
     chat_id: int, user_id: int, activity: str, start_time: datetime
 ):
-    """智能合并版：按活动开始时间归档，夜班/长活动使用班次判定修正"""
+    """智能恢复活动 - 按活动开始时间归档，保留班次信息，不误归前一天"""
     try:
         now = get_beijing_time()
         elapsed = int((now - start_time).total_seconds())
@@ -515,12 +515,11 @@ async def handle_expired_activity(
         if user_data:
             nickname = user_data.get("nickname", str(user_id))
 
-        # 🎯 默认使用活动开始时间来确定业务日期
-        business_date = await db.get_business_date(chat_id, start_time)
-        forced_date = business_date
+        # ✅ 使用活动开始时间作为归档日期
+        forced_date = start_time.date()
 
-        # 获取班次信息（从用户数据或开始时间判定）
-        shift = user_data.get("shift", "day")
+        # 获取班次信息（从用户数据或活动时间判定）
+        shift = user_data.get("shift", None)
         if not shift:
             shift_info = await db.determine_shift_for_time(
                 chat_id=chat_id,
@@ -529,22 +528,7 @@ async def handle_expired_activity(
             )
             if shift_info:
                 shift = shift_info.get("shift", "day")
-
-        # 智能修正：夜班或长活动 (>12小时) 使用班次判定
-        LONG_ACTIVITY_THRESHOLD = 12 * 3600  # 12小时
-        if shift == "night" or elapsed > LONG_ACTIVITY_THRESHOLD:
-            shift_info = await db.determine_shift_for_time(
-                chat_id=chat_id,
-                current_time=now,
-                checkin_type="work_end",
-            )
-            if shift_info:
-                forced_date = shift_info.get("record_date")
-                shift = shift_info.get("shift", shift)
-                logger.info(
-                    f"🔄 智能修正过期活动 - 夜班/长活动归档使用班次判定: "
-                    f"{shift_info.get('shift_detail')}, 归到 {forced_date}"
-                )
+        shift = shift or "day"  # 默认白班
 
         logger.info(
             f"🔄 恢复过期活动 - 活动开始时间: {start_time.strftime('%m/%d %H:%M:%S')}, "
@@ -1752,7 +1736,7 @@ async def _process_back_locked(
 
                 eat_end_notification_text = (
                     f"🍽️ <b>吃饭结束通知</b>\n"
-                    f"{MessageFormatter.format_user_link(uid, user_data.get('nickname', '用户'))} 回来了\n"
+                    f"{MessageFormatter.format_user_link(uid, user_data.get('nickname', '用户'))} 吃饭回来了\n"
                     f"⏱️ 吃饭耗时：<code>{elapsed_time_str}</code>\n"
                 )
 
