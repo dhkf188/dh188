@@ -2643,12 +2643,25 @@ async def send_work_notification(
         )
 
         # ========= 发送群 ==========
-        async def safe_send(target_id: int, text: str, description: str = ""):
+        async def safe_send(target_id: int, text: str, target_desc: str = ""):
             """安全发送：notification_service -> bot.send_message fallback"""
             try:
+                logger.info(f"[{trace_id}] 📤 尝试发送到 {target_desc} ID: {target_id}")
+
+                # 尝试获取聊天信息，确认机器人是否在群组中
+                try:
+                    chat_info = await bot.get_chat(target_id)
+                    logger.info(
+                        f"[{trace_id}] ℹ️ 目标群组信息: 标题='{chat_info.title}', 类型={chat_info.type}"
+                    )
+                except Exception as e:
+                    logger.error(
+                        f"[{trace_id}] ❌ 无法获取目标群组信息，机器人可能不在群组中: {e}"
+                    )
+
                 await notification_service.send_notification(target_id, text)
-                if description:
-                    logger.info(f"[{trace_id}] ✅ {description}发送成功({target_id})")
+                if target_desc:
+                    logger.info(f"[{trace_id}] ✅ {target_desc}发送成功({target_id})")
                 else:
                     logger.info(f"[{trace_id}] ✅ 发送成功({target_id})")
             except Exception as e:
@@ -2656,11 +2669,11 @@ async def send_work_notification(
                     f"[{trace_id}] ❌ 通知发送失败({target_id})，尝试备用bot.send_message: {e}"
                 )
                 try:
-                    # 添加 parse_mode="HTML" 保持格式
+                    # 使用 parse_mode="HTML" 保持格式一致
                     await bot.send_message(target_id, text, parse_mode="HTML")
-                    if description:
+                    if target_desc:
                         logger.info(
-                            f"[{trace_id}] ✅ fallback {description}成功({target_id})"
+                            f"[{trace_id}] ✅ fallback {target_desc}成功({target_id})"
                         )
                     else:
                         logger.info(f"[{trace_id}] ✅ fallback发送成功({target_id})")
@@ -2668,6 +2681,16 @@ async def send_work_notification(
                     logger.error(
                         f"[{trace_id}] ❌ fallback bot.send_message也失败({target_id}): {e2}"
                     )
+                    # 如果是403错误，说明机器人被踢出群组或没有权限
+                    if "403" in str(e2):
+                        logger.error(
+                            f"[{trace_id}] 🚫 机器人没有权限发送消息到 {target_id}，可能原因："
+                        )
+                        logger.error(f"[{trace_id}]   1. 机器人不在该群组中")
+                        logger.error(
+                            f"[{trace_id}]   2. 机器人被禁言或没有发送消息权限"
+                        )
+                        logger.error(f"[{trace_id}]   3. 群组设置了限制")
 
         # ========= 发送逻辑 ==========
 
@@ -4910,6 +4933,181 @@ async def cmd_finesstatus(message: types.Message):
         )
 
 
+@admin_required
+@rate_limit(rate=2, per=60)
+async def cmd_checkdualsetup(message: types.Message):
+    """检查双班重置配置"""
+    chat_id = message.chat.id
+
+    try:
+        group_data = await db.get_group_cached(chat_id)
+        if not group_data:
+            await message.answer("❌ 群组未初始化")
+            return
+
+        reset_hour = group_data.get("reset_hour", Config.DAILY_RESET_HOUR)
+        reset_minute = group_data.get("reset_minute", Config.DAILY_RESET_MINUTE)
+
+        shift_config = await db.get_shift_config(chat_id)
+        is_dual = shift_config.get("dual_mode", False)
+
+        now = get_beijing_time()
+        reset_time_today = now.replace(
+            hour=reset_hour, minute=reset_minute, second=0, microsecond=0
+        )
+        execute_time = reset_time_today + timedelta(hours=2)
+
+        text = (
+            f"🔍 <b>双班重置配置检查</b>\n\n"
+            f"• 群组ID: <code>{chat_id}</code>\n"
+            f"• 双班模式: {'✅ 开启' if is_dual else '❌ 关闭'}\n"
+            f"• 重置时间: <code>{reset_hour:02d}:{reset_minute:02d}</code>\n"
+            f"• 执行时间: <code>{execute_time.strftime('%H:%M')}</code>\n"
+            f"• 当前时间: <code>{now.strftime('%H:%M:%S')}</code>\n\n"
+        )
+
+        if is_dual:
+            if now < execute_time:
+                time_left = execute_time - now
+                minutes = int(time_left.total_seconds() / 60)
+                seconds = int(time_left.total_seconds() % 60)
+                text += f"⏳ 距离下次执行还有: <code>{minutes}分{seconds}秒</code>"
+            else:
+                text += f"✅ 当前在执行窗口内"
+        else:
+            text += f"💡 群组未开启双班模式，无需检查"
+
+        await message.answer(
+            text, parse_mode="HTML", reply_to_message_id=message.message_id
+        )
+
+    except Exception as e:
+        await message.answer(
+            f"❌ 检查失败: {e}", reply_to_message_id=message.message_id
+        )
+
+
+@admin_required
+@rate_limit(rate=2, per=60)
+async def cmd_testgroupaccess(message: types.Message):
+    """测试机器人是否能访问指定群组"""
+    chat_id = message.chat.id
+    args = message.text.split()
+
+    if len(args) < 2:
+        await message.answer(
+            "❌ 用法：/testgroupaccess <群组ID>\n"
+            "📝 示例：/testgroupaccess -5187163421",
+            reply_to_message_id=message.message_id,
+        )
+        return
+
+    try:
+        target_id = int(args[1])
+
+        # 获取额外群组配置
+        extra_group_id = await db.get_extra_work_group(chat_id)
+
+        result_text = f"🔍 <b>群组访问测试</b>\n\n"
+
+        # 测试目标群组
+        try:
+            chat_info = await bot.get_chat(target_id)
+            result_text += f"✅ 目标群组 <code>{target_id}</code> 可访问\n"
+            result_text += f"   • 标题：{chat_info.title}\n"
+            result_text += f"   • 类型：{chat_info.type}\n"
+
+            # 尝试发送测试消息
+            test_msg = await bot.send_message(
+                target_id,
+                f"🧪 这是一条测试消息\n发送时间：{get_beijing_time().strftime('%Y-%m-%d %H:%M:%S')}",
+                parse_mode="HTML",
+            )
+            result_text += f"✅ 测试消息发送成功 (消息ID: {test_msg.message_id})\n"
+
+        except Exception as e:
+            result_text += f"❌ 目标群组 <code>{target_id}</code> 访问失败\n"
+            result_text += f"   • 错误：{str(e)}\n"
+            if "403" in str(e):
+                result_text += "   • 原因：机器人不在群组中或没有权限\n"
+
+        # 显示当前配置
+        result_text += f"\n📊 当前额外群组配置：\n"
+        result_text += f"• 配置的群组：<code>{extra_group_id or '未设置'}</code>\n"
+
+        if extra_group_id and extra_group_id == target_id:
+            result_text += f"✅ 测试的群组与配置一致\n"
+        elif extra_group_id:
+            result_text += f"⚠️ 测试的群组与配置不一致\n"
+
+        await message.answer(
+            result_text, parse_mode="HTML", reply_to_message_id=message.message_id
+        )
+
+    except ValueError:
+        await message.answer(
+            "❌ 群组ID必须是数字", reply_to_message_id=message.message_id
+        )
+    except Exception as e:
+        await message.answer(
+            f"❌ 测试失败：{e}", reply_to_message_id=message.message_id
+        )
+
+
+@admin_required
+@rate_limit(rate=2, per=60)
+async def cmd_checkbotpermissions(message: types.Message):
+    """检查机器人在各个群组的权限"""
+    chat_id = message.chat.id
+
+    result_text = f"🔍 <b>机器人权限检查</b>\n\n"
+    result_text += f"🤖 机器人ID: <code>{bot.id}</code>\n"
+    result_text += f"🤖 机器人用户名: @{(await bot.me()).username}\n\n"
+
+    # 检查当前群组
+    try:
+        bot_member = await bot.get_chat_member(chat_id, bot.id)
+        result_text += f"📊 当前群组 <code>{chat_id}</code>:\n"
+        result_text += f"   • 状态：{bot_member.status}\n"
+        result_text += f"   • 是否为管理员：{'是' if bot_member.status in ['administrator', 'creator'] else '否'}\n"
+    except Exception as e:
+        result_text += f"❌ 无法获取当前群组权限: {e}\n"
+
+    # 检查额外群组
+    extra_group_id = await db.get_extra_work_group(chat_id)
+    if extra_group_id:
+        result_text += f"\n📊 额外群组 <code>{extra_group_id}</code>:\n"
+        try:
+            extra_member = await bot.get_chat_member(extra_group_id, bot.id)
+            result_text += f"   • 状态：{extra_member.status}\n"
+            result_text += f"   • 是否为管理员：{'是' if extra_member.status in ['administrator', 'creator'] else '否'}\n"
+            result_text += f"   • 可发送消息：{'是' if extra_member.can_send_messages else '未知'}\n"
+        except Exception as e:
+            result_text += f"   ❌ 无法获取权限: {e}\n"
+            if "403" in str(e):
+                result_text += f"   • 原因：机器人不在该群组中\n"
+
+    # 检查频道
+    group_data = await db.get_group_cached(chat_id)
+    channel_id = group_data.get("channel_id") if group_data else None
+    if channel_id:
+        result_text += f"\n📊 频道 <code>{channel_id}</code>:\n"
+        try:
+            channel_member = await bot.get_chat_member(channel_id, bot.id)
+            result_text += f"   • 状态：{channel_member.status}\n"
+        except Exception as e:
+            result_text += f"   ❌ 无法获取权限: {e}\n"
+
+    result_text += f"\n💡 <b>常见问题：</b>\n"
+    result_text += f"• 如果机器人不在群组中，请手动添加\n"
+    result_text += f"• 如果机器人不是管理员，可能受群组限制\n"
+    result_text += f"• 群组设置了慢速模式可能延迟消息显示"
+
+    await message.answer(
+        result_text, parse_mode="HTML", reply_to_message_id=message.message_id
+    )
+
+
 # =========== 上下班罚款指令 ===========
 @admin_required
 @rate_limit(rate=3, per=30)
@@ -6898,6 +7096,9 @@ async def register_handlers():
     dp.message.register(cmd_addextraworkgroup, Command("addextraworkgroup"))
     dp.message.register(cmd_clearextraworkgroup, Command("clearextraworkgroup"))
     dp.message.register(cmd_showeverypush, Command("showeverypush"))
+    dp.message.register(cmd_checkdualsetup, Command("checkdual"))
+    dp.message.register(cmd_testgroupaccess, Command("testgroupaccess"))
+    dp.message.register(cmd_checkbotpermissions, Command("checkperms"))
 
     # 按钮处理器
     dp.message.register(
