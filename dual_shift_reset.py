@@ -35,9 +35,10 @@ async def handle_hard_reset(
     硬重置总调度入口 - 单班/双班分流
 
     返回值:
-        True  - 双班模式执行成功
-        False - 双班模式执行失败
-        None  - 单班模式，调用方应继续执行原有逻辑
+        True   - 双班模式执行成功
+        False  - 双班模式执行失败（真正的错误）
+        None   - 单班模式，调用方应继续执行原有逻辑
+        "waiting" - 双班模式等待执行（还没到时间）
     """
     try:
         # 1. 获取班次配置，判断模式
@@ -53,14 +54,22 @@ async def handle_hard_reset(
         logger.info(f"🔄 [双班模式] 群组 {chat_id} 执行双班硬重置")
 
         try:
-            success = await _dual_shift_hard_reset(chat_id, operator_id)
+            result = await _dual_shift_hard_reset(chat_id, operator_id)
 
-            if success:
+            # 处理不同的返回值
+            if result == "waiting":
+                logger.info(f"⏳ [双班硬重置] 群组 {chat_id} 等待执行时间")
+                return "waiting"  # 返回 waiting 状态
+            elif result is True:
                 logger.info(f"✅ [双班硬重置] 群组 {chat_id} 执行成功")
-            else:
+                return True
+            elif result is False:
                 logger.error(f"❌ [双班硬重置] 群组 {chat_id} 执行失败")
-
-            return success  # 返回实际执行结果
+                return False
+            else:
+                # 其他未知返回值，当作失败处理
+                logger.error(f"❌ [双班硬重置] 群组 {chat_id} 返回未知值: {result}")
+                return False
 
         except Exception as e:
             logger.error(f"❌ [双班硬重置] 群组 {chat_id} 异常: {e}")
@@ -109,13 +118,14 @@ async def _dual_shift_hard_reset(
         execute_time = reset_time_today + timedelta(hours=2)
         if now < execute_time:
             minutes_left = int((execute_time - now).total_seconds() / 60)
+            seconds_left = int((execute_time - now).total_seconds() % 60)
             logger.info(
                 f"⏳ [双班硬重置] 群组 {chat_id} 等待执行\n"
                 f"   • 当前时间: {now.strftime('%H:%M')}\n"
                 f"   • 执行时间: {execute_time.strftime('%H:%M')}\n"
                 f"   • 剩余时间: {minutes_left} 分钟"
             )
-            return False  # 还未到执行时间
+            return "waiting"  # 还未到执行时间
 
         logger.info(
             f"🚀 [双班硬重置] 开始执行\n"
