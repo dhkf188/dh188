@@ -1267,15 +1267,14 @@ class PostgreSQLDatabase:
         if row:
             result = dict(row)
             # 确保 shift 字段存在
-            if 'shift' not in result or result['shift'] is None:
-                result['shift'] = 'day'
+            if "shift" not in result or result["shift"] is None:
+                result["shift"] = "day"
                 logger.warning(f"用户 {user_id} 的 shift 字段为 None，使用默认值 'day'")
-            
+
             self._set_cached(cache_key, result, 30)  # 30秒缓存
             logger.debug(f"获取用户缓存: {user_id}, shift={result['shift']}")
             return result
         return None
-
 
     async def update_user_activity(
         self,
@@ -3646,41 +3645,58 @@ class PostgreSQLDatabase:
         day_end_dt = datetime.combine(today, day_end_time).replace(tzinfo=tz)
 
         # =============================
-        # activity 判定（修复版）
+        # 🎯 活动判定 - 修复版
         # =============================
         if checkin_type == "activity":
+            # 核心原则：活动跟随活跃班次，不依赖时间窗口
             if active_shift:
-                # 有活跃班次时，根据时间确定具体 detail
+                # 有活跃班次时，直接跟随
                 if active_shift == "day":
                     current_shift_detail = "day"
+                    logger.debug(
+                        f"📊 activity跟随白班: active_shift={active_shift}, "
+                        f"now={now.strftime('%H:%M')}"
+                    )
                 else:  # active_shift == "night"
-                    # 判断是昨晚夜班还是今晚夜班
+                    # 夜班时需要判断是昨晚还是今晚
                     if now >= day_end_dt:
                         current_shift_detail = "night_tonight"  # 今晚夜班
+                        logger.debug(
+                            f"📊 activity跟随夜班(今晚): active_shift={active_shift}, "
+                            f"now={now.strftime('%H:%M')} >= {day_end_dt.strftime('%H:%M')}"
+                        )
                     else:
                         current_shift_detail = "night_last"  # 昨晚夜班
+                        logger.debug(
+                            f"📊 activity跟随夜班(昨晚): active_shift={active_shift}, "
+                            f"now={now.strftime('%H:%M')} < {day_end_dt.strftime('%H:%M')}"
+                        )
             else:
-                # 无活跃班次时，使用时间区间判定
+                # 没有活跃班次时，使用时间区间判定
                 if day_start_dt <= now < day_end_dt:
                     current_shift_detail = "day"
+                    logger.debug(
+                        f"📊 activity无活跃班次，时间在白班区间: {now.strftime('%H:%M')}"
+                    )
                 elif now >= day_end_dt:
-                    current_shift_detail = "night_tonight"
+                    current_shift_detail = "night_tonight"  # 今晚夜班
+                    logger.debug(
+                        f"📊 activity无活跃班次，时间在夜班区间(今晚): {now.strftime('%H:%M')}"
+                    )
                 else:
-                    current_shift_detail = "night_last"
-
-            logger.debug(
-                f"📊 activity判定: active_shift={active_shift}, "
-                f"now={now.strftime('%H:%M')}, result={current_shift_detail}"
-            )
+                    current_shift_detail = "night_last"  # 昨晚夜班
+                    logger.debug(
+                        f"📊 activity无活跃班次，时间在夜班区间(昨晚): {now.strftime('%H:%M')}"
+                    )
 
             return {
                 "day_window": {},
                 "night_window": {},
-                "current_shift": current_shift_detail,  # 返回完整的 detail
+                "current_shift": current_shift_detail,
             }
 
         # =============================
-        # 以下是打卡窗口逻辑（保持不变）
+        # 打卡窗口逻辑（完全保持不变）
         # =============================
         grace_before = shift_config.get("grace_before", Config.DEFAULT_GRACE_BEFORE)
         grace_after = shift_config.get("grace_after", Config.DEFAULT_GRACE_AFTER)
@@ -3874,7 +3890,7 @@ class PostgreSQLDatabase:
         chat_id: int,
         current_time: Optional[datetime] = None,
         checkin_type: str = "work_start",
-        active_shift: Optional[str] = None,  # 活跃班次优先
+        active_shift: Optional[str] = None,
     ) -> Dict[str, object]:
         """
         工程级班次判定函数 - 所有地方都调用它
@@ -3909,12 +3925,19 @@ class PostgreSQLDatabase:
                 shift_config=shift_config,
                 checkin_type=checkin_type,
                 now=now,
-                active_shift=active_shift,  # 优先使用活跃班次
+                active_shift=active_shift,
             )
             or {}
         )
 
         current_shift_detail = window_info.get("current_shift")
+
+        # 🎯 活动判定的额外日志
+        if checkin_type == "activity":
+            logger.debug(
+                f"🎯 [活动班次判定] active_shift={active_shift}, "
+                f"时间={now.strftime('%H:%M')}, 结果={current_shift_detail}"
+            )
 
         # -------------------------
         # 永不返回 None
