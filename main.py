@@ -6762,6 +6762,14 @@ async def daily_reset_task():
                         if result is True:
                             global_cache.set(reset_flag_key, True, ttl=86400)
                             logger.info(f"✅ [双班重置] 群组 {chat_id} 执行成功")
+                        elif result == "waiting":  # ✅ 新增 waiting 状态
+                            logger.debug(f"⏳ [双班重置] 群组 {chat_id} 等待执行时间")
+                        elif result is False:
+                            logger.error(f"❌ [双班重置] 群组 {chat_id} 执行失败")
+                        else:  # None
+                            logger.warning(
+                                f"⚠️ [双班重置] 群组 {chat_id} 返回None，可能是单班模式？"
+                            )
 
                 else:
                     # 单班模式：检查是否到达重置时间
@@ -6778,10 +6786,13 @@ async def daily_reset_task():
 
                 # ========== 🎯 执行重置 ==========
                 if is_dual_mode:
-                    # 双班模式：调用 handle_hard_reset
+                    # 双班模式
                     result = await handle_hard_reset(chat_id, None)
                     if result is True:
+                        global_cache.set(reset_flag_key, True, ttl=86400)
                         logger.info(f"✅ [双班重置] 群组 {chat_id} 执行成功")
+                    elif result == "waiting":  # ✅ 新增
+                        logger.debug(f"⏳ [双班重置] 群组 {chat_id} 等待执行时间")
                     elif result is False:
                         logger.error(f"❌ [双班重置] 群组 {chat_id} 执行失败")
                     else:  # None
