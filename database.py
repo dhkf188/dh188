@@ -1249,14 +1249,16 @@ class PostgreSQLDatabase:
         if cached is not None:
             return cached
 
-        # 只查询需要的字段，避免 SELECT *
+        # ✅ 修复：添加 shift 字段
         row = await self.fetchrow_with_retry(
             "获取用户数据",
             """
             SELECT user_id, nickname, current_activity, activity_start_time, 
-                total_accumulated_time, total_activity_count, total_fines,
-                overtime_count, total_overtime_time, last_updated,checkin_message_id
-            FROM users WHERE chat_id = $1 AND user_id = $2
+                   total_accumulated_time, total_activity_count, total_fines,
+                   overtime_count, total_overtime_time, last_updated, 
+                   checkin_message_id, shift  -- ✅ 添加 shift 字段
+            FROM users 
+            WHERE chat_id = $1 AND user_id = $2
             """,
             chat_id,
             user_id,
@@ -1264,10 +1266,16 @@ class PostgreSQLDatabase:
 
         if row:
             result = dict(row)
-            # 用户数据变化频繁，设置较短缓存时间
+            # 确保 shift 字段存在
+            if 'shift' not in result or result['shift'] is None:
+                result['shift'] = 'day'
+                logger.warning(f"用户 {user_id} 的 shift 字段为 None，使用默认值 'day'")
+            
             self._set_cached(cache_key, result, 30)  # 30秒缓存
+            logger.debug(f"获取用户缓存: {user_id}, shift={result['shift']}")
             return result
         return None
+
 
     async def update_user_activity(
         self,
