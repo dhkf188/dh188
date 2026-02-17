@@ -3606,43 +3606,64 @@ class PostgreSQLDatabase:
         shift_config: Dict[str, Any],
         checkin_type: str = None,
         now: Optional[datetime] = None,
+        active_shift: Optional[str] = None,  # 🆕 新增
     ) -> Dict[str, Any]:
-        """
-        计算班次时间窗口并判定当前班次
-        支持：上班/下班独立的时间窗口配置
-        """
-        # 1. 初始化当前时间
+
         if now is None:
             now = self.get_beijing_time()
 
-        # 2. 基础返回结构
-        default_return = {"day_window": {}, "night_window": {}, "current_shift": None}
-
-        # 3. 获取基准日期和时区
         today = now.date()
         tz = now.tzinfo
 
-        # 4. 验证配置
+        default_return = {
+            "day_window": {},
+            "night_window": {},
+            "current_shift": None,
+        }
+
         if not shift_config:
-            logger.warning("shift_config 为空，返回默认窗口")
             return default_return
 
-        # 5. 解析配置中的时间点
         try:
-            day_start = shift_config.get("day_start", "09:00")
-            day_end = shift_config.get("day_end", "21:00")
+            day_start_time = datetime.strptime(
+                shift_config.get("day_start", "09:00"), "%H:%M"
+            ).time()
 
-            day_start_time = datetime.strptime(day_start, "%H:%M").time()
-            day_end_time = datetime.strptime(day_end, "%H:%M").time()
-        except (ValueError, TypeError) as e:
-            logger.error(f"解析班次时间失败: {e}")
+            day_end_time = datetime.strptime(
+                shift_config.get("day_end", "21:00"), "%H:%M"
+            ).time()
+
+        except Exception:
             return default_return
 
-        # 6. 转换成当天的完整 datetime 对象并对齐时区
         day_start_dt = datetime.combine(today, day_start_time).replace(tzinfo=tz)
         day_end_dt = datetime.combine(today, day_end_time).replace(tzinfo=tz)
 
-        # 7. 获取时间窗口配置（分离的上班/下班）
+        # =============================
+        # activity 判定（工程级版本）
+        # =============================
+        if checkin_type == "activity":
+
+            if active_shift:
+                current_shift = active_shift
+            else:
+                if day_start_dt <= now < day_end_dt:
+                    current_shift = "day"
+                elif now >= day_end_dt:
+                    current_shift = "night_tonight"
+                else:
+                    current_shift = "night_last"
+
+            return {
+                "day_window": {},
+                "night_window": {},
+                "current_shift": current_shift,
+            }
+
+        # =============================
+        # 以下是打卡窗口逻辑（保持你原结构）
+        # =============================
+
         grace_before = shift_config.get("grace_before", Config.DEFAULT_GRACE_BEFORE)
         grace_after = shift_config.get("grace_after", Config.DEFAULT_GRACE_AFTER)
         workend_grace_before = shift_config.get(
@@ -3652,19 +3673,14 @@ class PostgreSQLDatabase:
             "workend_grace_after", Config.DEFAULT_WORKEND_GRACE_AFTER
         )
 
-        # 8. 计算三个核心窗口（使用分离的配置）
         day_window = {
             "work_start": {
-                "start": day_start_dt
-                - timedelta(minutes=grace_before),  # 上班前（用上班前配置）
-                "end": day_start_dt
-                + timedelta(minutes=grace_after),  # 上班后（用上班后配置）
+                "start": day_start_dt - timedelta(minutes=grace_before),
+                "end": day_start_dt + timedelta(minutes=grace_after),
             },
             "work_end": {
-                "start": day_end_dt
-                - timedelta(minutes=workend_grace_before),  # 下班前（用下班前配置）
-                "end": day_end_dt
-                + timedelta(minutes=workend_grace_after),  # 下班后（用下班后配置）
+                "start": day_end_dt - timedelta(minutes=workend_grace_before),
+                "end": day_end_dt + timedelta(minutes=workend_grace_after),
             },
         }
 
@@ -3698,34 +3714,32 @@ class PostgreSQLDatabase:
             },
         }
 
-        # 9. 判定当前班次（保持不变）
         current_shift = None
-        if checkin_type in ["work_start", "work_end"]:
-            # 依次匹配
-            if (
-                day_window[checkin_type]["start"]
-                <= now
-                <= day_window[checkin_type]["end"]
-            ):
+
+        if checkin_type in ("work_start", "work_end"):
+            lookup = checkin_type
+
+            if day_window[lookup]["start"] <= now <= day_window[lookup]["end"]:
                 current_shift = "day"
+
             elif (
-                last_night_window[checkin_type]["start"]
+                last_night_window[lookup]["start"]
                 <= now
-                <= last_night_window[checkin_type]["end"]
+                <= last_night_window[lookup]["end"]
             ):
                 current_shift = "night_last"
+
             elif (
-                tonight_window[checkin_type]["start"]
-                <= now
-                <= tonight_window[checkin_type]["end"]
+                tonight_window[lookup]["start"] <= now <= tonight_window[lookup]["end"]
             ):
                 current_shift = "night_tonight"
-            # 下午提前打卡今晚夜班
-            elif checkin_type == "work_start":
+
+            elif lookup == "work_start":
                 afternoon_start = day_window["work_start"]["end"] + timedelta(minutes=1)
                 afternoon_end = tonight_window["work_start"]["start"] - timedelta(
                     minutes=1
                 )
+
                 if afternoon_start <= now <= afternoon_end:
                     current_shift = "night_tonight"
 
@@ -3846,10 +3860,12 @@ class PostgreSQLDatabase:
         chat_id: int,
         current_time: Optional[datetime] = None,
         checkin_type: str = "work_start",
+        active_shift: Optional[str] = None,  # 🆕 新增参数
     ) -> Optional[Dict[str, object]]:
         """
-        统一的班次判定函数 - 所有地方都调用它
-        返回: None 表示无法确定班次
+        统一的班次判定函数
+        - work_start/work_end: 使用窗口判定
+        - activity: 优先使用 active_shift，降级使用时间区间
         """
         now = current_time or self.get_beijing_time()
         shift_config = await self.get_shift_config(chat_id) or {}
@@ -3869,18 +3885,16 @@ class PostgreSQLDatabase:
             }
 
         # 双班模式 - 计算时间窗口
-        window_info = (
-            self.calculate_shift_window(
-                shift_config=shift_config,
-                checkin_type=checkin_type,
-                now=now,
-            )
-            or {}
-        )
+        window_info = self.calculate_shift_window(
+            shift_config=shift_config,
+            checkin_type=checkin_type,
+            now=now,
+            active_shift=active_shift,  # 🆕 传入活跃班次
+        ) or {}
 
         current_shift_detail = window_info.get("current_shift")
 
-        # ✅ 无法确定时返回 None
+        # 无法确定时返回 None
         if current_shift_detail is None:
             logger.debug(
                 f"⏳ 无法确定班次: chat_id={chat_id}, time={now.strftime('%H:%M')}, type={checkin_type}"
@@ -3909,6 +3923,7 @@ class PostgreSQLDatabase:
             "record_date": business_date,
             "is_dual": True,
         }
+
 
     # ========== 数据清理 ==========
     async def cleanup_old_data(self, days: int = 30):
