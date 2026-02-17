@@ -1483,7 +1483,7 @@ async def _process_back_locked(
     uid: int,
     shift: str = None,
 ):
-    """线程安全的回座逻辑 - 保留夜班跨天判定，使用活动开始时的原始班次"""
+    """线程安全的回座逻辑 - 使用活动开始时间判断跨天归属"""
     start_time = time.time()
     key = f"{chat_id}:{uid}"
 
@@ -1517,22 +1517,15 @@ async def _process_back_locked(
         nickname = user_data.get("nickname", "未知用户")
 
         # ========== 🎯 获取原始班次信息 ==========
-        # 用户数据中可能存储了完整的班次信息
         original_shift = user_data.get("shift", "day")
-        # 注意：如果数据库没有单独存储 shift_detail，就用 shift 代替
-        original_shift_detail = user_data.get("shift_detail", original_shift)
 
         # 如果有传入班次参数（从快速回座按钮），优先使用
         if shift:
             final_shift = shift
-            final_shift_detail = shift  # 快速回座按钮可能不包含 detail
             logger.info(f"📝 使用传入班次: {final_shift}")
         else:
             final_shift = original_shift
-            final_shift_detail = original_shift_detail
-            logger.info(
-                f"📝 使用用户原始班次: {final_shift}, detail: {final_shift_detail}"
-            )
+            logger.info(f"📝 使用用户原始班次: {final_shift}")
 
         # 获取双班模式状态
         is_dual = await db.is_dual_mode_enabled(chat_id)
@@ -1585,41 +1578,45 @@ async def _process_back_locked(
             logger.warning("时间解析失败，使用当前时间作为备用")
             start_time_dt = now
 
-        # ========== 🎯 计算 record_date（夜班跨天逻辑） ==========
+        # ========== 🎯 计算 record_date（夜班跨天逻辑）==========
         if is_dual and final_shift == "night":
-            # 夜班：使用班次判定规则计算记录日期
-            if final_shift_detail == "night_tonight":
-                # 今晚夜班：开始时间在当天，活动归到今天
-                forced_date = start_time_dt.date()
-            elif final_shift_detail == "night_last":
-                # 昨晚夜班：开始时间在昨天，活动归到昨天
-                forced_date = start_time_dt.date() - timedelta(days=1)
-            else:
-                # 没有 detail 信息时，根据开始时间判断
-                # 获取群组配置中的白班开始时间
-                shift_config = await db.get_shift_config(chat_id)
-                day_start_str = shift_config.get("day_start", "09:00")
-                day_start_hour, day_start_min = map(int, day_start_str.split(":"))
+            # 夜班：根据开始时间判断是昨晚还是今晚
+            # 获取群组配置中的白班开始时间
+            shift_config = await db.get_shift_config(chat_id)
+            day_start_str = shift_config.get("day_start", "09:00")
+            day_start_hour, day_start_min = map(int, day_start_str.split(":"))
 
-                # 构建当天的白班开始时间
-                day_start_dt = start_time_dt.replace(
-                    hour=day_start_hour, minute=day_start_min, second=0, microsecond=0
+            # 构建当天的白班开始时间
+            day_start_dt = start_time_dt.replace(
+                hour=day_start_hour, minute=day_start_min, second=0, microsecond=0
+            )
+
+            # 判断逻辑：如果开始时间 >= 白班开始时间，说明是今晚夜班
+            if start_time_dt >= day_start_dt:
+                forced_date = start_time_dt.date()  # 今天
+                shift_detail = "night_tonight"  # 仅用于日志
+                logger.info(
+                    f"🌙 今晚夜班，开始时间: {start_time_dt.strftime('%H:%M')} >= {day_start_str}"
                 )
-
-                # 如果开始时间 >= 白班开始时间，说明是今晚夜班
-                if start_time_dt >= day_start_dt:
-                    forced_date = start_time_dt.date()  # 今天
-                else:
-                    forced_date = start_time_dt.date() - timedelta(days=1)  # 昨天
+            else:
+                forced_date = start_time_dt.date() - timedelta(days=1)  # 昨天
+                shift_detail = "night_last"  # 仅用于日志
+                logger.info(
+                    f"🌙 昨晚夜班，开始时间: {start_time_dt.strftime('%H:%M')} < {day_start_str}"
+                )
         else:
             # 白班：直接使用开始日期
             forced_date = start_time_dt.date()
+            shift_detail = "day"  # 仅用于日志
+            logger.info(
+                f"☀️ 白班，开始时间: {start_time_dt.strftime('%Y-%m-%d %H:%M:%S')}"
+            )
 
         record_date = forced_date
 
         logger.info(
             f"📅 日期计算: 开始时间={start_time_dt.strftime('%Y-%m-%d %H:%M:%S')}, "
-            f"班次={final_shift}, detail={final_shift_detail}, "
+            f"班次={final_shift}, 归属={shift_detail}, "
             f"强制日期={forced_date}"
         )
 
@@ -1645,10 +1642,7 @@ async def _process_back_locked(
         activity_start_time_for_notification = activity_start_time_str
 
         # ========== 🎯 完成活动时传入完整信息 ==========
-        logger.info(
-            f"📝 完成活动 - 班次: {final_shift}, detail: {final_shift_detail}, "
-            f"强制日期: {forced_date}"
-        )
+        logger.info(f"📝 完成活动 - 班次: {final_shift}, " f"强制日期: {forced_date}")
         await db.complete_user_activity(
             chat_id,
             uid,
@@ -1789,7 +1783,7 @@ async def _process_back_locked(
         # 添加调试日志，确认日期归属
         logger.info(
             f"📊 [回座完成] 用户{uid} | 活动:{act} | "
-            f"班次:{final_shift} | detail:{final_shift_detail} | "
+            f"班次:{final_shift} | 归属:{shift_detail} | "
             f"强制日期:{forced_date} | record_date:{record_date} | "
             f"超时:{is_overtime} | 罚款:{fine_amount}"
         )
@@ -1803,15 +1797,15 @@ async def _process_back_locked(
     finally:
         # finally 清理打卡消息ID
         try:
-            await db.clear_user_checkin_message(chat_id, uid)
-            logger.info(f"🧹 finally 兜底清理用户 {uid} 的打卡消息ID")
+            # 检查是否已经清理过
+            current_message_id = await db.get_user_checkin_message_id(chat_id, uid)
+            if current_message_id:
+                await db.clear_user_checkin_message(chat_id, uid)
+                logger.info(f"🧹 finally 清理用户 {uid} 的打卡消息ID")
+            else:
+                logger.debug(f"用户 {uid} 的打卡消息ID已不存在，无需清理")
         except Exception as e:
-            logger.warning(f"⚠️ finally 兜底清理失败 chat_id={chat_id}, uid={uid}: {e}")
-
-        # 释放锁
-        active_back_processing.pop(key, None)
-        duration = round(time.time() - start_time, 2)
-        logger.info(f"回座结束 chat_id={chat_id}, uid={uid}，耗时 {duration}s")
+            logger.warning(f"⚠️ finally 清理失败 chat_id={chat_id}, uid={uid}: {e}")
 
 
 async def send_overtime_notification_async(
