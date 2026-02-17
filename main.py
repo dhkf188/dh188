@@ -1487,13 +1487,22 @@ async def _process_back_locked(
     start_time = time.time()
     key = f"{chat_id}:{uid}"
 
-    # 防重入检测
-    if active_back_processing.get(key):
-        await message.answer(
-            "⚠️ 您的回座请求正在处理中，请稍候。", reply_to_message_id=message.message_id
-        )
-        return
-    active_back_processing[key] = True
+    # ========== 🎯 优化1：带超时的防重入检测 ==========
+    if key in active_back_processing:
+        lock_time = active_back_processing.get(key)
+        # 如果是时间戳且超过30秒，强制释放（防止死锁）
+        if isinstance(lock_time, (int, float)) and time.time() - lock_time > 30:
+            logger.warning(f"⚠️ [回座] 强制释放过期锁: {key} (持有时间: {time.time()-lock_time:.1f}秒)")
+            active_back_processing.pop(key, None)
+        else:
+            await message.answer(
+                "⚠️ 您的回座请求正在处理中，请稍候。", 
+                reply_to_message_id=message.message_id
+            )
+            return
+    
+    # 存储时间戳而不是简单的True，便于超时判断
+    active_back_processing[key] = time.time()
 
     try:
         now = get_beijing_time()
@@ -1790,6 +1799,7 @@ async def _process_back_locked(
 
     except Exception as e:
         logger.error(f"回座处理异常: {e}")
+        logger.error(traceback.format_exc())  # 🎯 添加完整堆栈
         await message.answer(
             "❌ 回座失败，请稍后重试。", reply_to_message_id=message.message_id
         )
