@@ -1254,7 +1254,7 @@ async def activity_timer(
 
 # ========== 核心打卡功能 ==========
 async def start_activity(message: types.Message, act: str):
-    """开始活动 - 统一使用班次判定"""
+    """开始活动 - 工程级优化版"""
     chat_id = message.chat.id
     uid = message.from_user.id
 
@@ -1262,87 +1262,120 @@ async def start_activity(message: types.Message, act: str):
     async with user_lock:
         await reset_daily_data_if_needed(chat_id, uid)
 
-        # 快速检查活动是否存在
+        # -----------------------------
+        # 检查活动是否存在
+        # -----------------------------
         if not await db.activity_exists(act):
             await message.answer(
-                f"❌ 活动 '{act}' 不存在", reply_to_message_id=message.message_id
+                f"❌ 活动 '{act}' 不存在",
+                reply_to_message_id=message.message_id
             )
             return
 
-        # 开始活动逻辑
-        name = message.from_user.full_name
-        now = get_beijing_time()
-
-        # ================== 🎯 统一班次判定 ==================
-        shift_info = await db.determine_shift_for_time(
-            chat_id=chat_id,
-            current_time=now,
-            checkin_type="work_start",  # 活动跟随上班班次
-        )
-
-        # 如果无法确定班次，提示用户
-        if not shift_info:
-            await message.answer(
-                "❌ 当前时间不在任何班次的活动窗口内\n\n" "💡 请先开始班次或联系管理员",
-                reply_to_message_id=message.message_id,
-            )
-            return
-
-        # 获取班次信息
-        current_shift = shift_info["shift"]
-        shift_detail = shift_info["shift_detail"]
-        record_date = shift_info["record_date"]
-        is_dual = shift_info.get("is_dual", False)
-
-        logger.info(
-            f"🔄 开始活动班次判定: shift={current_shift}, "
-            f"detail={shift_detail}, record_date={record_date}, "
-            f"双班模式={is_dual}"
-        )
-
-        # ================== 检查活动限制 ==================
-        can_perform, reason = await can_perform_activities(
-            chat_id, uid, current_shift, record_date  # 传入 record_date
-        )
-        if not can_perform:
-            await message.answer(reason)
-            return
-
-        # ================== 活动人数限制 ==================
-        user_limit = await db.get_activity_user_limit(act)
-        if user_limit > 0:
-            current_users = await db.get_current_activity_users(chat_id, act)
-            if current_users >= user_limit:
-                await message.answer(
-                    f"❌ 打卡失败~ 活动 '<code>{act}</code>' 人数已满！\n\n"
-                    f"📊 当前状态：\n"
-                    f"• 限制人数：<code>{user_limit}</code> 人\n"
-                    f"• 当前进行：<code>{current_users}</code> 人\n"
-                    f"• 剩余名额：<code>0</code> 人\n\n"
-                    f"💡 请等待其他用户回座后再打卡进行此活动或选择其他活动",
-                    reply_markup=await get_main_keyboard(
-                        chat_id=chat_id,
-                        show_admin=await is_admin(uid),
-                    ),
-                    reply_to_message_id=message.message_id,
-                    parse_mode="HTML",
-                )
-                return
-
-        # ================== 是否已有进行中活动 ==================
+        # -----------------------------
+        # 快速检查：是否有进行中活动
+        # -----------------------------
         has_active, current_act = await has_active_activity(chat_id, uid)
         if has_active:
             await message.answer(
                 Config.MESSAGES["has_activity"].format(current_act),
                 reply_markup=await get_main_keyboard(
                     chat_id=chat_id,
-                    show_admin=await is_admin(uid),
+                    show_admin=await is_admin(uid)
                 ),
-                reply_to_message_id=message.message_id,
+                reply_to_message_id=message.message_id
             )
             return
 
-        # ================== 活动次数限制 ==================
+        # -----------------------------
+        # 获取用户信息和当前时间
+        # -----------------------------
+        name = message.from_user.full_name
+        now = get_beijing_time()
+
+        # -----------------------------
+        # 获取当前活跃班次状态（可选）
+        # -----------------------------
+        shift_state = await db.get_current_shift_state(chat_id)
+        active_shift = shift_state.get("current_shift") if shift_state else None
+
+        # -----------------------------
+        # 统一班次判定
+        # -----------------------------
+        shift_info = await db.determine_shift_for_time(
+            chat_id=chat_id,
+            current_time=now,
+            checkin_type="activity",  # 活动判定
+            active_shift=active_shift,  # 优先活跃班次
+        )
+
+        # fallback 永不返回 None
+        if not shift_info and active_shift:
+            shift_info = {
+                "shift": active_shift,
+                "shift_detail": active_shift,
+                "record_date": await db.get_business_date(
+                    chat_id, current_dt=now, shift=active_shift
+                ),
+                "is_dual": True,
+            }
+
+        if not shift_info:
+            await message.answer(
+                "❌ 当前时间无法确定班次\n💡 请先开始班次或联系管理员",
+                reply_to_message_id=message.message_id
+            )
+            return
+
+        # -----------------------------
+        # 提取班次信息
+        # -----------------------------
+        current_shift = shift_info["shift"]  # day / night
+        shift_detail = shift_info["shift_detail"]  # day / night_last / night_tonight
+        record_date = shift_info["record_date"]
+        is_dual = shift_info.get("is_dual", False)
+
+        logger.info(
+            f"🔄 开始活动班次判定: shift={current_shift}, "
+            f"detail={shift_detail}, record_date={record_date}, "
+            f"双班模式={is_dual}, active_shift={active_shift}, "
+            f"full_shift_info={shift_info}"
+        )
+
+        # -----------------------------
+        # 活动限制检查
+        # -----------------------------
+        can_perform, reason = await can_perform_activities(
+            chat_id, uid, current_shift, record_date
+        )
+        if not can_perform:
+            await message.answer(reason)
+            return
+
+        # -----------------------------
+        # 活动人数限制
+        # -----------------------------
+        user_limit = await db.get_activity_user_limit(act)
+        if user_limit > 0:
+            current_users = await db.get_current_activity_users(chat_id, act)
+            if current_users >= user_limit:
+                await message.answer(
+                    f"❌ 活动 '<code>{act}</code>' 人数已满！\n\n"
+                    f"📊 限制人数：<code>{user_limit}</code> 人\n"
+                    f"• 当前进行：<code>{current_users}</code> 人\n"
+                    f"• 剩余名额：<code>0</code> 人",
+                    reply_markup=await get_main_keyboard(
+                        chat_id=chat_id,
+                        show_admin=await is_admin(uid)
+                    ),
+                    reply_to_message_id=message.message_id,
+                    parse_mode="HTML"
+                )
+                return
+
+        # -----------------------------
+        # 活动次数限制
+        # -----------------------------
         can_start, current_count, max_times = await check_activity_limit_by_shift(
             chat_id, uid, act, current_shift
         )
@@ -1350,67 +1383,59 @@ async def start_activity(message: types.Message, act: str):
             shift_text = "白班" if current_shift == "day" else "夜班"
             await message.answer(
                 f"❌ {shift_text}的 '<code>{act}</code>' 次数已达上限\n\n"
-                f"📊 当前次数：<code>{current_count}</code> / <code>{max_times}</code>\n\n"
-                f"💡 可尝试切换班次或联系管理员",
+                f"📊 当前次数：<code>{current_count}</code> / <code>{max_times}</code>",
                 reply_markup=await get_main_keyboard(
                     chat_id=chat_id,
-                    show_admin=await is_admin(uid),
+                    show_admin=await is_admin(uid)
                 ),
                 reply_to_message_id=message.message_id,
-                parse_mode="HTML",
+                parse_mode="HTML"
             )
             return
 
-        # ================== 更新用户活动状态 ==================
+        # -----------------------------
+        # 更新用户活动状态
+        # -----------------------------
         await db.update_user_activity(chat_id, uid, act, str(now), name, current_shift)
 
-        # ================== 活动时长限制 ==================
+        # -----------------------------
+        # 活动时长限制 & 启动计时器
+        # -----------------------------
         time_limit = await db.get_activity_time_limit(act)
+        await timer_manager.start_timer(chat_id, uid, act, time_limit, shift=current_shift)
 
-        # ================== 启动计时器 ==================
-        await timer_manager.start_timer(
-            chat_id, uid, act, time_limit, shift=current_shift
-        )
-
-        # ================== 发送打卡消息 ==================
+        # -----------------------------
+        # 发送打卡消息
+        # -----------------------------
         sent_message = await message.answer(
             MessageFormatter.format_activity_message(
-                uid,
-                name,
-                act,
-                now.strftime("%m/%d %H:%M:%S"),
-                current_count + 1,
-                max_times,
-                time_limit,
-                current_shift,
+                uid, name, act, now.strftime("%m/%d %H:%M:%S"),
+                current_count + 1, max_times, time_limit, current_shift
             ),
             reply_markup=await get_main_keyboard(
                 chat_id=chat_id,
-                show_admin=await is_admin(uid),
+                show_admin=await is_admin(uid)
             ),
             reply_to_message_id=message.message_id,
-            parse_mode="HTML",
+            parse_mode="HTML"
         )
 
         # 保存打卡消息ID
         await db.update_user_checkin_message(chat_id, uid, sent_message.message_id)
 
-        # ================== 日志 ==================
+        # -----------------------------
+        # 日志
+        # -----------------------------
         shift_text = "白班" if current_shift == "day" else "夜班"
         logger.info(
             f"📝 用户 {uid} 开始活动 {act}（{shift_text}），消息ID: {sent_message.message_id}, "
             f"记录日期: {record_date}"
         )
 
-        # ================== 推送通知 ==================
+        # -----------------------------
+        # 🚨 推送通知（完整版）
+        # -----------------------------
         try:
-            chat_title = str(chat_id)
-            try:
-                chat_info = await bot.get_chat(chat_id)
-                chat_title = chat_info.title or chat_title
-            except Exception:
-                pass
-
             notification_text = None
 
             if act == "吃饭":
@@ -1419,7 +1444,7 @@ async def start_activity(message: types.Message, act: str):
                     f" {MessageFormatter.format_user_link(uid, name)} 去吃饭了\n"
                     f"⏰ 时间：<code>{now.strftime('%H:%M:%S')}</code>\n"
                 )
-            elif act in ["上班", "下班"]:
+            elif act in ["上班", "下班"]:  # ✅ 恢复这个分支
                 icon = "🟢" if act == "上班" else "🔴"
                 action_text = "已上班" if act == "上班" else "已下班"
                 notification_text = (
@@ -1428,7 +1453,7 @@ async def start_activity(message: types.Message, act: str):
                     f"⏰ 时间：<code>{now.strftime('%H:%M:%S')}</code>\n"
                 )
 
-            if notification_text:
+            if notification_text:  # ✅ 统一发送
                 asyncio.create_task(
                     notification_service.send_notification(chat_id, notification_text)
                 )
@@ -5545,10 +5570,12 @@ async def handle_admin_panel_button(message: types.Message):
         "├ <code>/resetuser [用户ID]</code>\n"
         "└ <code>/resettime</code>\n\n"
         "⏰ <b>上下班管理</b>\n"
+        "├ <code>/setdualmode on 9:00 21:00</code>\n"
         "├ <code>/setworktime [上] [下]</code>\n"
         "├ <code>/setshiftgrace</code>\n"
         "├ <code>/setworkendgrace</code>\n"
         "├ <code>/worktime</code>\n"
+        "├ <code>/checkdual</code>\n"
         "├ <code>/delwork</code>\n"
         "└ <code>/delwork_clear</code>\n\n"
         "📊 <b>数据管理</b>\n"
