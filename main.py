@@ -1480,7 +1480,7 @@ async def _process_back_locked(
     uid: int,
     shift: str = None,
 ):
-    """线程安全的回座逻辑 - 统一使用 determine_shift_for_time 判定班次和日期"""
+    """线程安全的回座逻辑 - 使用活动开始时的原始班次"""
     start_time = time.time()
     key = f"{chat_id}:{uid}"
 
@@ -1513,59 +1513,20 @@ async def _process_back_locked(
         activity_start_time_str = user_data["activity_start_time"]
         nickname = user_data.get("nickname", "未知用户")
 
-        # ✅ 修复1：统一使用 determine_shift_for_time 获取班次信息
-        if shift is None:
-            # 优先使用传入的班次，如果没有则通过班次判定获取
-            shift_info = await db.determine_shift_for_time(
-                chat_id=chat_id,
-                current_time=now,
-                checkin_type="work_end",  # 回座相当于下班
-            )
+        # ========== 🚨 核心修复：不要重新判定班次 ==========
+        # 获取用户开始活动时的原始班次
+        original_shift = user_data.get("shift", "day")
 
-            if shift_info:
-                shift = shift_info["shift"]
-                shift_detail = shift_info["shift_detail"]
-                record_date = shift_info["record_date"]
-                is_dual = shift_info.get("is_dual", False)
-                logger.info(
-                    f"📝 从班次判定获取: shift={shift}, detail={shift_detail}, record_date={record_date}"
-                )
-            else:
-                # 无法判定时使用用户数据中的班次
-                shift = user_data.get("shift", "day")
-                shift_detail = shift
-                is_dual = await db.is_dual_mode_enabled(chat_id)
-                # 无法确定记录日期时使用当前日期
-                record_date = now.date()
-                logger.info(f"📝 使用用户数据班次: {shift}")
+        # 如果有传入班次参数（从快速回座按钮），优先使用
+        if shift:
+            final_shift = shift
+            logger.info(f"📝 使用传入班次: {final_shift}")
         else:
-            # 有传入班次时，也尝试获取完整的班次信息
-            shift_info = await db.determine_shift_for_time(
-                chat_id=chat_id,
-                current_time=now,
-                checkin_type="work_end",
-            )
-            if shift_info:
-                shift_detail = shift_info["shift_detail"]
-                record_date = shift_info["record_date"]
-                is_dual = shift_info.get("is_dual", False)
-            else:
-                shift_detail = shift
-                record_date = now.date()
-                is_dual = await db.is_dual_mode_enabled(chat_id)
-            logger.info(f"📝 使用传入班次: {shift}, detail={shift_detail}")
+            final_shift = original_shift
+            logger.info(f"📝 使用用户原始班次: {final_shift}")
 
-        # ✅ 修复2：计算强制日期（使用班次判定结果）
-        forced_date = None
-
-        if is_dual and shift == "night":
-            # 夜班活动：使用班次判定返回的 record_date
-            forced_date = record_date
-            logger.info(f"📅 夜班活动使用记录日期: {forced_date}")
-        else:
-            # 白班活动使用今天
-            forced_date = now.date()
-            logger.info(f"📅 白班活动使用今天: {forced_date}")
+        # 获取双班模式状态
+        is_dual = await db.is_dual_mode_enabled(chat_id)
 
         # 获取打卡消息ID
         checkin_message_id = await db.get_user_checkin_message_id(chat_id, uid)
@@ -1615,8 +1576,16 @@ async def _process_back_locked(
             logger.warning("时间解析失败，使用当前时间作为备用")
             start_time_dt = now
 
+        # ========== 🚨 使用活动开始时间计算强制日期 ==========
+        forced_date = start_time_dt.date()
+        
+        logger.info(
+            f"📅 日期计算: 开始时间={start_time_dt.strftime('%Y-%m-%d %H:%M:%S')}, "
+            f"强制日期={forced_date}"
+        )
+
         # 计算经过时间
-        elapsed = (now - start_time_dt).total_seconds()
+        elapsed = int((now - start_time_dt).total_seconds())
 
         # 并行获取时间限制
         time_limit_task = asyncio.create_task(db.get_activity_time_limit(act))
@@ -1636,8 +1605,8 @@ async def _process_back_locked(
         time_str = now.strftime("%m/%d %H:%M:%S")
         activity_start_time_for_notification = activity_start_time_str
 
-        # ✅ 修复3：完成活动时传入正确的强制日期
-        logger.info(f"📝 完成活动 - 班次: {shift}, 强制日期: {forced_date}")
+        # ========== 🚨 完成活动时传入原始班次和强制日期 ==========
+        logger.info(f"📝 完成活动 - 班次: {final_shift}, 强制日期: {forced_date}")
         await db.complete_user_activity(
             chat_id,
             uid,
@@ -1645,8 +1614,8 @@ async def _process_back_locked(
             int(elapsed),
             fine_amount,
             is_overtime,
-            shift,
-            forced_date=forced_date,
+            final_shift,  # 使用最终确定的班次
+            forced_date=forced_date,  # 使用开始时的日期
         )
 
         # 取消计时器
@@ -1775,11 +1744,10 @@ async def _process_back_locked(
             except Exception as e:
                 logger.error(f"❌ 吃饭回座推送失败: {e}")
 
-        # ✅ 修复4：添加调试日志，确认日期归属
+        # 添加调试日志，确认日期归属
         logger.info(
             f"📊 [回座完成] 用户{uid} | 活动:{act} | "
-            f"班次:{shift} | 强制日期:{forced_date} | "
-            f"record_date:{record_date if 'record_date' in locals() else 'N/A'} | "
+            f"班次:{final_shift} | 强制日期:{forced_date} | "
             f"超时:{is_overtime} | 罚款:{fine_amount}"
         )
 
