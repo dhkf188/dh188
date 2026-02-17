@@ -18,6 +18,7 @@ import time
 import traceback
 from datetime import datetime, timedelta, date
 from typing import Dict, Optional, Any, List
+from performance import global_cache
 
 # 直接导入同级模块
 from database import db
@@ -77,15 +78,22 @@ async def _dual_shift_hard_reset(
     chat_id: int, operator_id: Optional[int] = None
 ) -> bool:
     """
-    双班硬重置主流程
+    双班硬重置主流程（带幂等性）
     在重置时间+2小时执行
     """
     try:
-        await db.init_group(chat_id)
         now = db.get_beijing_time()
         today = now.date()
         yesterday = today - timedelta(days=1)
 
+        # ==================== 幂等性检查 ====================
+        reset_flag_key = f"dual_reset_executed:{chat_id}:{today.strftime('%Y%m%d')}"
+        if global_cache.get(reset_flag_key):
+            logger.info(f"⏭️ 群组 {chat_id} 今天已完成双班重置，跳过")
+            return True
+
+        # 初始化群组数据
+        await db.init_group(chat_id)
         group_data = await db.get_group_cached(chat_id)
         if not group_data:
             logger.warning(f"⚠️ [双班硬重置] 群组 {chat_id} 没有配置数据，跳过重置")
@@ -97,10 +105,8 @@ async def _dual_shift_hard_reset(
             hour=reset_hour, minute=reset_minute, second=0, microsecond=0
         )
 
-        # ========== 计算执行时间（重置时间+2小时） ==========
+        # ==================== 计算执行时间（重置时间+2小时） ====================
         execute_time = reset_time_today + timedelta(hours=2)
-
-        # ✅ 修复：时间未到返回 False，让调用方继续等待
         if now < execute_time:
             minutes_left = int((execute_time - now).total_seconds() / 60)
             logger.info(
@@ -109,9 +115,8 @@ async def _dual_shift_hard_reset(
                 f"   • 执行时间: {execute_time.strftime('%H:%M')}\n"
                 f"   • 剩余时间: {minutes_left} 分钟"
             )
-            return False  # ✅ 返回 False，表示还没执行
+            return False  # 还未到执行时间
 
-        # ========== 开始执行重置 ==========
         logger.info(
             f"🚀 [双班硬重置] 开始执行\n"
             f"   ┌─────────────────────────────────\n"
@@ -126,19 +131,14 @@ async def _dual_shift_hard_reset(
 
         total_start_time = time.time()
 
-        # ========== 使用 asyncio.gather 并发执行步骤1-2 ==========
+        # ==================== 1-2 步骤并发执行 ====================
         logger.info(f"📊 [步骤1-2/5] 并发处理未完成活动及补全下班记录...")
-
-        # 创建并发任务
         task1 = asyncio.create_task(
             _force_end_all_unfinished_shifts(chat_id, now, yesterday)
         )
         task2 = asyncio.create_task(_complete_missing_work_ends(chat_id, yesterday))
-
-        # 并发执行
         results = await asyncio.gather(task1, task2, return_exceptions=True)
 
-        # 解析结果
         force_stats = (
             results[0]
             if not isinstance(results[0], Exception)
@@ -150,10 +150,9 @@ async def _dual_shift_hard_reset(
                 "night_shift": {"total": 0, "success": 0},
             }
         )
-
         if isinstance(results[0], Exception):
             logger.error(f"❌ [强制结束活动] 失败: {results[0]}")
-            logger.error(traceback.format_exc())  # 添加堆栈信息
+            logger.error(traceback.format_exc())
 
         complete_stats = (
             results[1]
@@ -166,12 +165,11 @@ async def _dual_shift_hard_reset(
                 "night_shift": {"total": 0, "success": 0},
             }
         )
-
         if isinstance(results[1], Exception):
             logger.error(f"❌ [补全下班记录] 失败: {results[1]}")
-            logger.error(traceback.format_exc())  # 添加堆栈信息
+            logger.error(traceback.format_exc())
 
-        # ========== 3. 导出昨天所有数据（使用并发重试） ==========
+        # ==================== 3. 导出昨天数据 ====================
         logger.info(f"📊 [步骤3/5] 导出昨天数据 (白班+夜班)...")
         export_start = time.time()
         try:
@@ -182,7 +180,7 @@ async def _dual_shift_hard_reset(
             export_success = False
         export_time = time.time() - export_start
 
-        # ========== 4. 清除昨天所有数据 ==========
+        # ==================== 4. 清理昨天数据 ====================
         logger.info(f"📊 [步骤4/5] 清除昨天数据...")
         cleanup_start = time.time()
         try:
@@ -198,14 +196,14 @@ async def _dual_shift_hard_reset(
             }
         cleanup_time = time.time() - cleanup_start
 
-        # ========== 5. 清除班次状态 ==========
+        # ==================== 5. 清除班次状态 ====================
         try:
             await db.clear_shift_state(chat_id)
-            logger.info(f"   ✅ 班次状态已清除")
+            logger.info(f"✅ 班次状态已清除")
         except Exception as e:
             logger.error(f"❌ [清除班次状态] 失败: {e}")
 
-        # ========== 异步发送通知（不阻塞主流程） ==========
+        # ==================== 异步通知 ====================
         try:
             asyncio.create_task(
                 _send_reset_notification(
@@ -220,34 +218,13 @@ async def _dual_shift_hard_reset(
         except Exception as e:
             logger.error(f"❌ [发送通知] 失败: {e}")
 
-        # ========== 最终汇总 ==========
-        total_time = time.time() - total_start_time
+        # ==================== 设置幂等标记 ====================
+        global_cache.set(reset_flag_key, True, ttl=86400)
+        logger.info(f"✅ [双班重置] 群组 {chat_id} 执行成功，已设置幂等标记")
 
-        logger.info(
-            f"🎉 [双班硬重置完成] 群组 {chat_id}\n"
-            f"   ┌─────────────────────────────────\n"
-            f"   ├─ 执行结果汇总:\n"
-            f"   │  ├─ 强制结束活动:\n"
-            f"   │  │  ├─ 总计: {force_stats.get('total', 0)} 人\n"
-            f"   │  │  ├─ 白班: {force_stats.get('day_shift', {}).get('total', 0)} 人\n"
-            f"   │  │  ├─ 夜班: {force_stats.get('night_shift', {}).get('total', 0)} 人\n"
-            f"   │  │  └─ 成功: {force_stats.get('success', 0)} 人\n"
-            f"   │  ├─ 补全下班记录:\n"
-            f"   │  │  ├─ 总计: {complete_stats.get('total', 0)} 人\n"
-            f"   │  │  ├─ 白班: {complete_stats.get('day_shift', {}).get('total', 0)} 人\n"
-            f"   │  │  ├─ 夜班: {complete_stats.get('night_shift', {}).get('total', 0)} 人\n"
-            f"   │  │  └─ 成功: {complete_stats.get('success', 0)} 人\n"
-            f"   │  ├─ 数据导出: {'✅成功' if export_success else '❌失败'}\n"
-            f"   │  ├─ 清理昨天数据: {cleanup_stats.get('user_activities', 0)} 条活动\n"
-            f"   │  ├─ 班次状态: ✅已清除\n"
-            f"   │  └─ 今天数据: ✅ 完整保留\n"
-            f"   ├─ 性能统计:\n"
-            f"   │  ├─ 强制结束+补全耗时: {(export_start - total_start_time):.2f}秒\n"
-            f"   │  ├─ 导出耗时: {export_time:.2f}秒\n"
-            f"   │  ├─ 清理耗时: {cleanup_time:.2f}秒\n"
-            f"   │  └─ 总耗时: {total_time:.2f}秒\n"
-            f"   └─ 完成时间: {db.get_beijing_time().strftime('%Y-%m-%d %H:%M:%S')}"
-        )
+        # ==================== 总耗时日志 ====================
+        total_time = time.time() - total_start_time
+        logger.info(f"🎉 [双班硬重置完成] 群组 {chat_id} 总耗时: {total_time:.2f}秒")
 
         return True
 
@@ -659,14 +636,21 @@ async def _complete_single_work_end(
 
 
 # ========== 5. 导出昨天数据（并发重试版） ==========
-async def _export_yesterday_data_concurrent(chat_id: int, yesterday: date) -> bool:
+async def _export_yesterday_data_concurrent(
+    chat_id: int, yesterday: date, from_monthly: bool = False
+) -> bool:
     """
-    导出昨天白班+夜班数据 - 使用并发重试机制
-    """
-    # 创建多个重试任务并发执行
-    retry_tasks = []
+    导出昨天白班+夜班数据
 
-    for attempt in range(3):  # 最多尝试3次
+    Args:
+        chat_id: 群组ID
+        yesterday: 昨天日期
+        from_monthly: True=从月度表导出, False=从日常表导出
+    """
+    retry_tasks = []
+    source = "月度表" if from_monthly else "日常表"
+
+    for attempt in range(3):
         file_name = f"dual_shift_backup_{chat_id}_{yesterday.strftime('%Y%m%d')}_v{attempt+1}.csv"
 
         task = asyncio.create_task(
@@ -675,27 +659,24 @@ async def _export_yesterday_data_concurrent(chat_id: int, yesterday: date) -> bo
                 target_date=yesterday,
                 file_name=file_name,
                 is_daily_reset=True,
-                from_monthly_table=False,
+                from_monthly_table=from_monthly,  # ✅ 使用传入的参数
             )
         )
         retry_tasks.append(task)
 
-        # 每次尝试间隔2秒
         if attempt < 2:
             await asyncio.sleep(2)
 
-    # 并发执行所有重试任务
     results = await asyncio.gather(*retry_tasks, return_exceptions=True)
 
-    # 检查是否至少有一个成功
     for i, result in enumerate(results):
         if result is True:
-            logger.info(f"✅ [数据导出] 群组{chat_id} 第 {i+1} 次尝试成功")
+            logger.info(f"✅ [数据导出] 群组{chat_id} 第 {i+1} 次尝试成功 (从{source})")
             return True
         elif isinstance(result, Exception):
             logger.warning(f"⚠️ [数据导出] 第 {i+1} 次尝试失败: {result}")
 
-    logger.error(f"❌ [数据导出] 所有3次尝试均失败")
+    logger.error(f"❌ [数据导出] 群组{chat_id} 所有3次尝试均失败")
     return False
 
 

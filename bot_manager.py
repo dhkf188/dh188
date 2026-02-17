@@ -106,24 +106,6 @@ class RobustBotManager:
             except Exception as e:
                 error_msg = str(e).lower()
 
-                # 🎯 新增：检查是否是"无法发起对话"错误
-                if any(
-                    keyword in error_msg
-                    for keyword in [
-                        "can't initiate conversation",
-                        "bot can't initiate conversation",
-                        "cannot start a conversation",
-                        "bot can't start conversation",
-                        "bot can't send messages",
-                        "forbidden: bot can't initiate",
-                        "forbidden: bot can't send messages to this user",
-                    ]
-                ):
-                    logger.debug(
-                        f"📤 无法向用户 {chat_id} 发起私聊对话（用户未与机器人对话）"
-                    )
-                    return True  # 🎯 改为返回True，表示这不是一个错误，只是正常情况
-
                 # 网络相关错误 - 重试
                 if any(
                     keyword in error_msg
@@ -162,9 +144,6 @@ class RobustBotManager:
                         "chat not found",
                         "bot was blocked",
                         "user is deactivated",
-                        "not enough rights",
-                        "need administrator rights",
-                        "group chat was upgraded to a supergroup",
                     ]
                 ):
                     logger.warning(f"📤 发送消息失败(权限问题): {e}")
@@ -227,21 +206,6 @@ class RobustBotManager:
 
         return False
 
-    async def get_chat_with_retry(self, chat_id: int, **kwargs):
-        """带重试的获取聊天信息"""
-        max_attempts = 2
-
-        for attempt in range(1, max_attempts + 1):
-            try:
-                return await self.bot.get_chat(chat_id, **kwargs)
-            except Exception as e:
-                if attempt == max_attempts:
-                    logger.error(f"获取聊天信息重试{max_attempts}次后失败: {e}")
-                    raise
-
-                logger.warning(f"获取聊天信息失败，{attempt}秒后重试: {e}")
-                await asyncio.sleep(attempt)
-
     def is_healthy(self) -> bool:
         """检查Bot健康状态"""
         if not self._last_successful_connection:
@@ -275,45 +239,6 @@ class RobustBotManager:
             except Exception as e:
                 logger.error(f"健康监控异常: {e}")
                 await asyncio.sleep(30)
-
-    async def send_message_with_retry_emergency(
-        self, chat_id: int, text: str, **kwargs
-    ) -> bool:
-        """紧急消息发送 - 超时缩短"""
-        max_attempts = 2  # 减少重试次数
-        base_delay = 1
-
-        for attempt in range(1, max_attempts + 1):
-            try:
-                # 设置短超时
-                async with asyncio.timeout(10):  # 10秒超时
-                    await self.bot.send_message(chat_id, text, **kwargs)
-                return True
-            except asyncio.TimeoutError:
-                logger.warning(f"📤 发送消息超时 (尝试 {attempt}/{max_attempts})")
-                if attempt == max_attempts:
-                    return False
-            except Exception as e:
-                error_msg = str(e).lower()
-
-                # 只重试网络错误
-                if any(
-                    keyword in error_msg
-                    for keyword in ["timeout", "connection", "network"]
-                ):
-                    if attempt == max_attempts:
-                        logger.error(f"📤 发送消息重试{max_attempts}次后失败: {e}")
-                        return False
-
-                    delay = base_delay * attempt
-                    await asyncio.sleep(delay)
-                    continue
-                else:
-                    # 其他错误不重试
-                    logger.warning(f"📤 发送消息失败(不重试): {e}")
-                    return False
-
-        return False
 
 
 # 全局Bot管理器实例

@@ -1492,15 +1492,17 @@ async def _process_back_locked(
         lock_time = active_back_processing.get(key)
         # 如果是时间戳且超过30秒，强制释放（防止死锁）
         if isinstance(lock_time, (int, float)) and time.time() - lock_time > 30:
-            logger.warning(f"⚠️ [回座] 强制释放过期锁: {key} (持有时间: {time.time()-lock_time:.1f}秒)")
+            logger.warning(
+                f"⚠️ [回座] 强制释放过期锁: {key} (持有时间: {time.time()-lock_time:.1f}秒)"
+            )
             active_back_processing.pop(key, None)
         else:
             await message.answer(
-                "⚠️ 您的回座请求正在处理中，请稍候。", 
-                reply_to_message_id=message.message_id
+                "⚠️ 您的回座请求正在处理中，请稍候。",
+                reply_to_message_id=message.message_id,
             )
             return
-    
+
     # 存储时间戳而不是简单的True，便于超时判断
     active_back_processing[key] = time.time()
 
@@ -1811,7 +1813,7 @@ async def _process_back_locked(
             logger.info(f"✅ [回座锁释放] key={key}")
         else:
             logger.warning(f"⚠️ [回座锁释放] key={key} 已不存在")
-        
+
         # finally 清理打卡消息ID
         try:
             # 检查是否已经清理过
@@ -1823,11 +1825,10 @@ async def _process_back_locked(
                 logger.debug(f"用户 {uid} 的打卡消息ID已不存在，无需清理")
         except Exception as e:
             logger.warning(f"⚠️ finally 清理失败 chat_id={chat_id}, uid={uid}: {e}")
-        
+
         # 总耗时日志
         duration = round(time.time() - start_time, 2)
         logger.info(f"✅ [回座结束] key={key}，总耗时 {duration}s")
-
 
 
 async def send_overtime_notification_async(
@@ -6731,17 +6732,37 @@ async def daily_reset_task():
                 should_execute = False
                 mode_info = ""
 
+                # 在 daily_reset_task 函数中
+
                 if is_dual_mode:
                     # 双班模式：检查是否到达 "重置时间+2小时"
                     execute_time = reset_time_today + timedelta(hours=2)
-                    if (
-                        now.hour == execute_time.hour
-                        and now.minute == execute_time.minute
-                    ):
+
+                    # ✅ 修复：使用5分钟窗口，避免错过
+                    time_diff = abs((now - execute_time).total_seconds())
+                    if time_diff <= 300:  # 5分钟窗口
                         should_execute = True
                         mode_info = (
                             f"双班模式(执行时间:{execute_time.strftime('%H:%M')})"
                         )
+
+                        # ✅ 添加幂等性检查
+                        reset_flag_key = (
+                            f"dual_reset:{chat_id}:{now.strftime('%Y%m%d')}"
+                        )
+                        if global_cache.get(reset_flag_key):
+                            logger.debug(f"⏭️ 群组 {chat_id} 今天已执行双班重置")
+                            return
+
+                        logger.info(f"🔄 [{mode_info}] 群组 {chat_id} 开始执行重置")
+
+                        # 执行双班重置
+                        result = await handle_hard_reset(chat_id, None)
+
+                        if result is True:
+                            global_cache.set(reset_flag_key, True, ttl=86400)
+                            logger.info(f"✅ [双班重置] 群组 {chat_id} 执行成功")
+
                 else:
                     # 单班模式：检查是否到达重置时间
                     if now.hour == reset_hour and now.minute == reset_minute:
