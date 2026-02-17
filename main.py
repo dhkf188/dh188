@@ -1795,6 +1795,13 @@ async def _process_back_locked(
         )
 
     finally:
+        # ========== 🎯 必须释放防重入锁 ==========
+        if key in active_back_processing:
+            active_back_processing.pop(key, None)
+            logger.info(f"✅ [回座锁释放] key={key}")
+        else:
+            logger.warning(f"⚠️ [回座锁释放] key={key} 已不存在")
+        
         # finally 清理打卡消息ID
         try:
             # 检查是否已经清理过
@@ -1806,6 +1813,11 @@ async def _process_back_locked(
                 logger.debug(f"用户 {uid} 的打卡消息ID已不存在，无需清理")
         except Exception as e:
             logger.warning(f"⚠️ finally 清理失败 chat_id={chat_id}, uid={uid}: {e}")
+        
+        # 总耗时日志
+        duration = round(time.time() - start_time, 2)
+        logger.info(f"✅ [回座结束] key={key}，总耗时 {duration}s")
+
 
 
 async def send_overtime_notification_async(
@@ -5555,7 +5567,7 @@ async def handle_admin_panel_button(message: types.Message):
         "├ <code>/setgroup [ID]</code>\n"
         "├ <code>/addextraworkgroup [ID]</code> - 添加上下班额外推送群组\n"
         "├ <code>/setpush [目标] [开关]</code>\n"
-        "├ <code>/showpush</code>\n"
+        "├ <code>/showeverypush</code>\n"
         "│ 目标: ch|gr|ad\n"
         "│ 开关: on|off\n\n"
         "🎯 <b>活动管理</b>\n"
