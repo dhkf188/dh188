@@ -1267,8 +1267,7 @@ async def start_activity(message: types.Message, act: str):
         # -----------------------------
         if not await db.activity_exists(act):
             await message.answer(
-                f"❌ 活动 '{act}' 不存在",
-                reply_to_message_id=message.message_id
+                f"❌ 活动 '{act}' 不存在", reply_to_message_id=message.message_id
             )
             return
 
@@ -1280,10 +1279,9 @@ async def start_activity(message: types.Message, act: str):
             await message.answer(
                 Config.MESSAGES["has_activity"].format(current_act),
                 reply_markup=await get_main_keyboard(
-                    chat_id=chat_id,
-                    show_admin=await is_admin(uid)
+                    chat_id=chat_id, show_admin=await is_admin(uid)
                 ),
-                reply_to_message_id=message.message_id
+                reply_to_message_id=message.message_id,
             )
             return
 
@@ -1323,7 +1321,7 @@ async def start_activity(message: types.Message, act: str):
         if not shift_info:
             await message.answer(
                 "❌ 当前时间无法确定班次\n💡 请先开始班次或联系管理员",
-                reply_to_message_id=message.message_id
+                reply_to_message_id=message.message_id,
             )
             return
 
@@ -1365,11 +1363,10 @@ async def start_activity(message: types.Message, act: str):
                     f"• 当前进行：<code>{current_users}</code> 人\n"
                     f"• 剩余名额：<code>0</code> 人",
                     reply_markup=await get_main_keyboard(
-                        chat_id=chat_id,
-                        show_admin=await is_admin(uid)
+                        chat_id=chat_id, show_admin=await is_admin(uid)
                     ),
                     reply_to_message_id=message.message_id,
-                    parse_mode="HTML"
+                    parse_mode="HTML",
                 )
                 return
 
@@ -1385,11 +1382,10 @@ async def start_activity(message: types.Message, act: str):
                 f"❌ {shift_text}的 '<code>{act}</code>' 次数已达上限\n\n"
                 f"📊 当前次数：<code>{current_count}</code> / <code>{max_times}</code>",
                 reply_markup=await get_main_keyboard(
-                    chat_id=chat_id,
-                    show_admin=await is_admin(uid)
+                    chat_id=chat_id, show_admin=await is_admin(uid)
                 ),
                 reply_to_message_id=message.message_id,
-                parse_mode="HTML"
+                parse_mode="HTML",
             )
             return
 
@@ -1402,22 +1398,29 @@ async def start_activity(message: types.Message, act: str):
         # 活动时长限制 & 启动计时器
         # -----------------------------
         time_limit = await db.get_activity_time_limit(act)
-        await timer_manager.start_timer(chat_id, uid, act, time_limit, shift=current_shift)
+        await timer_manager.start_timer(
+            chat_id, uid, act, time_limit, shift=current_shift
+        )
 
         # -----------------------------
         # 发送打卡消息
         # -----------------------------
         sent_message = await message.answer(
             MessageFormatter.format_activity_message(
-                uid, name, act, now.strftime("%m/%d %H:%M:%S"),
-                current_count + 1, max_times, time_limit, current_shift
+                uid,
+                name,
+                act,
+                now.strftime("%m/%d %H:%M:%S"),
+                current_count + 1,
+                max_times,
+                time_limit,
+                current_shift,
             ),
             reply_markup=await get_main_keyboard(
-                chat_id=chat_id,
-                show_admin=await is_admin(uid)
+                chat_id=chat_id, show_admin=await is_admin(uid)
             ),
             reply_to_message_id=message.message_id,
-            parse_mode="HTML"
+            parse_mode="HTML",
         )
 
         # 保存打卡消息ID
@@ -1480,7 +1483,7 @@ async def _process_back_locked(
     uid: int,
     shift: str = None,
 ):
-    """线程安全的回座逻辑 - 使用活动开始时的原始班次"""
+    """线程安全的回座逻辑 - 保留夜班跨天判定，使用活动开始时的原始班次"""
     start_time = time.time()
     key = f"{chat_id}:{uid}"
 
@@ -1513,17 +1516,23 @@ async def _process_back_locked(
         activity_start_time_str = user_data["activity_start_time"]
         nickname = user_data.get("nickname", "未知用户")
 
-        # ========== 🚨 核心修复：不要重新判定班次 ==========
-        # 获取用户开始活动时的原始班次
+        # ========== 🎯 获取原始班次信息 ==========
+        # 用户数据中可能存储了完整的班次信息
         original_shift = user_data.get("shift", "day")
+        # 注意：如果数据库没有单独存储 shift_detail，就用 shift 代替
+        original_shift_detail = user_data.get("shift_detail", original_shift)
 
         # 如果有传入班次参数（从快速回座按钮），优先使用
         if shift:
             final_shift = shift
+            final_shift_detail = shift  # 快速回座按钮可能不包含 detail
             logger.info(f"📝 使用传入班次: {final_shift}")
         else:
             final_shift = original_shift
-            logger.info(f"📝 使用用户原始班次: {final_shift}")
+            final_shift_detail = original_shift_detail
+            logger.info(
+                f"📝 使用用户原始班次: {final_shift}, detail: {final_shift_detail}"
+            )
 
         # 获取双班模式状态
         is_dual = await db.is_dual_mode_enabled(chat_id)
@@ -1576,11 +1585,41 @@ async def _process_back_locked(
             logger.warning("时间解析失败，使用当前时间作为备用")
             start_time_dt = now
 
-        # ========== 🚨 使用活动开始时间计算强制日期 ==========
-        forced_date = start_time_dt.date()
-        
+        # ========== 🎯 计算 record_date（夜班跨天逻辑） ==========
+        if is_dual and final_shift == "night":
+            # 夜班：使用班次判定规则计算记录日期
+            if final_shift_detail == "night_tonight":
+                # 今晚夜班：开始时间在当天，活动归到今天
+                forced_date = start_time_dt.date()
+            elif final_shift_detail == "night_last":
+                # 昨晚夜班：开始时间在昨天，活动归到昨天
+                forced_date = start_time_dt.date() - timedelta(days=1)
+            else:
+                # 没有 detail 信息时，根据开始时间判断
+                # 获取群组配置中的白班开始时间
+                shift_config = await db.get_shift_config(chat_id)
+                day_start_str = shift_config.get("day_start", "09:00")
+                day_start_hour, day_start_min = map(int, day_start_str.split(":"))
+
+                # 构建当天的白班开始时间
+                day_start_dt = start_time_dt.replace(
+                    hour=day_start_hour, minute=day_start_min, second=0, microsecond=0
+                )
+
+                # 如果开始时间 >= 白班开始时间，说明是今晚夜班
+                if start_time_dt >= day_start_dt:
+                    forced_date = start_time_dt.date()  # 今天
+                else:
+                    forced_date = start_time_dt.date() - timedelta(days=1)  # 昨天
+        else:
+            # 白班：直接使用开始日期
+            forced_date = start_time_dt.date()
+
+        record_date = forced_date
+
         logger.info(
             f"📅 日期计算: 开始时间={start_time_dt.strftime('%Y-%m-%d %H:%M:%S')}, "
+            f"班次={final_shift}, detail={final_shift_detail}, "
             f"强制日期={forced_date}"
         )
 
@@ -1605,8 +1644,11 @@ async def _process_back_locked(
         time_str = now.strftime("%m/%d %H:%M:%S")
         activity_start_time_for_notification = activity_start_time_str
 
-        # ========== 🚨 完成活动时传入原始班次和强制日期 ==========
-        logger.info(f"📝 完成活动 - 班次: {final_shift}, 强制日期: {forced_date}")
+        # ========== 🎯 完成活动时传入完整信息 ==========
+        logger.info(
+            f"📝 完成活动 - 班次: {final_shift}, detail: {final_shift_detail}, "
+            f"强制日期: {forced_date}"
+        )
         await db.complete_user_activity(
             chat_id,
             uid,
@@ -1615,7 +1657,7 @@ async def _process_back_locked(
             fine_amount,
             is_overtime,
             final_shift,  # 使用最终确定的班次
-            forced_date=forced_date,  # 使用开始时的日期
+            forced_date=forced_date,  # 使用计算后的日期
         )
 
         # 取消计时器
@@ -1747,7 +1789,8 @@ async def _process_back_locked(
         # 添加调试日志，确认日期归属
         logger.info(
             f"📊 [回座完成] 用户{uid} | 活动:{act} | "
-            f"班次:{final_shift} | 强制日期:{forced_date} | "
+            f"班次:{final_shift} | detail:{final_shift_detail} | "
+            f"强制日期:{forced_date} | record_date:{record_date} | "
             f"超时:{is_overtime} | 罚款:{fine_amount}"
         )
 
