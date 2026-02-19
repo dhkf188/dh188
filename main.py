@@ -2583,6 +2583,248 @@ async def process_work_checkin(message: types.Message, checkin_type: str):
                     activity_auto_ended = True
                     logger.info(f"[{trace_id}] 🔄 已自动结束活动：{current_activity}")
 
+        # ========== 2. 下班打卡 ==========
+        elif checkin_type == "work_end":
+            # 班次有效性检查
+            if is_dual_mode and shift_detail is None:
+                await message.answer(
+                    f"❌ 当前时间不在任何班次的{action_text}窗口内",
+                    reply_to_message_id=message.message_id,
+                    reply_markup=await get_main_keyboard(chat_id, await is_admin_task),
+                )
+                return
+
+            # 🎯 检查重复下班
+            has_record = await _check_shift_work_record(
+                chat_id,
+                uid,
+                "work_end",
+                shift,
+                record_date,
+            )
+            if has_record:
+                existing_record = await _get_existing_work_record(
+                    chat_id,
+                    uid,
+                    "work_end",
+                    shift,
+                    record_date,
+                )
+                if existing_record:
+                    existing_time = existing_record.get("checkin_time", "未知时间")
+                    existing_status = existing_record.get("status", "未知状态")
+                    existing_created = existing_record.get("created_at")
+                    created_str = (
+                        existing_created.strftime("%m/%d %H:%M")
+                        if existing_created
+                        else "未知"
+                    )
+
+                    await message.answer(
+                        f"🚫 您本班次已经打过{action_text}卡了！\n\n"
+                        f"📊 <b>已有记录详情：</b>\n"
+                        f"    • 打卡时间：<code>{existing_time}</code>\n"
+                        f"    • 打卡状态：{existing_status}\n"
+                        f"    • 班次类型：<code>{shift_text}</code>\n"
+                        f"    • 记录时间：<code>{created_str}</code>",
+                        parse_mode="HTML",
+                        reply_to_message_id=message.message_id,
+                        reply_markup=await get_main_keyboard(
+                            chat_id, await is_admin_task
+                        ),
+                    )
+                else:
+                    await message.answer(
+                        f"❌ 您本班次已经打过{action_text}卡！",
+                        reply_to_message_id=message.message_id,
+                        reply_markup=await get_main_keyboard(
+                            chat_id, await is_admin_task
+                        ),
+                    )
+                logger.info(f"[{trace_id}] ⚠️ 用户本班次重复{action_text}")
+                return
+
+            # 🎯 检查是否已打上班卡 - 支持跨天夜班
+            has_work_start = await _check_shift_work_record(
+                chat_id,
+                uid,
+                "work_start",
+                shift,
+                record_date,
+            )
+
+            # ===== ⭐ 修复1：夜班特殊处理 - 检查昨天是否有上班记录 =====
+            original_record_date = record_date  # 保存原始日期用于日志
+            if not has_work_start and shift == "night":
+                # 夜班：可能是昨晚的夜班还没打卡，尝试查昨天的记录
+                yesterday = record_date - timedelta(days=1)
+                has_work_start_yesterday = await _check_shift_work_record(
+                    chat_id,
+                    uid,
+                    "work_start",
+                    shift,
+                    yesterday,
+                )
+                if has_work_start_yesterday:
+                    # 如果是昨晚的夜班，更新 record_date 为昨天
+                    record_date = yesterday
+                    has_work_start = True
+                    logger.info(
+                        f"[{trace_id}] 🌙 检测到昨晚夜班上班记录，使用昨天日期: {yesterday}"
+                    )
+                else:
+                    shift_text = "白班" if shift == "day" else "夜班"
+                    await message.answer(
+                        f"❌ 您本班次还没有打上班卡，无法打{action_text}卡！\n"
+                        f"💡 请先打{shift_text}上班卡",
+                        reply_to_message_id=message.message_id,
+                        reply_markup=await get_main_keyboard(
+                            chat_id, await is_admin_task
+                        ),
+                    )
+                    logger.warning(f"[{trace_id}] ⚠️ 用户试图{action_text}打卡但未上班")
+                    return
+            elif not has_work_start:
+                shift_text = "白班" if shift == "day" else "夜班"
+                await message.answer(
+                    f"❌ 您本班次还没有打上班卡，无法打{action_text}卡！\n"
+                    f"💡 请先打{shift_text}上班卡",
+                    reply_to_message_id=message.message_id,
+                    reply_markup=await get_main_keyboard(chat_id, await is_admin_task),
+                )
+                logger.warning(f"[{trace_id}] ⚠️ 用户试图{action_text}打卡但未上班")
+                return
+
+            # ========== 🎯 计算早退/罚款 ==========
+            if shift_detail in ["night_last", "night_tonight"] or shift == "night":
+                # 夜班：下班时间是第二天早上（白班开始时间）
+                expected_time = work_hours["work_start"]
+                # 夜班下班总是在第二天
+                expected_date = record_date + timedelta(days=1)
+
+                # ===== ⭐ 修复2：时间合理性检查 =====
+                # 获取白班开始时间
+                day_start = shift_config.get("day_start", "09:00")
+                day_start_hour, day_start_min = map(int, day_start.split(":"))
+                day_start_dt = now.replace(
+                    hour=day_start_hour, minute=day_start_min, second=0, microsecond=0
+                )
+
+                # 如果是早上（小于白班开始时间+4小时），且record_date是今天
+                if (
+                    now < day_start_dt + timedelta(hours=4)
+                    and original_record_date == now.date()
+                ):
+                    # 检查今天是否有夜班上班记录
+                    has_today_start = await _check_shift_work_record(
+                        chat_id,
+                        uid,
+                        "work_start",
+                        shift,
+                        now.date(),
+                    )
+
+                    if not has_today_start:
+                        # 没有今天的夜班上班记录，说明是在打昨晚的夜班下班
+                        logger.info(f"[{trace_id}] 🌙 早上打夜班下班，自动归到昨天")
+                        record_date = now.date() - timedelta(days=1)
+                        expected_date = record_date + timedelta(days=1)
+
+                        # 重新获取expected_dt
+                        expected_hour, expected_minute = map(
+                            int, expected_time.split(":")
+                        )
+                        expected_dt = datetime.combine(
+                            expected_date, dt_time(expected_hour, expected_minute)
+                        ).replace(tzinfo=now.tzinfo)
+
+                        time_diff_seconds = int((now - expected_dt).total_seconds())
+                        time_diff_minutes = time_diff_seconds / 60
+
+                        logger.info(
+                            f"🌙 夜班下班(修正后): 期望时间={expected_time}, "
+                            f"期望日期={expected_date}, 时间差={time_diff_minutes:.1f}分钟"
+                        )
+                    else:
+                        # 有今天的夜班上班记录，说明是今晚夜班
+                        logger.info(
+                            f"[{trace_id}] 🌙 检测到今晚夜班上班记录，使用今天日期"
+                        )
+                        record_date = now.date()
+                        expected_date = record_date + timedelta(days=1)
+
+                        expected_hour, expected_minute = map(
+                            int, expected_time.split(":")
+                        )
+                        expected_dt = datetime.combine(
+                            expected_date, dt_time(expected_hour, expected_minute)
+                        ).replace(tzinfo=now.tzinfo)
+
+                        time_diff_seconds = int((now - expected_dt).total_seconds())
+                        time_diff_minutes = time_diff_seconds / 60
+                else:
+                    # 正常情况
+                    expected_hour, expected_minute = map(int, expected_time.split(":"))
+                    expected_dt = datetime.combine(
+                        expected_date, dt_time(expected_hour, expected_minute)
+                    ).replace(tzinfo=now.tzinfo)
+
+                    time_diff_seconds = int((now - expected_dt).total_seconds())
+                    time_diff_minutes = time_diff_seconds / 60
+
+                logger.info(
+                    f"🌙 夜班下班: 期望时间={expected_time}, "
+                    f"期望日期={expected_date}, 时间差={time_diff_minutes:.1f}分钟"
+                )
+            else:  # day
+                # 白班：下班时间是当天
+                expected_time = work_hours["work_end"]
+                expected_date = record_date
+
+                expected_hour, expected_minute = map(int, expected_time.split(":"))
+                expected_dt = datetime.combine(
+                    expected_date, dt_time(expected_hour, expected_minute)
+                ).replace(tzinfo=now.tzinfo)
+
+                # ✅ 直接使用当前时间计算时间差
+                time_diff_seconds = int((now - expected_dt).total_seconds())
+                time_diff_minutes = time_diff_seconds / 60
+
+            logger.debug(
+                f"📊 [{trace_id}] 时间差计算: now={now}, expected={expected_dt}, 差值={time_diff_seconds}秒"
+            )
+
+            fine_amount = 0
+            status = "✅ 准时"
+            is_late_early = False
+            emoji_status = "👍"
+
+            if time_diff_seconds < 0:
+                fine_amount = await calculate_work_fine(
+                    "work_end", abs(time_diff_minutes)
+                )
+                duration = MessageFormatter.format_duration(abs(time_diff_seconds))
+                status = f"🚨 早退 {duration}"
+                if fine_amount:
+                    status += f"（💰扣除绩效 {fine_amount} 分）"
+                is_late_early = True
+                emoji_status = "🏃"
+            elif time_diff_seconds > 0:
+                duration = MessageFormatter.format_duration(time_diff_seconds)
+                status = f"✅ 加班 {duration}"
+                emoji_status = "⏰"
+
+            # 自动结束活动
+            activity_auto_ended = False
+            current_activity = user_data.get("current_activity") if user_data else None
+            if current_activity:
+                with suppress(Exception):
+                    await auto_end_current_activity(
+                        chat_id, uid, user_data, now, message
+                    )
+                    activity_auto_ended = True
+                    logger.info(f"[{trace_id}] 🔄 已自动结束活动：{current_activity}")
+
             # ========== 🎯 写入数据库（带重试）==========
             db_write_success = False
             for attempt in range(3):
@@ -2597,10 +2839,10 @@ async def process_work_checkin(message: types.Message, checkin_type: str):
                                  checkin_time, status, time_diff_minutes,
                                  fine_amount, shift, shift_detail)
                                 VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)
-                            """,
+                                """,
                                 chat_id,
                                 uid,
-                                record_date,
+                                record_date,  # 使用修正后的日期
                                 "work_end",
                                 current_time,
                                 status,
@@ -2618,7 +2860,7 @@ async def process_work_checkin(message: types.Message, checkin_type: str):
                                     SET active_worker_count = active_worker_count - 1,
                                         updated_at = CURRENT_TIMESTAMP
                                     WHERE chat_id = $1
-                                """,
+                                    """,
                                     chat_id,
                                 )
 
@@ -2627,7 +2869,7 @@ async def process_work_checkin(message: types.Message, checkin_type: str):
                                     SELECT active_worker_count 
                                     FROM group_shift_state 
                                     WHERE chat_id = $1
-                                """,
+                                    """,
                                     chat_id,
                                 )
 
@@ -2641,14 +2883,13 @@ async def process_work_checkin(message: types.Message, checkin_type: str):
                                         """
                                         DELETE FROM group_shift_state 
                                         WHERE chat_id = $1
-                                    """,
+                                        """,
                                         chat_id,
                                     )
                                     logger.info(
                                         f"🏁 [{trace_id}] 班次自动结束: 群组={chat_id}"
                                     )
 
-                                    # ✅ 修复：定义异步函数发送通知
                                     async def send_end_notification():
                                         try:
                                             await message.answer(
@@ -2676,7 +2917,7 @@ async def process_work_checkin(message: types.Message, checkin_type: str):
                                                 AND wr2.shift = wr.shift
                                                 AND wr2.checkin_type = 'work_end'
                                           )
-                                    """,
+                                        """,
                                         chat_id,
                                         record_date,
                                         shift,
