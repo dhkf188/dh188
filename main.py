@@ -723,7 +723,6 @@ async def has_active_activity(chat_id: int, uid: int) -> tuple[bool, Optional[st
     return user_data["current_activity"] is not None, user_data["current_activity"]
 
 
-# main.py - 替换 can_perform_activities 函数
 async def can_perform_activities(
     chat_id: int,
     uid: int,
@@ -2702,7 +2701,6 @@ async def _check_shift_work_record(
                     return True
 
                 # 方法2：如果没查到，再使用时间窗口查询（兼容旧数据）
-                # 获取时间窗口作为fallback
                 window_info = db.calculate_shift_window(
                     shift_config=shift_config, checkin_type=checkin_type, now=now
                 )
@@ -2713,7 +2711,7 @@ async def _check_shift_work_record(
                 day_start = shift_config.get("day_start", "09:00")
                 day_start_hour, day_start_min = map(int, day_start.split(":"))
                 today_start = datetime.combine(
-                    now.date(), time(day_start_hour, day_start_min)
+                    now.date(), dt_time(day_start_hour, day_start_min)
                 ).replace(tzinfo=now.tzinfo)
 
                 if now < today_start:
@@ -7539,22 +7537,27 @@ async def initialize_services():
         bot = bot_manager.bot
         dp = bot_manager.dispatcher
 
-        # 🎯 关键：验证 bot 和 bot_manager 是否真的初始化了
-        global notification_service
-        notification_service = NotificationService(bot_manager=bot_manager)
-        notification_service.bot = bot
+        # 🎯 关键修复：导入 utils 中的全局 notification_service 实例
+        from utils import notification_service as utils_notification_service
+        from utils import init_notification_service
 
-        # 5. 🎯 核心修复：双重设置 NotificationService
-        notification_service.bot_manager = bot_manager
-        notification_service.bot = bot  # 直接使用上面获取的 bot 实例
+        global notification_service
+
+        # ✅ 使用 utils 中的全局实例，而不是创建新的
+        notification_service = utils_notification_service
+
+        # ✅ 调用初始化函数设置 bot_manager 和 bot
+        init_notification_service(bot_manager_instance=bot_manager, bot_instance=bot)
 
         # 🎯 验证设置是否成功
         if not notification_service.bot_manager:
             logger.error("❌ notification_service.bot_manager 设置失败")
         if not notification_service.bot:
             logger.error("❌ notification_service.bot 设置失败")
-
-        logger.info("✅ 通知服务配置完成")
+        else:
+            logger.info(
+                f"✅ 通知服务配置完成: bot_manager={notification_service.bot_manager is not None}, bot={notification_service.bot is not None}"
+            )
 
         # 6. 设置定时器回调
         timer_manager.set_activity_timer_callback(activity_timer)
