@@ -1004,6 +1004,73 @@ class HeartbeatManager:
         }
 
 
+# utils.py - 添加 ShiftStateManager 类
+class ShiftStateManager:
+    """班次状态管理器 - 只处理过期清理"""
+
+    def __init__(self):
+        self._check_interval = 300  # 5分钟
+        self._is_running = False
+        self._task = None
+        self.logger = logging.getLogger("GroupCheckInBot.ShiftStateManager")
+
+    async def start(self):
+        """启动清理任务"""
+        self._is_running = True
+        self._task = asyncio.create_task(self._cleanup_loop())
+        self.logger.info("✅ 班次状态管理器已启动")
+
+    async def stop(self):
+        """停止清理任务"""
+        self._is_running = False
+        if self._task:
+            self._task.cancel()
+            try:
+                await self._task
+            except asyncio.CancelledError:
+                pass
+        self.logger.info("🛑 班次状态管理器已停止")
+
+    async def _cleanup_loop(self):
+        """只清理过期班次，不做业务判断"""
+        while self._is_running:
+            try:
+                await asyncio.sleep(self._check_interval)
+
+                from main import get_beijing_time
+
+                now = get_beijing_time()
+
+                # 获取所有群组
+                from database import db
+
+                all_groups = await db.get_all_groups()
+
+                for chat_id in all_groups:
+                    try:
+                        state = await db.get_current_shift_state(chat_id)
+                        if not state:
+                            continue
+
+                        start_time = state["shift_start_time"]
+                        if isinstance(start_time, str):
+                            start_time = datetime.fromisoformat(start_time)
+
+                        # 只检查过期（16小时）
+                        if now - start_time > timedelta(hours=16):
+                            await db.clear_shift_state(chat_id)
+                            self.logger.info(f"🧹 过期清理班次: 群组={chat_id}")
+
+                    except Exception as e:
+                        self.logger.error(f"处理群组 {chat_id} 失败: {e}")
+
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                self.logger.error(f"清理循环异常: {e}")
+                await asyncio.sleep(60)
+
+
 # 工具函数
 def get_beijing_time() -> datetime:
     """获取北京时间"""
@@ -1165,3 +1232,4 @@ timer_manager = ActivityTimerManager()
 performance_optimizer = EnhancedPerformanceOptimizer()
 heartbeat_manager = HeartbeatManager()
 notification_service = NotificationService()
+shift_state_manager = ShiftStateManager()
