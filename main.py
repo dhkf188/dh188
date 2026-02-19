@@ -2339,7 +2339,7 @@ async def process_work_checkin(message: types.Message, checkin_type: str):
             logger.info(f"✅[{trace_id}] {shift_text}{action_text}打卡流程完成")
             return
 
-        # ========== 2. 下班打卡 ==========
+# ========== 2. 下班打卡 ==========
         elif checkin_type == "work_end":
             # 班次有效性检查
             if is_dual_mode and shift_detail is None:
@@ -2379,10 +2379,10 @@ async def process_work_checkin(message: types.Message, checkin_type: str):
                     await message.answer(
                         f"🚫 您本班次已经打过{action_text}卡了！\n\n"
                         f"📊 <b>已有记录详情：</b>\n"
-                        f"   • 打卡时间：<code>{existing_time}</code>\n"
-                        f"   • 打卡状态：{existing_status}\n"
-                        f"   • 班次类型：<code>{shift_text}</code>\n"
-                        f"   • 记录时间：<code>{created_str}</code>",
+                        f"    • 打卡时间：<code>{existing_time}</code>\n"
+                        f"    • 打卡状态：{existing_status}\n"
+                        f"    • 班次类型：<code>{shift_text}</code>\n"
+                        f"    • 记录时间：<code>{created_str}</code>",
                         parse_mode="HTML",
                         reply_to_message_id=message.message_id,
                         reply_markup=await get_main_keyboard(
@@ -2421,10 +2421,8 @@ async def process_work_checkin(message: types.Message, checkin_type: str):
             # ========== 🎯 计算早退/罚款 ==========
             if shift == "night":
                 # 夜班：下班时间是第二天早上（白班开始时间）
-                expected_time = work_hours[
-                    "work_start"
-                ]  # 使用白班开始时间作为夜班下班时间
-                expected_date = record_date + timedelta(days=1)  # 日期+1天
+                expected_time = work_hours["work_start"]
+                expected_date = record_date + timedelta(days=1)
                 logger.info(
                     f"🌙 夜班下班: 期望时间={expected_time}, 期望日期={expected_date}"
                 )
@@ -2438,11 +2436,10 @@ async def process_work_checkin(message: types.Message, checkin_type: str):
                 expected_date, dt_time(expected_hour, expected_minute)
             ).replace(tzinfo=now.tzinfo)
 
-            # ✅ 修复：直接使用当前时间计算时间差，不需要创建 checkin_dt
+            # ✅ 修复：直接使用当前时间计算时间差
             time_diff_seconds = int((now - expected_dt).total_seconds())
             time_diff_minutes = time_diff_seconds / 60
 
-            # 添加调试日志
             logger.debug(
                 f"📊 [{trace_id}] 时间差计算: now={now}, expected={expected_dt}, 差值={time_diff_seconds}秒"
             )
@@ -2480,7 +2477,7 @@ async def process_work_checkin(message: types.Message, checkin_type: str):
 
             # ========== 🎯 写入数据库（带重试）==========
             db_write_success = False
-            for attempt in range(3):  # ✅ 3次重试
+            for attempt in range(3):
                 try:
                     async with db.pool.acquire() as conn:
                         async with conn.transaction():
@@ -2507,7 +2504,6 @@ async def process_work_checkin(message: types.Message, checkin_type: str):
 
                             # 2. 更新班次状态（原子操作-1）- 仅双班模式
                             if is_dual_mode:
-                                # 减少人数
                                 await conn.execute(
                                     """
                                     UPDATE group_shift_state
@@ -2518,7 +2514,6 @@ async def process_work_checkin(message: types.Message, checkin_type: str):
                                     chat_id,
                                 )
 
-                                # 获取当前人数
                                 current_count = await conn.fetchval(
                                     """
                                     SELECT active_worker_count 
@@ -2545,16 +2540,19 @@ async def process_work_checkin(message: types.Message, checkin_type: str):
                                         f"🏁 [{trace_id}] 班次自动结束: 群组={chat_id}"
                                     )
 
-                                    # 事务外发送通知
-                                    asyncio.create_task(
-                                        message.answer(
-                                            f"📢 <b>{shift_text}结束</b>\n"
-                                            f"所有用户已完成下班打卡，班次状态已清除",
-                                            parse_mode="HTML",
-                                        )
-                                    )
+                                    # ✅ 修复：定义异步函数发送通知
+                                    async def send_end_notification():
+                                        try:
+                                            await message.answer(
+                                                f"📢 <b>{shift_text}结束</b>\n"
+                                                f"所有用户已完成下班打卡，班次状态已清除",
+                                                parse_mode="HTML",
+                                            )
+                                        except Exception as e:
+                                            logger.error(f"发送班次结束通知失败: {e}")
+                                    
+                                    asyncio.create_task(send_end_notification())
                                 else:
-                                    # 检查是否还有其他用户未下班
                                     remaining_users = await conn.fetch(
                                         """
                                         SELECT user_id FROM work_records wr
@@ -2578,10 +2576,7 @@ async def process_work_checkin(message: types.Message, checkin_type: str):
 
                                     if remaining_users:
                                         user_list = ", ".join(
-                                            [
-                                                str(u["user_id"])
-                                                for u in remaining_users[:3]
-                                            ]
+                                            [str(u["user_id"]) for u in remaining_users[:3]]
                                         )
                                         logger.info(
                                             f"ℹ️ [{trace_id}] 未下班用户: {user_list}"
@@ -2589,20 +2584,20 @@ async def process_work_checkin(message: types.Message, checkin_type: str):
                                         )
 
                     db_write_success = True
-                    break  # 成功则跳出重试循环
+                    break
 
                 except Exception as e:
                     logger.error(
                         f"[{trace_id}] ❌ 数据库写入失败 (尝试 {attempt + 1}/3): {e}"
                     )
                     logger.error(traceback.format_exc())
-                    if attempt == 2:  # 最后一次重试失败
+                    if attempt == 2:
                         await message.answer(
                             "❌ 系统繁忙，请稍后重试",
                             reply_to_message_id=message.message_id,
                         )
                         return
-                    await asyncio.sleep(1 * (2**attempt))  # 指数退避
+                    await asyncio.sleep(1 * (2**attempt))
 
             if not db_write_success:
                 return
@@ -2644,47 +2639,7 @@ async def process_work_checkin(message: types.Message, checkin_type: str):
             )
 
             logger.info(f"✅[{trace_id}] {shift_text}{action_text}打卡流程完成")
-            return
-
-            # ========== 发送成功消息 ==========
-            result_msg = (
-                f"{emoji_status} <b>{shift_text}{action_text}完成</b>\n"
-                f"👤 用户：{MessageFormatter.format_user_link(uid, name)}\n"
-                f"⏰ 打卡时间：<code>{current_time}</code>\n"
-                f"📅 {action_text}时间：<code>{expected_dt.strftime('%m/%d %H:%M')}</code>\n"
-                f"📊 状态：{status}"
-            )
-
-            if activity_auto_ended and current_activity:
-                result_msg += f"\n\n🔄 检测到未结束活动 <code>{current_activity}</code>，已自动结束"
-
-            await message.answer(
-                result_msg,
-                reply_markup=await get_main_keyboard(chat_id, await is_admin_task),
-                reply_to_message_id=message.message_id,
-                parse_mode="HTML",
-            )
-
-            # ✅ 发送通知
-            status_display = status_type if is_late_early else "准时"
-            if time_diff_seconds > 0 and action_text == "下班":
-                status_display = "加班"
-
-            await send_work_notification(
-                chat_id,
-                uid,
-                name,
-                current_time,
-                expected_dt,
-                action_text,
-                status_display,
-                fine_amount,
-                trace_id,
-            )
-
-            logger.info(f"✅[{trace_id}] {shift_text}{action_text}打卡流程完成")
-            return
-
+            return  # ✅ 只有一个 return
 
 async def _check_shift_work_record(
     chat_id: int, user_id: int, checkin_type: str, shift: str, business_date: date
