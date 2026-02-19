@@ -1082,7 +1082,7 @@ def calculate_cross_day_time_diff(
     current_dt: datetime,
     expected_time: str,
     checkin_type: str,
-    record_date: Optional[date] = None,  # ✅ 新增参数
+    record_date: Optional[date] = None,  # 强制要求这个参数
 ) -> Tuple[float, int, datetime]:
     """
     智能化的时间差计算（支持跨天和最近匹配）
@@ -1091,7 +1091,7 @@ def calculate_cross_day_time_diff(
         current_dt: 当前时间
         expected_time: 期望时间字符串 (HH:MM)
         checkin_type: 打卡类型 (work_start/work_end)
-        record_date: 记录日期（由班次判定提供）
+        record_date: 记录日期（由班次判定提供）- 必须参数
 
     Returns:
         (时间差分钟, 时间差秒, 期望的datetime对象)
@@ -1099,36 +1099,22 @@ def calculate_cross_day_time_diff(
     try:
         expected_hour, expected_minute = map(int, expected_time.split(":"))
 
-        # ✅ 修复1：如果提供了 record_date，使用确定的日期
-        if record_date:
-            # 使用指定的记录日期
-            expected_dt = datetime.combine(
-                record_date, dt_time(expected_hour, expected_minute)
-            ).replace(tzinfo=current_dt.tzinfo)
+        # ========= 修复：强制使用 record_date，不允许智能匹配 =========
+        if record_date is None:
+            logger.error(f"❌ calculate_cross_day_time_diff 缺少 record_date 参数")
+            # 降级使用今天（但应该尽量避免这种情况）
+            record_date = current_dt.date()
+            logger.warning(f"⚠️ 降级使用今天日期: {record_date}")
 
-            logger.debug(
-                f"📅 使用指定日期: {record_date}, "
-                f"期望时间: {expected_dt.strftime('%Y-%m-%d %H:%M')}"
-            )
+        # 使用指定的记录日期构建期望时间
+        expected_dt = datetime.combine(
+            record_date, dt_time(expected_hour, expected_minute)
+        ).replace(tzinfo=current_dt.tzinfo)
 
-        # ✅ 修复2：如果没有 record_date，使用智能匹配（向后兼容）
-        else:
-            # 生成前一天、当天、后一天三个候选时间点
-            candidates = []
-            for d in (-1, 0, 1):
-                candidate = current_dt.replace(
-                    hour=expected_hour, minute=expected_minute, second=0, microsecond=0
-                ) + timedelta(days=d)
-                candidates.append(candidate)
-
-            # 找到与当前时间最接近的 expected_dt
-            expected_dt = min(
-                candidates, key=lambda t: abs((t - current_dt).total_seconds())
-            )
-
-            logger.debug(
-                f"📅 智能匹配日期, 选择: {expected_dt.strftime('%Y-%m-%d %H:%M')}"
-            )
+        logger.debug(
+            f"📅 时间差计算 - 使用指定日期: {record_date}, "
+            f"期望时间: {expected_dt.strftime('%Y-%m-%d %H:%M')}"
+        )
 
         # 计算时间差（单位：分钟和秒）
         time_diff_seconds = int((current_dt - expected_dt).total_seconds())
@@ -1174,6 +1160,7 @@ performance_optimizer = EnhancedPerformanceOptimizer()
 heartbeat_manager = HeartbeatManager()
 notification_service = NotificationService()
 shift_state_manager = ShiftStateManager()
+
 
 # ========== 重置通知函数 ==========
 async def send_reset_notification(
