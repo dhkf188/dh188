@@ -12,6 +12,7 @@ from functools import wraps
 from aiogram import types
 from database import db
 from performance import global_cache, task_manager
+from datetime import time as dt_time
 
 
 logger = logging.getLogger("GroupCheckInBot")
@@ -1102,7 +1103,7 @@ def calculate_cross_day_time_diff(
         if record_date:
             # 使用指定的记录日期
             expected_dt = datetime.combine(
-                record_date, time(expected_hour, expected_minute)
+                record_date, dt_time(expected_hour, expected_minute)
             ).replace(tzinfo=current_dt.tzinfo)
 
             logger.debug(
@@ -1224,6 +1225,30 @@ async def send_reset_notification(
 
     except Exception as e:
         logger.error(f"发送重置通知失败 {chat_id}: {e}")
+
+
+def init_notification_service(bot_manager_instance=None, bot_instance=None):
+    """初始化通知服务 - 供外部调用"""
+    global notification_service
+
+    # 确保 notification_service 是全局实例
+    if "notification_service" not in globals():
+        logger.error("❌ notification_service 全局实例不存在")
+        return
+
+    if bot_manager_instance:
+        notification_service.bot_manager = bot_manager_instance
+        logger.info(
+            f"✅ notification_service.bot_manager 已设置: {bot_manager_instance}"
+        )
+
+    if bot_instance:
+        notification_service.bot = bot_instance
+        logger.info(f"✅ notification_service.bot 已设置: {bot_instance}")
+
+    logger.info(
+        f"📊 通知服务初始化状态: bot_manager={notification_service.bot_manager is not None}, bot={notification_service.bot is not None}"
+    )
 
 
 # 全局实例
