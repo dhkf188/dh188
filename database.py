@@ -3936,9 +3936,52 @@ class PostgreSQLDatabase:
         # 🎯 活动判定 - 修复版
         # =============================
         if checkin_type == "activity":
-            # ... 活动判定代码保持不变 ...
-            # 这部分代码返回的是字符串，没有问题
-            pass
+            # 核心原则：活动跟随活跃班次，不依赖时间窗口
+            if active_shift:
+                # 有活跃班次时，直接跟随
+                if active_shift == "day":
+                    current_shift_detail = "day"
+                    logger.debug(
+                        f"📊 activity跟随白班: active_shift={active_shift}, "
+                        f"now={now.strftime('%H:%M')}"
+                    )
+                else:  # active_shift == "night"
+                    # 夜班时需要判断是昨晚还是今晚
+                    if now >= day_end_dt:
+                        current_shift_detail = "night_tonight"  # 今晚夜班
+                        logger.debug(
+                            f"📊 activity跟随夜班(今晚): active_shift={active_shift}, "
+                            f"now={now.strftime('%H:%M')} >= {day_end_dt.strftime('%H:%M')}"
+                        )
+                    else:
+                        current_shift_detail = "night_last"  # 昨晚夜班
+                        logger.debug(
+                            f"📊 activity跟随夜班(昨晚): active_shift={active_shift}, "
+                            f"now={now.strftime('%H:%M')} < {day_end_dt.strftime('%H:%M')}"
+                        )
+            else:
+                # 没有活跃班次时，使用时间区间判定
+                if day_start_dt <= now < day_end_dt:
+                    current_shift_detail = "day"
+                    logger.debug(
+                        f"📊 activity无活跃班次，时间在白班区间: {now.strftime('%H:%M')}"
+                    )
+                elif now >= day_end_dt:
+                    current_shift_detail = "night_tonight"  # 今晚夜班
+                    logger.debug(
+                        f"📊 activity无活跃班次，时间在夜班区间(今晚): {now.strftime('%H:%M')}"
+                    )
+                else:
+                    current_shift_detail = "night_last"  # 昨晚夜班
+                    logger.debug(
+                        f"📊 activity无活跃班次，时间在夜班区间(昨晚): {now.strftime('%H:%M')}"
+                    )
+
+            return {
+                "day_window": {},
+                "night_window": {},
+                "current_shift": current_shift_detail,
+            }
 
         # =============================
         # 打卡窗口逻辑 - ✅ 修复：显式添加时区
@@ -3955,34 +3998,62 @@ class PostgreSQLDatabase:
         # ✅ 修复：所有计算出的时间都显式添加时区
         day_window = {
             "work_start": {
-                "start": (day_start_dt - timedelta(minutes=grace_before)).replace(tzinfo=tz),
-                "end": (day_start_dt + timedelta(minutes=grace_after)).replace(tzinfo=tz),
+                "start": (day_start_dt - timedelta(minutes=grace_before)).replace(
+                    tzinfo=tz
+                ),
+                "end": (day_start_dt + timedelta(minutes=grace_after)).replace(
+                    tzinfo=tz
+                ),
             },
             "work_end": {
-                "start": (day_end_dt - timedelta(minutes=workend_grace_before)).replace(tzinfo=tz),
-                "end": (day_end_dt + timedelta(minutes=workend_grace_after)).replace(tzinfo=tz),
+                "start": (day_end_dt - timedelta(minutes=workend_grace_before)).replace(
+                    tzinfo=tz
+                ),
+                "end": (day_end_dt + timedelta(minutes=workend_grace_after)).replace(
+                    tzinfo=tz
+                ),
             },
         }
 
         last_night_window = {
             "work_start": {
-                "start": (day_end_dt - timedelta(days=1) - timedelta(minutes=workend_grace_before)).replace(tzinfo=tz),
-                "end": (day_end_dt - timedelta(days=1) + timedelta(minutes=workend_grace_after)).replace(tzinfo=tz),
+                "start": (
+                    day_end_dt
+                    - timedelta(days=1)
+                    - timedelta(minutes=workend_grace_before)
+                ).replace(tzinfo=tz),
+                "end": (
+                    day_end_dt
+                    - timedelta(days=1)
+                    + timedelta(minutes=workend_grace_after)
+                ).replace(tzinfo=tz),
             },
             "work_end": {
-                "start": (day_start_dt - timedelta(minutes=grace_before)).replace(tzinfo=tz),
-                "end": (day_start_dt + timedelta(minutes=grace_after)).replace(tzinfo=tz),
+                "start": (day_start_dt - timedelta(minutes=grace_before)).replace(
+                    tzinfo=tz
+                ),
+                "end": (day_start_dt + timedelta(minutes=grace_after)).replace(
+                    tzinfo=tz
+                ),
             },
         }
 
         tonight_window = {
             "work_start": {
-                "start": (day_end_dt - timedelta(minutes=workend_grace_before)).replace(tzinfo=tz),
-                "end": (day_end_dt + timedelta(minutes=workend_grace_after)).replace(tzinfo=tz),
+                "start": (day_end_dt - timedelta(minutes=workend_grace_before)).replace(
+                    tzinfo=tz
+                ),
+                "end": (day_end_dt + timedelta(minutes=workend_grace_after)).replace(
+                    tzinfo=tz
+                ),
             },
             "work_end": {
-                "start": (day_start_dt + timedelta(days=1) - timedelta(minutes=grace_before)).replace(tzinfo=tz),
-                "end": (day_start_dt + timedelta(days=1) + timedelta(minutes=grace_after)).replace(tzinfo=tz),
+                "start": (
+                    day_start_dt + timedelta(days=1) - timedelta(minutes=grace_before)
+                ).replace(tzinfo=tz),
+                "end": (
+                    day_start_dt + timedelta(days=1) + timedelta(minutes=grace_after)
+                ).replace(tzinfo=tz),
             },
         }
 
