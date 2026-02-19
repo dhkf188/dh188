@@ -2361,7 +2361,6 @@ class PostgreSQLDatabase:
             return activities
 
     # ========== 上下班记录操作 ==========
-
     async def add_work_record(
         self,
         chat_id: int,
@@ -2376,17 +2375,19 @@ class PostgreSQLDatabase:
         shift_detail: str = None,
     ):
         """
-        添加上下班记录 - 完整同步版
+        添加上下班记录 - 完整同步版（包含班次计数器）
         支持：
         - 多班次判定
         - 四表实时同步
         - 软重置(soft_reset)兼容
         - 跨天时长计算
+        - ⭐ 班次计数器管理
         """
 
         # ========= 0. 统一业务日期与月份统计点 =========
         business_date = await self.get_business_date(chat_id)
         statistic_date = business_date.replace(day=1)
+        now = self.get_beijing_time()
 
         # ========= 1. 自动判定班次 =========
         if shift is None:
@@ -2455,9 +2456,79 @@ class PostgreSQLDatabase:
                     shift_detail,
                 )
 
-                # ========= 4. 更新 daily_statistics =========
-                # 4.1 日罚款
-                activity_name = "work_fines"  # 默认值
+                # ========= ⭐ 4. 更新班次计数器 =========
+                if checkin_type == "work_start":
+                    # 上班打卡：原子操作+1
+                    await conn.execute(
+                        """
+                        INSERT INTO group_shift_state
+                        (chat_id, current_shift, record_date, shift_start_time, 
+                         started_by_user_id, active_worker_count)
+                        VALUES ($1, $2, $3, $4, $5, 1)
+                        ON CONFLICT (chat_id)
+                        DO UPDATE SET
+                            current_shift = EXCLUDED.current_shift,
+                            record_date = EXCLUDED.record_date,
+                            shift_start_time = EXCLUDED.shift_start_time,
+                            started_by_user_id = EXCLUDED.started_by_user_id,
+                            active_worker_count = group_shift_state.active_worker_count + 1,
+                            updated_at = CURRENT_TIMESTAMP
+                        """,
+                        chat_id,
+                        shift,
+                        record_date,
+                        now,
+                        user_id,
+                    )
+                    
+                    logger.debug(
+                        f"📊 [班次计数器] 上班打卡 +1: 群组={chat_id}, "
+                        f"用户={user_id}, 班次={shift}"
+                    )
+
+                elif checkin_type == "work_end":
+                    # 下班打卡：原子操作-1
+                    await conn.execute(
+                        """
+                        UPDATE group_shift_state
+                        SET active_worker_count = active_worker_count - 1,
+                            updated_at = CURRENT_TIMESTAMP
+                        WHERE chat_id = $1
+                        """,
+                        chat_id,
+                    )
+                    
+                    # 获取当前人数
+                    current_count = await conn.fetchval(
+                        """
+                        SELECT active_worker_count 
+                        FROM group_shift_state 
+                        WHERE chat_id = $1
+                        """,
+                        chat_id,
+                    )
+                    
+                    # 如果人数 <= 0，删除班次状态
+                    if current_count is not None and current_count <= 0:
+                        await conn.execute(
+                            """
+                            DELETE FROM group_shift_state 
+                            WHERE chat_id = $1
+                            """,
+                            chat_id,
+                        )
+                        logger.info(
+                            f"🏁 [班次计数器] 人数归零，班次结束: 群组={chat_id}, "
+                            f"最后下班用户={user_id}, 班次={shift}"
+                        )
+                    else:
+                        logger.debug(
+                            f"📊 [班次计数器] 下班打卡 -1: 群组={chat_id}, "
+                            f"用户={user_id}, 班次={shift}, 剩余人数={current_count}"
+                        )
+
+                # ========= 5. 更新 daily_statistics =========
+                activity_name = "work_fines"
                 if fine_amount > 0:
                     activity_name = (
                         "work_start_fines"
@@ -2490,10 +2561,8 @@ class PostgreSQLDatabase:
                         shift,
                     )
 
-                # 4.2 下班逻辑：记录工作天数 + 工时
                 work_duration_seconds = 0
                 if checkin_type == "work_end":
-                    # 工作天数
                     await conn.execute(
                         """
                         INSERT INTO daily_statistics
@@ -2513,7 +2582,6 @@ class PostgreSQLDatabase:
                         shift,
                     )
 
-                    # 查询上班时间
                     start_row = await conn.fetchrow(
                         """
                         SELECT checkin_time FROM work_records
@@ -2536,10 +2604,9 @@ class PostgreSQLDatabase:
                             end_dt = datetime.strptime(checkin_time, "%H:%M")
                             diff_minutes = (end_dt - start_dt).total_seconds() / 60
                             if diff_minutes < 0:
-                                diff_minutes += 1440  # 跨夜处理
+                                diff_minutes += 1440
                             work_duration_seconds = int(diff_minutes * 60)
 
-                            # 更新工时
                             await conn.execute(
                                 """
                                 INSERT INTO daily_statistics
@@ -2563,9 +2630,8 @@ class PostgreSQLDatabase:
                         except Exception as e:
                             logger.error(f"工时计算失败: {e}")
 
-                # ========= 5. 更新 monthly_statistics =========
+                # ========= 6. 更新 monthly_statistics =========
                 if checkin_type == "work_end":
-                    # 月工作天数
                     await conn.execute(
                         """
                         INSERT INTO monthly_statistics
@@ -2583,7 +2649,6 @@ class PostgreSQLDatabase:
                         shift,
                     )
 
-                    # 月工时
                     if work_duration_seconds > 0:
                         await conn.execute(
                             """
@@ -2603,7 +2668,6 @@ class PostgreSQLDatabase:
                             shift,
                         )
 
-                # 月度罚款
                 if fine_amount > 0:
                     await conn.execute(
                         """
@@ -2624,7 +2688,7 @@ class PostgreSQLDatabase:
                         shift,
                     )
 
-                # ========= 6. 更新 users 表罚款总计 =========
+                # ========= 7. 更新 users 表罚款总计 =========
                 if fine_amount > 0:
                     await conn.execute(
                         """
@@ -2637,13 +2701,14 @@ class PostgreSQLDatabase:
                         user_id,
                     )
 
-        # ========= 7. 清理缓存 =========
+        # ========= 8. 清理缓存 =========
         self._cache.pop(f"user:{chat_id}:{user_id}", None)
 
         logger.debug(
             f"✅ [四表同步完成] 用户:{user_id} | 业务日期:{business_date} | "
             f"班次:{shift} | 罚款:{fine_amount} | 工时:{work_duration_seconds}s"
         )
+
 
     async def get_work_records_by_shift(
         self, chat_id: int, user_id: int, shift: str = None
