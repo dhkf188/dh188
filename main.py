@@ -1098,9 +1098,18 @@ async def activity_timer(
                 nickname = user_data.get("nickname", str(uid))
 
                 # ===== 强制回座 2 小时 =====
-                if elapsed >= 120 * 60 and not force_back_sent:
+                time_limit_seconds = limit_int * 60  # 活动限制时间（秒）
+                overtime_seconds = max(0, elapsed - time_limit_seconds)  # 超时时长
+
+                if overtime_seconds >= 120 * 60 and not force_back_sent:
                     force_back_sent = True
                     fine_amount = await calculate_fine(act, 120)
+                    logger.info(
+                        f"⏰ [强制回座] 用户{uid} 活动{act} "
+                        f"超时 {MessageFormatter.format_time(overtime_seconds)} "
+                        f"(总时长: {MessageFormatter.format_time(elapsed)}, "
+                        f"限制: {limit_int}分钟)"
+                    )
 
                     await db.complete_user_activity(
                         chat_id=chat_id,
@@ -2876,66 +2885,18 @@ async def _get_existing_work_record(
     chat_id: int, user_id: int, checkin_type: str, shift: str, business_date: date
 ) -> Optional[Dict]:
     """
-    获取已存在的打卡记录详情 - 修复版
-    统一时区处理
+    获取已存在的打卡记录详情 - 简化版
+    直接使用 business_date 查询，不再依赖复杂的时间窗口
     """
     try:
-        now = get_beijing_time()
-
-        # 获取班次配置
-        shift_config = await db.get_shift_config(chat_id)
-
-        # 复用 calculate_shift_window 获取窗口信息
-        window_info = db.calculate_shift_window(
-            shift_config=shift_config, checkin_type=checkin_type, now=now
-        )
-
-        # 确定目标窗口
-        target_start = None
-        target_end = None
-
-        if shift == "day":
-            if checkin_type in window_info.get("day_window", {}):
-                target_start = window_info["day_window"][checkin_type]["start"]
-                target_end = window_info["day_window"][checkin_type]["end"]
-        else:
-            current_shift = window_info.get("current_shift")
-            night_window = window_info.get("night_window", {})
-
-            if current_shift == "night_last":
-                last_night = night_window.get("last_night", {})
-                if checkin_type in last_night:
-                    target_start = last_night[checkin_type]["start"]
-                    target_end = last_night[checkin_type]["end"]
-            elif current_shift == "night_tonight":
-                tonight = night_window.get("tonight", {})
-                if checkin_type in tonight:
-                    target_start = tonight[checkin_type]["start"]
-                    target_end = tonight[checkin_type]["end"]
-
-        if not target_start or not target_end:
-            logger.warning(
-                f"无法从窗口确定打卡范围，使用24小时fallback: {shift} {checkin_type}"
-            )
-            target_start = now - timedelta(hours=24)
-            target_end = now + timedelta(hours=1)
-
-        # ✅ 修复：确保时间带时区
-        if target_start.tzinfo is None:
-            target_start = target_start.replace(tzinfo=now.tzinfo)
-        if target_end.tzinfo is None:
-            target_end = target_end.replace(tzinfo=now.tzinfo)
-
         async with db.pool.acquire() as conn:
-            # ✅ 修复：统一使用无时区进行比较
             row = await conn.fetchrow(
                 """
                 SELECT checkin_time, status, created_at, record_date 
                 FROM work_records 
                 WHERE chat_id = $1 AND user_id = $2 
                 AND checkin_type = $3 AND shift = $4
-                AND created_at AT TIME ZONE 'Asia/Shanghai' >= $5::timestamp
-                AND created_at AT TIME ZONE 'Asia/Shanghai' <= $6::timestamp
+                AND record_date = $5
                 ORDER BY created_at DESC
                 LIMIT 1
                 """,
@@ -2943,8 +2904,7 @@ async def _get_existing_work_record(
                 user_id,
                 checkin_type,
                 shift,
-                target_start.replace(tzinfo=None),
-                target_end.replace(tzinfo=None),
+                business_date,  # ✅ 直接使用传入的 business_date
             )
 
             if row:
@@ -2992,22 +2952,24 @@ async def send_work_notification(
         chat_info = await bot.get_chat(chat_id)
         chat_title = getattr(chat_info, "title", str(chat_id))
 
-        # ========= 修复1：安全时间差计算（支持跨天）==========
+        # ========= 修复：直接使用班次判定的 expected_dt，不要手动调整 =========
         checkin_hour, checkin_min = map(int, checkin_time.split(":"))
-        checkin_dt = expected_dt.replace(
-            hour=checkin_hour, minute=checkin_min, second=0, microsecond=0
-        )
+        checkin_dt = datetime.combine(
+            expected_dt.date(),  # 使用班次判定确定的日期
+            dt_time(checkin_hour, checkin_min),
+        ).replace(tzinfo=expected_dt.tzinfo)
 
-        if (
-            checkin_dt < expected_dt
-            and (expected_dt - checkin_dt).total_seconds() > 43200
-        ):
-            checkin_dt += timedelta(days=1)
-            logger.debug(f"[{trace_id}] 🔄 检测到跨天，调整打卡时间: {checkin_dt}")
-
+        # 直接计算时间差，不进行任何跨天调整
         diff_seconds = int((checkin_dt - expected_dt).total_seconds())
 
-        # ========= 修复2：迟到/早退判定 ==========
+        logger.debug(
+            f"[{trace_id}] 📊 时间差计算:\n"
+            f"   • 期望时间: {expected_dt.strftime('%Y-%m-%d %H:%M:%S')}\n"
+            f"   • 打卡时间: {checkin_dt.strftime('%Y-%m-%d %H:%M:%S')}\n"
+            f"   • 时间差: {diff_seconds}秒"
+        )
+
+        # ========= 迟到/早退判定 ==========
         if action_text == "上班":
             if diff_seconds > 0:
                 actual_status = "迟到"
@@ -3039,14 +3001,14 @@ async def send_work_notification(
                 title = "✅ <b>下班准时通知</b>"
                 status_line = "⏱️ 准时下班"
 
-        # ========= 修复3：班次信息 ==========
+        # ========= 班次信息 ==========
         shift_state = await db.get_current_shift_state(chat_id)
         shift_text = "白班"
         if shift_state:
             current_shift = shift_state.get("current_shift", "day")
             shift_text = "白班" if current_shift == "day" else "夜班"
 
-        # ========= 频道文案（保持原有详细格式）==========
+        # ========= 频道文案 ==========
         channel_notif_text = (
             f"{title} <code>{shift_text}</code>\n"
             f"🏢 群组/班次：<code>{chat_title}</code> \n"
@@ -3121,32 +3083,31 @@ async def send_work_notification(
 
         channel_notif_text += f"{status_line}"
 
-        # ========= 额外群组文案（简洁版）==========
+        # ========= 额外群组文案 ==========
         extra_notif_text = f"<code>{shift_text}</code> {MessageFormatter.format_user_link(user_id, user_name)} {action_text} 了！\n"
 
         if fine_amount > 0:
             extra_notif_text += f"\n💰 扣除绩效：<code>{fine_amount}</code> 分"
 
-        # ========= 修复4：添加调试日志 ==========
+        # ========= 调试日志 ==========
         logger.info(
             f"[{trace_id}] 📊 通知详情:\n"
             f"   • 用户: {user_name}({user_id})\n"
             f"   • 动作: {action_text}\n"
             f"   • 状态: {actual_status}\n"
             f"   • 打卡时间: {checkin_time}\n"
-            f"   • 期望时间: {expected_dt.strftime('%H:%M')}\n"
+            f"   • 期望时间: {expected_dt.strftime('%m/%d %H:%M')}\n"
             f"   • 时间差: {diff_seconds}秒 ({MessageFormatter.format_duration(abs(diff_seconds))})\n"
             f"   • 罚款: {fine_amount}\n"
             f"   • 班次: {shift_text}"
         )
 
-        # ========= 发送群 ==========
+        # ========= 发送逻辑 ==========
         async def safe_send(target_id: int, text: str, target_desc: str = ""):
-            """安全发送：直接使用 bot.send_message 发送到指定目标"""
+            """安全发送消息"""
             try:
                 logger.info(f"[{trace_id}] 📤 尝试发送到 {target_desc} ID: {target_id}")
 
-                # 尝试获取聊天信息，确认机器人是否在群组中
                 try:
                     target_info = await bot.get_chat(target_id)
                     logger.info(
@@ -3156,10 +3117,8 @@ async def send_work_notification(
                     logger.error(
                         f"[{trace_id}] ❌ 无法获取目标群组信息，机器人可能不在群组中: {e}"
                     )
-                    # 如果获取不到聊天信息，说明机器人不在这个群组中，直接返回
                     return
 
-                # 直接使用 bot.send_message
                 await bot.send_message(target_id, text, parse_mode="HTML")
 
                 if target_desc:
@@ -3170,7 +3129,6 @@ async def send_work_notification(
             except Exception as e:
                 logger.error(f"[{trace_id}] ❌ 发送到 {target_desc} 失败: {e}")
 
-                # 尝试使用 bot_manager 重试
                 try:
                     logger.info(f"[{trace_id}] 🔄 尝试使用 bot_manager 重试...")
                     if bot_manager and hasattr(bot_manager, "send_message_with_retry"):
@@ -3185,30 +3143,13 @@ async def send_work_notification(
                 except Exception as e2:
                     logger.error(f"[{trace_id}] ❌ bot_manager 重试也失败: {e2}")
 
-                # 如果是403错误，说明机器人被踢出群组或没有权限
-                if "403" in str(e):
-                    logger.error(
-                        f"[{trace_id}] 🚫 机器人没有权限发送消息到 {target_id}，可能原因："
-                    )
-                    logger.error(f"[{trace_id}]   1. 机器人不在该群组中")
-                    logger.error(f"[{trace_id}]   2. 机器人被禁言或没有发送消息权限")
-                    logger.error(f"[{trace_id}]   3. 群组设置了限制")
-
-        # ========= 发送逻辑（可配置）==========
-
-        # 1. 发送到当前群组（根据推送设置）- 已禁用
-        if enable_group_push:
-            logger.info(f"[{trace_id}] ℹ️ 当前群组推送已禁用")
-        else:
-            logger.info(f"[{trace_id}] ℹ️ 推送设置已禁用当前群组通知")
-
-        # 2. 发送到频道（根据推送设置）- 使用详细文案
+        # 发送到频道
         if channel_id and enable_channel_push:
             await safe_send(channel_id, channel_notif_text, "频道")
         elif channel_id:
             logger.info(f"[{trace_id}] ℹ️ 推送设置已禁用频道通知")
 
-        # 3. 发送到额外群组（这个不受推送设置影响，独立控制）- 使用简洁文案
+        # 发送到额外群组
         if extra_work_group_id:
             logger.info(f"[{trace_id}] 📤 发送到额外群组: {extra_work_group_id}")
             await safe_send(extra_work_group_id, extra_notif_text, "额外上下班群组")
@@ -3219,7 +3160,6 @@ async def send_work_notification(
         logger.error(
             f"[{trace_id}] ❌ send_work_notification总异常: {e}", exc_info=True
         )
-        # 不抛出异常，保证主流程安全
 
 
 # ========== 管理员装饰器 ==========
@@ -7455,27 +7395,39 @@ async def monthly_maintenance_task():
     """
     每月维护任务：
     1. 每月1号自动导出上个月数据（包含跨天夜班）
-    2. 每天凌晨3点自动清理90天前的数据
+    2. 每天凌晨3点自动清理指定天数前的数据
     """
     logger.info("📅 月度维护任务已启动")
+
+    # 记录上次执行清理的日期，避免重复执行
+    last_cleanup_date = None
+    last_export_date = None
 
     while True:
         try:
             now = get_beijing_time()
+            today = now.date()
 
             # ===== 1. 每天凌晨3点执行清理 =====
-            if now.hour == Config.CLEANUP_HOUR and now.minute == Config.CLEANUP_MINUTE:
+            if (
+                now.hour == Config.CLEANUP_HOUR
+                and now.minute == Config.CLEANUP_MINUTE
+                and last_cleanup_date != today
+            ):  # 确保每天只执行一次
+
                 if Config.AUTO_CLEANUP_ENABLED:
                     logger.info(
-                        f"🧹 开始自动清理 ({Config.DATA_RETENTION_DAYS}天前的数据)"
+                        f"🧹 开始自动清理\n"
+                        f"   ├─ 日常保留: {Config.DATA_RETENTION_DAYS}天\n"
+                        f"   └─ 月度保留: {Config.MONTHLY_DATA_RETENTION_DAYS}天"
                     )
 
-                    # 清理日常数据
+                    # 清理日常数据（传天数）
                     daily_deleted = await db.cleanup_old_data(
                         Config.DATA_RETENTION_DAYS
                     )
 
-                    # 清理月度数据
+                    # ✅ 修复：清理月度数据（传天数）
                     monthly_deleted = await db.cleanup_monthly_data(
                         Config.MONTHLY_DATA_RETENTION_DAYS
                     )
@@ -7486,15 +7438,16 @@ async def monthly_maintenance_task():
                         f"   └─ 月度数据: {monthly_deleted} 条"
                     )
 
-                    # 等待23小时，避免一天内重复清理
-                    await asyncio.sleep(23 * 3600)
+                    last_cleanup_date = today  # 记录今天已清理
 
             # ===== 2. 每月1号凌晨2点执行导出 =====
             if (
                 now.day == 1
                 and now.hour == Config.MONTHLY_EXPORT_HOUR
                 and now.minute == Config.MONTHLY_EXPORT_MINUTE
-            ):
+                and last_export_date != today
+            ):  # 确保每月只执行一次
+
                 if Config.MONTHLY_EXPORT_ENABLED:
                     # 计算上个月的年月
                     if now.month == 1:
@@ -7508,6 +7461,7 @@ async def monthly_maintenance_task():
 
                     all_groups = await db.get_all_groups()
                     success_count = 0
+                    failed_count = 0
 
                     for chat_id in all_groups:
                         try:
@@ -7558,24 +7512,30 @@ async def monthly_maintenance_task():
                             else:
                                 logger.debug(f"📭 群组 {chat_id} 本月无数据")
 
-                            await asyncio.sleep(2)
+                            # 避免请求过快
+                            await asyncio.sleep(1)
 
                         except Exception as e:
+                            failed_count += 1
                             logger.error(f"❌ 群组 {chat_id} 导出失败: {e}")
+                            logger.error(traceback.format_exc())
 
                     logger.info(
-                        f"📊 月度导出完成: {success_count}/{len(all_groups)} 个群组"
+                        f"📊 月度导出完成\n"
+                        f"   ├─ 成功: {success_count} 个群组\n"
+                        f"   ├─ 失败: {failed_count} 个群组\n"
+                        f"   └─ 总计: {len(all_groups)} 个群组"
                     )
 
-                    # 等待23小时，避免1号重复执行
-                    await asyncio.sleep(23 * 3600)
+                    last_export_date = today  # 记录今天已导出
 
             # 每分钟检查一次
             await asyncio.sleep(60)
 
         except Exception as e:
             logger.error(f"❌ 月度维护任务异常: {e}")
-            await asyncio.sleep(3600)
+            logger.error(traceback.format_exc())
+            await asyncio.sleep(60)  # 出错后等待1分钟再试，而不是1小时
 
 
 # ========== Web服务器 ==========
