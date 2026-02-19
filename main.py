@@ -2339,7 +2339,7 @@ async def process_work_checkin(message: types.Message, checkin_type: str):
             logger.info(f"✅[{trace_id}] {shift_text}{action_text}打卡流程完成")
             return
 
-# ========== 2. 下班打卡 ==========
+        # ========== 2. 下班打卡 ==========
         elif checkin_type == "work_end":
             # 班次有效性检查
             if is_dual_mode and shift_detail is None:
@@ -2550,7 +2550,7 @@ async def process_work_checkin(message: types.Message, checkin_type: str):
                                             )
                                         except Exception as e:
                                             logger.error(f"发送班次结束通知失败: {e}")
-                                    
+
                                     asyncio.create_task(send_end_notification())
                                 else:
                                     remaining_users = await conn.fetch(
@@ -2576,7 +2576,10 @@ async def process_work_checkin(message: types.Message, checkin_type: str):
 
                                     if remaining_users:
                                         user_list = ", ".join(
-                                            [str(u["user_id"]) for u in remaining_users[:3]]
+                                            [
+                                                str(u["user_id"])
+                                                for u in remaining_users[:3]
+                                            ]
                                         )
                                         logger.info(
                                             f"ℹ️ [{trace_id}] 未下班用户: {user_list}"
@@ -2640,6 +2643,7 @@ async def process_work_checkin(message: types.Message, checkin_type: str):
 
             logger.info(f"✅[{trace_id}] {shift_text}{action_text}打卡流程完成")
             return  # ✅ 只有一个 return
+
 
 async def _check_shift_work_record(
     chat_id: int, user_id: int, checkin_type: str, shift: str, business_date: date
@@ -2735,6 +2739,12 @@ async def _check_shift_work_record(
                         target_end = tonight[checkin_type]["end"]
 
                 if target_start and target_end:
+                    # ✅ 添加保护性代码：确保时间带时区
+                    if target_start.tzinfo is None:
+                        target_start = target_start.replace(tzinfo=now.tzinfo)
+                    if target_end.tzinfo is None:
+                        target_end = target_end.replace(tzinfo=now.tzinfo)
+
                     row = await conn.fetchrow(
                         """
                         SELECT 1 FROM work_records 
