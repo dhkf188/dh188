@@ -2420,9 +2420,16 @@ async def process_work_checkin(message: types.Message, checkin_type: str):
 
             # ========== 🎯 计算早退/罚款 ==========
             if shift == "night":
-                expected_time = work_hours["work_start"]
-                expected_date = record_date + timedelta(days=1)
+                # 夜班：下班时间是第二天早上（白班开始时间）
+                expected_time = work_hours[
+                    "work_start"
+                ]  # 使用白班开始时间作为夜班下班时间
+                expected_date = record_date + timedelta(days=1)  # 日期+1天
+                logger.info(
+                    f"🌙 夜班下班: 期望时间={expected_time}, 期望日期={expected_date}"
+                )
             else:
+                # 白班：下班时间是当天
                 expected_time = work_hours["work_end"]
                 expected_date = record_date
 
@@ -2431,8 +2438,14 @@ async def process_work_checkin(message: types.Message, checkin_type: str):
                 expected_date, dt_time(expected_hour, expected_minute)
             ).replace(tzinfo=now.tzinfo)
 
+            # ✅ 修复：直接使用当前时间计算时间差，不需要创建 checkin_dt
             time_diff_seconds = int((now - expected_dt).total_seconds())
             time_diff_minutes = time_diff_seconds / 60
+
+            # 添加调试日志
+            logger.debug(
+                f"📊 [{trace_id}] 时间差计算: now={now}, expected={expected_dt}, 差值={time_diff_seconds}秒"
+            )
 
             fine_amount = 0
             status = "✅ 准时"
@@ -2541,7 +2554,7 @@ async def process_work_checkin(message: types.Message, checkin_type: str):
                                         )
                                     )
                                 else:
-                                    # 检查是否还有其他用户未下班（详细日志）
+                                    # 检查是否还有其他用户未下班
                                     remaining_users = await conn.fetch(
                                         """
                                         SELECT user_id FROM work_records wr
@@ -2582,7 +2595,7 @@ async def process_work_checkin(message: types.Message, checkin_type: str):
                     logger.error(
                         f"[{trace_id}] ❌ 数据库写入失败 (尝试 {attempt + 1}/3): {e}"
                     )
-                    logger.error(traceback.format_exc())  # ✅ 详细错误日志
+                    logger.error(traceback.format_exc())
                     if attempt == 2:  # 最后一次重试失败
                         await message.answer(
                             "❌ 系统繁忙，请稍后重试",
@@ -2593,6 +2606,45 @@ async def process_work_checkin(message: types.Message, checkin_type: str):
 
             if not db_write_success:
                 return
+
+            # ========== 发送成功消息 ==========
+            result_msg = (
+                f"{emoji_status} <b>{shift_text}{action_text}完成</b>\n"
+                f"👤 用户：{MessageFormatter.format_user_link(uid, name)}\n"
+                f"⏰ 打卡时间：<code>{current_time}</code>\n"
+                f"📅 {action_text}时间：<code>{expected_dt.strftime('%m/%d %H:%M')}</code>\n"
+                f"📊 状态：{status}"
+            )
+
+            if activity_auto_ended and current_activity:
+                result_msg += f"\n\n🔄 检测到未结束活动 <code>{current_activity}</code>，已自动结束"
+
+            await message.answer(
+                result_msg,
+                reply_markup=await get_main_keyboard(chat_id, await is_admin_task),
+                reply_to_message_id=message.message_id,
+                parse_mode="HTML",
+            )
+
+            # ✅ 发送通知
+            status_display = status_type if is_late_early else "准时"
+            if time_diff_seconds > 0 and action_text == "下班":
+                status_display = "加班"
+
+            await send_work_notification(
+                chat_id,
+                uid,
+                name,
+                current_time,
+                expected_dt,
+                action_text,
+                status_display,
+                fine_amount,
+                trace_id,
+            )
+
+            logger.info(f"✅[{trace_id}] {shift_text}{action_text}打卡流程完成")
+            return
 
             # ========== 发送成功消息 ==========
             result_msg = (
