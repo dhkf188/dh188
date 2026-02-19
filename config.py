@@ -97,6 +97,17 @@ class Config:
     # 月度数据配置
     MONTHLY_DATA_RETENTION_DAYS = int(os.getenv("MONTHLY_DATA_RETENTION_DAYS", "40"))
 
+    # ✅ 月度导出配置
+    MONTHLY_EXPORT_ENABLED = (
+        os.getenv("MONTHLY_EXPORT_ENABLED", "true").lower() == "true"
+    )
+    MONTHLY_EXPORT_HOUR = int(os.getenv("MONTHLY_EXPORT_HOUR", "2"))
+    MONTHLY_EXPORT_MINUTE = int(os.getenv("MONTHLY_EXPORT_MINUTE", "0"))
+
+    AUTO_CLEANUP_ENABLED = os.getenv("AUTO_CLEANUP_ENABLED", "true").lower() == "true"
+    CLEANUP_HOUR = int(os.getenv("CLEANUP_HOUR", "3"))
+    CLEANUP_MINUTE = int(os.getenv("CLEANUP_MINUTE", "0"))
+
     # 清理间隔（秒）
     CLEANUP_INTERVAL = int(os.getenv("CLEANUP_INTERVAL", "600"))
     MEMORY_CLEANUP_INTERVAL = 300
