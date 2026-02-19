@@ -2649,8 +2649,8 @@ async def _check_shift_work_record(
     chat_id: int, user_id: int, checkin_type: str, shift: str, business_date: date
 ) -> bool:
     """
-    检查指定班次的打卡记录 - 修复版
-    修复：夜班判断使用业务日期 + 时间窗口结合
+    检查指定班次的打卡记录 - 最终修复版
+    修复：统一时区处理，避免 offset-naive 和 offset-aware 比较错误
     """
     try:
         now = get_beijing_time()
@@ -2739,27 +2739,29 @@ async def _check_shift_work_record(
                         target_end = tonight[checkin_type]["end"]
 
                 if target_start and target_end:
-                    # ✅ 添加保护性代码：确保时间带时区
+                    # ✅ 修复1：确保时间带时区
                     if target_start.tzinfo is None:
                         target_start = target_start.replace(tzinfo=now.tzinfo)
                     if target_end.tzinfo is None:
                         target_end = target_end.replace(tzinfo=now.tzinfo)
 
+                    # ✅ 修复2：统一使用无时区进行比较
+                    # 将数据库的 timestamptz 转换为无时区，同时将 Python 参数也转为无时区
                     row = await conn.fetchrow(
                         """
                         SELECT 1 FROM work_records 
                         WHERE chat_id = $1 AND user_id = $2 
                         AND checkin_type = $3 AND shift = $4
-                        AND created_at >= $5
-                        AND created_at <= $6
+                        AND created_at AT TIME ZONE 'Asia/Shanghai' >= $5::timestamp
+                        AND created_at AT TIME ZONE 'Asia/Shanghai' <= $6::timestamp
                         LIMIT 1
                         """,
                         chat_id,
                         user_id,
                         checkin_type,
                         shift,
-                        target_start,
-                        target_end,
+                        target_start.replace(tzinfo=None),
+                        target_end.replace(tzinfo=None),
                     )
                     return row is not None
 
@@ -2769,13 +2771,13 @@ async def _check_shift_work_record(
         logger.error(f"检查班次打卡记录失败: {e}")
         return False
 
-
 # ✅ 修正后的函数定义（添加 business_date 参数）
 async def _get_existing_work_record(
     chat_id: int, user_id: int, checkin_type: str, shift: str, business_date: date
 ) -> Optional[Dict]:
     """
-    获取已存在的打卡记录详情 - 复用 calculate_shift_window
+    获取已存在的打卡记录详情 - 修复版
+    统一时区处理
     """
     try:
         now = get_beijing_time()
@@ -2788,7 +2790,7 @@ async def _get_existing_work_record(
             shift_config=shift_config, checkin_type=checkin_type, now=now
         )
 
-        # 确定目标窗口（同上的逻辑）
+        # 确定目标窗口
         target_start = None
         target_end = None
 
@@ -2818,15 +2820,22 @@ async def _get_existing_work_record(
             target_start = now - timedelta(hours=24)
             target_end = now + timedelta(hours=1)
 
+        # ✅ 修复：确保时间带时区
+        if target_start.tzinfo is None:
+            target_start = target_start.replace(tzinfo=now.tzinfo)
+        if target_end.tzinfo is None:
+            target_end = target_end.replace(tzinfo=now.tzinfo)
+
         async with db.pool.acquire() as conn:
+            # ✅ 修复：统一使用无时区进行比较
             row = await conn.fetchrow(
                 """
                 SELECT checkin_time, status, created_at, record_date 
                 FROM work_records 
                 WHERE chat_id = $1 AND user_id = $2 
                 AND checkin_type = $3 AND shift = $4
-                AND created_at >= $5
-                AND created_at <= $6
+                AND created_at AT TIME ZONE 'Asia/Shanghai' >= $5::timestamp
+                AND created_at AT TIME ZONE 'Asia/Shanghai' <= $6::timestamp
                 ORDER BY created_at DESC
                 LIMIT 1
                 """,
@@ -2834,8 +2843,8 @@ async def _get_existing_work_record(
                 user_id,
                 checkin_type,
                 shift,
-                target_start,
-                target_end,
+                target_start.replace(tzinfo=None),
+                target_end.replace(tzinfo=None),
             )
 
             if row:
@@ -2850,7 +2859,6 @@ async def _get_existing_work_record(
     except Exception as e:
         logger.error(f"获取现有记录失败: {e}")
         return None
-
 
 async def send_work_notification(
     chat_id: int,
