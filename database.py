@@ -4315,26 +4315,92 @@ class PostgreSQLDatabase:
                     "DELETE FROM users WHERE last_updated < $1", cutoff_date
                 )
 
-    async def cleanup_monthly_data(self, target_date: date = None):
-        """清理月度统计数据"""
-        if target_date is None:
-            today = self.get_beijing_time()
-            # 使用配置而不是硬编码90天
-            monthly_cutoff = (
-                (today - timedelta(days=Config.MONTHLY_DATA_RETENTION_DAYS))
-                .date()
-                .replace(day=1)
-            )
-            target_date = monthly_cutoff
+    async def cleanup_monthly_data(self, days_or_date=None):
+        """
+        清理月度统计数据
 
-        self._ensure_pool_initialized()
-        async with self.pool.acquire() as conn:
-            result = await conn.execute(
-                "DELETE FROM monthly_statistics WHERE statistic_date < $1", target_date
-            )
-            return (
-                int(result.split()[-1]) if result and result.startswith("DELETE") else 0
-            )
+        Args:
+            days_or_date: 可以是：
+                - int: 清理多少天前的数据
+                - date: 清理指定日期前的数据
+                - None: 使用配置的默认天数
+
+        Returns:
+            删除的记录数
+        """
+        import traceback
+
+        try:
+            today = self.get_beijing_time()
+
+            # ===== 确定截止日期 =====
+            if days_or_date is None:
+                # 没有参数：使用配置的默认天数
+                cutoff_date = (
+                    (today - timedelta(days=Config.MONTHLY_DATA_RETENTION_DAYS))
+                    .date()
+                    .replace(day=1)
+                )
+                logger.info(
+                    f"📅 使用默认配置: {Config.MONTHLY_DATA_RETENTION_DAYS}天, "
+                    f"截止日期={cutoff_date}"
+                )
+
+            elif isinstance(days_or_date, int):
+                # 传入的是天数
+                if days_or_date <= 0:
+                    logger.warning(f"⚠️ 无效的天数: {days_or_date}，必须大于0")
+                    return 0
+
+                cutoff_date = (
+                    (today - timedelta(days=days_or_date)).date().replace(day=1)
+                )
+                logger.info(
+                    f"📅 按天数清理: {days_or_date}天前, 截止日期={cutoff_date}"
+                )
+
+            elif isinstance(days_or_date, date):
+                # 传入的是日期
+                cutoff_date = days_or_date
+                logger.info(f"📅 按日期清理: 截止日期={cutoff_date}")
+
+            else:
+                logger.error(f"❌ 无效的参数类型: {type(days_or_date)}")
+                return 0
+
+            # ===== 验证日期 =====
+            if cutoff_date > today.date():
+                logger.warning(f"⚠️ 截止日期 {cutoff_date} 晚于今天，不会删除任何数据")
+                return 0
+
+            # ===== 执行清理 =====
+            self._ensure_pool_initialized()
+            async with self.pool.acquire() as conn:
+                result = await conn.execute(
+                    "DELETE FROM monthly_statistics WHERE statistic_date < $1",
+                    cutoff_date,
+                )
+
+                deleted_count = 0
+                if result and result.startswith("DELETE"):
+                    try:
+                        deleted_count = int(result.split()[-1])
+                    except (ValueError, IndexError):
+                        pass
+
+                logger.info(
+                    f"✅ 月度数据清理完成\n"
+                    f"   ├─ 截止日期: {cutoff_date}\n"
+                    f"   ├─ 删除记录: {deleted_count} 条\n"
+                    f"   └─ 参数: {days_or_date or '默认'}"
+                )
+
+                return deleted_count
+
+        except Exception as e:
+            logger.error(f"❌ 月度数据清理失败: {e}")
+            logger.error(traceback.format_exc())
+            return 0
 
     async def cleanup_specific_month(self, year: int, month: int):
         """清理指定年月的月度统计数据"""
