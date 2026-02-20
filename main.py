@@ -2230,6 +2230,40 @@ async def process_work_checkin(message: types.Message, checkin_type: str):
                 )
                 return
 
+            # 🆕 新增：检查并强制结束其他班次的活动
+            user_data = await db.get_user_cached(chat_id, uid)
+            if user_data and user_data.get("current_activity"):
+                current_shift = user_data.get("shift", "day")
+                current_activity = user_data["current_activity"]
+
+                # 如果新班次与旧活动班次不同，强制结束旧活动
+                if current_shift != shift:  # shift 是刚判定的新班次
+                    logger.info(
+                        f"🔄 [上班强制结束] 用户{uid} "
+                        f"旧班次({current_shift})活动: {current_activity}, "
+                        f"新班次({shift})上班，自动结束旧活动"
+                    )
+
+                    # 发送通知告知用户
+                    await message.answer(
+                        f"🔄 <b>系统自动处理</b>\n"
+                        f"检测到您有未结束的<code>{current_shift}</code>班次活动：<code>{current_activity}</code>\n"
+                        f"由于您正在打<code>{shift}</code>班次上班卡，该活动已自动结束。",
+                        parse_mode="HTML",
+                    )
+
+                    # 复用现有的自动结束函数
+                    await auto_end_current_activity(
+                        chat_id=chat_id,
+                        uid=uid,
+                        user_data=user_data,
+                        now=now,
+                        message=message,
+                    )
+
+                    # 重新获取用户数据（活动已结束）
+                    user_data = await db.get_user_cached(chat_id, uid)
+
             # 🎯 检查重复上班
             has_record = await _check_shift_work_record(
                 chat_id,
@@ -2873,96 +2907,208 @@ async def _check_shift_work_record(
     chat_id: int, user_id: int, checkin_type: str, shift: str, business_date: date
 ) -> bool:
     """
-    检查指定班次的打卡记录 - 最终修复版
+    检查指定班次的打卡记录 - 完整保留所有功能
+
+    Args:
+        chat_id: 群组ID
+        user_id: 用户ID
+        checkin_type: 打卡类型 (work_start/work_end)
+        shift: 班次 (day/night)
+        business_date: 业务日期（由上层 determine_shift_for_time 提供）
+
+    Returns:
+        bool: 是否存在记录
     """
     try:
         now = get_beijing_time()
+        trace_id = f"{chat_id}-{user_id}-{int(time.time())}"
+
+        # ========== 1. 参数验证 ==========
+        if not all([chat_id, user_id, checkin_type, shift, business_date]):
+            logger.error(f"❌ [{trace_id}] _check_shift_work_record 缺少必要参数")
+            return False
 
         # 获取班次配置
         shift_config = await db.get_shift_config(chat_id)
 
-        # 🎯 获取业务日期（用于夜班判断）
+        # ========== 2. 获取业务日期（用于夜班判断） ==========
         from database import db as database_db
 
+        # 🎯 仍然通过 get_business_date 获取实际业务日期，确保与班次判定一致
         actual_business_date = await database_db.get_business_date(
             chat_id=chat_id, current_dt=now, shift=shift, checkin_type=checkin_type
         )
 
         async with db.pool.acquire() as conn:
-            # 方法1：使用业务日期查询
+            # ========== 3. 方法1：使用业务日期查询（主要方法） ==========
             row = await conn.fetchrow(
                 """
                 SELECT 1 FROM work_records 
-                WHERE chat_id = $1 AND user_id = $2 
-                AND checkin_type = $3 AND shift = $4
-                AND record_date = $5
+                WHERE chat_id = $1 
+                  AND user_id = $2 
+                  AND checkin_type = $3 
+                  AND shift = $4
+                  AND record_date = $5
                 LIMIT 1
                 """,
                 chat_id,
                 user_id,
                 checkin_type,
                 shift,
-                actual_business_date,
+                actual_business_date,  # 使用动态计算的业务日期
             )
 
             if row:
+                logger.debug(
+                    f"✅ [{trace_id}] 找到打卡记录(业务日期): "
+                    f"type={checkin_type}, shift={shift}, date={actual_business_date}"
+                )
                 return True
 
-            # 方法2：如果没查到，再使用时间窗口查询（仅作为向后兼容）
+            # ========== 4. 方法2：使用传入的 business_date 查询（备用） ==========
+            row = await conn.fetchrow(
+                """
+                SELECT 1 FROM work_records 
+                WHERE chat_id = $1 
+                  AND user_id = $2 
+                  AND checkin_type = $3 
+                  AND shift = $4
+                  AND record_date = $5
+                LIMIT 1
+                """,
+                chat_id,
+                user_id,
+                checkin_type,
+                shift,
+                business_date,  # 使用传入的业务日期
+            )
+
+            if row:
+                logger.debug(
+                    f"✅ [{trace_id}] 找到打卡记录(传入日期): "
+                    f"type={checkin_type}, shift={shift}, date={business_date}"
+                )
+                return True
+
+            # ========== 5. 夜班特殊处理：检查前一天（保留跨天逻辑） ==========
             if shift == "night":
-                # 获取窗口信息
-                window_info = db.calculate_shift_window(
-                    shift_config=shift_config, checkin_type=checkin_type, now=now
+                previous_date = business_date - timedelta(days=1)
+                row = await conn.fetchrow(
+                    """
+                    SELECT 1 FROM work_records 
+                    WHERE chat_id = $1 
+                      AND user_id = $2 
+                      AND checkin_type = $3 
+                      AND shift = $4
+                      AND record_date = $5
+                    LIMIT 1
+                    """,
+                    chat_id,
+                    user_id,
+                    checkin_type,
+                    shift,
+                    previous_date,
                 )
 
-                night_window = window_info.get("night_window", {})
-
-                # 根据当前时间判断用哪个窗口
-                day_start = shift_config.get("day_start", "09:00")
-                day_start_hour, day_start_min = map(int, day_start.split(":"))
-                today_start = datetime.combine(
-                    now.date(), dt_time(day_start_hour, day_start_min)
-                ).replace(tzinfo=now.tzinfo)
-
-                if now < today_start:
-                    last_night = night_window.get("last_night", {})
-                    target_start = last_night.get(checkin_type, {}).get("start")
-                    target_end = last_night.get(checkin_type, {}).get("end")
-                else:
-                    tonight = night_window.get("tonight", {})
-                    target_start = tonight.get(checkin_type, {}).get("start")
-                    target_end = tonight.get(checkin_type, {}).get("end")
-
-                if target_start and target_end:
-                    # 时区处理
-                    if target_start.tzinfo is None:
-                        target_start = target_start.replace(tzinfo=now.tzinfo)
-                    if target_end.tzinfo is None:
-                        target_end = target_end.replace(tzinfo=now.tzinfo)
-
-                    # 统一使用无时区比较
-                    row = await conn.fetchrow(
-                        """
-                        SELECT 1 FROM work_records 
-                        WHERE chat_id = $1 AND user_id = $2 
-                        AND checkin_type = $3 AND shift = $4
-                        AND created_at AT TIME ZONE 'Asia/Shanghai' >= $5::timestamp
-                        AND created_at AT TIME ZONE 'Asia/Shanghai' <= $6::timestamp
-                        LIMIT 1
-                        """,
-                        chat_id,
-                        user_id,
-                        checkin_type,
-                        shift,
-                        target_start.replace(tzinfo=None),
-                        target_end.replace(tzinfo=None),
+                if row:
+                    logger.debug(
+                        f"🌙 [{trace_id}] 找到夜班记录(前一天): "
+                        f"type={checkin_type}, date={previous_date}"
                     )
-                    return row is not None
+                    return True
 
+                # 再检查前一天的实际业务日期
+                actual_previous = actual_business_date - timedelta(days=1)
+                row = await conn.fetchrow(
+                    """
+                    SELECT 1 FROM work_records 
+                    WHERE chat_id = $1 
+                      AND user_id = $2 
+                      AND checkin_type = $3 
+                      AND shift = $4
+                      AND record_date = $5
+                    LIMIT 1
+                    """,
+                    chat_id,
+                    user_id,
+                    checkin_type,
+                    shift,
+                    actual_previous,
+                )
+
+                if row:
+                    logger.debug(
+                        f"🌙 [{trace_id}] 找到夜班记录(前一天实际日期): "
+                        f"type={checkin_type}, date={actual_previous}"
+                    )
+                    return True
+
+            # ========== 6. 方法3：时间窗口查询（最终保底） ==========
+            # 获取窗口信息
+            window_info = db.calculate_shift_window(
+                shift_config=shift_config, checkin_type=checkin_type, now=now
+            )
+
+            night_window = window_info.get("night_window", {})
+
+            # 根据当前时间判断用哪个窗口
+            day_start = shift_config.get("day_start", "09:00")
+            day_start_hour, day_start_min = map(int, day_start.split(":"))
+            today_start = datetime.combine(
+                now.date(), dt_time(day_start_hour, day_start_min)
+            ).replace(tzinfo=now.tzinfo)
+
+            if now < today_start:
+                last_night = night_window.get("last_night", {})
+                target_start = last_night.get(checkin_type, {}).get("start")
+                target_end = last_night.get(checkin_type, {}).get("end")
+            else:
+                tonight = night_window.get("tonight", {})
+                target_start = tonight.get(checkin_type, {}).get("start")
+                target_end = tonight.get(checkin_type, {}).get("end")
+
+            if target_start and target_end:
+                # 时区处理
+                if target_start.tzinfo is None:
+                    target_start = target_start.replace(tzinfo=now.tzinfo)
+                if target_end.tzinfo is None:
+                    target_end = target_end.replace(tzinfo=now.tzinfo)
+
+                # 统一使用无时区比较
+                row = await conn.fetchrow(
+                    """
+                    SELECT 1 FROM work_records 
+                    WHERE chat_id = $1 
+                      AND user_id = $2 
+                      AND checkin_type = $3 
+                      AND shift = $4
+                      AND created_at AT TIME ZONE 'Asia/Shanghai' >= $5::timestamp
+                      AND created_at AT TIME ZONE 'Asia/Shanghai' <= $6::timestamp
+                    LIMIT 1
+                    """,
+                    chat_id,
+                    user_id,
+                    checkin_type,
+                    shift,
+                    target_start.replace(tzinfo=None),
+                    target_end.replace(tzinfo=None),
+                )
+                if row:
+                    logger.debug(
+                        f"✅ [{trace_id}] 找到打卡记录(窗口查询): "
+                        f"type={checkin_type}, shift={shift}"
+                    )
+                    return True
+
+            logger.debug(
+                f"❌ [{trace_id}] 未找到打卡记录: "
+                f"type={checkin_type}, shift={shift}, date={business_date}"
+            )
             return False
 
     except Exception as e:
-        logger.error(f"检查班次打卡记录失败: {e}")
+        logger.error(f"❌ [{trace_id}] 检查班次打卡记录失败: {e}")
+        logger.error(traceback.format_exc())
         return False
 
 
