@@ -7330,226 +7330,252 @@ async def export_and_push_csv(
 
 # ========== 定时任务 ==========
 async def daily_reset_task():
-    """每日自动重置任务 - 单班/双班分流"""
+    """每日重置监控任务 - 统一处理单班/双班"""
     logger.info("🚀 每日重置监控任务已启动")
-
+    
+    # 先确保日志表存在
+    try:
+        async with db.pool.acquire() as conn:
+            await conn.execute("""
+                CREATE TABLE IF NOT EXISTS reset_logs (
+                    id SERIAL PRIMARY KEY,
+                    chat_id BIGINT NOT NULL,
+                    mode VARCHAR(10) NOT NULL,
+                    reset_date DATE NOT NULL,
+                    created_at TIMESTAMP NOT NULL DEFAULT NOW(),
+                    UNIQUE(chat_id, mode, reset_date)
+                )
+            """)
+            logger.info("✅ 重置日志表已确认")
+    except Exception as e:
+        logger.error(f"创建重置日志表失败: {e}")
+    
     sem = asyncio.Semaphore(10)
-
-    async def process_single_group(chat_id, now):
+    TASK_TIMEOUT = 300  # 单个群组重置超时时间（5分钟）
+    
+    async def process_group_reset(chat_id: int, now: datetime):
+        """处理单个群组的重置（带超时保护）"""
+        start_time = time.time()
+        
         async with sem:
             try:
-                group_data = await db.get_group_cached(chat_id)
-                reset_hour = group_data.get("reset_hour", Config.DAILY_RESET_HOUR)
-                reset_minute = group_data.get("reset_minute", Config.DAILY_RESET_MINUTE)
-
-                # 获取班次配置
-                from dual_shift_reset import handle_hard_reset
-
-                shift_config = await db.get_shift_config(chat_id)
-                is_dual_mode = shift_config.get("dual_mode", False)
-
-                # ========== 🎯 1. 计算执行时间 ==========
-                reset_time_today = now.replace(
-                    hour=reset_hour, minute=reset_minute, second=0, microsecond=0
-                )
-
-                if is_dual_mode:
-                    # 双班模式：需要正确处理凌晨边界
-                    reset_time_yesterday = reset_time_today - timedelta(days=1)
-                    execute_yesterday = reset_time_yesterday + timedelta(hours=2)
-                    execute_today = reset_time_today + timedelta(hours=2)
-
-                    # 判断当前在哪个执行窗口
-                    if execute_yesterday <= now < execute_today:
-                        execute_time = execute_yesterday
-                        target_date = reset_time_yesterday.date()
-                        period_info = "昨天"
-                    else:
-                        execute_time = execute_today
-                        target_date = reset_time_today.date()
-                        period_info = "今天"
-
-                    # 检查是否到达执行时间（5分钟窗口）
-                    time_diff = abs((now - execute_time).total_seconds())
-                    if time_diff > 300:
-                        return  # 不在执行窗口内
-
-                    mode_info = f"双班模式(执行时间:{execute_time.strftime('%H:%M')},{period_info})"
-
-                    # 双班模式幂等性检查
-                    reset_flag_key = (
-                        f"dual_reset:{chat_id}:{target_date.strftime('%Y%m%d')}"
-                    )
-                    if global_cache.get(reset_flag_key):
-                        logger.debug(f"⏭️ 群组 {chat_id} 今天已执行双班重置")
-                        return
-
-                else:
-                    # 单班模式：检查是否到达重置时间
-                    if now.hour != reset_hour or now.minute != reset_minute:
-                        return  # 不在执行时间
-
-                    mode_info = (
-                        f"单班模式(重置时间:{reset_hour:02d}:{reset_minute:02d})"
-                    )
-
-                    # 单班模式幂等性检查
-                    reset_flag_key = f"single_reset:{chat_id}:{now.strftime('%Y%m%d')}"
-                    if global_cache.get(reset_flag_key):
-                        logger.debug(f"⏭️ 群组 {chat_id} 今天已执行单班重置")
-                        return
-
-                # ========== 🎯 2. 到达执行时间，开始重置 ==========
-                logger.info(f"🔄 [{mode_info}] 群组 {chat_id} 开始执行重置")
-
-                if is_dual_mode:
-                    # 双班模式
-                    result = await handle_hard_reset(chat_id, None)
-                    if result is True:
-                        global_cache.set(reset_flag_key, True, ttl=86400)
-                        logger.info(f"✅ [双班重置] 群组 {chat_id} 执行成功")
-                    elif result is False:
-                        logger.error(f"❌ [双班重置] 群组 {chat_id} 执行失败")
-                    else:  # None
-                        logger.warning(
-                            f"⚠️ [双班重置] 群组 {chat_id} 返回None，可能是配置问题"
-                        )
-                else:
-                    # 单班模式
-                    business_date = (
-                        now.date()
-                        if now.hour >= 12
-                        else (now - timedelta(days=1)).date()
-                    )
-
-                    # 导出备份
-                    try:
-                        await export_and_push_csv(
-                            chat_id,
-                            target_date=business_date,
-                            file_name=f"backup_{chat_id}_{business_date.strftime('%Y%m%d')}.csv",
-                        )
-                    except Exception as e:
-                        logger.error(f"群组 {chat_id} 备份失败: {e}")
-
-                    # 完成未结束活动
-                    await db.complete_all_pending_activities_before_reset(chat_id, now)
-
-                    # 重置用户数据
-                    await db.force_reset_all_users_in_group(
-                        chat_id, target_date=business_date
-                    )
-
-                    # 清理定时器
-                    if hasattr(timer_manager, "cancel_all_timers_for_group"):
-                        await timer_manager.cancel_all_timers_for_group(
-                            chat_id, preserve_message=False
-                        )
-
-                    # 发送通知
-                    try:
-                        await send_reset_notification(chat_id, {}, now)
-                    except Exception as e:
-                        logger.error(f"群组 {chat_id} 通知发送失败: {e}")
-
-                    # 设置单班模式幂等标记
-                    global_cache.set(reset_flag_key, True, ttl=86400)
-                    logger.info(f"✅ [单班重置] 群组 {chat_id} 执行成功")
-
-            except Exception as e:
-                logger.error(f"❌ 处理群组 {chat_id} 严重失败: {e}")
-                logger.error(traceback.format_exc())
-
-    while True:
-        try:
-            now = get_beijing_time()
-            all_groups = await db.get_all_groups()
-            tasks = [process_single_group(cid, now) for cid in all_groups]
-            await asyncio.gather(*tasks)
-        except Exception as e:
-            logger.error(f"❌ daily_reset_task 循环主逻辑出错: {e}")
-        await asyncio.sleep(60)
-
-
-async def dual_shift_reset_monitor():
-    """
-    专门监控双班群组的硬重置执行
-    每30秒检查一次，5分钟执行窗口
-    """
-    logger.info("🚀 双班重置监控任务已启动")
-
-    # 放在循环外，避免重复导入
-    from dual_shift_reset import handle_hard_reset
-
-    while True:
-        try:
-            now = get_beijing_time()
-            all_groups = await db.get_all_groups()
-
-            for chat_id in all_groups:
-                try:
-                    # 1. 快速检查：是否是双班模式
-                    if not await db.is_dual_mode_enabled(chat_id):
-                        continue
-
-                    # 2. 获取群组配置
+                # 使用超时保护
+                async with asyncio.timeout(TASK_TIMEOUT):
+                    # 1. 获取群组配置
                     group_data = await db.get_group_cached(chat_id)
                     if not group_data:
-                        continue
-
+                        return
+                        
                     reset_hour = group_data.get("reset_hour", Config.DAILY_RESET_HOUR)
-                    reset_minute = group_data.get(
-                        "reset_minute", Config.DAILY_RESET_MINUTE
-                    )
-
-                    # 3. 计算执行时间（跨天安全）
-                    reset_time = datetime.combine(
-                        now.date(), time(reset_hour, reset_minute)
-                    )
-                    # 如果当前时间在重置时间之前2小时以上，说明是昨天的重置
-                    if now < reset_time - timedelta(hours=2):
-                        reset_time -= timedelta(days=1)
-                    execute_time = reset_time + timedelta(hours=2)
-
-                    # 4. 检查是否已执行（幂等性）
-                    target_date = execute_time.date()
-                    reset_flag_key = (
-                        f"dual_reset:{chat_id}:{target_date.strftime('%Y%m%d')}"
-                    )
-                    if global_cache.get(reset_flag_key):
-                        continue
-
-                    # ✅ 修复：使用 ±5分钟窗口
-                    time_diff = abs((now - execute_time).total_seconds())
-                    if time_diff <= 300:  # 5分钟窗口
-                        logger.info(
-                            f"🎯 [双班重置] 群组 {chat_id} 进入执行窗口\n"
-                            f"   • 当前时间: {now.strftime('%H:%M:%S')}\n"
-                            f"   • 目标时间: {execute_time.strftime('%H:%M:%S')}\n"
-                            f"   • 时间差: {time_diff:.0f}秒"
-                        )
-
-                        success = await handle_hard_reset(chat_id, None)
-
-                        if success is True:
-                            global_cache.set(reset_flag_key, True, ttl=86400)
-                            logger.info(f"✅ [双班重置] 群组 {chat_id} 执行成功")
-                        elif success is False:
-                            logger.error(f"❌ [双班重置] 群组 {chat_id} 执行失败")
-                        else:  # None
-                            logger.warning(
-                                f"⚠️ [双班重置] 群组 {chat_id} 返回None，可能是单班模式？"
-                            )
-
-                except Exception as e:
-                    logger.error(f"❌ 处理群组 {chat_id} 双班重置失败: {e}")
-                    logger.error(traceback.format_exc())
-
+                    reset_minute = group_data.get("reset_minute", Config.DAILY_RESET_MINUTE)
+                    
+                    # 2. 判断模式
+                    shift_config = await db.get_shift_config(chat_id)
+                    is_dual_mode = shift_config.get("dual_mode", False)
+                    
+                    # 3. 根据模式选择处理器
+                    if is_dual_mode:
+                        await process_dual_mode_reset(chat_id, now, reset_hour, reset_minute)
+                    else:
+                        await process_single_mode_reset(chat_id, now, reset_hour, reset_minute)
+                    
+                    # 记录执行时间
+                    elapsed = time.time() - start_time
+                    if elapsed > 10:  # 只记录耗时较长的
+                        logger.info(f"⏱️ 群组 {chat_id} 重置完成，耗时: {elapsed:.2f}秒")
+                    
+            except asyncio.TimeoutError:
+                logger.error(f"❌ 群组 {chat_id} 重置超时（>{TASK_TIMEOUT}秒）")
+            except Exception as e:
+                logger.error(f"❌ 处理群组 {chat_id} 重置失败: {e}")
+                logger.error(traceback.format_exc())
+    
+    async def process_dual_mode_reset(chat_id: int, now: datetime, reset_hour: int, reset_minute: int):
+        """处理双班模式重置 - 5分钟执行窗口"""
+        from dual_shift_reset import handle_hard_reset
+        
+        # 计算今天的重置时间点
+        reset_time_today = now.replace(
+            hour=reset_hour, minute=reset_minute, second=0, microsecond=0
+        )
+        
+        # 计算两个执行窗口（重置时间+2小时）
+        execute_windows = [
+            (reset_time_today - timedelta(days=1)) + timedelta(hours=2),  # 昨天的重置+2小时
+            reset_time_today + timedelta(hours=2)                          # 今天的重置+2小时
+        ]
+        
+        # 检查是否在任意执行窗口内（5分钟）
+        execute_time = None
+        target_date = None
+        period_info = None
+        
+        for i, wt in enumerate(execute_windows):
+            time_diff = abs((now - wt).total_seconds())
+            if time_diff <= 300:  # 5分钟窗口
+                execute_time = wt
+                target_date = wt.date()
+                period_info = "昨天" if i == 0 else "今天"
+                break
+        
+        if not execute_time:
+            return  # 不在执行窗口
+        
+        # 统一幂等性检查
+        if not await check_reset_idempotency(chat_id, "dual", target_date):
+            return
+        
+        logger.info(
+            f"🎯 [双班重置] 群组 {chat_id}\n"
+            f"   • 当前时间: {now.strftime('%H:%M:%S')}\n"
+            f"   • 执行时间: {execute_time.strftime('%H:%M:%S')} ({period_info})\n"
+            f"   • 重置时间: {reset_hour:02d}:{reset_minute:02d}\n"
+            f"   • 目标日期: {target_date}"
+        )
+        
+        # 执行双班重置
+        result = await handle_hard_reset(chat_id, None)
+        
+        if result is True:
+            await set_reset_idempotency(chat_id, "dual", target_date)
+            logger.info(f"✅ [双班重置] 群组 {chat_id} 执行成功")
+        elif result is False:
+            logger.error(f"❌ [双班重置] 群组 {chat_id} 执行失败")
+        else:  # None
+            logger.warning(f"⚠️ [双班重置] 群组 {chat_id} 返回None，可能是配置问题")
+    
+    async def process_single_mode_reset(chat_id: int, now: datetime, reset_hour: int, reset_minute: int):
+        """处理单班模式重置 - 精确到分钟执行"""
+        # 检查是否到达重置时间（精确匹配）
+        if now.hour != reset_hour or now.minute != reset_minute:
+            return
+        
+        # 统一幂等性检查
+        if not await check_reset_idempotency(chat_id, "single", now.date()):
+            return
+        
+        logger.info(
+            f"🎯 [单班重置] 群组 {chat_id}\n"
+            f"   • 当前时间: {now.strftime('%H:%M:%S')}\n"
+            f"   • 重置时间: {reset_hour:02d}:{reset_minute:02d}"
+        )
+        
+        # 计算业务日期（单班模式特有的逻辑）
+        if now.hour >= 12:
+            business_date = now.date()
+        else:
+            business_date = now.date() - timedelta(days=1)
+        
+        # 1. 导出备份
+        try:
+            timestamp = now.strftime('%Y%m%d_%H%M%S')
+            await export_and_push_csv(
+                chat_id,
+                target_date=business_date,
+                file_name=f"backup_{chat_id}_{business_date.strftime('%Y%m%d')}_{timestamp}.csv",
+            )
         except Exception as e:
-            logger.error(f"❌ 双班重置监控任务主循环失败: {e}")
+            logger.error(f"群组 {chat_id} 备份失败: {e}")
+        
+        # 2. 完成未结束活动
+        await db.complete_all_pending_activities_before_reset(chat_id, now)
+        
+        # 3. 重置用户数据
+        await db.force_reset_all_users_in_group(chat_id, target_date=business_date)
+        
+        # 4. 清理定时器
+        if hasattr(timer_manager, "cancel_all_timers_for_group"):
+            await timer_manager.cancel_all_timers_for_group(chat_id, preserve_message=False)
+        
+        # 5. 发送通知
+        try:
+            await send_reset_notification(chat_id, {}, now)
+        except Exception as e:
+            logger.error(f"群组 {chat_id} 通知发送失败: {e}")
+        
+        # 6. 设置幂等标记
+        await set_reset_idempotency(chat_id, "single", now.date())
+        logger.info(f"✅ [单班重置] 群组 {chat_id} 执行成功")
+    
+    async def check_reset_idempotency(chat_id: int, mode: str, target_date: date) -> bool:
+        """统一幂等性检查"""
+        reset_flag_key = f"{mode}_reset:{chat_id}:{target_date.strftime('%Y%m%d')}"
+        
+        # 1. 检查缓存
+        if global_cache.get(reset_flag_key):
+            logger.debug(f"⏭️ 群组 {chat_id} {mode}模式 今天已执行重置")
+            return False
+        
+        # 2. 检查数据库（双重保障）
+        try:
+            async with db.pool.acquire() as conn:
+                exists = await conn.fetchval(
+                    """
+                    SELECT EXISTS(
+                        SELECT 1 FROM reset_logs 
+                        WHERE chat_id = $1 AND mode = $2 AND reset_date = $3
+                    )
+                    """,
+                    chat_id, mode, target_date
+                )
+                if exists:
+                    logger.debug(f"📦 群组 {chat_id} 数据库记录已存在重置")
+                    # 同步到缓存
+                    global_cache.set(reset_flag_key, True, ttl=86400)
+                    return False
+        except Exception as e:
+            logger.error(f"数据库幂等性检查失败: {e}")
+            # 出错时允许执行（防卡死）
+        
+        return True
+    
+    async def set_reset_idempotency(chat_id: int, mode: str, target_date: date):
+        """设置幂等性标记"""
+        reset_flag_key = f"{mode}_reset:{chat_id}:{target_date.strftime('%Y%m%d')}"
+        global_cache.set(reset_flag_key, True, ttl=86400)
+        
+        # 记录到数据库
+        try:
+            async with db.pool.acquire() as conn:
+                await conn.execute(
+                    """
+                    INSERT INTO reset_logs (chat_id, mode, reset_date)
+                    VALUES ($1, $2, $3)
+                    ON CONFLICT (chat_id, mode, reset_date) DO NOTHING
+                    """,
+                    chat_id, mode, target_date
+                )
+        except Exception as e:
+            logger.error(f"记录重置日志失败: {e}")
+    
+    # ==================== 主循环 ====================
+    loop_count = 0
+    while True:
+        try:
+            loop_start = time.time()
+            loop_count += 1
+            
+            now = get_beijing_time()
+            all_groups = await db.get_all_groups()
+            
+            # 只在整点或半小时记录调试日志，减少日志量
+            if now.minute in [0, 30]:
+                logger.debug(f"🔄 第 {loop_count} 次检查，当前时间: {now.strftime('%H:%M')}, 群组数: {len(all_groups)}")
+            
+            # 批量处理所有群组
+            tasks = [process_group_reset(cid, now) for cid in all_groups]
+            await asyncio.gather(*tasks, return_exceptions=True)
+            
+            # 记录循环执行时间（如果超过阈值）
+            loop_elapsed = time.time() - loop_start
+            if loop_elapsed > 10:
+                logger.info(f"⏱️ 重置检查循环耗时: {loop_elapsed:.2f}秒")
+            
+        except Exception as e:
+            logger.error(f"❌ 重置任务主循环出错: {e}")
             logger.error(traceback.format_exc())
-
-        await asyncio.sleep(30)
+            
+        await asyncio.sleep(30)  # 30秒检查一次
 
 
 # ========== 软重置定时任务 ==========
