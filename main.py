@@ -6359,7 +6359,7 @@ async def show_history(message: types.Message, shift: str = None):
     activity_limits = await db.get_activity_limits_cached()
 
     async with db.pool.acquire() as conn:
-        # 🎯 修改：如果指定了班次，只查询该班次的数据
+        # 如果指定了班次，只查询该班次的数据
         if shift:
             rows = await conn.fetch(
                 """
@@ -6387,30 +6387,23 @@ async def show_history(message: types.Message, shift: str = None):
 
     activities_by_shift = {"day": {}, "night": {}}
 
-    # 🎯 修改：分别统计各活动在不同班次的数据
     for r in rows:
         s = r["shift"] or "day"
         act = r["activity_name"]
 
-        # 初始化班次字典
         if act not in activities_by_shift[s]:
             activities_by_shift[s][act] = {"count": 0, "time": 0}
 
-        # 累加数据
         activities_by_shift[s][act]["count"] += r["activity_count"]
         activities_by_shift[s][act]["time"] += r["accumulated_time"]
 
-    # 🎯 修改：根据班次参数计算总统计
+    # 根据班次参数计算总统计
     if shift:
-        # 只统计指定班次的数据
         shift_data = activities_by_shift.get(shift, {})
         total_time_all = sum(info["time"] for info in shift_data.values())
         total_count_all = sum(info["count"] for info in shift_data.values())
-
-        # 用于显示的活动数据（只显示指定班次）
         display_activities = shift_data
     else:
-        # 统计所有班次的总数据
         total_time_all = 0
         total_count_all = 0
         for s_data in activities_by_shift.values():
@@ -6418,7 +6411,6 @@ async def show_history(message: types.Message, shift: str = None):
                 total_time_all += info["time"]
                 total_count_all += info["count"]
 
-        # 用于显示的活动数据（合并所有班次）
         display_activities = {}
         for s, acts in activities_by_shift.items():
             for act, info in acts.items():
@@ -6449,18 +6441,15 @@ async def show_history(message: types.Message, shift: str = None):
         return block
 
     if shift:
-        # 显示指定班次的活动
         shift_display = render_activity_block(activities_by_shift.get(shift, {}))
         if shift_display:
             text += shift_display
     elif is_dual_mode:
-        # 双班模式，分开显示
         for s in ("day", "night"):
             block = render_activity_block(activities_by_shift.get(s, {}))
             if block:
                 text += f"\n【{'白班' if s == 'day' else '夜班'}】\n{block}"
     else:
-        # 单班模式，显示合并的活动
         text += render_activity_block(display_activities)
 
     # ==================== 3️⃣ 当前周期总统计（按班次）====================
@@ -6478,10 +6467,55 @@ async def show_history(message: types.Message, shift: str = None):
             f"• 总活动次数：<code>{total_count_all}</code> 次\n"
         )
 
-    # ==================== 4️⃣ 罚款统计 ====================
-    total_fine = user_data.get("total_fines", 0)
-    if total_fine > 0:
-        text += f"💰 累计罚款：<code>{total_fine}</code> 分\n"
+    # ==================== 4️⃣ 罚款统计（按班次）====================
+    async with db.pool.acquire() as conn:
+        if shift:
+            # 查询指定班次的罚款
+            fine_total = (
+                await conn.fetchval(
+                    """
+                SELECT COALESCE(SUM(accumulated_time), 0)
+                FROM daily_statistics
+                WHERE chat_id = $1 
+                  AND user_id = $2 
+                  AND record_date = $3 
+                  AND shift = $4
+                  AND activity_name IN ('total_fines', 'work_fines', 
+                                       'work_start_fines', 'work_end_fines')
+                """,
+                    chat_id,
+                    uid,
+                    business_date,
+                    shift,
+                )
+                or 0
+            )
+        else:
+            # 查询所有班次的罚款
+            fine_total = (
+                await conn.fetchval(
+                    """
+                SELECT COALESCE(SUM(accumulated_time), 0)
+                FROM daily_statistics
+                WHERE chat_id = $1 
+                  AND user_id = $2 
+                  AND record_date = $3 
+                  AND activity_name IN ('total_fines', 'work_fines', 
+                                       'work_start_fines', 'work_end_fines')
+                """,
+                    chat_id,
+                    uid,
+                    business_date,
+                )
+                or 0
+            )
+
+    if fine_total > 0:
+        if shift:
+            shift_text = "白班" if shift == "day" else "夜班"
+            text += f"💰 {shift_text}累计罚款：<code>{fine_total}</code> 分\n"
+        else:
+            text += f"💰 累计罚款：<code>{fine_total}</code> 分\n"
 
     # ==================== 5️⃣ 班次提示 ====================
     if is_dual_mode and not shift:
