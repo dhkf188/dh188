@@ -685,33 +685,24 @@ async def check_activity_limit_by_shift(
 ) -> tuple[bool, int, int]:
     """
     检查活动次数是否达到上限
-    - 单班模式：不区分班次
-    - 双班模式：按班次统计
+    - 单班模式：不区分班次 (shift=None)
+    - 双班模式：按班次统计 (shift="day" 或 "night")
     """
     await db.init_group(chat_id)
     await db.init_user(chat_id, user_id)
 
     shift_config = await db.get_shift_config(chat_id)
 
-    # 🧠 单班模式兜底
+    # 单班模式：强制不按班次统计
     if not shift_config or not shift_config.get("dual_mode", False):
-        shift = None  # 强制不按班次
+        shift = None
 
-    # 获取当前次数
-    if shift is None:
-        current_count = (
-            await db.get_user_activity_count_by_shift(  # ✅ 使用正确的函数名
-                chat_id, user_id, activity, shift
-            )
-        )
-    else:
-        # 暂时先使用总次数，或者实现按班次计数
-        current_count = await db.get_user_activity_count_by_shift(
-            chat_id, user_id, activity, shift
-        )
+    # ✅ 统一调用，shift 可以是 None
+    current_count = await db.get_user_activity_count_by_shift(
+        chat_id, user_id, activity, shift
+    )
 
     max_times = await db.get_activity_max_times(activity)
-
     return current_count < max_times, current_count, max_times
 
 
