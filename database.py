@@ -973,25 +973,25 @@ class PostgreSQLDatabase:
         return None
 
     # ========== 按照班次活动查询 =========
-
     async def get_user_activity_count_by_shift(
         self,
         chat_id: int,
         user_id: int,
         activity: str,
-        shift: str,  # ✅ 明确要求字符串
+        shift: Optional[str] = None,  # ✅ 改为可选参数，支持单班模式
     ) -> int:
         """
-        按班次获取用户活动次数（严格版）
+        按班次获取用户活动次数（生产级版本）
 
         特性：
-        - 强制参数类型正确
-        - 如果传入错误类型，抛出明确异常
-        - 帮助开发者快速定位问题
+        - 支持单班模式 (shift=None)
+        - 支持双班模式 (shift="day" 或 "night")
+        - 自动容错转换 (night_last/night_tonight → night)
+        - 严格的参数类型检查
+        - 详细的调试日志
         """
 
         # ========= 1️⃣ 严格的参数类型检查 =========
-
         if not isinstance(chat_id, int):
             raise TypeError(
                 f"❌ chat_id 必须是 int，但收到了 {type(chat_id)}: {chat_id}"
@@ -1007,84 +1007,79 @@ class PostgreSQLDatabase:
                 f"❌ activity 必须是 str，但收到了 {type(activity)}: {activity}"
             )
 
-        # ✅ 关键检查：shift 必须是字符串
-        if not isinstance(shift, str):
+        # shift 可以是 None 或字符串
+        if shift is not None and not isinstance(shift, str):
             # 如果是字典，给出明确的错误信息和修复建议
             if isinstance(shift, dict):
                 error_msg = (
-                    f"❌ shift 参数错误：传入了字典，但期望字符串\n"
+                    f"❌ shift 参数错误：传入了字典，但期望字符串或 None\n"
                     f"   收到的字典: {shift}\n"
                     f"   你应该从字典中提取 'shift' 字段，例如：shift_info.get('shift')\n"
                     f"   调用堆栈：\n"
                 )
-                # 记录调用堆栈，帮助定位问题
                 import traceback
 
                 error_msg += "".join(traceback.format_stack()[:-1])
                 logger.error(error_msg)
-                raise TypeError("shift 参数必须是字符串，不能是字典")
+                raise TypeError("shift 参数必须是字符串或 None，不能是字典")
             else:
-                raise TypeError(f"❌ shift 必须是 str，但收到了 {type(shift)}: {shift}")
-
-        # ========= 2️⃣ 班次值验证 =========
-
-        shift = shift.strip()
-
-        # 数据库实际存储的值是 "day" 和 "night"
-        # 注意：不是 "night_last" 或 "night_tonight"，这些是业务逻辑层的概念
-        VALID_SHIFTS = {"day", "night"}
-
-        if shift not in VALID_SHIFTS:
-            # 如果是 "night_last" 或 "night_tonight"，给出明确的转换建议
-            if shift in {"night_last", "night_tonight"}:
-                error_msg = (
-                    f"❌ 无效的班次值: '{shift}'\n"
-                    f"   数据库只存储 'day' 或 'night'\n"
-                    f"   你应该在调用前将 '{shift}' 转换为 'night'\n"
-                    f"   例如：if shift_detail in ('night_last', 'night_tonight'): shift = 'night'"
+                raise TypeError(
+                    f"❌ shift 必须是 str 或 None，但收到了 {type(shift)}: {shift}"
                 )
-                logger.error(error_msg)
-                raise ValueError(error_msg)
-            else:
-                raise ValueError(f"❌ 无效的班次值: '{shift}'，必须是 'day' 或 'night'")
 
-        # ========= 3️⃣ 获取业务日期 =========
-
+        # ========= 2️⃣ 获取业务日期 =========
         today = await self.get_business_date(chat_id)
 
+        # ========= 3️⃣ 构建查询 =========
+        query = """
+            SELECT activity_count
+            FROM user_activities
+            WHERE chat_id = $1
+              AND user_id = $2
+              AND activity_date = $3
+              AND activity_name = $4
+        """
+        params = [chat_id, user_id, today, activity]
+
+        # ========= 4️⃣ 处理班次参数 =========
+        final_shift = None
+        if shift is not None:
+            shift = shift.strip()
+
+            # 自动转换夜班详情值
+            if shift in {"night_last", "night_tonight"}:
+                logger.debug(f"🔄 自动转换班次值: {shift} -> night")
+                final_shift = "night"
+            elif shift in {"day", "night"}:
+                final_shift = shift
+            else:
+                raise ValueError(
+                    f"❌ 无效的班次值: '{shift}'，必须是 'day', 'night', 或 None"
+                )
+
+            query += " AND shift = $5"
+            params.append(final_shift)
+
+        # ========= 5️⃣ 调试日志 =========
         logger.debug(
             f"🔎 查询活动次数: chat_id={chat_id}, "
             f"user_id={user_id}, date={today}, "
-            f"activity={activity}, shift={shift}"
+            f"activity={activity}, shift={final_shift or '所有班次'}"
         )
 
-        # ========= 4️⃣ 执行查询 =========
-
+        # ========= 6️⃣ 执行查询 =========
         try:
             count = await self.execute_with_retry(
                 "按班次获取活动次数",
-                """
-                SELECT activity_count
-                FROM user_activities
-                WHERE chat_id = $1
-                  AND user_id = $2
-                  AND activity_date = $3
-                  AND activity_name = $4
-                  AND shift = $5
-                """,
-                chat_id,
-                user_id,
-                today,
-                activity,
-                shift,
+                query,
+                *params,
                 fetchval=True,
             )
         except Exception as e:
             logger.error(f"❌ 数据库查询失败: {e}")
-            raise  # ✅ 不掩盖数据库错误
+            raise
 
-        # ========= 5️⃣ 返回结果 =========
-
+        # ========= 7️⃣ 返回结果 =========
         return count if count is not None else 0
 
     async def get_user_cached(self, chat_id: int, user_id: int) -> Optional[Dict]:
@@ -4193,313 +4188,617 @@ class PostgreSQLDatabase:
 
         return business_date
 
+    # async def determine_shift_for_time(
+    #     self,
+    #     chat_id: int,
+    #     current_time: Optional[datetime] = None,
+    #     checkin_type: str = "work_start",
+    #     active_shift: Optional[str] = None,
+    #     active_record_date: Optional[date] = None,  # 🆕 新增：来自状态的日期
+    # ) -> Dict[str, object]:
+    #     """
+    #     工程级班次判定函数 - 所有地方都调用它
+    #     - work_start/work_end: 使用窗口判定
+    #     - activity: 优先使用 active_shift，降级使用时间区间
+    #     - 永不返回 None，保持业务闭环
+
+    #     🆕 增强：支持状态模型优先
+    #     - 如果传入 active_shift 和 active_record_date，直接使用状态信息
+    #     - 否则使用时间模型判定
+    #     """
+    #     now = current_time or self.get_beijing_time()
+    #     shift_config = await self.get_shift_config(chat_id) or {}
+    #     is_dual = shift_config.get("dual_mode", False)
+
+    #     # -------------------------
+    #     # 单班模式
+    #     # -------------------------
+    #     if not is_dual:
+    #         business_date = await self.get_business_date(
+    #             chat_id=chat_id, current_dt=now
+    #         )
+    #         return {
+    #             "shift": "day",
+    #             "shift_detail": "day",
+    #             "business_date": business_date,
+    #             "record_date": business_date,
+    #             "is_dual": False,
+    #             "in_window": True,  # 单班模式始终允许打卡
+    #             "window_info": None,
+    #             "using_state": False,  # 🆕 标记是否使用状态模型
+    #         }
+
+    #     # -------------------------
+    #     # 🎯 核心：状态模型优先
+    #     # -------------------------
+    #     if active_shift and active_record_date:
+    #         # ===== 有状态：直接使用状态信息 =====
+    #         shift = active_shift
+    #         record_date = active_record_date
+
+    #         # 确定 shift_detail
+    #         if shift == "day":
+    #             shift_detail = "day"
+    #         else:  # night
+    #             # 判断是今晚还是昨晚夜班
+    #             day_end_str = shift_config.get("day_end", "21:00")
+    #             day_end_hour, day_end_min = map(int, day_end_str.split(":"))
+    #             day_end_dt = now.replace(
+    #                 hour=day_end_hour, minute=day_end_min, second=0, microsecond=0
+    #             )
+
+    #             if now >= day_end_dt:
+    #                 shift_detail = "night_tonight"
+    #             else:
+    #                 shift_detail = "night_last"
+
+    #         # ===== 计算窗口（基于状态的日期）=====
+    #         window_info = (
+    #             self.calculate_shift_window(
+    #                 shift_config=shift_config,
+    #                 checkin_type=checkin_type,
+    #                 now=now,
+    #                 active_shift=shift,
+    #                 active_record_date=record_date,  # 🆕 传入状态日期
+    #             )
+    #             or {}
+    #         )
+
+    #         # 检查是否在窗口内
+    #         in_window = False
+    #         if checkin_type in ("work_start", "work_end"):
+    #             # 获取窗口时间范围
+    #             if checkin_type == "work_start":
+    #                 if shift == "day":
+    #                     day_window = window_info.get("day_window", {}).get(
+    #                         "work_start", {}
+    #                     )
+    #                     if (
+    #                         day_window.get("start")
+    #                         and day_window.get("end")
+    #                         and day_window["start"] <= now <= day_window["end"]
+    #                     ):
+    #                         in_window = True
+    #                 else:  # night
+    #                     if shift_detail == "night_last":
+    #                         night_window = window_info.get("night_window", {})
+    #                         last_night = night_window.get("last_night", {}).get(
+    #                             "work_start", {}
+    #                         )
+    #                         if (
+    #                             last_night.get("start")
+    #                             and last_night.get("end")
+    #                             and last_night["start"] <= now <= last_night["end"]
+    #                         ):
+    #                             in_window = True
+    #                     else:  # night_tonight
+    #                         night_window = window_info.get("night_window", {})
+    #                         tonight = night_window.get("tonight", {}).get(
+    #                             "work_start", {}
+    #                         )
+    #                         if (
+    #                             tonight.get("start")
+    #                             and tonight.get("end")
+    #                             and tonight["start"] <= now <= tonight["end"]
+    #                         ):
+    #                             in_window = True
+    #             else:  # work_end
+    #                 if shift == "day":
+    #                     day_window = window_info.get("day_window", {}).get(
+    #                         "work_end", {}
+    #                     )
+    #                     if (
+    #                         day_window.get("start")
+    #                         and day_window.get("end")
+    #                         and day_window["start"] <= now <= day_window["end"]
+    #                     ):
+    #                         in_window = True
+    #                 else:  # night
+    #                     if shift_detail == "night_last":
+    #                         night_window = window_info.get("night_window", {})
+    #                         last_night = night_window.get("last_night", {}).get(
+    #                             "work_end", {}
+    #                         )
+    #                         if (
+    #                             last_night.get("start")
+    #                             and last_night.get("end")
+    #                             and last_night["start"] <= now <= last_night["end"]
+    #                         ):
+    #                             in_window = True
+    #                     else:  # night_tonight
+    #                         night_window = window_info.get("night_window", {})
+    #                         tonight = night_window.get("tonight", {}).get(
+    #                             "work_end", {}
+    #                         )
+    #                         if (
+    #                             tonight.get("start")
+    #                             and tonight.get("end")
+    #                             and tonight["start"] <= now <= tonight["end"]
+    #                         ):
+    #                             in_window = True
+
+    #         # 获取业务日期
+    #         business_date = await self.get_business_date(
+    #             chat_id=chat_id,
+    #             current_dt=now,
+    #             shift=shift,
+    #             checkin_type=checkin_type,
+    #             shift_detail=shift_detail,
+    #             record_date=record_date,  # 🆕 传入状态日期
+    #         )
+
+    #         return {
+    #             "shift": shift,
+    #             "shift_detail": shift_detail,
+    #             "business_date": business_date,
+    #             "record_date": record_date,  # 🆕 使用状态的日期
+    #             "is_dual": True,
+    #             "in_window": in_window,
+    #             "window_info": window_info,
+    #             "using_state": True,  # 🆕 标记使用了状态模型
+    #         }
+
+    #     # -------------------------
+    #     # 无状态：使用时间模型（原有逻辑）
+    #     # -------------------------
+    #     # 双班模式 - 计算窗口
+    #     window_info = (
+    #         self.calculate_shift_window(
+    #             shift_config=shift_config,
+    #             checkin_type=checkin_type,
+    #             now=now,
+    #             active_shift=active_shift,
+    #         )
+    #         or {}
+    #     )
+
+    #     current_shift_detail = window_info.get("current_shift")
+
+    #     # 🆕 核心修复：检查是否在窗口内
+    #     in_window = False
+    #     if current_shift_detail and checkin_type in ("work_start", "work_end"):
+    #         # 获取窗口时间范围
+    #         if checkin_type == "work_start":
+    #             day_window = window_info.get("day_window", {}).get("work_start", {})
+    #             night_window = window_info.get("night_window", {})
+
+    #             if current_shift_detail == "day":
+    #                 if (
+    #                     day_window.get("start")
+    #                     and day_window.get("end")
+    #                     and day_window["start"] <= now <= day_window["end"]
+    #                 ):
+    #                     in_window = True
+    #             elif current_shift_detail == "night_last":
+    #                 last_night = night_window.get("last_night", {}).get(
+    #                     "work_start", {}
+    #                 )
+    #                 if (
+    #                     last_night.get("start")
+    #                     and last_night.get("end")
+    #                     and last_night["start"] <= now <= last_night["end"]
+    #                 ):
+    #                     in_window = True
+    #             elif current_shift_detail == "night_tonight":
+    #                 tonight = night_window.get("tonight", {}).get("work_start", {})
+    #                 if (
+    #                     tonight.get("start")
+    #                     and tonight.get("end")
+    #                     and tonight["start"] <= now <= tonight["end"]
+    #                 ):
+    #                     in_window = True
+    #         else:  # work_end
+    #             day_window = window_info.get("day_window", {}).get("work_end", {})
+    #             night_window = window_info.get("night_window", {})
+
+    #             if current_shift_detail == "day":
+    #                 if (
+    #                     day_window.get("start")
+    #                     and day_window.get("end")
+    #                     and day_window["start"] <= now <= day_window["end"]
+    #                 ):
+    #                     in_window = True
+    #             elif current_shift_detail == "night_last":
+    #                 last_night = night_window.get("last_night", {}).get("work_end", {})
+    #                 if (
+    #                     last_night.get("start")
+    #                     and last_night.get("end")
+    #                     and last_night["start"] <= now <= last_night["end"]
+    #                 ):
+    #                     in_window = True
+    #             elif current_shift_detail == "night_tonight":
+    #                 tonight = night_window.get("tonight", {}).get("work_end", {})
+    #                 if (
+    #                     tonight.get("start")
+    #                     and tonight.get("end")
+    #                     and tonight["start"] <= now <= tonight["end"]
+    #                 ):
+    #                     in_window = True
+
+    #     # 🎯 活动判定的额外日志
+    #     if checkin_type == "activity":
+    #         logger.debug(
+    #             f"🎯 [活动班次判定] active_shift={active_shift}, "
+    #             f"时间={now.strftime('%H:%M')}, 结果={current_shift_detail}"
+    #         )
+    #         in_window = True
+
+    #     # -------------------------
+    #     # 永不返回 None
+    #     # -------------------------
+    #     if current_shift_detail is None:
+    #         day_start_str = shift_config.get("day_start", "09:00")
+    #         day_end_str = shift_config.get("day_end", "21:00")
+    #         day_start_dt = datetime.combine(
+    #             now.date(), datetime.strptime(day_start_str, "%H:%M").time()
+    #         ).replace(tzinfo=now.tzinfo)
+    #         day_end_dt = datetime.combine(
+    #             now.date(), datetime.strptime(day_end_str, "%H:%M").time()
+    #         ).replace(tzinfo=now.tzinfo)
+
+    #         if day_start_dt <= now < day_end_dt:
+    #             current_shift_detail = "day"
+    #         elif now >= day_end_dt:
+    #             current_shift_detail = "night_tonight"
+    #         else:
+    #             current_shift_detail = "night_last"
+
+    #         in_window = checkin_type == "activity"
+
+    #     # -------------------------
+    #     # 转换为简化班次
+    #     # -------------------------
+    #     shift = (
+    #         "night"
+    #         if current_shift_detail in ("night_last", "night_tonight")
+    #         else "day"
+    #     )
+
+    #     # -------------------------
+    #     # 获取业务日期
+    #     # -------------------------
+    #     business_date = await self.get_business_date(
+    #         chat_id=chat_id,
+    #         current_dt=now,
+    #         shift=shift,
+    #         checkin_type=checkin_type,
+    #         shift_detail=current_shift_detail,
+    #     )
+
+    #     return {
+    #         "shift": shift,
+    #         "shift_detail": current_shift_detail,
+    #         "business_date": business_date,
+    #         "record_date": business_date,
+    #         "is_dual": True,
+    #         "in_window": in_window,
+    #         "window_info": window_info,
+    #         "using_state": False,  # 🆕 标记未使用状态模型
+    #     }
+
     async def determine_shift_for_time(
         self,
         chat_id: int,
         current_time: Optional[datetime] = None,
         checkin_type: str = "work_start",
         active_shift: Optional[str] = None,
-        active_record_date: Optional[date] = None,  # 🆕 新增：来自状态的日期
+        active_record_date: Optional[date] = None,
     ) -> Dict[str, object]:
         """
-        工程级班次判定函数 - 所有地方都调用它
-        - work_start/work_end: 使用窗口判定
-        - activity: 优先使用 active_shift，降级使用时间区间
-        - 永不返回 None，保持业务闭环
+        企业级终极班次判定函数
 
-        🆕 增强：支持状态模型优先
-        - 如果传入 active_shift 和 active_record_date，直接使用状态信息
-        - 否则使用时间模型判定
+        特性：
+
+        状态模型优先
+        夜班跨天绝对正确
+        record_date 永远正确
+        activity 永远安全
         """
+
         now = current_time or self.get_beijing_time()
+
         shift_config = await self.get_shift_config(chat_id) or {}
+
         is_dual = shift_config.get("dual_mode", False)
 
-        # -------------------------
+        # ============================================================
         # 单班模式
-        # -------------------------
-        if not is_dual:
-            business_date = await self.get_business_date(
-                chat_id=chat_id, current_dt=now
-            )
-            return {
-                "shift": "day",
-                "shift_detail": "day",
-                "business_date": business_date,
-                "record_date": business_date,
-                "is_dual": False,
-                "in_window": True,  # 单班模式始终允许打卡
-                "window_info": None,
-                "using_state": False,  # 🆕 标记是否使用状态模型
-            }
+        # ============================================================
 
-        # -------------------------
-        # 🎯 核心：状态模型优先
-        # -------------------------
+        if not is_dual:
+
+            business_date = await self.get_business_date(
+                chat_id=chat_id,
+                current_dt=now,
+            )
+
+            return dict(
+                shift="day",
+                shift_detail="day",
+                business_date=business_date,
+                record_date=business_date,
+                is_dual=False,
+                in_window=True,
+                window_info=None,
+                using_state=False,
+            )
+
+        # ============================================================
+        # 🎯 状态模型（最高优先级）
+        # ============================================================
+
         if active_shift and active_record_date:
-            # ===== 有状态：直接使用状态信息 =====
+
+            if active_shift not in ("day", "night"):
+                raise ValueError(f"非法 shift: {active_shift}")
+
+            if not isinstance(active_record_date, date):
+                raise TypeError("active_record_date 必须是 date")
+
             shift = active_shift
+
             record_date = active_record_date
 
-            # 确定 shift_detail
-            if shift == "day":
-                shift_detail = "day"
-            else:  # night
-                # 判断是今晚还是昨晚夜班
-                day_end_str = shift_config.get("day_end", "21:00")
-                day_end_hour, day_end_min = map(int, day_end_str.split(":"))
-                day_end_dt = now.replace(
-                    hour=day_end_hour, minute=day_end_min, second=0, microsecond=0
-                )
+            # =====================================================
+            # 正确计算 shift_detail（关键修复）
+            # =====================================================
 
-                if now >= day_end_dt:
+            if shift == "day":
+
+                shift_detail = "day"
+
+            else:
+
+                day_end_str = shift_config.get("day_end", "21:00")
+
+                day_end_time = datetime.strptime(day_end_str, "%H:%M").time()
+
+                night_start = datetime.combine(
+                    record_date,
+                    day_end_time,
+                ).replace(tzinfo=now.tzinfo)
+
+                night_end = night_start + timedelta(days=1)
+
+                if night_start <= now < night_end:
+
                     shift_detail = "night_tonight"
+
                 else:
+
                     shift_detail = "night_last"
 
-            # ===== 计算窗口（基于状态的日期）=====
+            # =====================================================
+            # 获取窗口
+            # =====================================================
+
             window_info = (
                 self.calculate_shift_window(
                     shift_config=shift_config,
                     checkin_type=checkin_type,
                     now=now,
                     active_shift=shift,
-                    active_record_date=record_date,  # 🆕 传入状态日期
+                    active_record_date=record_date,
                 )
                 or {}
             )
 
-            # 检查是否在窗口内
-            in_window = False
-            if checkin_type in ("work_start", "work_end"):
-                # 获取窗口时间范围
-                if checkin_type == "work_start":
-                    if shift == "day":
-                        day_window = window_info.get("day_window", {}).get(
-                            "work_start", {}
-                        )
-                        if (
-                            day_window.get("start")
-                            and day_window.get("end")
-                            and day_window["start"] <= now <= day_window["end"]
-                        ):
-                            in_window = True
-                    else:  # night
-                        if shift_detail == "night_last":
-                            night_window = window_info.get("night_window", {})
-                            last_night = night_window.get("last_night", {}).get(
-                                "work_start", {}
-                            )
-                            if (
-                                last_night.get("start")
-                                and last_night.get("end")
-                                and last_night["start"] <= now <= last_night["end"]
-                            ):
-                                in_window = True
-                        else:  # night_tonight
-                            night_window = window_info.get("night_window", {})
-                            tonight = night_window.get("tonight", {}).get(
-                                "work_start", {}
-                            )
-                            if (
-                                tonight.get("start")
-                                and tonight.get("end")
-                                and tonight["start"] <= now <= tonight["end"]
-                            ):
-                                in_window = True
-                else:  # work_end
-                    if shift == "day":
-                        day_window = window_info.get("day_window", {}).get(
-                            "work_end", {}
-                        )
-                        if (
-                            day_window.get("start")
-                            and day_window.get("end")
-                            and day_window["start"] <= now <= day_window["end"]
-                        ):
-                            in_window = True
-                    else:  # night
-                        if shift_detail == "night_last":
-                            night_window = window_info.get("night_window", {})
-                            last_night = night_window.get("last_night", {}).get(
-                                "work_end", {}
-                            )
-                            if (
-                                last_night.get("start")
-                                and last_night.get("end")
-                                and last_night["start"] <= now <= last_night["end"]
-                            ):
-                                in_window = True
-                        else:  # night_tonight
-                            night_window = window_info.get("night_window", {})
-                            tonight = night_window.get("tonight", {}).get(
-                                "work_end", {}
-                            )
-                            if (
-                                tonight.get("start")
-                                and tonight.get("end")
-                                and tonight["start"] <= now <= tonight["end"]
-                            ):
-                                in_window = True
+            # =====================================================
+            # activity 永远允许
+            # =====================================================
 
-            # 获取业务日期
+            if checkin_type == "activity":
+
+                in_window = True
+
+            else:
+
+                in_window = self._is_time_in_window(
+                    now,
+                    shift,
+                    shift_detail,
+                    checkin_type,
+                    window_info,
+                )
+
+            # =====================================================
+            # 业务日期
+            # =====================================================
+
             business_date = await self.get_business_date(
                 chat_id=chat_id,
                 current_dt=now,
                 shift=shift,
                 checkin_type=checkin_type,
                 shift_detail=shift_detail,
-                record_date=record_date,  # 🆕 传入状态日期
+                record_date=record_date,
             )
 
-            return {
-                "shift": shift,
-                "shift_detail": shift_detail,
-                "business_date": business_date,
-                "record_date": record_date,  # 🆕 使用状态的日期
-                "is_dual": True,
-                "in_window": in_window,
-                "window_info": window_info,
-                "using_state": True,  # 🆕 标记使用了状态模型
-            }
+            return dict(
+                shift=shift,
+                shift_detail=shift_detail,
+                business_date=business_date,
+                record_date=record_date,
+                is_dual=True,
+                in_window=in_window,
+                window_info=window_info,
+                using_state=True,
+            )
 
-        # -------------------------
-        # 无状态：使用时间模型（原有逻辑）
-        # -------------------------
-        # 双班模式 - 计算窗口
+        # ============================================================
+        # 无状态模式
+        # ============================================================
+
         window_info = (
             self.calculate_shift_window(
                 shift_config=shift_config,
                 checkin_type=checkin_type,
                 now=now,
-                active_shift=active_shift,
             )
             or {}
         )
 
-        current_shift_detail = window_info.get("current_shift")
+        shift_detail = window_info.get("current_shift")
 
-        # 🆕 核心修复：检查是否在窗口内
-        in_window = False
-        if current_shift_detail and checkin_type in ("work_start", "work_end"):
-            # 获取窗口时间范围
-            if checkin_type == "work_start":
-                day_window = window_info.get("day_window", {}).get("work_start", {})
-                night_window = window_info.get("night_window", {})
+        # =====================================================
+        # fallback 安全计算
+        # =====================================================
 
-                if current_shift_detail == "day":
-                    if (
-                        day_window.get("start")
-                        and day_window.get("end")
-                        and day_window["start"] <= now <= day_window["end"]
-                    ):
-                        in_window = True
-                elif current_shift_detail == "night_last":
-                    last_night = night_window.get("last_night", {}).get(
-                        "work_start", {}
-                    )
-                    if (
-                        last_night.get("start")
-                        and last_night.get("end")
-                        and last_night["start"] <= now <= last_night["end"]
-                    ):
-                        in_window = True
-                elif current_shift_detail == "night_tonight":
-                    tonight = night_window.get("tonight", {}).get("work_start", {})
-                    if (
-                        tonight.get("start")
-                        and tonight.get("end")
-                        and tonight["start"] <= now <= tonight["end"]
-                    ):
-                        in_window = True
-            else:  # work_end
-                day_window = window_info.get("day_window", {}).get("work_end", {})
-                night_window = window_info.get("night_window", {})
+        if shift_detail is None:
 
-                if current_shift_detail == "day":
-                    if (
-                        day_window.get("start")
-                        and day_window.get("end")
-                        and day_window["start"] <= now <= day_window["end"]
-                    ):
-                        in_window = True
-                elif current_shift_detail == "night_last":
-                    last_night = night_window.get("last_night", {}).get("work_end", {})
-                    if (
-                        last_night.get("start")
-                        and last_night.get("end")
-                        and last_night["start"] <= now <= last_night["end"]
-                    ):
-                        in_window = True
-                elif current_shift_detail == "night_tonight":
-                    tonight = night_window.get("tonight", {}).get("work_end", {})
-                    if (
-                        tonight.get("start")
-                        and tonight.get("end")
-                        and tonight["start"] <= now <= tonight["end"]
-                    ):
-                        in_window = True
-
-        # 🎯 活动判定的额外日志
-        if checkin_type == "activity":
-            logger.debug(
-                f"🎯 [活动班次判定] active_shift={active_shift}, "
-                f"时间={now.strftime('%H:%M')}, 结果={current_shift_detail}"
+            shift_detail = self._fallback_shift_detail(
+                now,
+                shift_config,
             )
+
+        shift = "night" if shift_detail.startswith("night") else "day"
+
+        # =====================================================
+        # 判断窗口
+        # =====================================================
+
+        if checkin_type == "activity":
+
             in_window = True
 
-        # -------------------------
-        # 永不返回 None
-        # -------------------------
-        if current_shift_detail is None:
-            day_start_str = shift_config.get("day_start", "09:00")
-            day_end_str = shift_config.get("day_end", "21:00")
-            day_start_dt = datetime.combine(
-                now.date(), datetime.strptime(day_start_str, "%H:%M").time()
-            ).replace(tzinfo=now.tzinfo)
-            day_end_dt = datetime.combine(
-                now.date(), datetime.strptime(day_end_str, "%H:%M").time()
-            ).replace(tzinfo=now.tzinfo)
+        else:
 
-            if day_start_dt <= now < day_end_dt:
-                current_shift_detail = "day"
-            elif now >= day_end_dt:
-                current_shift_detail = "night_tonight"
-            else:
-                current_shift_detail = "night_last"
+            in_window = self._is_time_in_window(
+                now,
+                shift,
+                shift_detail,
+                checkin_type,
+                window_info,
+            )
 
-            in_window = checkin_type == "activity"
+        # =====================================================
+        # record_date 正确计算
+        # =====================================================
 
-        # -------------------------
-        # 转换为简化班次
-        # -------------------------
-        shift = (
-            "night"
-            if current_shift_detail in ("night_last", "night_tonight")
-            else "day"
-        )
-
-        # -------------------------
-        # 获取业务日期
-        # -------------------------
-        business_date = await self.get_business_date(
+        record_date = await self.get_business_date(
             chat_id=chat_id,
             current_dt=now,
             shift=shift,
             checkin_type=checkin_type,
-            shift_detail=current_shift_detail,
+            shift_detail=shift_detail,
         )
 
-        return {
-            "shift": shift,
-            "shift_detail": current_shift_detail,
-            "business_date": business_date,
-            "record_date": business_date,
-            "is_dual": True,
-            "in_window": in_window,
-            "window_info": window_info,
-            "using_state": False,  # 🆕 标记未使用状态模型
-        }
+        return dict(
+            shift=shift,
+            shift_detail=shift_detail,
+            business_date=record_date,
+            record_date=record_date,
+            is_dual=True,
+            in_window=in_window,
+            window_info=window_info,
+            using_state=False,
+        )
+
+    def _is_time_in_window(
+        self,
+        now: datetime,
+        shift: str,
+        shift_detail: str,
+        checkin_type: str,
+        window_info: dict,
+    ) -> bool:
+        """判断时间是否在窗口内"""
+        try:
+            if checkin_type == "work_start":
+                if shift == "day":
+                    day_window = window_info.get("day_window", {}).get("work_start", {})
+                    return bool(
+                        day_window.get("start")
+                        and day_window.get("end")
+                        and day_window["start"] <= now <= day_window["end"]
+                    )
+                else:  # night
+                    night_window = window_info.get("night_window", {})
+                    if shift_detail == "night_last":
+                        target = night_window.get("last_night", {}).get(
+                            "work_start", {}
+                        )
+                    else:  # night_tonight
+                        target = night_window.get("tonight", {}).get("work_start", {})
+                    return bool(
+                        target.get("start")
+                        and target.get("end")
+                        and target["start"] <= now <= target["end"]
+                    )
+            else:  # work_end
+                if shift == "day":
+                    day_window = window_info.get("day_window", {}).get("work_end", {})
+                    return bool(
+                        day_window.get("start")
+                        and day_window.get("end")
+                        and day_window["start"] <= now <= day_window["end"]
+                    )
+                else:  # night
+                    night_window = window_info.get("night_window", {})
+                    if shift_detail == "night_last":
+                        target = night_window.get("last_night", {}).get("work_end", {})
+                    else:  # night_tonight
+                        target = night_window.get("tonight", {}).get("work_end", {})
+                    return bool(
+                        target.get("start")
+                        and target.get("end")
+                        and target["start"] <= now <= target["end"]
+                    )
+        except Exception as e:
+            logger.error(f"窗口检查失败: {e}")
+            return False
+
+    def _fallback_shift_detail(
+        self,
+        now,
+        shift_config,
+    ):
+
+        day_start = shift_config.get("day_start", "09:00")
+
+        day_end = shift_config.get("day_end", "21:00")
+
+        day_start_dt = datetime.combine(
+            now.date(),
+            datetime.strptime(day_start, "%H:%M").time(),
+        ).replace(tzinfo=now.tzinfo)
+
+        day_end_dt = datetime.combine(
+            now.date(),
+            datetime.strptime(day_end, "%H:%M").time(),
+        ).replace(tzinfo=now.tzinfo)
+
+        if day_start_dt <= now < day_end_dt:
+
+            return "day"
+
+        elif now >= day_end_dt:
+
+            return "night_tonight"
+
+        else:
+
+            return "night_last"
 
     # ========== 数据清理 ==========
     async def cleanup_old_data(self, days: int = 30):
