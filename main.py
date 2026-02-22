@@ -2070,7 +2070,7 @@ async def send_overtime_notification_async(
 
 # ========== 上下班打卡功能 ==========
 async def process_work_checkin(message: types.Message, checkin_type: str):
-    """智能化上下班打卡系统 - 统一版（完整修复版）"""
+    """智能化上下班打卡系统 - 统一版（状态模型优先）"""
 
     chat_id = message.chat.id
     uid = message.from_user.id
@@ -2131,109 +2131,117 @@ async def process_work_checkin(message: types.Message, checkin_type: str):
         # ========== 模式判断 ==========
         is_dual_mode = shift_config.get("dual_mode", False) if shift_config else False
 
-        # ========== ⭐ 统一使用 determine_shift_for_time 进行基础判定 ==========
+        # ========== 🎯 获取用户当前活跃班次状态 ==========
+        user_shift_state = await db.get_user_active_shift(chat_id, uid)
+
+        # ========== 🎯 统一调用班次判定函数 ==========
         shift_info = await db.determine_shift_for_time(
             chat_id=chat_id,
             current_time=now,
             checkin_type=checkin_type,
-            active_shift=None,
+            active_shift=user_shift_state["shift"] if user_shift_state else None,
+            active_record_date=(
+                user_shift_state["record_date"] if user_shift_state else None
+            ),
         )
 
-        # 验证是否在窗口内
-        if shift_info is None or shift_info.get("shift_detail") is None:
-            # 获取友好的时间窗口描述
+        # ========== 🎯 检查班次判定结果 ==========
+        if shift_info is None:
+            logger.error(f"[{trace_id}] ❌ 班次判定返回 None")
+            await message.answer(
+                "❌ 系统班次判定失败，请稍后重试",
+                reply_to_message_id=message.message_id,
+                reply_markup=await get_main_keyboard(chat_id, await is_admin_task),
+            )
+            return
+
+        # 检查是否在窗口内
+        if not shift_info.get("in_window", False):
+            # 从 shift_info 获取信息构建错误消息
+            shift = shift_info["shift"]
+            shift_detail = shift_info["shift_detail"]
+            record_date = shift_info["record_date"]
+            window_info = shift_info.get("window_info", {})
+
+            shift_text = "白班" if shift == "day" else "夜班"
+
+            # 构建错误消息
             if checkin_type == "work_start":
-                day_start = shift_config.get("day_start", "09:00")
-                day_end = shift_config.get("day_end", "21:00")
-                grace_before = shift_config.get("grace_before", 120)
-                grace_after = shift_config.get("grace_after", 360)
-
-                # 白班上班窗口
-                day_start_h, day_start_m = map(int, day_start.split(":"))
-                day_start_dt = now.replace(
-                    hour=day_start_h, minute=day_start_m, second=0
-                )
-                day_work_start_start = (
-                    day_start_dt - timedelta(minutes=grace_before)
-                ).strftime("%H:%M")
-                day_work_start_end = (
-                    day_start_dt + timedelta(minutes=grace_after)
-                ).strftime("%H:%M")
-
-                # 夜班上班窗口（对应昨晚下班）
-                day_end_h, day_end_m = map(int, day_end.split(":"))
-                day_end_dt = now.replace(hour=day_end_h, minute=day_end_m, second=0)
-                night_work_start_start = (
-                    day_end_dt - timedelta(days=1) - timedelta(minutes=grace_before)
-                ).strftime("%H:%M")
-                night_work_start_end = (
-                    day_end_dt - timedelta(days=1) + timedelta(minutes=grace_after)
-                ).strftime("%H:%M")
-
-                await message.answer(
-                    f"❌ 当前时间不在{action_text}打卡窗口内\n\n"
-                    f"📊 <b>允许的上班时间：</b>\n"
-                    f"• 白班上班：<code>{day_work_start_start} ~ {day_work_start_end}</code>\n"
-                    f"• 夜班上班：<code>{night_work_start_start} ~ {night_work_start_end}</code>（次日凌晨）\n\n"
-                    f"⏰ 当前时间：<code>{current_time}</code>\n"
-                    f"💡 请等待对班时间窗口或联系管理员调整时间设置",
-                    reply_to_message_id=message.message_id,
-                    reply_markup=await get_main_keyboard(chat_id, await is_admin_task),
-                    parse_mode="HTML",
-                )
-                return
+                # 获取窗口信息
+                if shift == "day":
+                    day_window = window_info.get("day_window", {}).get("work_start", {})
+                    window_start = day_window.get("start", now)
+                    window_end = day_window.get("end", now)
+                else:
+                    if shift_detail == "night_last":
+                        night_window = window_info.get("night_window", {})
+                        last_night = night_window.get("last_night", {}).get(
+                            "work_start", {}
+                        )
+                        window_start = last_night.get("start", now)
+                        window_end = last_night.get("end", now)
+                    else:  # night_tonight
+                        night_window = window_info.get("night_window", {})
+                        tonight = night_window.get("tonight", {}).get("work_start", {})
+                        window_start = tonight.get("start", now)
+                        window_end = tonight.get("end", now)
             else:  # work_end
-                day_start = shift_config.get("day_start", "09:00")
-                day_end = shift_config.get("day_end", "21:00")
-                workend_grace_before = shift_config.get("workend_grace_before", 120)
-                workend_grace_after = shift_config.get("workend_grace_after", 360)
+                if shift == "day":
+                    day_window = window_info.get("day_window", {}).get("work_end", {})
+                    window_start = day_window.get("start", now)
+                    window_end = day_window.get("end", now)
+                else:
+                    if shift_detail == "night_last":
+                        night_window = window_info.get("night_window", {})
+                        last_night = night_window.get("last_night", {}).get(
+                            "work_end", {}
+                        )
+                        window_start = last_night.get("start", now)
+                        window_end = last_night.get("end", now)
+                    else:  # night_tonight
+                        night_window = window_info.get("night_window", {})
+                        tonight = night_window.get("tonight", {}).get("work_end", {})
+                        window_start = tonight.get("start", now)
+                        window_end = tonight.get("end", now)
 
-                # 白班下班窗口
-                day_end_h, day_end_m = map(int, day_end.split(":"))
-                day_end_dt = now.replace(hour=day_end_h, minute=day_end_m, second=0)
-                day_work_end_start = (
-                    day_end_dt - timedelta(minutes=workend_grace_before)
-                ).strftime("%H:%M")
-                day_work_end_end = (
-                    day_end_dt + timedelta(minutes=workend_grace_after)
-                ).strftime("%H:%M")
+            window_start_str = (
+                window_start.strftime("%H:%M")
+                if hasattr(window_start, "strftime")
+                else "未知"
+            )
+            window_end_str = (
+                window_end.strftime("%H:%M")
+                if hasattr(window_end, "strftime")
+                else "未知"
+            )
 
-                # 夜班下班窗口（对应第二天早上）
-                day_start_h, day_start_m = map(int, day_start.split(":"))
-                day_start_dt = now.replace(
-                    hour=day_start_h, minute=day_start_m, second=0
+            date_desc = f"（基于{record_date}）"
+            if shift == "night" and checkin_type == "work_end":
+                date_desc = (
+                    f"（基于{record_date}，下班日期{record_date + timedelta(days=1)}）"
                 )
-                night_work_end_start = (
-                    day_start_dt
-                    + timedelta(days=1)
-                    - timedelta(minutes=workend_grace_before)
-                ).strftime("%H:%M")
-                night_work_end_end = (
-                    day_start_dt
-                    + timedelta(days=1)
-                    + timedelta(minutes=workend_grace_after)
-                ).strftime("%H:%M")
 
-                await message.answer(
-                    f"❌ 当前时间不在{action_text}打卡窗口内\n\n"
-                    f"📊 <b>允许的下班时间：</b>\n"
-                    f"• 白班下班：<code>{day_work_end_start} ~ {day_work_end_end}</code>\n"
-                    f"• 夜班下班：<code>{night_work_end_start} ~ {night_work_end_end}</code>（次日早上）\n\n"
-                    f"⏰ 当前时间：<code>{current_time}</code>\n"
-                    f"💡 请等待对班时间窗口或联系管理员调整时间设置",
-                    reply_to_message_id=message.message_id,
-                    reply_markup=await get_main_keyboard(chat_id, await is_admin_task),
-                    parse_mode="HTML",
-                )
-                return
+            await message.answer(
+                f"❌ 当前时间不在{shift_text}{action_text}窗口内{date_desc}\n\n"
+                f"📊 允许的{shift_text}{action_text}时间：<code>{window_start_str} ~ {window_end_str}</code>\n"
+                f"⏰ 当前时间：<code>{current_time}</code>\n"
+                f"💡 请等待正确的打卡时间窗口",
+                reply_to_message_id=message.message_id,
+                reply_markup=await get_main_keyboard(chat_id, await is_admin_task),
+                parse_mode="HTML",
+            )
+            return
 
-        # 从 shift_info 获取基础值
-        shift = shift_info["shift"]  # "day" 或 "night"
-        shift_detail = shift_info[
-            "shift_detail"
-        ]  # "day", "night_last", "night_tonight"
+        # ========== 从 shift_info 获取基础值 ==========
+        shift = shift_info["shift"]
+        shift_detail = shift_info["shift_detail"]
         record_date = shift_info["record_date"]
-        business_date = shift_info.get("business_date", record_date)
+        using_state = shift_info.get("using_state", False)
+
+        logger.info(
+            f"[{trace_id}] 📌 {'状态模型' if using_state else '时间模型'}: "
+            f"{shift} (详情: {shift_detail}), 记录日期: {record_date}"
+        )
 
         # ========== 班次文本映射 ==========
         shift_text_map = {
@@ -2260,7 +2268,7 @@ async def process_work_checkin(message: types.Message, checkin_type: str):
                 )
                 return
 
-            # 🎯 修复1：检查班次切换，自动结束旧班次的活动
+            # 🎯 检查班次切换，自动结束旧班次的活动
             user_data = await db.get_user_cached(chat_id, uid)
             if user_data and user_data.get("current_activity"):
                 current_shift = user_data.get("shift", "day")
