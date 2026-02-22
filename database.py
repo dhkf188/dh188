@@ -244,126 +244,6 @@ class PostgreSQLDatabase:
         group_data = await self.get_group_cached(chat_id)
         return bool(group_data and group_data.get("dual_mode", False))
 
-    # ========== 核心业务日期逻辑(管理员设定的周器时间-统一) ==========
-    async def get_business_date(
-        self,
-        chat_id: int,
-        current_dt: datetime = None,
-        shift: Optional[str] = None,
-        checkin_type: Optional[str] = None,
-        shift_detail: Optional[str] = None,
-    ) -> date:
-        """获取业务日期 - 单班/双班完全隔离"""
-
-        if current_dt is None:
-            current_dt = self.get_beijing_time()
-
-        today = current_dt.date()
-
-        # ========== 1. 先判断双班模式 ==========
-        is_dual = await self.is_dual_mode_enabled(chat_id)
-
-        # ========== 2. 双班模式 - 使用传入参数或窗口计算 ==========
-        if is_dual:
-            # 🆕 提前上班判定 - 放在最前面
-            shift_config = await self.get_shift_config(chat_id)
-            day_start = shift_config.get("day_start", "09:00")
-            grace_before = shift_config.get("grace_before", 120)
-
-            # 解析白班开始时间
-            day_start_time = datetime.strptime(day_start, "%H:%M").time()
-            day_start_dt = datetime.combine(today, day_start_time).replace(
-                tzinfo=current_dt.tzinfo
-            )
-
-            # 计算白班最早允许时间
-            earliest_day_time = day_start_dt - timedelta(minutes=grace_before)
-
-            # 如果当前时间 >= 白班最早允许时间，就认为是今天
-            if current_dt >= earliest_day_time:
-                logger.info(
-                    f"📅 [提前上班判定] "
-                    f"chat={chat_id}, "
-                    f"time={current_dt.strftime('%H:%M')}, "
-                    f"earliest={earliest_day_time.strftime('%H:%M')}, "
-                    f"result={today}"
-                )
-                return today
-
-            # 2.1 优先使用shift_detail直接判定
-            if shift_detail in ("night_last", "night_tonight", "day"):
-                if shift_detail == "night_last":
-                    logger.debug(
-                        f"📅 [双班-detail] chat={chat_id}, detail={shift_detail}, 日期={today - timedelta(days=1)}"
-                    )
-                    return today - timedelta(days=1)
-
-                logger.debug(
-                    f"📅 [双班-detail] chat={chat_id}, detail={shift_detail}, 日期={today}"
-                )
-                return today
-
-            # 2.2 通过窗口计算
-            if shift and checkin_type:
-                shift_config = await self.get_shift_config(chat_id)
-                window_info = (
-                    self.calculate_shift_window(
-                        shift_config=shift_config,
-                        checkin_type=checkin_type,
-                        now=current_dt,
-                    )
-                    or {}
-                )
-
-                current_shift_detail = window_info.get("current_shift")
-
-                if current_shift_detail == "night_last":
-                    business_date = today - timedelta(days=1)
-                elif current_shift_detail in ("night_tonight", "day"):
-                    business_date = today
-                else:
-                    business_date = today
-
-                logger.debug(
-                    f"📅 [双班-window] chat={chat_id}, detail={current_shift_detail}, 日期={business_date}"
-                )
-                return business_date
-
-            # 2.3 兜底
-            logger.debug(f"📅 [双班-fallback] chat={chat_id}, 日期={today}")
-            return today
-
-        # ========== 3. 单班模式 - 完全独立的逻辑 ==========
-        group_data = await self.get_group_cached(chat_id)
-
-        if group_data:
-            reset_hour = group_data.get("reset_hour", Config.DAILY_RESET_HOUR)
-            reset_minute = group_data.get("reset_minute", Config.DAILY_RESET_MINUTE)
-        else:
-            reset_hour = Config.DAILY_RESET_HOUR
-            reset_minute = Config.DAILY_RESET_MINUTE
-
-        reset_time_today = current_dt.replace(
-            hour=reset_hour,
-            minute=reset_minute,
-            second=0,
-            microsecond=0,
-        )
-
-        if current_dt < reset_time_today:
-            business_date = (current_dt - timedelta(days=1)).date()
-        else:
-            business_date = current_dt.date()
-
-        logger.debug(
-            f"📅 [单班] chat={chat_id}, 当前={current_dt.strftime('%H:%M')}, "
-            f"重置={reset_time_today.strftime('%H:%M')}, 日期={business_date}"
-        )
-
-        return business_date
-
-    # 在 database.py 的 PostgreSQLDatabase 类中添加
-
     async def get_business_date_range(
         self, chat_id: int, current_dt: datetime = None
     ) -> Dict[str, date]:
@@ -374,7 +254,6 @@ class PostgreSQLDatabase:
         if current_dt is None:
             current_dt = self.get_beijing_time()
 
-        # 🎯 复用现有的 get_business_date 函数
         business_today = await self.get_business_date(chat_id, current_dt)
         business_yesterday = business_today - timedelta(days=1)
         business_day_before = business_today - timedelta(days=2)
@@ -4162,21 +4041,22 @@ class PostgreSQLDatabase:
         shift: str = None,
         checkin_type: str = None,
         shift_detail: str = None,
-        record_date: Optional[date] = None,  # 🆕 新增：来自状态的日期
+        record_date: Optional[date] = None,
     ) -> date:
         """
         获取业务日期 - 支持状态模型
 
         业务日期规则：
         - 状态模型优先：如果传入 record_date，直接使用
-        - 否则使用时间模型计算
+        - 业务参数优先：如果传入 shift_detail，优先使用
+        - 否则使用时间模型计算（包含提前上班判定）
         """
         if current_dt is None:
             current_dt = self.get_beijing_time()
 
         today = current_dt.date()
 
-        # ===== 🎯 状态模型优先 =====
+        # ===== 🎯 状态模型优先（最高优先级）=====
         if record_date is not None:
             # 有状态：直接使用状态的日期
             if shift == "night" and checkin_type == "work_end":
@@ -4200,66 +4080,88 @@ class PostgreSQLDatabase:
                 )
             return business_date
 
-        # ===== 原有的时间模型逻辑（完全不变）=====
-
-        # 🔹 只判断一次双班模式
+        # ===== 判断双班模式 =====
         is_dual = await self.is_dual_mode_enabled(chat_id)
 
         # =====================================================
-        # 🎯 双班模式 - 优先使用 shift_detail
+        # 🎯 双班模式
         # =====================================================
-        if is_dual and shift_detail in ("night_last", "night_tonight", "day"):
+        if is_dual:
+            # ===== 1️⃣ shift_detail 判定（业务参数优先）=====
+            if shift_detail in ("night_last", "night_tonight", "day"):
+                if shift_detail == "night_last":
+                    business_date = today - timedelta(days=1)
+                else:
+                    business_date = today
 
-            if shift_detail == "night_last":
-                business_date = today - timedelta(days=1)
-            else:
-                business_date = today
-
-            logger.debug(
-                f"📅 [业务日期-双班-detail] "
-                f"chat_id={chat_id}, "
-                f"time={current_dt.strftime('%H:%M:%S')}, "
-                f"shift_detail={shift_detail}, "
-                f"checkin_type={checkin_type}, "
-                f"result={business_date}"
-            )
-            return business_date
-
-        # =====================================================
-        # 双班模式 - 窗口兜底
-        # =====================================================
-        if is_dual and shift and checkin_type:
-
-            shift_config = await self.get_shift_config(chat_id)
-
-            window_info = (
-                self.calculate_shift_window(
-                    shift_config=shift_config,
-                    checkin_type=checkin_type,
-                    now=current_dt,
+                logger.debug(
+                    f"📅 [业务日期-双班-detail] "
+                    f"chat_id={chat_id}, "
+                    f"time={current_dt.strftime('%H:%M:%S')}, "
+                    f"shift_detail={shift_detail}, "
+                    f"checkin_type={checkin_type}, "
+                    f"result={business_date}"
                 )
-                or {}
+                return business_date
+
+            # ===== 2️⃣ 获取班次配置用于时间窗口计算 =====
+            shift_config = await self.get_shift_config(chat_id)
+            day_start = shift_config.get("day_start", "09:00")
+            grace_before = shift_config.get("grace_before", 120)
+
+            # 解析白班开始时间
+            day_start_time = datetime.strptime(day_start, "%H:%M").time()
+            day_start_dt = datetime.combine(today, day_start_time).replace(
+                tzinfo=current_dt.tzinfo
             )
 
-            current_shift_detail = window_info.get("current_shift")
+            # 计算白班最早允许时间
+            earliest_day_time = day_start_dt - timedelta(minutes=grace_before)
 
-            if current_shift_detail == "night_last":
-                business_date = today - timedelta(days=1)
-            elif current_shift_detail in ("night_tonight", "day"):
-                business_date = today
-            else:
-                business_date = today  # 安全兜底
+            # ===== 3️⃣ 提前上班判定（无参数时）=====
+            if current_dt >= earliest_day_time:
+                logger.info(
+                    f"📅 [提前上班判定] "
+                    f"chat={chat_id}, "
+                    f"time={current_dt.strftime('%H:%M')}, "
+                    f"earliest={earliest_day_time.strftime('%H:%M')}, "
+                    f"result={today}"
+                )
+                return today
 
-            logger.debug(
-                f"📅 业务日期(双班-window): chat_id={chat_id}, "
-                f"shift={shift}, checkin_type={checkin_type}, "
-                f"判定={current_shift_detail}, 日期={business_date}"
-            )
+            # ===== 4️⃣ 窗口计算兜底（无参数时）=====
+            if shift and checkin_type:
+                window_info = (
+                    self.calculate_shift_window(
+                        shift_config=shift_config,
+                        checkin_type=checkin_type,
+                        now=current_dt,
+                    )
+                    or {}
+                )
 
-            return business_date
+                current_shift_detail = window_info.get("current_shift")
+
+                if current_shift_detail == "night_last":
+                    business_date = today - timedelta(days=1)
+                elif current_shift_detail in ("night_tonight", "day"):
+                    business_date = today
+                else:
+                    business_date = today  # 安全兜底
+
+                logger.debug(
+                    f"📅 业务日期(双班-window): chat_id={chat_id}, "
+                    f"shift={shift}, checkin_type={checkin_type}, "
+                    f"判定={current_shift_detail}, 日期={business_date}"
+                )
+                return business_date
+
+            # ===== 5️⃣ 双班模式兜底 =====
+            logger.debug(f"📅 [双班-fallback] chat={chat_id}, 日期={today}")
+            return today
 
         # =====================================================
-        # 单班模式
+        # 单班模式（完全不变）
         # =====================================================
         group_data = await self.get_group_cached(chat_id)
 
