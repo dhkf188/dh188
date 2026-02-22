@@ -7498,59 +7498,65 @@ async def daily_reset_task():
     async def process_dual_mode_reset(
         chat_id: int, now: datetime, reset_hour: int, reset_minute: int
     ):
-        """处理双班模式重置 - 5分钟执行窗口"""
-        from dual_shift_reset import handle_hard_reset  # 内部导入避免循环
+        """处理双班模式重置 - 完整修复版"""
+        from dual_shift_reset import handle_hard_reset
+        from database import db
 
-        # 计算今天的重置时间点
-        reset_time_today = now.replace(
-            hour=reset_hour, minute=reset_minute, second=0, microsecond=0
-        )
+        # ===== 1. 获取业务日期 =====
+        business_today = await db.get_business_date(chat_id, now)
+        business_yesterday = business_today - timedelta(days=1)
 
-        # 计算两个执行窗口（重置时间+2小时）
-        execute_windows = [
-            (reset_time_today - timedelta(days=1))
-            + timedelta(hours=2),  # 昨天的重置+2小时
-            reset_time_today + timedelta(hours=2),  # 今天的重置+2小时
-        ]
+        natural_today = now.date()
 
-        # 检查是否在任意执行窗口内（5分钟）
-        execute_time = None
-        target_date = None
-        period_info = None
+        # ===== 2. 计算执行时间 =====
+        reset_time_today = datetime.combine(
+            natural_today, dt_time(reset_hour, reset_minute)
+        ).replace(tzinfo=now.tzinfo)
 
-        for i, wt in enumerate(execute_windows):
-            time_diff = abs((now - wt).total_seconds())
-            if time_diff <= 300:  # 5分钟窗口
-                execute_time = wt
-                target_date = wt.date()
-                period_info = "昨天" if i == 0 else "今天"
-                break
+        execute_time_today = reset_time_today + timedelta(hours=2)
 
-        if not execute_time:
-            return  # 不在执行窗口
+        reset_time_yesterday = datetime.combine(
+            natural_today - timedelta(days=1), dt_time(reset_hour, reset_minute)
+        ).replace(tzinfo=now.tzinfo)
 
-        # 统一幂等性检查
-        if not await check_reset_idempotency(chat_id, "dual", target_date):
+        execute_time_yesterday = reset_time_yesterday + timedelta(hours=2)
+
+        # ===== 3. 判断执行窗口 =====
+        EXECUTION_WINDOW = 300
+
+        time_to_today = abs((now - execute_time_today).total_seconds())
+        time_to_yesterday = abs((now - execute_time_yesterday).total_seconds())
+
+        if time_to_today <= EXECUTION_WINDOW:
+            target_date = business_yesterday
+            period_info = "正常执行"
+        elif time_to_yesterday <= EXECUTION_WINDOW:
+            target_date = business_yesterday - timedelta(days=1)
+            period_info = "补执行"
+        else:
+            return
+
+        # ===== 4. 幂等性检查 =====
+        reset_flag_key = f"dual_reset:{chat_id}:{business_today.strftime('%Y%m%d')}"
+        from performance import global_cache
+
+        if global_cache.get(reset_flag_key):
+            logger.info(f"⏭️ 群组 {chat_id} 今天已执行")
             return
 
         logger.info(
-            f"🎯 [双班重置] 群组 {chat_id}\n"
-            f"   • 当前时间: {now.strftime('%H:%M:%S')}\n"
-            f"   • 执行时间: {execute_time.strftime('%H:%M:%S')} ({period_info})\n"
-            f"   • 重置时间: {reset_hour:02d}:{reset_minute:02d}\n"
-            f"   • 目标日期: {target_date}"
+            f"🚀 [双班重置] 群组 {chat_id}\n"
+            f"   ├─ 业务今天: {business_today}\n"
+            f"   ├─ 目标日期: {target_date}\n"
+            f"   ├─ 执行类型: {period_info}"
         )
 
-        # 执行双班重置
-        result = await handle_hard_reset(chat_id, None)
+        # ===== 5. 执行重置 =====
+        result = await handle_hard_reset(chat_id, None, target_date=target_date)
 
         if result is True:
-            await set_reset_idempotency(chat_id, "dual", target_date)
-            logger.info(f"✅ [双班重置] 群组 {chat_id} 执行成功")
-        elif result is False:
-            logger.error(f"❌ [双班重置] 群组 {chat_id} 执行失败")
-        else:  # None
-            logger.warning(f"⚠️ [双班重置] 群组 {chat_id} 返回None，可能是配置问题")
+            global_cache.set(reset_flag_key, True, ttl=86400)
+            logger.info(f"✅ 成功")
 
     async def process_single_mode_reset(
         chat_id: int, now: datetime, reset_hour: int, reset_minute: int
