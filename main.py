@@ -7510,7 +7510,7 @@ async def daily_reset_task():
 
         # ===== 2. 计算执行时间 =====
         reset_time_today = datetime.combine(
-            natural_today, dt_time(reset_hour, reset_minute)
+            natural_today, dt_time(reset_hour, reset_minute)  # ✅ 更简洁
         ).replace(tzinfo=now.tzinfo)
 
         execute_time_today = reset_time_today + timedelta(hours=2)
