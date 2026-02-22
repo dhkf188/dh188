@@ -1,15 +1,6 @@
 """
-双班硬重置 - 单文件完整实现（独立版，无外部依赖）
-放置在与 main.py、database.py 同级目录
-
-使用规范：
-- 不修改原有单班逻辑
-- 所有时间动态计算，无硬编码
-- 完全复用已有导出函数
-- ✅ 独立强制结束，100%归因昨天
-- ✅ 统一处理白班+夜班未下班用户
-- ✅ 自动补全下班记录
-- ✅ 并发优化处理
+双班硬重置 - 完整修复版（统一使用业务日期）
+保留所有原有功能，仅修复日期计算逻辑
 """
 
 import logging
@@ -27,17 +18,13 @@ from main import export_and_push_csv
 logger = logging.getLogger("GroupCheckInBot.DualShiftReset")
 
 
-# ========== 1. 调度入口（供cmd_setresettime调用） ==========
+# ========== 1. 调度入口 ==========
 async def handle_hard_reset(
     chat_id: int, operator_id: Optional[int] = None
 ) -> Optional[bool]:
     """
     硬重置总调度入口 - 单班/双班分流
-
-    返回值:
-        True  - 双班模式执行成功
-        False - 双班模式执行失败
-        None  - 单班模式，调用方应继续执行原有逻辑
+    【修复版】统一使用业务日期
     """
     try:
         # 1. 获取班次配置，判断模式
@@ -60,17 +47,17 @@ async def handle_hard_reset(
             else:
                 logger.error(f"❌ [双班硬重置] 群组 {chat_id} 执行失败")
 
-            return success  # 返回实际执行结果
+            return success
 
         except Exception as e:
             logger.error(f"❌ [双班硬重置] 群组 {chat_id} 异常: {e}")
             logger.error(traceback.format_exc())
-            return False  # 双班模式执行异常
+            return False
 
     except Exception as e:
         logger.error(f"❌ 硬重置调度失败 {chat_id}: {e}")
         logger.error(traceback.format_exc())
-        return None  # 调度失败，让调用方自行处理
+        return None
 
 
 # ========== 2. 双班硬重置核心流程 ==========
@@ -79,15 +66,29 @@ async def _dual_shift_hard_reset(
 ) -> bool:
     """
     双班硬重置主流程（带幂等性）
-    在重置时间+2小时执行
+    【修复版】统一使用业务日期
     """
     try:
         now = db.get_beijing_time()
-        today = now.date()
-        yesterday = today - timedelta(days=1)
+
+        # ==================== 🎯 获取业务日期范围 ====================
+        date_range = await db.get_business_date_range(chat_id, now)
+        business_today = date_range["business_today"]
+        business_yesterday = date_range["business_yesterday"]
+        business_day_before = date_range["business_day_before"]
+        natural_today = date_range["natural_today"]
+
+        logger.info(
+            f"📅 [双班重置] 日期信息:\n"
+            f"   • 自然今天: {natural_today}\n"
+            f"   • 业务今天: {business_today}\n"
+            f"   • 业务昨天: {business_yesterday}"
+        )
 
         # ==================== 幂等性检查 ====================
-        reset_flag_key = f"dual_reset_executed:{chat_id}:{today.strftime('%Y%m%d')}"
+        reset_flag_key = (
+            f"dual_reset_executed:{chat_id}:{business_today.strftime('%Y%m%d')}"
+        )
         if global_cache.get(reset_flag_key):
             logger.info(f"⏭️ 群组 {chat_id} 今天已完成双班重置，跳过")
             return True
@@ -102,56 +103,89 @@ async def _dual_shift_hard_reset(
         reset_hour = group_data.get("reset_hour", 0)
         reset_minute = group_data.get("reset_minute", 0)
 
-        # ==================== 🎯 修复：正确计算执行时间 ====================
-        # 计算今天的重置时间
-        reset_time_today = now.replace(
-            hour=reset_hour, minute=reset_minute, second=0, microsecond=0
+        # ==================== 🎯 修复：用自然日期计算执行时间 ====================
+        # 今天的重置时间（自然日期）
+        reset_time_natural_today = datetime.combine(
+            natural_today,
+            datetime.strptime(f"{reset_hour:02d}:{reset_minute:02d}", "%H:%M").time(),
+        ).replace(tzinfo=now.tzinfo)
+
+        # 今天的执行时间
+        execute_time_today = reset_time_natural_today + timedelta(hours=2)
+
+        # 昨天的重置时间（自然日期）
+        reset_time_natural_yesterday = datetime.combine(
+            natural_today - timedelta(days=1),
+            datetime.strptime(f"{reset_hour:02d}:{reset_minute:02d}", "%H:%M").time(),
+        ).replace(tzinfo=now.tzinfo)
+
+        # 昨天的执行时间
+        execute_time_yesterday = reset_time_natural_yesterday + timedelta(hours=2)
+
+        # 判断应该用哪个执行窗口（5分钟窗口）
+        EXECUTION_WINDOW = 300  # 5分钟
+
+        time_to_today = abs((now - execute_time_today).total_seconds())
+        time_to_yesterday = abs((now - execute_time_yesterday).total_seconds())
+
+        logger.debug(
+            f"📊 执行时间计算:\n"
+            f"   • 当前时间: {now.strftime('%Y-%m-%d %H:%M:%S')}\n"
+            f"   • 自然今天: {natural_today}\n"
+            f"   • 业务今天: {business_today}\n"
+            f"   • 今天执行: {execute_time_today.strftime('%Y-%m-%d %H:%M')}\n"
+            f"   • 距离今天: {time_to_today/60:.1f}分钟\n"
+            f"   • 昨天执行: {execute_time_yesterday.strftime('%Y-%m-%d %H:%M')}\n"
+            f"   • 距离昨天: {time_to_yesterday/60:.1f}分钟"
         )
 
-        # 计算昨天的重置时间
-        reset_time_yesterday = reset_time_today - timedelta(days=1)
-
-        # 计算两个执行时间点
-        execute_yesterday = reset_time_yesterday + timedelta(hours=2)
-        execute_today = reset_time_today + timedelta(hours=2)
-
-        # 判断应该用哪个执行窗口
-        # 逻辑：如果当前时间在昨天的执行窗口内，用昨天的重置时间
-        if execute_yesterday <= now < execute_today:
-            reset_time = reset_time_yesterday
-            execute_time = execute_yesterday
-            target_date = reset_time_yesterday.date()
-            period_info = "昨天"
-            logger.debug(
-                f"📅 使用昨天重置时间: {reset_time_yesterday.strftime('%Y-%m-%d %H:%M')}"
-            )
-        else:
-            reset_time = reset_time_today
-            execute_time = execute_today
-            target_date = reset_time_today.date()
-            period_info = "今天"
-            logger.debug(
-                f"📅 使用今天重置时间: {reset_time_today.strftime('%Y-%m-%d %H:%M')}"
-            )
-
-        # ==================== 检查是否到达执行时间 ====================
-        if now < execute_time:
-            minutes_left = int((execute_time - now).total_seconds() / 60)
-            seconds_left = int((execute_time - now).total_seconds() % 60)
+        if time_to_today <= EXECUTION_WINDOW:
+            # ✅ 正常执行：今天 11:00，清理业务昨天的数据
+            target_date = business_yesterday
+            execute_time = execute_time_today
+            period_info = "正常执行"
             logger.info(
-                f"⏳ [双班硬重置] 群组 {chat_id} 等待执行\n"
-                f"   • 当前时间: {now.strftime('%H:%M:%S')}\n"
-                f"   • 执行时间: {execute_time.strftime('%H:%M:%S')} ({period_info})\n"
-                f"   • 剩余时间: {minutes_left}分{seconds_left}秒"
+                f"📅 正常执行窗口\n"
+                f"   • 目标日期: {target_date} (业务昨天)\n"
+                f"   • 业务今天: {business_today}"
             )
-            return False  # 还未到执行时间
+            
+        elif time_to_yesterday <= EXECUTION_WINDOW:
+            # ✅ 补执行：昨天没执行，今天补执行
+            # 应该清理的还是业务昨天的数据！
+            target_date = business_yesterday  # ✅ 修复：用 business_yesterday
+            execute_time = execute_time_yesterday
+            period_info = "补执行"
+            logger.warning(
+                f"⚠️ 补执行场景\n"
+                f"   • 当前时间: {now.strftime('%Y-%m-%d %H:%M')}\n"
+                f"   • 本应执行: {execute_time_yesterday.strftime('%Y-%m-%d %H:%M')}\n"
+                f"   • 目标日期: {target_date} (业务昨天)"
+            )
+            
+        else:
+            # 不在执行窗口
+            logger.debug(
+                f"⏳ 不在执行窗口内\n"
+                f"   • 当前时间: {now.strftime('%H:%M:%S')}\n"
+                f"   • 今天执行: {execute_time_today.strftime('%H:%M')}\n"
+                f"   • 距离今天: {time_to_today/60:.1f}分钟\n"
+                f"   • 昨天执行: {execute_time_yesterday.strftime('%H:%M')}\n"
+                f"   • 距离昨天: {time_to_yesterday/60:.1f}分钟"
+            )
+            return False
+
 
         logger.info(
             f"🚀 [双班硬重置] 开始执行\n"
             f"   ┌─────────────────────────────────\n"
             f"   ├─ 群组ID: {chat_id}\n"
             f"   ├─ 当前时间: {now.strftime('%Y-%m-%d %H:%M:%S')}\n"
-            f"   ├─ 重置时间: {reset_time.strftime('%H:%M')} ({period_info})\n"
+            f"   ├─ 自然今天: {natural_today}\n"
+            f"   ├─ 业务今天: {business_today}\n"
+            f"   ├─ 业务昨天: {business_yesterday}\n"
+            f"   ├─ 重置时间: {reset_hour:02d}:{reset_minute:02d}\n"
+            f"   ├─ 执行类型: {period_info}\n"
             f"   ├─ 执行时间: {execute_time.strftime('%H:%M')}\n"
             f"   ├─ 目标日期: {target_date}\n"
             f"   └─ 操作员: {operator_id or '系统'}"
@@ -181,9 +215,11 @@ async def _dual_shift_hard_reset(
         # ==================== 1-2 步骤并发执行 ====================
         logger.info(f"📊 [步骤1-2/5] 并发处理未完成活动及补全下班记录...")
         task1 = asyncio.create_task(
-            _force_end_all_unfinished_shifts(chat_id, now, target_date)
+            _force_end_all_unfinished_shifts(chat_id, now, target_date, business_today)
         )
-        task2 = asyncio.create_task(_complete_missing_work_ends(chat_id, target_date))
+        task2 = asyncio.create_task(
+            _complete_missing_work_ends(chat_id, target_date, business_today)
+        )
 
         # 等待任务完成并处理结果
         results = await asyncio.gather(task1, task2, return_exceptions=True)
@@ -209,7 +245,7 @@ async def _dual_shift_hard_reset(
             logger.error(traceback.format_exc())
 
         # ==================== 3. 导出目标日期数据 ====================
-        logger.info(f"📊 [步骤3/5] 导出目标日期数据 (白班+夜班)...")
+        logger.info(f"📊 [步骤3/5] 导出目标日期数据...")
         export_start = time.time()
         try:
             export_success = await _export_yesterday_data_concurrent(
@@ -225,7 +261,9 @@ async def _dual_shift_hard_reset(
         logger.info(f"📊 [步骤4/5] 清除目标日期数据...")
         cleanup_start = time.time()
         try:
-            cleanup_stats = await _cleanup_old_data(chat_id, target_date, today)
+            cleanup_stats = await _cleanup_old_data(
+                chat_id, target_date, business_today
+            )
         except Exception as e:
             logger.error(f"❌ [数据清理] 失败: {e}")
             logger.error(traceback.format_exc())
@@ -238,31 +276,21 @@ async def _dual_shift_hard_reset(
         cleanup_time = time.time() - cleanup_start
 
         # ==================== 5. 清除班次状态 ====================
+        deleted_count = 0
         try:
             async with db.pool.acquire() as conn:
-                # ✅ 只删除昨天的班次状态（record_date < today）
                 result = await conn.execute(
                     """
                     DELETE FROM group_shift_state 
-                    WHERE chat_id = $1 
-                    AND record_date < $2
+                    WHERE chat_id = $1 AND record_date < $2
                     """,
                     chat_id,
-                    today,  # 今天的日期
+                    business_today,
                 )
-
-                # 解析删除数量
-                deleted_count = 0
-                if result and result.startswith("DELETE"):
-                    try:
-                        deleted_count = int(result.split()[-1])
-                    except (ValueError, IndexError):
-                        pass
+                deleted_count = _parse_delete_count(result)
 
                 if deleted_count > 0:
-                    logger.info(
-                        f"✅ 已清除 {deleted_count} 个昨天的班次状态，今天的班次状态已保留"
-                    )
+                    logger.info(f"✅ 已清除 {deleted_count} 个过期班次状态")
 
                     # 清理相关缓存
                     keys_to_remove = [
@@ -274,7 +302,7 @@ async def _dual_shift_hard_reset(
                         db._cache.pop(key, None)
                         db._cache_ttl.pop(key, None)
                 else:
-                    logger.info("✅ 没有需要清除的昨天班次状态")
+                    logger.info("✅ 没有需要清除的班次状态")
 
         except Exception as e:
             logger.error(f"❌ [清除班次状态] 失败: {e}")
@@ -308,7 +336,7 @@ async def _dual_shift_hard_reset(
             f"   ├─ 补全下班: {complete_stats['success']}/{complete_stats['total']}\n"
             f"   ├─ 导出成功: {export_success}\n"
             f"   ├─ 清理记录: {cleanup_stats.get('user_activities', 0)}条\n"
-            f"   ├─ 清除班次状态: {deleted_count if 'deleted_count' in locals() else 0}个\n"
+            f"   ├─ 清除班次状态: {deleted_count}个\n"
             f"   └─ 总耗时: {total_time:.2f}秒"
         )
 
@@ -326,17 +354,15 @@ async def _dual_shift_hard_reset(
 
 # ========== 3. 统一强制结束所有未完成活动 ==========
 async def _force_end_all_unfinished_shifts(
-    chat_id: int, now: datetime, yesterday: date
+    chat_id: int, now: datetime, target_date: date, business_today: date
 ) -> Dict[str, Any]:
-    """
-    强制结束所有未完成的活动
-    - 昨天开始到今天还没结束的活动
-    - 全部强制结束并归到昨天
-    """
+    """强制结束所有进行中的活动（只结束业务昨天及之前开始的活动）"""
     stats = {
         "total": 0,
         "success": 0,
         "failed": 0,
+        "day_shift": {"total": 0, "success": 0, "failed": 0},
+        "night_shift": {"total": 0, "success": 0, "failed": 0},
         "details": [],
     }
 
@@ -360,13 +386,15 @@ async def _force_end_all_unfinished_shifts(
                 logger.info(f"📊 群组 {chat_id} 没有进行中的活动")
                 return stats
 
-            logger.info(f"📊 发现 {len(rows)} 个进行中的活动，开始处理...")
+            logger.info(f"📊 发现 {len(rows)} 个进行中的活动，开始并发处理...")
 
             # 并发处理所有活动
             tasks = []
             for row in rows:
                 task = asyncio.create_task(
-                    _force_end_single_activity(conn, chat_id, row, now, yesterday)
+                    _force_end_single_activity(
+                        conn, chat_id, row, now, target_date, business_today
+                    )
                 )
                 tasks.append(task)
 
@@ -376,16 +404,31 @@ async def _force_end_all_unfinished_shifts(
             for i, result in enumerate(results):
                 if isinstance(result, Exception):
                     stats["failed"] += 1
+                    if rows[i]["shift"] == "day":
+                        stats["day_shift"]["failed"] += 1
+                    else:
+                        stats["night_shift"]["failed"] += 1
                     logger.error(f"❌ 处理用户 {rows[i]['user_id']} 失败: {result}")
                 else:
                     stats["success"] += 1
+                    if result["shift"] == "day":
+                        stats["day_shift"]["success"] += 1
+                    else:
+                        stats["night_shift"]["success"] += 1
                     stats["details"].append(result)
+
+            stats["day_shift"]["total"] = sum(1 for r in rows if r["shift"] == "day")
+            stats["night_shift"]["total"] = sum(
+                1 for r in rows if r["shift"] == "night"
+            )
 
         logger.info(
             f"✅ [强制结束活动完成] 群组 {chat_id}\n"
             f"   ├─ 总计: {stats['total']} 人\n"
             f"   ├─ 成功: {stats['success']} 人\n"
-            f"   └─ 失败: {stats['failed']} 人"
+            f"   ├─ 失败: {stats['failed']} 人\n"
+            f"   ├─ 白班: {stats['day_shift']['success']}/{stats['day_shift']['total']}\n"
+            f"   └─ 夜班: {stats['night_shift']['success']}/{stats['night_shift']['total']}"
         )
 
     except Exception as e:
@@ -396,9 +439,14 @@ async def _force_end_all_unfinished_shifts(
 
 
 async def _force_end_single_activity(
-    conn, chat_id: int, user_row: dict, now: datetime, target_date: date
+    conn,
+    chat_id: int,
+    user_row: dict,
+    now: datetime,
+    target_date: date,
+    business_today: date,
 ) -> Dict[str, Any]:
-    """强制结束单个活动 - 归到 target_date（昨天）"""
+    """强制结束单个活动 - 正确计算强制日期"""
     result = {
         "user_id": user_row["user_id"],
         "shift": user_row["shift"],
@@ -412,6 +460,21 @@ async def _force_end_single_activity(
     try:
         activity = user_row["current_activity"]
         start_time = datetime.fromisoformat(user_row["activity_start_time"])
+        start_date = start_time.date()
+
+        # 确定应该归到哪一天
+        if start_date < business_today:
+            # 业务今天之前开始的活动
+            if start_date <= target_date:
+                forced_date = target_date
+            else:
+                forced_date = business_today - timedelta(days=1)
+        else:
+            # 今天开始的活动，不结束
+            logger.debug(f"⏭️ 保留今天活动: 用户{user_row['user_id']}")
+            result["success"] = True
+            return result
+
         elapsed = int((now - start_time).total_seconds())
 
         # 获取活动限制
@@ -448,7 +511,7 @@ async def _force_end_single_activity(
         result["fine"] = fine_amount
         result["is_overtime"] = is_overtime
 
-        # 使用 complete_user_activity 强制归到目标日期（昨天）
+        # 使用 complete_user_activity 强制归到指定日期
         await db.complete_user_activity(
             chat_id=chat_id,
             user_id=user_row["user_id"],
@@ -457,7 +520,7 @@ async def _force_end_single_activity(
             fine_amount=fine_amount,
             is_overtime=is_overtime,
             shift=user_row["shift"],
-            forced_date=target_date,  # ✅ 强制归到昨天
+            forced_date=forced_date,
         )
 
         result["success"] = True
@@ -465,7 +528,7 @@ async def _force_end_single_activity(
         logger.info(
             f"✅ [强制结束] 用户{user_row['user_id']} | "
             f"活动:{activity} | 班次:{user_row['shift']} | "
-            f"日期:{target_date} | 时长:{elapsed}s | 罚款:{fine_amount}"
+            f"归到:{forced_date} | 时长:{elapsed}s | 罚款:{fine_amount}"
         )
 
     except Exception as e:
@@ -476,22 +539,22 @@ async def _force_end_single_activity(
 
 
 # ========== 4. 补全未打卡的下班记录 ==========
-async def _complete_missing_work_ends(chat_id: int, yesterday: date) -> Dict[str, Any]:
-    """
-    补全昨天忘记下班的下班记录
-    - 昨天有上班但没有下班的用户
-    - 包括白班和夜班
-    """
+async def _complete_missing_work_ends(
+    chat_id: int, target_date: date, business_today: date
+) -> Dict[str, Any]:
+    """为昨天有上班记录但没有下班记录的用户补全下班记录"""
     stats = {
         "total": 0,
         "success": 0,
         "failed": 0,
+        "day_shift": {"total": 0, "success": 0, "failed": 0},
+        "night_shift": {"total": 0, "success": 0, "failed": 0},
         "details": [],
     }
 
     try:
         async with db.pool.acquire() as conn:
-            # 查询昨天有上班但没有下班的用户
+            # 查询 target_date 有上班记录但没有下班记录的用户
             rows = await conn.fetch(
                 """
                 SELECT 
@@ -515,7 +578,7 @@ async def _complete_missing_work_ends(chat_id: int, yesterday: date) -> Dict[str
                   )
                 """,
                 chat_id,
-                yesterday,
+                target_date,
             )
 
             stats["total"] = len(rows)
@@ -539,7 +602,7 @@ async def _complete_missing_work_ends(chat_id: int, yesterday: date) -> Dict[str
             for row in rows:
                 task = asyncio.create_task(
                     _complete_single_work_end(
-                        conn, chat_id, row, yesterday, auto_end_time, shift_config
+                        conn, chat_id, row, target_date, auto_end_time, shift_config
                     )
                 )
                 tasks.append(task)
@@ -550,18 +613,33 @@ async def _complete_missing_work_ends(chat_id: int, yesterday: date) -> Dict[str
             for i, result in enumerate(results):
                 if isinstance(result, Exception):
                     stats["failed"] += 1
+                    if rows[i]["shift"] == "day":
+                        stats["day_shift"]["failed"] += 1
+                    else:
+                        stats["night_shift"]["failed"] += 1
                     logger.error(
                         f"❌ 补全用户 {rows[i]['user_id']} 下班记录失败: {result}"
                     )
                 else:
                     stats["success"] += 1
+                    if result["shift"] == "day":
+                        stats["day_shift"]["success"] += 1
+                    else:
+                        stats["night_shift"]["success"] += 1
                     stats["details"].append(result)
+
+            stats["day_shift"]["total"] = sum(1 for r in rows if r["shift"] == "day")
+            stats["night_shift"]["total"] = sum(
+                1 for r in rows if r["shift"] == "night"
+            )
 
         logger.info(
             f"✅ [补全下班记录完成] 群组 {chat_id}\n"
             f"   ├─ 总计: {stats['total']} 人\n"
             f"   ├─ 成功: {stats['success']} 人\n"
-            f"   └─ 失败: {stats['failed']} 人"
+            f"   ├─ 失败: {stats['failed']} 人\n"
+            f"   ├─ 白班: {stats['day_shift']['success']}/{stats['day_shift']['total']}\n"
+            f"   └─ 夜班: {stats['night_shift']['success']}/{stats['night_shift']['total']}"
         )
 
     except Exception as e:
@@ -595,9 +673,7 @@ async def _complete_single_work_end(
             expected_end_time = shift_config.get("day_end", "18:00")
             work_end_date = target_date
         else:
-            expected_end_time = shift_config.get(
-                "day_start", "09:00"
-            )  # 夜班下班是第二天早上
+            expected_end_time = shift_config.get("day_start", "09:00")
             work_end_date = target_date + timedelta(days=1)
 
         # 计算时间差
@@ -651,7 +727,7 @@ async def _complete_single_work_end(
             shift_detail=row.get("shift_detail", row["shift"]),
         )
 
-        # 更新用户的工作时长统计（通过 daily_statistics）
+        # 更新用户的工作时长统计
         await conn.execute(
             """
             INSERT INTO daily_statistics
@@ -661,7 +737,7 @@ async def _complete_single_work_end(
             DO UPDATE SET
                 accumulated_time = daily_statistics.accumulated_time + EXCLUDED.accumulated_time,
                 updated_at = CURRENT_TIMESTAMP
-        """,
+            """,
             chat_id,
             row["user_id"],
             target_date,
@@ -685,13 +761,11 @@ async def _complete_single_work_end(
     return result
 
 
-# ========== 5. 导出昨天数据（并发重试版） ==========
+# ========== 5. 导出数据 ==========
 async def _export_yesterday_data_concurrent(
     chat_id: int, target_date: date, from_monthly: bool = False
 ) -> bool:
-    """
-    并发导出昨天白班+夜班数据，成功一次就推送，其余成功只记录日志且不生成文件
-    """
+    """并发导出数据，成功一次就推送"""
     source = "月度表" if from_monthly else "日常表"
     already_sent = False
     success_count = 0
@@ -699,8 +773,6 @@ async def _export_yesterday_data_concurrent(
     async def task_wrapper(attempt: int) -> bool:
         nonlocal already_sent
         file_name = f"dual_shift_backup_{chat_id}_{target_date.strftime('%Y%m%d')}.csv"
-
-        # 第一次成功推送后，其余任务不再生成 CSV
         push_file = not already_sent
 
         try:
@@ -710,33 +782,28 @@ async def _export_yesterday_data_concurrent(
                 file_name=file_name,
                 is_daily_reset=True,
                 from_monthly_table=from_monthly,
-                push_file=push_file,  # ✅ 控制是否实际推送/生成文件
+                push_file=push_file,
             )
 
             if result:
                 if not already_sent:
                     already_sent = True
                     logger.info(
-                        f"✅ [数据导出] 群组{chat_id} 第{attempt+1}次尝试成功 (从{source})，已推送"
+                        f"✅ [数据导出] 群组{chat_id} 第{attempt+1}次尝试成功，已推送"
                     )
                 else:
                     logger.info(
-                        f"✅ [数据导出] 群组{chat_id} 第{attempt+1}次尝试成功 (从{source})，已跳过生成/推送"
+                        f"✅ [数据导出] 群组{chat_id} 第{attempt+1}次尝试成功，已跳过"
                     )
                 return True
-            else:
-                logger.warning(f"⚠️ [数据导出] 第{attempt+1}次尝试返回 False")
-                return False
+            return False
 
         except Exception as e:
             logger.warning(f"⚠️ [数据导出] 第{attempt+1}次尝试失败: {e}")
             return False
 
-    # 创建并发任务
     tasks = [asyncio.create_task(task_wrapper(i)) for i in range(3)]
-
     results = await asyncio.gather(*tasks)
-
     success_count = sum(1 for r in results if r is True)
 
     if already_sent:
@@ -749,15 +816,9 @@ async def _export_yesterday_data_concurrent(
 
 # ========== 6. 数据清理 ==========
 async def _cleanup_old_data(
-    chat_id: int, yesterday: date, today: date
+    chat_id: int, target_date: date, business_today: date
 ) -> Dict[str, int]:
-    """
-    数据清理 - 清理昨天及之前的所有班次数据
-    包括：
-    - 昨天所有数据（record_date = 昨天）
-    - 今天凌晨的夜班数据（record_date = 今天，但属于昨天班次）
-    - 所有夜班用户状态重置（包括已打卡和未打卡）
-    """
+    """数据清理 - 只删目标日期，不删业务今天"""
     stats = {
         "user_activities": 0,
         "work_records": 0,
@@ -768,126 +829,68 @@ async def _cleanup_old_data(
     try:
         async with db.pool.acquire() as conn:
             async with conn.transaction():
-                # ===== 1. 清理昨天的工作记录 =====
-                result = await conn.execute(
-                    "DELETE FROM work_records WHERE chat_id = $1 AND record_date = $2",
-                    chat_id,
-                    yesterday,
-                )
-                stats["work_records"] += _parse_delete_count(result)
-
-                # ===== 2. 清理昨天的活动记录 =====
-                result = await conn.execute(
-                    "DELETE FROM user_activities WHERE chat_id = $1 AND activity_date = $2",
-                    chat_id,
-                    yesterday,
-                )
-                stats["user_activities"] += _parse_delete_count(result)
-
-                # ===== 3. 清理昨天的日统计 =====
-                result = await conn.execute(
-                    "DELETE FROM daily_statistics WHERE chat_id = $1 AND record_date = $2",
-                    chat_id,
-                    yesterday,
-                )
-                stats["daily_statistics"] += _parse_delete_count(result)
-
-                # ===== 4. 清理今天凌晨的夜班数据（属于昨天班次）=====
-                # 4.1 清理今天凌晨的夜班工作记录
-                result = await conn.execute(
-                    """
-                    DELETE FROM work_records 
-                    WHERE chat_id = $1 
-                      AND record_date = $2
-                      AND shift = 'night'
-                    """,
-                    chat_id,
-                    today,
-                )
-                stats["work_records"] += _parse_delete_count(result)
-
-                # 4.2 清理今天凌晨的夜班活动记录
+                # 1. user_activities
                 result = await conn.execute(
                     """
                     DELETE FROM user_activities 
-                    WHERE chat_id = $1 
-                      AND activity_date = $2
-                      AND shift = 'night'
+                    WHERE chat_id = $1 AND activity_date = $2
                     """,
                     chat_id,
-                    today,
+                    target_date,
                 )
-                stats["user_activities"] += _parse_delete_count(result)
+                stats["user_activities"] = _parse_delete_count(result)
 
-                # 4.3 清理今天凌晨的夜班日统计
+                # 2. work_records
+                result = await conn.execute(
+                    """
+                    DELETE FROM work_records 
+                    WHERE chat_id = $1 AND record_date = $2
+                    """,
+                    chat_id,
+                    target_date,
+                )
+                stats["work_records"] = _parse_delete_count(result)
+
+                # 3. daily_statistics
                 result = await conn.execute(
                     """
                     DELETE FROM daily_statistics 
-                    WHERE chat_id = $1 
-                      AND record_date = $2
-                      AND shift = 'night'
+                    WHERE chat_id = $1 AND record_date = $2
                     """,
                     chat_id,
-                    today,
+                    target_date,
                 )
-                stats["daily_statistics"] += _parse_delete_count(result)
+                stats["daily_statistics"] = _parse_delete_count(result)
 
-                # ===== 5. 重置所有夜班用户状态（合并版本）=====
+                # 4. 清理用户昨日活动状态
                 result = await conn.execute(
                     """
                     UPDATE users 
                     SET current_activity = NULL, 
                         activity_start_time = NULL,
-                        checkin_message_id = NULL,
                         last_updated = $2
                     WHERE chat_id = $1 
-                      AND shift = 'night'
-                      AND last_updated IN ($3, $4)
+                      AND last_updated <= $3
                       AND current_activity IS NOT NULL
                     """,
                     chat_id,
-                    today,
-                    yesterday,
-                    today,
+                    business_today,
+                    target_date,
                 )
-                stats["users_reset"] += _parse_update_count(result)
+                stats["users_reset"] = _parse_update_count(result)
 
-                # ===== 6. 清理孤儿数据（可选，增强数据完整性）=====
-                # 6.1 清理没有对应用户的孤立工作记录
-                await conn.execute(
-                    """
-                    DELETE FROM work_records w
-                    WHERE w.chat_id = $1
-                      AND NOT EXISTS (
-                          SELECT 1 FROM users u
-                          WHERE u.chat_id = w.chat_id 
-                            AND u.user_id = w.user_id
-                      )
-                    """,
-                    chat_id,
-                )
-
-                # 6.2 清理没有对应用户的孤立活动记录
-                await conn.execute(
-                    """
-                    DELETE FROM user_activities a
-                    WHERE a.chat_id = $1
-                      AND NOT EXISTS (
-                          SELECT 1 FROM users u
-                          WHERE u.chat_id = a.chat_id 
-                            AND u.user_id = a.user_id
-                      )
-                    """,
-                    chat_id,
-                )
+        total_deleted = (
+            stats["user_activities"] + stats["work_records"] + stats["daily_statistics"]
+        )
 
         logger.info(
             f"🧹 [数据清理] 群组{chat_id}\n"
-            f"   ├─ 清理昨天数据: {stats['user_activities']} 条活动, {stats['work_records']} 条工作记录\n"
-            f"   ├─ 清理今天凌晨夜班: 完成\n"
-            f"   ├─ 重置夜班用户状态: {stats['users_reset']} 人\n"
-            f"   ├─ 清理孤儿数据: 完成\n"
-            f"   └─ 今天白班数据: ✅ 完整保留"
+            f"   • 删除用户活动: {stats['user_activities']} 条\n"
+            f"   • 删除工作记录: {stats['work_records']} 条\n"
+            f"   • 删除日统计: {stats['daily_statistics']} 条\n"
+            f"   • 重置用户状态: {stats['users_reset']} 人\n"
+            f"   • 总计删除: {total_deleted} 条\n"
+            f"   • 今天数据: ✅ 完整保留 (业务今天 = {business_today})"
         )
 
     except Exception as e:
@@ -962,25 +965,19 @@ def _parse_update_count(result: str) -> int:
 
 # ========== 9. 恢复班次状态 ==========
 async def recover_shift_states():
-    """
-    系统启动时恢复所有用户的班次状态
-    根据未下班的上班记录重建 group_shift_state
-    """
+    """系统启动时恢复所有用户的班次状态"""
     logger.info("🔄 开始恢复用户班次状态...")
     recovered_count = 0
 
     try:
-        # 获取所有群组
         all_groups = await db.get_all_groups()
 
         for chat_id in all_groups:
             try:
-                # 只处理双班模式群组
                 if not await db.is_dual_mode_enabled(chat_id):
                     continue
 
                 async with db.pool.acquire() as conn:
-                    # 查询所有未下班的用户（按用户和班次分组）
                     rows = await conn.fetch(
                         """
                         SELECT 
@@ -1005,7 +1002,6 @@ async def recover_shift_states():
                     )
 
                     for row in rows:
-                        # 恢复用户班次状态
                         await db.set_user_shift_state(
                             chat_id=chat_id,
                             user_id=row["user_id"],
