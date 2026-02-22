@@ -2277,17 +2277,23 @@ class PostgreSQLDatabase:
             return False
 
     async def get_user_all_activities(
-        self, chat_id: int, user_id: int
+        self, chat_id: int, user_id: int, target_date: date = None  # ✅ 新增可选参数
     ) -> Dict[str, Dict]:
-        """获取用户所有活动数据"""
-        today = await self.get_business_date(chat_id)
+        """获取用户活动数据，可指定日期"""
+        if target_date is None:
+            target_date = await self.get_business_date(chat_id)  # 默认使用业务日期
+
         self._ensure_pool_initialized()
         async with self.pool.acquire() as conn:
             rows = await conn.fetch(
-                "SELECT activity_name, activity_count, accumulated_time FROM user_activities WHERE chat_id = $1 AND user_id = $2 AND activity_date = $3",
+                """
+                SELECT activity_name, activity_count, accumulated_time 
+                FROM user_activities 
+                WHERE chat_id = $1 AND user_id = $2 AND activity_date = $3
+                """,
                 chat_id,
                 user_id,
-                today,
+                target_date,  # ✅ 使用传入的日期
             )
 
             activities = {}
