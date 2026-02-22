@@ -362,6 +362,40 @@ class PostgreSQLDatabase:
 
         return business_date
 
+    # 在 database.py 的 PostgreSQLDatabase 类中添加
+
+    async def get_business_date_range(
+        self, chat_id: int, current_dt: datetime = None
+    ) -> Dict[str, date]:
+        """
+        获取业务日期范围（今天、昨天、前天）
+        用于重置时统一使用业务日期
+        """
+        if current_dt is None:
+            current_dt = self.get_beijing_time()
+
+        # 🎯 复用现有的 get_business_date 函数
+        business_today = await self.get_business_date(chat_id, current_dt)
+        business_yesterday = business_today - timedelta(days=1)
+        business_day_before = business_today - timedelta(days=2)
+
+        # 自然日期仅用于日志
+        natural_today = current_dt.date()
+
+        logger.debug(
+            f"📅 业务日期范围:\n"
+            f"   • 自然今天: {natural_today}\n"
+            f"   • 业务今天: {business_today}\n"
+            f"   • 业务昨天: {business_yesterday}"
+        )
+
+        return {
+            "business_today": business_today,
+            "business_yesterday": business_yesterday,
+            "business_day_before": business_day_before,
+            "natural_today": natural_today,
+        }
+
     # ========== 初始化方法 ==========
     async def initialize(self):
         """初始化数据库"""
