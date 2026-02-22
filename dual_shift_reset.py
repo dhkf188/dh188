@@ -239,11 +239,18 @@ async def _dual_shift_hard_reset(
 
         # ==================== 5. 清除班次状态 ====================
         try:
-            # 🆕 直接删除 group_shift_state 表中的所有记录
             async with db.pool.acquire() as conn:
+                # ✅ 只删除昨天的班次状态（record_date < today）
                 result = await conn.execute(
-                    "DELETE FROM group_shift_state WHERE chat_id = $1", chat_id
+                    """
+                    DELETE FROM group_shift_state 
+                    WHERE chat_id = $1 
+                    AND record_date < $2
+                    """,
+                    chat_id,
+                    today,  # 今天的日期
                 )
+
                 # 解析删除数量
                 deleted_count = 0
                 if result and result.startswith("DELETE"):
@@ -253,7 +260,9 @@ async def _dual_shift_hard_reset(
                         pass
 
                 if deleted_count > 0:
-                    logger.info(f"✅ 已清除 {deleted_count} 个用户班次状态")
+                    logger.info(
+                        f"✅ 已清除 {deleted_count} 个昨天的班次状态，今天的班次状态已保留"
+                    )
 
                     # 清理相关缓存
                     keys_to_remove = [
@@ -265,7 +274,7 @@ async def _dual_shift_hard_reset(
                         db._cache.pop(key, None)
                         db._cache_ttl.pop(key, None)
                 else:
-                    logger.info("✅ 没有需要清除的班次状态")
+                    logger.info("✅ 没有需要清除的昨天班次状态")
 
         except Exception as e:
             logger.error(f"❌ [清除班次状态] 失败: {e}")
