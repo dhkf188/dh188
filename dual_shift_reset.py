@@ -104,7 +104,6 @@ async def _dual_shift_hard_reset(
         reset_minute = group_data.get("reset_minute", 0)
 
         # ==================== 🎯 修复：用自然日期计算执行时间 ====================
-        # 今天的重置时间（自然日期）
         reset_time_natural_today = datetime.combine(
             natural_today,
             datetime.strptime(f"{reset_hour:02d}:{reset_minute:02d}", "%H:%M").time(),
