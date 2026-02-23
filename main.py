@@ -6807,7 +6807,7 @@ async def show_history(message: types.Message, shift: str = None):
     )
 
 async def show_rank(message: types.Message, shift: str = None):
-    """显示排行榜 - 修复夜班查询（完整版）"""
+    """显示排行榜 - 修复夜班查询和类型转换"""
 
     chat_id = message.chat.id
     uid = message.from_user.id
@@ -6881,14 +6881,15 @@ async def show_rank(message: types.Message, shift: str = None):
                 # 夜班特殊处理日期
                 if shift == "night":
                     if current_hour < 12:
-                        query += " AND ds.record_date = $3 AND ds.shift = $5"
+                        # 🚨 修复：使用 CAST 或直接传入 date 对象
+                        query += " AND ds.record_date = $3::date AND ds.shift = $5"
                         params.extend([business_date - timedelta(days=1), shift])
                         logger.info(f"🌙 [排行榜-夜班] 凌晨查询日期: {business_date - timedelta(days=1)}")
                     else:
-                        query += " AND ds.record_date = $3 AND ds.shift = $5"
+                        query += " AND ds.record_date = $3::date AND ds.shift = $5"
                         params.extend([business_date, shift])
                 else:  # 白班
-                    query += " AND ds.record_date = $3 AND ds.shift = $5"
+                    query += " AND ds.record_date = $3::date AND ds.shift = $5"
                     params.extend([business_date, shift])
             else:
                 # 全部班次查询
@@ -6917,8 +6918,8 @@ async def show_rank(message: types.Message, shift: str = None):
                     # 凌晨：前一天夜班 + 当天白班
                     query += """ 
                         AND (
-                            (ds.record_date = $3 AND ds.shift = 'night') OR
-                            (ds.record_date = $4 AND ds.shift = 'day')
+                            (ds.record_date = $3::date AND ds.shift = 'night') OR
+                            (ds.record_date = $4::date AND ds.shift = 'day')
                         )
                     """
                     params.extend([business_date - timedelta(days=1), business_date])
@@ -6929,7 +6930,7 @@ async def show_rank(message: types.Message, shift: str = None):
                     )
                 else:
                     # 下午/晚上：只查当天
-                    query += " AND ds.record_date = $3"
+                    query += " AND ds.record_date = $3::date"
                     params.append(business_date)
 
             query += """
@@ -7010,7 +7011,6 @@ async def show_rank(message: types.Message, shift: str = None):
         parse_mode="HTML",
         reply_to_message_id=message.message_id,
     )
-
 # ========== 快速回座回调 ==========
 async def handle_quick_back(callback_query: types.CallbackQuery):
     """处理快速回座按钮 - 支持班次传递"""
