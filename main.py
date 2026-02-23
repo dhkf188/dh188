@@ -7740,7 +7740,7 @@ async def daily_reset_task():
             return
 
         # ===== 4. 幂等性检查 =====
-        reset_flag_key = f"dual_reset:{chat_id}:{business_today.strftime('%Y%m%d')}"
+        reset_flag_key = f"dual_reset:{chat_id}:{target_date.strftime('%Y%m%d')}"
         from performance import global_cache
 
         if global_cache.get(reset_flag_key):
