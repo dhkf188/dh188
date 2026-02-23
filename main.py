@@ -1316,8 +1316,7 @@ async def start_activity(message: types.Message, act: str):
         # -----------------------------
         if not await db.activity_exists(act):
             await message.answer(
-                f"❌ 活动 '{act}' 不存在", 
-                reply_to_message_id=message.message_id
+                f"❌ 活动 '{act}' 不存在", reply_to_message_id=message.message_id
             )
             return
 
@@ -2692,8 +2691,7 @@ async def process_work_checkin(message: types.Message, checkin_type: str):
                                         async def send_end_notification():
                                             try:
                                                 await message.answer(
-                                                    f"📢 <b>{shift_text}班次结束</b>\n"
-                                                    f"所有用户已完成下班打卡",
+                                                    f"📢 <b>{shift_text}班次结束</b> 所有用户已完成下班打卡",
                                                     parse_mode="HTML",
                                                 )
                                             except Exception as e:
@@ -3123,35 +3121,56 @@ async def send_work_notification(
         # 如果是下班通知，添加上班时间和工作时长
         if action_text == "下班":
             try:
-                # 获取今天的上班记录
-                work_records = await db.get_work_records_by_shift(
-                    chat_id, user_id, shift_text
-                )
-                if work_records and work_records.get("work_start"):
-                    # 获取上班时间
-                    work_start_time = work_records["work_start"][0]["checkin_time"]
+                business_date = await db.get_business_date(chat_id)
 
-                    # 计算工作时长
+                # 使用 shift_text 保持兼容
+                shift_value = shift if shift else shift_text
+
+                if shift_value in ["night", "夜班"]:
+                    start_date = business_date - timedelta(days=1)
+                    logger.info(
+                        f"[{trace_id}] 🌙 夜班下班，查询日期范围: {start_date} 到 {business_date}"
+                    )
+                else:
+                    start_date = business_date
+                    logger.info(f"[{trace_id}] ☀️ 白班下班，查询日期: {business_date}")
+
+                end_date = business_date
+
+                work_records = await db.get_work_records_by_shift(
+                    chat_id,
+                    user_id,
+                    shift_value,
+                    start_date,
+                    end_date,
+                )
+
+                work_start_time = None
+
+                if work_records and work_records.get("work_start"):
+                    work_start_time = work_records["work_start"][0]["checkin_time"]
+                    logger.info(f"[{trace_id}] 📝 找到上班记录: {work_start_time}")
+
+                if work_start_time:
                     start_dt = datetime.strptime(work_start_time, "%H:%M")
                     end_dt = datetime.strptime(checkin_time, "%H:%M")
 
-                    # 处理跨天（如果下班时间小于上班时间，说明跨天了）
                     if end_dt < start_dt:
                         end_dt += timedelta(days=1)
+                        logger.info(f"[{trace_id}] 🔄 跨天工作: {start_dt} -> {end_dt}")
 
                     work_duration = int((end_dt - start_dt).total_seconds())
                     work_duration_str = MessageFormatter.format_duration(work_duration)
 
                     # 获取今日活动总时长
-                    business_date = await db.get_business_date(chat_id)
                     async with db.pool.acquire() as conn:
                         activity_total = (
                             await conn.fetchval(
                                 """
-                            SELECT SUM(accumulated_time) 
-                            FROM user_activities 
-                            WHERE chat_id = $1 AND user_id = $2 AND activity_date = $3
-                            """,
+                                SELECT SUM(accumulated_time) 
+                                FROM user_activities 
+                                WHERE chat_id = $1 AND user_id = $2 AND activity_date = $3
+                                """,
                                 chat_id,
                                 user_id,
                                 business_date,
@@ -3180,6 +3199,9 @@ async def send_work_notification(
                     channel_notif_text += (
                         f"💪 实际工作时间：<code>{actual_work_str}</code>\n"
                     )
+                else:
+                    logger.warning(f"[{trace_id}] ⚠️ 未找到上班记录")
+
             except Exception as e:
                 logger.error(f"[{trace_id}] ❌ 计算工作时长失败: {e}")
 
