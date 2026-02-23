@@ -6461,7 +6461,7 @@ async def handle_fixed_activity(message: types.Message):
 
 # ========== 用户功能 ==========
 async def show_history(message: types.Message, shift: str = None):
-    """显示用户历史记录 - 业务周期权威版 + 班次维度（融合终极版）"""
+    """显示用户历史记录 - 修复夜班查询（完整版）"""
 
     chat_id = message.chat.id
     uid = message.from_user.id
@@ -6471,6 +6471,7 @@ async def show_history(message: types.Message, shift: str = None):
     await db.init_user(chat_id, uid)
 
     business_date = await db.get_business_date(chat_id)
+    current_hour = get_beijing_time().hour  # 获取当前小时用于夜班判断
 
     group_data = await db.get_group_cached(chat_id)
     reset_hour = group_data.get("reset_hour", Config.DAILY_RESET_HOUR)
@@ -6553,8 +6554,17 @@ async def show_history(message: types.Message, shift: str = None):
     activity_limits = await db.get_activity_limits_cached()
 
     async with db.pool.acquire() as conn:
-        # 如果指定了班次，只查询该班次的数据
+        # 🚨 核心修复：根据班次和当前时间确定查询日期
         if shift:
+            # 单班次查询
+            query_date = business_date
+            if shift == "night" and current_hour < 12:
+                query_date = business_date - timedelta(days=1)
+                logger.info(
+                    f"🌙 [我的记录-夜班] 凌晨查询: "
+                    f"业务日期={business_date}, 查询日期={query_date}"
+                )
+            
             rows = await conn.fetch(
                 """
                 SELECT activity_name, activity_count, accumulated_time, shift
@@ -6564,20 +6574,45 @@ async def show_history(message: types.Message, shift: str = None):
                 """,
                 chat_id,
                 uid,
-                business_date,
+                query_date,
                 shift,
             )
         else:
-            rows = await conn.fetch(
-                """
-                SELECT activity_name, activity_count, accumulated_time, shift
-                FROM user_activities
-                WHERE chat_id = $1 AND user_id = $2 AND activity_date = $3
-                """,
-                chat_id,
-                uid,
-                business_date,
-            )
+            # 全部班次查询：需要联合查询前一天夜班和当天白班
+            if current_hour < 12:
+                # 凌晨：查询前一天的所有夜班 + 当天的白班
+                rows = await conn.fetch(
+                    """
+                    SELECT activity_name, activity_count, accumulated_time, shift
+                    FROM user_activities
+                    WHERE chat_id = $1 AND user_id = $2 
+                      AND (
+                          (activity_date = $3 AND shift = 'night') OR
+                          (activity_date = $4 AND shift = 'day')
+                      )
+                    """,
+                    chat_id,
+                    uid,
+                    business_date - timedelta(days=1),  # 前一天
+                    business_date,                       # 当天
+                )
+                logger.info(
+                    f"🌙 [我的记录-全部] 凌晨查询: "
+                    f"夜班日期={business_date - timedelta(days=1)}, "
+                    f"白班日期={business_date}"
+                )
+            else:
+                # 下午/晚上：查询当天的所有班次
+                rows = await conn.fetch(
+                    """
+                    SELECT activity_name, activity_count, accumulated_time, shift
+                    FROM user_activities
+                    WHERE chat_id = $1 AND user_id = $2 AND activity_date = $3
+                    """,
+                    chat_id,
+                    uid,
+                    business_date,
+                )
 
     activities_by_shift = {"day": {}, "night": {}}
 
@@ -6664,7 +6699,11 @@ async def show_history(message: types.Message, shift: str = None):
     # ==================== 4️⃣ 罚款统计（按班次）====================
     async with db.pool.acquire() as conn:
         if shift:
-            # 查询指定班次的罚款
+            # 🚨 罚款统计也需要夜班日期调整
+            fine_query_date = business_date
+            if shift == "night" and current_hour < 12:
+                fine_query_date = business_date - timedelta(days=1)
+            
             fine_total = (
                 await conn.fetchval(
                     """
@@ -6679,30 +6718,66 @@ async def show_history(message: types.Message, shift: str = None):
                 """,
                     chat_id,
                     uid,
-                    business_date,
+                    fine_query_date,
                     shift,
                 )
                 or 0
             )
         else:
-            # 查询所有班次的罚款
-            fine_total = (
-                await conn.fetchval(
+            # 🚨 全部班次罚款统计也需要联合查询
+            if current_hour < 12:
+                # 凌晨：前一天夜班 + 当天白班
+                fine_total_day = await conn.fetchval(
                     """
-                SELECT COALESCE(SUM(accumulated_time), 0)
-                FROM daily_statistics
-                WHERE chat_id = $1 
-                  AND user_id = $2 
-                  AND record_date = $3 
-                  AND activity_name IN ('total_fines', 'work_fines', 
-                                       'work_start_fines', 'work_end_fines')
-                """,
+                    SELECT COALESCE(SUM(accumulated_time), 0)
+                    FROM daily_statistics
+                    WHERE chat_id = $1 
+                      AND user_id = $2 
+                      AND record_date = $3 
+                      AND shift = 'day'
+                      AND activity_name IN ('total_fines', 'work_fines', 
+                                           'work_start_fines', 'work_end_fines')
+                    """,
                     chat_id,
                     uid,
                     business_date,
+                ) or 0
+                
+                fine_total_night = await conn.fetchval(
+                    """
+                    SELECT COALESCE(SUM(accumulated_time), 0)
+                    FROM daily_statistics
+                    WHERE chat_id = $1 
+                      AND user_id = $2 
+                      AND record_date = $3 
+                      AND shift = 'night'
+                      AND activity_name IN ('total_fines', 'work_fines', 
+                                           'work_start_fines', 'work_end_fines')
+                    """,
+                    chat_id,
+                    uid,
+                    business_date - timedelta(days=1),
+                ) or 0
+                
+                fine_total = fine_total_day + fine_total_night
+            else:
+                fine_total = (
+                    await conn.fetchval(
+                        """
+                    SELECT COALESCE(SUM(accumulated_time), 0)
+                    FROM daily_statistics
+                    WHERE chat_id = $1 
+                      AND user_id = $2 
+                      AND record_date = $3 
+                      AND activity_name IN ('total_fines', 'work_fines', 
+                                           'work_start_fines', 'work_end_fines')
+                    """,
+                        chat_id,
+                        uid,
+                        business_date,
+                    )
+                    or 0
                 )
-                or 0
-            )
 
     if fine_total > 0:
         if shift:
@@ -6731,8 +6806,8 @@ async def show_history(message: types.Message, shift: str = None):
         parse_mode="HTML",
     )
 
-
 async def show_rank(message: types.Message, shift: str = None):
+    """显示排行榜 - 修复夜班查询（完整版）"""
 
     chat_id = message.chat.id
     uid = message.from_user.id
@@ -6747,15 +6822,16 @@ async def show_rank(message: types.Message, shift: str = None):
         )
         return
 
-    # 🧠 获取业务日期
+    # 🧠 获取业务日期和当前时间
     business_date = await db.get_business_date(chat_id)
+    current_hour = get_beijing_time().hour
 
-    # 读取重置配置（原代码功能）
+    # 读取重置配置
     group_data = await db.get_group_cached(chat_id)
     reset_hour = group_data.get("reset_hour", Config.DAILY_RESET_HOUR)
     reset_minute = group_data.get("reset_minute", Config.DAILY_RESET_MINUTE)
 
-    # ===== 构建标题（融合版） =====
+    # ===== 构建标题 =====
     if shift:
         shift_text = "白班" if shift == "day" else "夜班"
         title = f"🏆 【{shift_text}】活动排行榜"
@@ -6778,32 +6854,83 @@ async def show_rank(message: types.Message, shift: str = None):
     # ===== 遍历所有活动 =====
     for act in activity_limits.keys():
         try:
-            query = """
-                SELECT 
-                    ds.user_id,
-                    u.nickname,
-                    SUM(ds.accumulated_time) AS total_time,
-                    SUM(ds.activity_count) AS total_count,
-                    CASE 
-                        WHEN u.current_activity = $1 
-                        THEN TRUE 
-                        ELSE FALSE 
-                    END AS is_active
-                FROM daily_statistics ds
-                LEFT JOIN users u 
-                    ON ds.chat_id = u.chat_id 
-                   AND ds.user_id = u.user_id
-                WHERE ds.chat_id = $2
-                  AND ds.record_date = $3
-                  AND ds.activity_name = $4
-            """
-
-            params = [act, chat_id, business_date, act]
-
-            # 🔀 班次过滤
+            # 🚨 核心修复：根据班次和当前时间构建查询
             if shift:
-                query += " AND ds.shift = $5"
-                params.append(shift)
+                # 单班次查询
+                query = """
+                    SELECT 
+                        ds.user_id,
+                        u.nickname,
+                        SUM(ds.accumulated_time) AS total_time,
+                        SUM(ds.activity_count) AS total_count,
+                        CASE 
+                            WHEN u.current_activity = $1 
+                            THEN TRUE 
+                            ELSE FALSE 
+                        END AS is_active
+                    FROM daily_statistics ds
+                    LEFT JOIN users u 
+                        ON ds.chat_id = u.chat_id 
+                       AND ds.user_id = u.user_id
+                    WHERE ds.chat_id = $2
+                      AND ds.activity_name = $4
+                """
+                
+                params = [act, chat_id, act]
+                
+                # 夜班特殊处理日期
+                if shift == "night":
+                    if current_hour < 12:
+                        query += " AND ds.record_date = $3 AND ds.shift = $5"
+                        params.extend([business_date - timedelta(days=1), shift])
+                        logger.info(f"🌙 [排行榜-夜班] 凌晨查询日期: {business_date - timedelta(days=1)}")
+                    else:
+                        query += " AND ds.record_date = $3 AND ds.shift = $5"
+                        params.extend([business_date, shift])
+                else:  # 白班
+                    query += " AND ds.record_date = $3 AND ds.shift = $5"
+                    params.extend([business_date, shift])
+            else:
+                # 全部班次查询
+                query = """
+                    SELECT 
+                        ds.user_id,
+                        u.nickname,
+                        SUM(ds.accumulated_time) AS total_time,
+                        SUM(ds.activity_count) AS total_count,
+                        CASE 
+                            WHEN u.current_activity = $1 
+                            THEN TRUE 
+                            ELSE FALSE 
+                        END AS is_active
+                    FROM daily_statistics ds
+                    LEFT JOIN users u 
+                        ON ds.chat_id = u.chat_id 
+                       AND ds.user_id = u.user_id
+                    WHERE ds.chat_id = $2
+                      AND ds.activity_name = $4
+                """
+                
+                params = [act, chat_id, act]
+                
+                if current_hour < 12:
+                    # 凌晨：前一天夜班 + 当天白班
+                    query += """ 
+                        AND (
+                            (ds.record_date = $3 AND ds.shift = 'night') OR
+                            (ds.record_date = $4 AND ds.shift = 'day')
+                        )
+                    """
+                    params.extend([business_date - timedelta(days=1), business_date])
+                    logger.info(
+                        f"🌙 [排行榜-全部] 凌晨查询范围: "
+                        f"夜班={business_date - timedelta(days=1)}, "
+                        f"白班={business_date}"
+                    )
+                else:
+                    # 下午/晚上：只查当天
+                    query += " AND ds.record_date = $3"
+                    params.append(business_date)
 
             query += """
                 GROUP BY ds.user_id, u.nickname, u.current_activity
@@ -6883,7 +7010,6 @@ async def show_rank(message: types.Message, shift: str = None):
         parse_mode="HTML",
         reply_to_message_id=message.message_id,
     )
-
 
 # ========== 快速回座回调 ==========
 async def handle_quick_back(callback_query: types.CallbackQuery):
