@@ -8623,7 +8623,7 @@ async def on_startup():
         logger.info(f"✅ 管理员指令菜单注册结果: {res_admin}")
 
         # 4. 初始化数据库
-        if hasattr(db, "init"):
+        if hasattr(db, "initialize"):
             await db.initialize()
 
         await send_startup_notification()
