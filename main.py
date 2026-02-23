@@ -6584,10 +6584,8 @@ async def show_history(message: types.Message, shift: str = None):
                 else:
                     # 白班已开始，查当天的白班
                     query_date = business_date
-                    logger.info(
-                        f"☀️ [我的记录-白班] 正常查询当天: {query_date}"
-                    )
-            
+                    logger.info(f"☀️ [我的记录-白班] 正常查询当天: {query_date}")
+
             rows = await conn.fetch(
                 """
                 SELECT activity_name, activity_count, accumulated_time, shift
@@ -6610,7 +6608,7 @@ async def show_history(message: types.Message, shift: str = None):
                     f"当前时间={current_hour:02d}:{current_minute:02d}, "
                     f"白班开始={day_start_str}, 查询日期={query_date}"
                 )
-                
+
                 rows = await conn.fetch(
                     """
                     SELECT activity_name, activity_count, accumulated_time, shift
@@ -6624,10 +6622,8 @@ async def show_history(message: types.Message, shift: str = None):
                 )
             else:
                 # 白班已开始：查当天的所有数据
-                logger.info(
-                    f"☀️ [我的记录-全部] 正常查询当天: {business_date}"
-                )
-                
+                logger.info(f"☀️ [我的记录-全部] 正常查询当天: {business_date}")
+
                 rows = await conn.fetch(
                     """
                     SELECT activity_name, activity_count, accumulated_time, shift
@@ -6733,7 +6729,7 @@ async def show_history(message: types.Message, shift: str = None):
                     fine_query_date = business_date - timedelta(days=1)
                 else:
                     fine_query_date = business_date
-            
+
             fine_total = (
                 await conn.fetchval(
                     """
@@ -6761,7 +6757,7 @@ async def show_history(message: types.Message, shift: str = None):
             else:
                 fine_query_date = business_date
                 logger.info(f"☀️ [罚款统计-全部] 正常查询当天: {fine_query_date}")
-            
+
             fine_total = (
                 await conn.fetchval(
                     """
@@ -6887,10 +6883,8 @@ async def show_rank(message: types.Message, shift: str = None):
                     else:
                         # 白班已开始，查当天的白班
                         query_date = business_date
-                        logger.info(
-                            f"☀️ [排行榜-白班] 正常查询当天: {query_date}"
-                        )
-                
+                        logger.info(f"☀️ [排行榜-白班] 正常查询当天: {query_date}")
+
                 query = """
                     SELECT 
                         ds.user_id,
@@ -6926,7 +6920,7 @@ async def show_rank(message: types.Message, shift: str = None):
                         f"当前时间={current_hour:02d}:{current_minute:02d}, "
                         f"白班开始={day_start_str}, 查询日期={query_date}"
                     )
-                    
+
                     query = """
                         SELECT 
                             ds.user_id,
@@ -6953,10 +6947,8 @@ async def show_rank(message: types.Message, shift: str = None):
                     params = [act, chat_id, query_date, act]
                 else:
                     # 白班已开始：查当天的所有数据
-                    logger.info(
-                        f"☀️ [排行榜-全部] 正常查询当天: {business_date}"
-                    )
-                    
+                    logger.info(f"☀️ [排行榜-全部] 正常查询当天: {business_date}")
+
                     query = """
                         SELECT 
                             ds.user_id,
@@ -7053,6 +7045,7 @@ async def show_rank(message: types.Message, shift: str = None):
         parse_mode="HTML",
         reply_to_message_id=message.message_id,
     )
+
 
 # ========== 快速回座回调 ==========
 async def handle_quick_back(callback_query: types.CallbackQuery):
@@ -7190,7 +7183,7 @@ async def export_and_push_csv(
     push_file: bool = True,
 ) -> bool:
     """
-    导出群组数据为 CSV 并推送 - 终极完整整合版
+    导出群组数据为 CSV 并推送 - 修复夜班日期问题
     返回: True/False 表示导出是否成功
     """
     # ========== 0. 前置检查 ==========
@@ -7263,9 +7256,20 @@ async def export_and_push_csv(
                 return "夜班"
             return "白班"
 
-        # ========== 3. 规范日期与文件名 ==========
+        # ========== 3. 获取当前时间和白班配置 ==========
         beijing_now = get_beijing_time()
+        current_hour = beijing_now.hour
+        current_minute = beijing_now.minute
+        current_time_decimal = current_hour + current_minute / 60
 
+        # 获取白班开始时间（默认9点）
+        shift_config = await db.get_shift_config(chat_id)
+        day_start_str = shift_config.get("day_start", "09:00")
+        day_start_hour = int(day_start_str.split(":")[0])
+        day_start_minute = int(day_start_str.split(":")[1])
+        day_start_decimal = day_start_hour + day_start_minute / 60
+
+        # ========== 4. 规范日期与文件名 ==========
         if target_date is not None:
             if hasattr(target_date, "date"):
                 target_date = target_date.date()
@@ -7280,7 +7284,22 @@ async def export_and_push_csv(
                     target_date = None
 
         if target_date is None:
-            target_date = await db.get_business_date(chat_id)
+            business_date = await db.get_business_date(chat_id)
+
+            # 🚨 核心修复：根据当前时间决定导出哪一天的数据
+            if current_time_decimal < day_start_decimal:
+                # 9点前：导出前一天的数据（包含夜班）
+                export_date = business_date - timedelta(days=1)
+                logger.info(
+                    f"🌙 [{operation_id}] 凌晨导出前一天数据: "
+                    f"当前时间={current_hour:02d}:{current_minute:02d}, "
+                    f"白班开始={day_start_str}, 导出日期={export_date}"
+                )
+            else:
+                # 9点后：导出当天的数据
+                export_date = business_date
+                logger.info(f"☀️ [{operation_id}] 正常导出当天数据: {export_date}")
+            target_date = export_date
 
         if not file_name:
             if is_daily_reset:
@@ -7290,7 +7309,7 @@ async def export_and_push_csv(
             else:
                 file_name = f"manual_export_{chat_id}_{beijing_now.strftime('%Y%m%d_%H%M%S')}.csv"
 
-        # ========== 4. 获取统计数据 ==========
+        # ========== 5. 获取统计数据 ==========
         logger.info(
             f"🔍 [{operation_id}] 获取群组 {chat_id} 的统计数据，日期: {target_date}"
         )
@@ -7343,7 +7362,7 @@ async def export_and_push_csv(
                 activity_limits = Config.DEFAULT_ACTIVITY_LIMITS.copy()
                 group_stats = []
 
-        # ========== 🆕 5. 数据验证和补全 ==========
+        # ========== 6. 数据验证和补全 ==========
         if not group_stats:
             logger.warning(f"⚠️ [{operation_id}] 群组 {chat_id} 没有数据需要导出")
             if not is_daily_reset:
@@ -7393,11 +7412,11 @@ async def export_and_push_csv(
             f"📊 [{operation_id}] 数据验证完成，有效数据: {len(group_stats)} 条"
         )
 
-        # ========== 6. 构造CSV表头 ==========
+        # ========== 7. 构造CSV表头 ==========
         csv_buffer = StringIO()
         writer = csv.writer(csv_buffer)
 
-        # ✅ 完整的表头，包含所有工作相关字段
+        # 完整的表头，包含所有工作相关字段
         headers = ["用户ID", "用户昵称", "班次"]
 
         activity_names = sorted(activity_limits.keys())
@@ -7424,7 +7443,7 @@ async def export_and_push_csv(
 
         writer.writerow(headers)
 
-        # ========== 7. 填充数据 ==========
+        # ========== 8. 填充数据 ==========
         unique_users = set()
         total_records = 0
         has_valid_data = False
@@ -7487,20 +7506,20 @@ async def export_and_push_csv(
 
             writer.writerow(row)
 
-        # ========== 8. 最终数据验证 ==========
+        # ========== 9. 最终数据验证 ==========
         if not has_valid_data and total_records == 0:
             logger.warning(f"⚠️ [{operation_id}] 群组 {chat_id} 没有有效数据需要导出")
             if not is_daily_reset:
                 await bot.send_message(chat_id, "⚠️ 当前没有数据需要导出")
             return True
 
-        # ========== 9. 生成CSV文件 ==========
+        # ========== 10. 生成CSV文件 ==========
         csv_content = csv_buffer.getvalue()
         csv_buffer.close()
 
         temp_file = f"temp_{operation_id}_{file_name}"
 
-        # ========== 10. 并行执行文件操作 ==========
+        # ========== 11. 并行执行文件操作 ==========
         async def write_file_async():
             try:
                 async with aiofiles.open(temp_file, "w", encoding="utf-8-sig") as f:
@@ -7531,7 +7550,7 @@ async def export_and_push_csv(
             await bot.send_message(chat_id, f"❌ 导出失败: 文件写入失败")
             return False
 
-        # ========== 11. 构建富文本描述 ==========
+        # ========== 12. 构建富文本描述 ==========
         display_date = target_date.strftime("%Y年%m月%d日")
         dashed_line = getattr(
             MessageFormatter, "create_dashed_line", lambda: "─" * 30
@@ -7546,7 +7565,7 @@ async def export_and_push_csv(
             f"💾 包含完整的工作记录统计（上班/下班次数、迟到/早退等）"
         )
 
-        # ========== 12. 发送到当前群组 ==========
+        # ========== 13. 发送到当前群组 ==========
         input_file = FSInputFile(temp_file, filename=file_name)
         send_to_group_success = False
 
@@ -7563,7 +7582,7 @@ async def export_and_push_csv(
             logger.error(f"❌ [{operation_id}] 发送到群组失败: {e}")
             await bot.send_message(chat_id, f"❌ 数据导出失败: {str(e)[:100]}")
 
-        # ========== 13. 推送到通知服务 ==========
+        # ========== 14. 推送到通知服务 ==========
         if to_admin_if_no_group and notification_service:
             try:
                 await notification_service.send_document(
@@ -7572,7 +7591,7 @@ async def export_and_push_csv(
             except Exception as e:
                 logger.warning(f"⚠️ [{operation_id}] 推送到通知服务失败: {e}")
 
-        # ========== 14. 后台清理 ==========
+        # ========== 15. 后台清理 ==========
         async def cleanup_background():
             await asyncio.sleep(2)
             if temp_file and os.path.exists(temp_file):
@@ -7580,7 +7599,7 @@ async def export_and_push_csv(
 
         asyncio.create_task(cleanup_background())
 
-        # ========== 15. 性能统计 ==========
+        # ========== 16. 性能统计 ==========
         duration = time.time() - start_time
         logger.info(
             f"✅ [{operation_id}] 数据导出完成\n"
@@ -8605,7 +8624,7 @@ async def on_startup():
 
         # 4. 初始化数据库
         if hasattr(db, "init"):
-            await db.init()
+            await db.initialize()
 
         await send_startup_notification()
         logger.info("✅ 系统启动完成，准备接收消息")
