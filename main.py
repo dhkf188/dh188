@@ -234,7 +234,7 @@ async def calculate_work_fine(checkin_type: str, late_minutes: float) -> int:
 async def send_startup_notification():
     """发送启动通知给管理员"""
     try:
-        startup_time = get_beijing_time().strftime("%Y-%m-%d %H:%M:%S")
+        startup_time = db.get_beijing_time().strftime("%Y-%m-%d %H:%M:%S")
         message = (
             f"🤖 <b>打卡机器人已启动</b>\n"
             f"⏰ 启动时间: <code>{startup_time}</code>\n"
@@ -262,7 +262,7 @@ async def send_startup_notification():
 async def send_shutdown_notification():
     """发送关闭通知给管理员"""
     try:
-        shutdown_time = get_beijing_time().strftime("%Y-%m-%d %H:%M:%S")
+        shutdown_time = db.get_beijing_time().strftime("%Y-%m-%d %H:%M:%S")
         uptime = time.time() - start_time
         uptime_str = MessageFormatter.format_time(int(uptime))
 
@@ -294,7 +294,7 @@ async def send_shutdown_notification():
 async def generate_monthly_report(chat_id: int, year: int = None, month: int = None):
     """生成月度报告 - 基于新的月度统计表"""
     if year is None or month is None:
-        today = get_beijing_time()
+        today = db.get_beijing_time()
         year = today.year
         month = today.month
 
@@ -317,7 +317,7 @@ async def generate_monthly_report(chat_id: int, year: int = None, month: int = N
     report = (
         f"📊 <b>{year}年{month}月打卡统计报告</b>\n"
         f"🏢 群组：<code>{chat_title}</code>\n"
-        f"📅 生成时间：<code>{get_beijing_time().strftime('%Y-%m-%d %H:%M:%S')}</code>\n"
+        f"📅 生成时间：<code>{db.get_beijing_time().strftime('%Y-%m-%d %H:%M:%S')}</code>\n"
         f"{MessageFormatter.create_dashed_line()}\n"
     )
 
@@ -440,7 +440,7 @@ async def export_monthly_csv(
 ):
     """导出月度数据为 CSV 并推送 - 优化版本"""
     if year is None or month is None:
-        today = get_beijing_time()
+        today = db.get_beijing_time()
         year = today.year
         month = today.month
 
@@ -470,7 +470,7 @@ async def export_monthly_csv(
             f"📊 月度数据导出\n"
             f"🏢 群组：<code>{chat_title}</code>\n"
             f"📅 统计月份：<code>{year}年{month}月</code>\n"
-            f"⏰ 导出时间：<code>{get_beijing_time().strftime('%Y-%m-%d %H:%M:%S')}</code>\n"
+            f"⏰ 导出时间：<code>{db.get_beijing_time().strftime('%Y-%m-%d %H:%M:%S')}</code>\n"
             f"{MessageFormatter.create_dashed_line()}\n"
             f"💾 包含每个用户的月度活动统计"
         )
@@ -507,7 +507,7 @@ async def handle_expired_activity(
 ):
     """智能恢复活动 - 按活动开始时间归档，保留班次信息，不误归前一天"""
     try:
-        now = get_beijing_time()
+        now = db.get_beijing_time()
         elapsed = int((now - start_time).total_seconds())
         nickname = "用户"
 
@@ -630,7 +630,7 @@ async def recover_expired_activities():
 async def reset_daily_data_if_needed(chat_id: int, uid: int):
     """业务日期统一版每日重置（完全对齐业务日期体系）"""
     try:
-        now = get_beijing_time()
+        now = db.get_beijing_time()
 
         # 🧠 获取业务日期（系统唯一的“今天”）
         business_date = await db.get_business_date(chat_id, now)
@@ -734,7 +734,7 @@ async def check_activity_limit_by_shift(
     query_date = None
     if shift == "night":
         business_date = await db.get_business_date(chat_id)
-        current_hour = get_beijing_time().hour
+        current_hour = db.get_beijing_time().hour
         if current_hour < 12:  # 凌晨查询夜班
             query_date = business_date - timedelta(days=1)
             logger.info(
@@ -776,7 +776,7 @@ async def can_perform_activities(
     if not await db.has_work_hours_enabled(chat_id):
         return True, ""
 
-    now = get_beijing_time()
+    now = db.get_beijing_time()
 
     # ===== 🎯 新增：先尝试获取用户当前活跃班次 =====
     user_current_shift = await db.get_user_current_shift(chat_id, uid)
@@ -1136,7 +1136,7 @@ async def activity_timer(
                     f"👤 用户：{MessageFormatter.format_user_link(uid, nickname)}\n"
                     f"📝 活动：<code>{act}</code>\n"
                     f"📊 班次：<code>{shift_text}</code>\n"
-                    f"⏰ 自动回座时间：<code>{get_beijing_time().strftime('%m/%d %H:%M:%S')}</code>\n"
+                    f"⏰ 自动回座时间：<code>{db.get_beijing_time().strftime('%m/%d %H:%M:%S')}</code>\n"
                     f"⏱️ 总活动时长：<code>{MessageFormatter.format_time(elapsed)}</code>\n"
                     f"⚠️ 系统自动回座原因：超时超过2小时\n"
                     f"💰 本次扣除绩效：<code>{fine_amount}</code> 分"
@@ -1169,7 +1169,7 @@ async def activity_timer(
                     break
 
                 start_time = datetime.fromisoformat(user_data["activity_start_time"])
-                now = get_beijing_time()
+                now = db.get_beijing_time()
                 elapsed = int((now - start_time).total_seconds())
 
                 try:
@@ -1380,7 +1380,7 @@ async def start_activity(message: types.Message, act: str):
         # 获取用户信息和当前时间
         # -----------------------------
         name = message.from_user.full_name
-        now = get_beijing_time()
+        now = db.get_beijing_time()
 
         # ===== ⭐ 获取用户班次状态 =====
         user_shift_state = await db.get_user_active_shift(chat_id, uid)
@@ -1587,7 +1587,7 @@ async def _process_back_locked(
     active_back_processing[key] = time.time()
 
     try:
-        now = get_beijing_time()
+        now = db.get_beijing_time()
 
         # 获取用户数据
         user_data = await db.get_user_cached(chat_id, uid)
@@ -2072,7 +2072,7 @@ async def process_work_checkin(message: types.Message, checkin_type: str):
         logger.info(f"❌ 群组 {chat_id} 未启用上下班功能，用户 {uid} 尝试打卡")
         return
 
-    now = get_beijing_time()
+    now = db.get_beijing_time()
     current_time = now.strftime("%H:%M")
     trace_id = f"{chat_id}-{uid}-{int(time.time())}"
 
@@ -2830,7 +2830,7 @@ async def _check_shift_work_record(
         bool: 是否存在记录
     """
     try:
-        now = get_beijing_time()
+        now = db.get_beijing_time()
         trace_id = f"{chat_id}-{user_id}-{int(time.time())}"
 
         # ========== 1. 参数验证 ==========
@@ -5868,7 +5868,7 @@ async def cmd_checkdualsetup(message: types.Message):
         shift_config = await db.get_shift_config(chat_id)
         is_dual = shift_config.get("dual_mode", False)
 
-        now = get_beijing_time()
+        now = db.get_beijing_time()
         reset_time_today = now.replace(
             hour=reset_hour, minute=reset_minute, second=0, microsecond=0
         )
@@ -5937,7 +5937,7 @@ async def cmd_testgroupaccess(message: types.Message):
             # 尝试发送测试消息
             test_msg = await bot.send_message(
                 target_id,
-                f"🧪 这是一条测试消息\n发送时间：{get_beijing_time().strftime('%Y-%m-%d %H:%M:%S')}",
+                f"🧪 这是一条测试消息\n发送时间：{db.get_beijing_time().strftime('%Y-%m-%d %H:%M:%S')}",
                 parse_mode="HTML",
             )
             result_text += f"✅ 测试消息发送成功 (消息ID: {test_msg.message_id})\n"
@@ -6471,8 +6471,8 @@ async def show_history(message: types.Message, shift: str = None):
     await db.init_user(chat_id, uid)
 
     business_date = await db.get_business_date(chat_id)
-    current_hour = get_beijing_time().hour
-    current_minute = get_beijing_time().minute
+    current_hour = db.get_beijing_time().hour
+    current_minute = db.get_beijing_time().minute
     current_time_decimal = current_hour + current_minute / 60
 
     group_data = await db.get_group_cached(chat_id)
@@ -6822,8 +6822,8 @@ async def show_rank(message: types.Message, shift: str = None):
 
     # 🧠 获取业务日期和当前时间
     business_date = await db.get_business_date(chat_id)
-    current_hour = get_beijing_time().hour
-    current_minute = get_beijing_time().minute
+    current_hour = db.get_beijing_time().hour
+    current_minute = db.get_beijing_time().minute
     current_time_decimal = current_hour + current_minute / 60
 
     # 获取白班开始时间（默认9点）
@@ -7257,7 +7257,7 @@ async def export_and_push_csv(
             return "白班"
 
         # ========== 3. 获取当前时间和白班配置 ==========
-        beijing_now = get_beijing_time()
+        beijing_now = db.get_beijing_time()
         current_hour = beijing_now.hour
         current_minute = beijing_now.minute
         current_time_decimal = current_hour + current_minute / 60
@@ -7920,7 +7920,7 @@ async def soft_reset_task():
     executed_cache: dict[int, date] = {}  # 记录每个群最后一次软重置业务日期
 
     while True:
-        now = get_beijing_time()
+        now = db.get_beijing_time()
         logger.debug(f"软重置任务检查，当前时间: {now}")
 
         try:
@@ -8061,7 +8061,7 @@ async def monthly_maintenance_task():
 
     while True:
         try:
-            now = get_beijing_time()
+            now = db.get_beijing_time()
             today = now.date()
 
             # ===== 1. 每天凌晨3点执行清理 =====
