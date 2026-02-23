@@ -13,7 +13,7 @@ from performance import global_cache
 
 # 直接导入同级模块
 from database import db
-from main import export_and_push_csv
+
 
 logger = logging.getLogger("GroupCheckInBot.DualShiftReset")
 
@@ -757,6 +757,8 @@ async def _export_yesterday_data_concurrent(
     chat_id: int, target_date: date, from_monthly: bool = False
 ) -> bool:
     """并发导出数据，成功一次就推送"""
+    from main import export_and_push_csv
+
     source = "月度表" if from_monthly else "日常表"
     already_sent = False
     success_count = 0
