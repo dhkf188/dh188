@@ -2491,40 +2491,22 @@ class PostgreSQLDatabase:
         )
 
     async def get_work_records_by_shift(
-        self,
-        chat_id: int,
-        user_id: int,
-        shift: str = None,
-        start_date: Optional[date] = None,  # 🆕 新增开始日期
-        end_date: Optional[date] = None,  # 🆕 新增结束日期
+        self, chat_id: int, user_id: int, shift: str = None
     ) -> Dict[str, List[Dict[str, Any]]]:
-        """获取用户上下班记录（支持按班次过滤和日期范围）"""
-
-        if start_date is None:
-            start_date = await self.get_business_date(chat_id)
-        if end_date is None:
-            end_date = start_date
+        """获取用户上下班记录（支持按班次过滤）"""
+        today = await self.get_business_date(chat_id)
 
         query = """
             SELECT checkin_type, checkin_time, status, time_diff_minutes, 
-                   fine_amount, shift, created_at, record_date
+                   fine_amount, shift, created_at
             FROM work_records 
-            WHERE chat_id = $1 AND user_id = $2 
-              AND record_date >= $3 AND record_date <= $4
+            WHERE chat_id = $1 AND user_id = $2 AND record_date = $3
         """
-        params = [chat_id, user_id, start_date, end_date]
+        params = [chat_id, user_id, today]
 
         if shift:
-            # 将 "白班"/"夜班" 转换为 "day"/"night"
-            if shift in ["day", "白班"]:
-                shift_value = "day"
-            elif shift in ["night", "夜班", "night_last", "night_tonight"]:
-                shift_value = "night"
-            else:
-                raise ValueError(f"❌ 无效的班次值: {shift}")
-
-            query += " AND shift = $5"
-            params.append(shift_value)
+            query += " AND shift = $4"
+            params.append(shift)
 
         query += " ORDER BY created_at DESC"
 
@@ -2532,7 +2514,7 @@ class PostgreSQLDatabase:
             "按班次获取工作记录", query, *params, fetch=True
         )
 
-        records: Dict[str, List[Dict[str, Any]]] = {}
+        records = {}
         if rows:
             for row in rows:
                 checkin_type = row["checkin_type"]
@@ -4133,7 +4115,7 @@ class PostgreSQLDatabase:
 
             # ===== 3️⃣ 提前上班判定（无参数时）=====
             if current_dt >= earliest_day_time:
-                logger.debug(
+                logger.info(
                     f"📅 [提前上班判定] "
                     f"chat={chat_id}, "
                     f"time={current_dt.strftime('%H:%M')}, "
