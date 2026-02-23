@@ -4115,7 +4115,7 @@ class PostgreSQLDatabase:
 
             # ===== 3️⃣ 提前上班判定（无参数时）=====
             if current_dt >= earliest_day_time:
-                logger.info(
+                logger.debug(
                     f"📅 [提前上班判定] "
                     f"chat={chat_id}, "
                     f"time={current_dt.strftime('%H:%M')}, "
