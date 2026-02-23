@@ -20,9 +20,7 @@ logger = logging.getLogger("GroupCheckInBot.DualShiftReset")
 
 # ========== 1. 调度入口 ==========
 async def handle_hard_reset(
-    chat_id: int,
-    operator_id: Optional[int] = None,
-    target_date: Optional[date] = None,  # ✅ 添加 target_date 参数
+    chat_id: int, operator_id: Optional[int] = None
 ) -> Optional[bool]:
     """
     硬重置总调度入口 - 单班/双班分流
@@ -42,13 +40,7 @@ async def handle_hard_reset(
         logger.info(f"🔄 [双班模式] 群组 {chat_id} 执行双班硬重置")
 
         try:
-            # ✅ 如果传入了 target_date，直接使用，否则计算
-            if target_date:
-                success = await _dual_shift_hard_reset(
-                    chat_id, operator_id, target_date
-                )
-            else:
-                success = await _dual_shift_hard_reset(chat_id, operator_id)
+            success = await _dual_shift_hard_reset(chat_id, operator_id)
 
             if success:
                 logger.info(f"✅ [双班硬重置] 群组 {chat_id} 执行成功")
@@ -70,9 +62,7 @@ async def handle_hard_reset(
 
 # ========== 2. 双班硬重置核心流程 ==========
 async def _dual_shift_hard_reset(
-    chat_id: int,
-    operator_id: Optional[int] = None,
-    forced_target_date: Optional[date] = None,  # ✅ 添加强制目标日期参数
+    chat_id: int, operator_id: Optional[int] = None
 ) -> bool:
     """
     双班硬重置主流程（带幂等性）
@@ -95,59 +85,9 @@ async def _dual_shift_hard_reset(
             f"   • 业务昨天: {business_yesterday}"
         )
 
-        # ==================== 确定目标日期 ====================
-        if forced_target_date:
-            target_date = forced_target_date
-            logger.info(f"🎯 [双班重置] 使用强制目标日期: {target_date}")
-        else:
-            # 正常计算目标日期
-            group_data = await db.get_group_cached(chat_id)
-            reset_hour = group_data.get("reset_hour", 0)
-            reset_minute = group_data.get("reset_minute", 0)
-
-            # 用自然日期计算执行时间
-            reset_time_natural_today = datetime.combine(
-                natural_today,
-                datetime.strptime(
-                    f"{reset_hour:02d}:{reset_minute:02d}", "%H:%M"
-                ).time(),
-            ).replace(tzinfo=now.tzinfo)
-
-            # 今天的执行时间
-            execute_time_today = reset_time_natural_today + timedelta(hours=2)
-
-            # 昨天的重置时间（自然日期）
-            reset_time_natural_yesterday = datetime.combine(
-                natural_today - timedelta(days=1),
-                datetime.strptime(
-                    f"{reset_hour:02d}:{reset_minute:02d}", "%H:%M"
-                ).time(),
-            ).replace(tzinfo=now.tzinfo)
-
-            # 昨天的执行时间
-            execute_time_yesterday = reset_time_natural_yesterday + timedelta(hours=2)
-
-            # 判断应该用哪个执行窗口（5分钟窗口）
-            EXECUTION_WINDOW = 300
-
-            time_to_today = abs((now - execute_time_today).total_seconds())
-            time_to_yesterday = abs((now - execute_time_yesterday).total_seconds())
-
-            if time_to_today <= EXECUTION_WINDOW:
-                target_date = business_yesterday
-                period_info = "正常执行"
-                logger.info(f"📅 正常执行窗口，目标日期: {target_date}")
-            elif time_to_yesterday <= EXECUTION_WINDOW:
-                target_date = business_yesterday
-                period_info = "补执行"
-                logger.warning(f"⚠️ 补执行场景，目标日期: {target_date}")
-            else:
-                logger.debug(f"⏳ 不在执行窗口内")
-                return False
-
         # ==================== 幂等性检查 ====================
         reset_flag_key = (
-            f"dual_reset_executed:{chat_id}:{target_date.strftime('%Y%m%d')}"
+            f"dual_reset_executed:{chat_id}:{business_today.strftime('%Y%m%d')}"
         )
         if global_cache.get(reset_flag_key):
             logger.info(f"⏭️ 群组 {chat_id} 今天已完成双班重置，跳过")
@@ -163,6 +103,77 @@ async def _dual_shift_hard_reset(
         reset_hour = group_data.get("reset_hour", 0)
         reset_minute = group_data.get("reset_minute", 0)
 
+        # ==================== 🎯 修复：用自然日期计算执行时间 ====================
+        reset_time_natural_today = datetime.combine(
+            natural_today,
+            datetime.strptime(f"{reset_hour:02d}:{reset_minute:02d}", "%H:%M").time(),
+        ).replace(tzinfo=now.tzinfo)
+
+        # 今天的执行时间
+        execute_time_today = reset_time_natural_today + timedelta(hours=2)
+
+        # 昨天的重置时间（自然日期）
+        reset_time_natural_yesterday = datetime.combine(
+            natural_today - timedelta(days=1),
+            datetime.strptime(f"{reset_hour:02d}:{reset_minute:02d}", "%H:%M").time(),
+        ).replace(tzinfo=now.tzinfo)
+
+        # 昨天的执行时间
+        execute_time_yesterday = reset_time_natural_yesterday + timedelta(hours=2)
+
+        # 判断应该用哪个执行窗口（5分钟窗口）
+        EXECUTION_WINDOW = 300  # 5分钟
+
+        time_to_today = abs((now - execute_time_today).total_seconds())
+        time_to_yesterday = abs((now - execute_time_yesterday).total_seconds())
+
+        logger.debug(
+            f"📊 执行时间计算:\n"
+            f"   • 当前时间: {now.strftime('%Y-%m-%d %H:%M:%S')}\n"
+            f"   • 自然今天: {natural_today}\n"
+            f"   • 业务今天: {business_today}\n"
+            f"   • 今天执行: {execute_time_today.strftime('%Y-%m-%d %H:%M')}\n"
+            f"   • 距离今天: {time_to_today/60:.1f}分钟\n"
+            f"   • 昨天执行: {execute_time_yesterday.strftime('%Y-%m-%d %H:%M')}\n"
+            f"   • 距离昨天: {time_to_yesterday/60:.1f}分钟"
+        )
+
+        if time_to_today <= EXECUTION_WINDOW:
+            # ✅ 正常执行：今天 11:00，清理业务昨天的数据
+            target_date = business_yesterday
+            execute_time = execute_time_today
+            period_info = "正常执行"
+            logger.info(
+                f"📅 正常执行窗口\n"
+                f"   • 目标日期: {target_date} (业务昨天)\n"
+                f"   • 业务今天: {business_today}"
+            )
+
+        elif time_to_yesterday <= EXECUTION_WINDOW:
+            # ✅ 补执行：昨天没执行，今天补执行
+            # 应该清理的还是业务昨天的数据！
+            target_date = business_yesterday  # ✅ 修复：用 business_yesterday
+            execute_time = execute_time_yesterday
+            period_info = "补执行"
+            logger.warning(
+                f"⚠️ 补执行场景\n"
+                f"   • 当前时间: {now.strftime('%Y-%m-%d %H:%M')}\n"
+                f"   • 本应执行: {execute_time_yesterday.strftime('%Y-%m-%d %H:%M')}\n"
+                f"   • 目标日期: {target_date} (业务昨天)"
+            )
+
+        else:
+            # 不在执行窗口
+            logger.debug(
+                f"⏳ 不在执行窗口内\n"
+                f"   • 当前时间: {now.strftime('%H:%M:%S')}\n"
+                f"   • 今天执行: {execute_time_today.strftime('%H:%M')}\n"
+                f"   • 距离今天: {time_to_today/60:.1f}分钟\n"
+                f"   • 昨天执行: {execute_time_yesterday.strftime('%H:%M')}\n"
+                f"   • 距离昨天: {time_to_yesterday/60:.1f}分钟"
+            )
+            return False
+
         logger.info(
             f"🚀 [双班硬重置] 开始执行\n"
             f"   ┌─────────────────────────────────\n"
@@ -170,8 +181,11 @@ async def _dual_shift_hard_reset(
             f"   ├─ 当前时间: {now.strftime('%Y-%m-%d %H:%M:%S')}\n"
             f"   ├─ 自然今天: {natural_today}\n"
             f"   ├─ 业务今天: {business_today}\n"
-            f"   ├─ 目标日期: {target_date}\n"
+            f"   ├─ 业务昨天: {business_yesterday}\n"
             f"   ├─ 重置时间: {reset_hour:02d}:{reset_minute:02d}\n"
+            f"   ├─ 执行类型: {period_info}\n"
+            f"   ├─ 执行时间: {execute_time.strftime('%H:%M')}\n"
+            f"   ├─ 目标日期: {target_date}\n"
             f"   └─ 操作员: {operator_id or '系统'}"
         )
 
