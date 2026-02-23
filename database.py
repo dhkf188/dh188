@@ -2491,22 +2491,40 @@ class PostgreSQLDatabase:
         )
 
     async def get_work_records_by_shift(
-        self, chat_id: int, user_id: int, shift: str = None
+        self,
+        chat_id: int,
+        user_id: int,
+        shift: str = None,
+        start_date: Optional[date] = None,  # 🆕 新增开始日期
+        end_date: Optional[date] = None,  # 🆕 新增结束日期
     ) -> Dict[str, List[Dict[str, Any]]]:
-        """获取用户上下班记录（支持按班次过滤）"""
-        today = await self.get_business_date(chat_id)
+        """获取用户上下班记录（支持按班次过滤和日期范围）"""
+
+        if start_date is None:
+            start_date = await self.get_business_date(chat_id)
+        if end_date is None:
+            end_date = start_date
 
         query = """
             SELECT checkin_type, checkin_time, status, time_diff_minutes, 
-                   fine_amount, shift, created_at
+                   fine_amount, shift, created_at, record_date
             FROM work_records 
-            WHERE chat_id = $1 AND user_id = $2 AND record_date = $3
+            WHERE chat_id = $1 AND user_id = $2 
+              AND record_date >= $3 AND record_date <= $4
         """
-        params = [chat_id, user_id, today]
+        params = [chat_id, user_id, start_date, end_date]
 
         if shift:
-            query += " AND shift = $4"
-            params.append(shift)
+            # 将 "白班"/"夜班" 转换为 "day"/"night"
+            if shift in ["day", "白班"]:
+                shift_value = "day"
+            elif shift in ["night", "夜班", "night_last", "night_tonight"]:
+                shift_value = "night"
+            else:
+                raise ValueError(f"❌ 无效的班次值: {shift}")
+
+            query += " AND shift = $5"
+            params.append(shift_value)
 
         query += " ORDER BY created_at DESC"
 
@@ -2514,7 +2532,7 @@ class PostgreSQLDatabase:
             "按班次获取工作记录", query, *params, fetch=True
         )
 
-        records = {}
+        records: Dict[str, List[Dict[str, Any]]] = {}
         if rows:
             for row in rows:
                 checkin_type = row["checkin_type"]
