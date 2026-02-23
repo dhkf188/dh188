@@ -665,6 +665,39 @@ async def reset_daily_data_if_needed(chat_id: int, uid: int):
         # 🎯 唯一重置规则：是否跨了业务日期
         if last_updated < business_date:
             logger.info(f"🔄 重置用户数据: {chat_id}-{uid} | 业务日期 {business_date}")
+
+            # ⚠️ 关键修复：如果用户有进行中的活动，先自动结束
+            if user_data.get("current_activity"):
+                act = user_data["current_activity"]
+                start_time_str = user_data["activity_start_time"]
+                try:
+                    start_time = datetime.fromisoformat(start_time_str)
+                    elapsed = int((now - start_time).total_seconds())
+
+                    # 获取班次
+                    shift = user_data.get("shift", "day")
+
+                    # 完成活动（强制归到 business_date 前一天）
+                    forced_date = business_date - timedelta(days=1)
+
+                    await db.complete_user_activity(
+                        chat_id=chat_id,
+                        user_id=uid,
+                        activity=act,
+                        elapsed_time=elapsed,
+                        fine_amount=0,
+                        is_overtime=False,
+                        shift=shift,
+                        forced_date=forced_date,
+                    )
+
+                    logger.info(
+                        f"🔄 自动结束跨期活动: {uid} - {act} (归到 {forced_date})"
+                    )
+                except Exception as e:
+                    logger.error(f"自动结束活动失败: {e}")
+
+            # 执行重置
             await db.reset_user_daily_data(chat_id, uid, business_date)
             await db.update_user_last_updated(chat_id, uid, business_date)
 
@@ -690,18 +723,21 @@ async def check_activity_limit_by_shift(
     """
     await db.init_group(chat_id)
     await db.init_user(chat_id, user_id)
-
+    
+    # ⚠️ 关键修复：确保数据已重置后再检查
+    await reset_daily_data_if_needed(chat_id, user_id)
+    
     shift_config = await db.get_shift_config(chat_id)
-
+    
     # 单班模式：强制不按班次统计
     if not shift_config or not shift_config.get("dual_mode", False):
         shift = None
-
+    
     # ✅ 统一调用，shift 可以是 None
     current_count = await db.get_user_activity_count_by_shift(
         chat_id, user_id, activity, shift
     )
-
+    
     max_times = await db.get_activity_max_times(activity)
     return current_count < max_times, current_count, max_times
 
@@ -3210,8 +3246,18 @@ async def send_work_notification(
         # ========= 额外群组文案 ==========
         extra_notif_text = f"<code>{shift_text}</code> {MessageFormatter.format_user_link(user_id, user_name)} {action_text} 了！\n"
 
+        # 只显示迟到/早退的罚款信息
         if fine_amount > 0:
-            extra_notif_text += f"\n💰 扣除绩效：<code>{fine_amount}</code> 分"
+            if action_text == "上班" and diff_seconds > 0:  # 上班迟到
+                extra_notif_text += (
+                    f"⚠️ 迟到 {MessageFormatter.format_duration(diff_seconds)}，"
+                    f"💰扣除绩效：<code>{fine_amount}</code> 分"
+                )
+            elif action_text == "下班" and diff_seconds < 0:  # 下班早退
+                extra_notif_text += (
+                    f"⚠️ 早退 {MessageFormatter.format_duration(abs(diff_seconds))}，"
+                    f"💰扣除绩效：<code>{fine_amount}</code> 分"
+                )
 
         # ========= 调试日志 ==========
         logger.info(
