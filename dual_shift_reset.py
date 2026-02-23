@@ -146,9 +146,7 @@ async def _dual_shift_hard_reset(
                 return False
 
         # ==================== 幂等性检查 ====================
-        reset_flag_key = (
-            f"dual_reset_executed:{chat_id}:{target_date.strftime('%Y%m%d')}"
-        )
+        reset_flag_key = f"dual_reset:{chat_id}:{business_today.strftime('%Y%m%d')}"
         if global_cache.get(reset_flag_key):
             logger.info(f"⏭️ 群组 {chat_id} 今天已完成双班重置，跳过")
             return True
@@ -262,6 +260,9 @@ async def _dual_shift_hard_reset(
         # ==================== 5. 清除班次状态 ====================
         deleted_count = 0
         try:
+            if not db.pool or not db._initialized:
+                logger.error("数据库连接池未初始化")
+                return
             async with db.pool.acquire() as conn:
                 result = await conn.execute(
                     """
@@ -351,6 +352,9 @@ async def _force_end_all_unfinished_shifts(
     }
 
     try:
+        if not db.pool or not db._initialized:
+            logger.error("数据库连接池未初始化")
+            return
         async with db.pool.acquire() as conn:
             # 查询所有进行中的活动
             rows = await conn.fetch(
@@ -537,6 +541,9 @@ async def _complete_missing_work_ends(
     }
 
     try:
+        if not db.pool or not db._initialized:
+            logger.error("数据库连接池未初始化")
+            return
         async with db.pool.acquire() as conn:
             # 查询 target_date 有上班记录但没有下班记录的用户
             rows = await conn.fetch(
@@ -811,6 +818,9 @@ async def _cleanup_old_data(
     }
 
     try:
+        if not db.pool or not db._initialized:
+            logger.error("数据库连接池未初始化")
+            return
         async with db.pool.acquire() as conn:
             async with conn.transaction():
                 # 1. user_activities
@@ -961,6 +971,9 @@ async def recover_shift_states():
                 if not await db.is_dual_mode_enabled(chat_id):
                     continue
 
+                if not db.pool or not db._initialized:
+                    logger.error("数据库连接池未初始化")
+                    return
                 async with db.pool.acquire() as conn:
                     rows = await conn.fetch(
                         """
