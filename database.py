@@ -978,7 +978,8 @@ class PostgreSQLDatabase:
         chat_id: int,
         user_id: int,
         activity: str,
-        shift: Optional[str] = None,  # ✅ 改为可选参数，支持单班模式
+        shift: Optional[str] = None,
+        query_date: Optional[date] = None,  # 🆕 新增参数
     ) -> int:
         """
         按班次获取用户活动次数（生产级版本）
@@ -987,6 +988,7 @@ class PostgreSQLDatabase:
         - 支持单班模式 (shift=None)
         - 支持双班模式 (shift="day" 或 "night")
         - 自动容错转换 (night_last/night_tonight → night)
+        - 支持传入自定义查询日期（用于夜班凌晨查询）
         - 严格的参数类型检查
         - 详细的调试日志
         """
@@ -1005,6 +1007,11 @@ class PostgreSQLDatabase:
         if not isinstance(activity, str):
             raise TypeError(
                 f"❌ activity 必须是 str，但收到了 {type(activity)}: {activity}"
+            )
+
+        if query_date is not None and not isinstance(query_date, date):
+            raise TypeError(
+                f"❌ query_date 必须是 date 类型，但收到了 {type(query_date)}: {query_date}"
             )
 
         # shift 可以是 None 或字符串
@@ -1027,8 +1034,23 @@ class PostgreSQLDatabase:
                     f"❌ shift 必须是 str 或 None，但收到了 {type(shift)}: {shift}"
                 )
 
-        # ========= 2️⃣ 获取业务日期 =========
-        today = await self.get_business_date(chat_id)
+        # ========= 2️⃣ 获取业务日期（支持传入自定义日期）=========
+        if query_date:
+            target_date = query_date
+            logger.debug(f"📅 使用传入查询日期: {target_date}")
+        else:
+            target_date = await self.get_business_date(chat_id)
+            # 🚨 夜班特殊处理：如果没有传入日期，根据当前时间自动调整
+            if shift == "night":
+                current_hour = self.get_beijing_time().hour 
+                if current_hour < 12:
+                    target_date = target_date - timedelta(days=1)
+                    logger.info(
+                        f"🌙 [自动调整] 夜班凌晨查询: "
+                        f"原始业务日期={target_date + timedelta(days=1)}, "
+                        f"调整后={target_date}"
+                    )
+            logger.debug(f"📅 使用业务日期: {target_date}")
 
         # ========= 3️⃣ 构建查询 =========
         query = """
@@ -1039,7 +1061,7 @@ class PostgreSQLDatabase:
               AND activity_date = $3
               AND activity_name = $4
         """
-        params = [chat_id, user_id, today, activity]
+        params = [chat_id, user_id, target_date, activity]
 
         # ========= 4️⃣ 处理班次参数 =========
         final_shift = None
@@ -1063,7 +1085,7 @@ class PostgreSQLDatabase:
         # ========= 5️⃣ 调试日志 =========
         logger.debug(
             f"🔎 查询活动次数: chat_id={chat_id}, "
-            f"user_id={user_id}, date={today}, "
+            f"user_id={user_id}, date={target_date}, "
             f"activity={activity}, shift={final_shift or '所有班次'}"
         )
 
