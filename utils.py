@@ -113,7 +113,7 @@ class MessageFormatter:
 
         # 5. 次数上限警告
         if count >= max_times:
-            message += f"🚨 警告：本次结束后，您今日的{MessageFormatter.format_copyable_text(activity)}次数将达到上限，请留意！"
+            message += f"🚨 警告：本次结束后，您今日的{MessageFormatter.format_copyable_text(activity)}次数将达到上限，请留意！\n"
 
         # 6. 页脚与提示
         message += (
