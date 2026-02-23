@@ -665,39 +665,6 @@ async def reset_daily_data_if_needed(chat_id: int, uid: int):
         # 🎯 唯一重置规则：是否跨了业务日期
         if last_updated < business_date:
             logger.info(f"🔄 重置用户数据: {chat_id}-{uid} | 业务日期 {business_date}")
-
-            # ⚠️ 关键修复：如果用户有进行中的活动，先自动结束
-            if user_data.get("current_activity"):
-                act = user_data["current_activity"]
-                start_time_str = user_data["activity_start_time"]
-                try:
-                    start_time = datetime.fromisoformat(start_time_str)
-                    elapsed = int((now - start_time).total_seconds())
-
-                    # 获取班次
-                    shift = user_data.get("shift", "day")
-
-                    # 完成活动（强制归到 business_date 前一天）
-                    forced_date = business_date - timedelta(days=1)
-
-                    await db.complete_user_activity(
-                        chat_id=chat_id,
-                        user_id=uid,
-                        activity=act,
-                        elapsed_time=elapsed,
-                        fine_amount=0,
-                        is_overtime=False,
-                        shift=shift,
-                        forced_date=forced_date,
-                    )
-
-                    logger.info(
-                        f"🔄 自动结束跨期活动: {uid} - {act} (归到 {forced_date})"
-                    )
-                except Exception as e:
-                    logger.error(f"自动结束活动失败: {e}")
-
-            # 执行重置
             await db.reset_user_daily_data(chat_id, uid, business_date)
             await db.update_user_last_updated(chat_id, uid, business_date)
 
@@ -718,27 +685,33 @@ async def check_activity_limit_by_shift(
 ) -> tuple[bool, int, int]:
     """
     检查活动次数是否达到上限
-    - 单班模式：不区分班次 (shift=None)
-    - 双班模式：按班次统计 (shift="day" 或 "night")
+    - 单班模式：不区分班次
+    - 双班模式：按班次统计
     """
     await db.init_group(chat_id)
     await db.init_user(chat_id, user_id)
-    
-    # ⚠️ 关键修复：确保数据已重置后再检查
-    await reset_daily_data_if_needed(chat_id, user_id)
-    
+
     shift_config = await db.get_shift_config(chat_id)
-    
-    # 单班模式：强制不按班次统计
+
+    # 🧠 单班模式兜底
     if not shift_config or not shift_config.get("dual_mode", False):
-        shift = None
-    
-    # ✅ 统一调用，shift 可以是 None
-    current_count = await db.get_user_activity_count_by_shift(
-        chat_id, user_id, activity, shift
-    )
-    
+        shift = None  # 强制不按班次
+
+    # 获取当前次数
+    if shift is None:
+        current_count = (
+            await db.get_user_activity_count_by_shift(  # ✅ 使用正确的函数名
+                chat_id, user_id, activity, shift
+            )
+        )
+    else:
+        # 暂时先使用总次数，或者实现按班次计数
+        current_count = await db.get_user_activity_count_by_shift(
+            chat_id, user_id, activity, shift
+        )
+
     max_times = await db.get_activity_max_times(activity)
+
     return current_count < max_times, current_count, max_times
 
 
@@ -1339,7 +1312,7 @@ async def activity_timer(
 
 # ========== 核心打卡功能 ==========
 async def start_activity(message: types.Message, act: str):
-    """开始活动 - 优化版（使用班次判定）"""
+    """开始活动 - 统一版（使用班次判定）"""
     chat_id = message.chat.id
     uid = message.from_user.id
 
@@ -1348,7 +1321,7 @@ async def start_activity(message: types.Message, act: str):
         await reset_daily_data_if_needed(chat_id, uid)
 
         # -----------------------------
-        # 基础检查
+        # 检查活动是否存在
         # -----------------------------
         if not await db.activity_exists(act):
             await message.answer(
@@ -1356,6 +1329,9 @@ async def start_activity(message: types.Message, act: str):
             )
             return
 
+        # -----------------------------
+        # 快速检查：是否有进行中活动
+        # -----------------------------
         has_active, current_act = await has_active_activity(chat_id, uid)
         if has_active:
             await message.answer(
@@ -1373,8 +1349,10 @@ async def start_activity(message: types.Message, act: str):
         name = message.from_user.full_name
         now = get_beijing_time()
 
-        # ===== ⭐ 获取用户班次状态 =====
+        # ===== ⭐ 修复：开始活动时优先使用用户班次状态 =====
+        # 先尝试获取用户的活跃班次状态
         user_shift_state = await db.get_user_active_shift(chat_id, uid)
+
         if not user_shift_state:
             await message.answer(
                 "❌ 您当前没有进行中的班次，请先打上班卡！",
@@ -1385,8 +1363,12 @@ async def start_activity(message: types.Message, act: str):
             )
             return
 
-        # 解析班次开始时间（用于过期检查）
-        shift_start_time = user_shift_state["shift_start_time"]
+        # 从班次状态获取信息
+        current_shift = user_shift_state["shift"]  # "day" 或 "night"
+        record_date = user_shift_state["record_date"]  # date 对象
+        shift_start_time = user_shift_state["shift_start_time"]  # datetime
+
+        # 解析班次开始时间
         if isinstance(shift_start_time, str):
             try:
                 shift_start_time = datetime.fromisoformat(
@@ -1399,7 +1381,7 @@ async def start_activity(message: types.Message, act: str):
 
         # 检查班次是否过期（16小时）
         if now - shift_start_time > timedelta(hours=16):
-            await db.clear_user_shift_state(chat_id, uid, user_shift_state["shift"])
+            await db.clear_user_shift_state(chat_id, uid, current_shift)
             await message.answer(
                 "❌ 您的班次已过期（超过16小时），请重新上班打卡！",
                 reply_markup=await get_main_keyboard(
@@ -1409,24 +1391,55 @@ async def start_activity(message: types.Message, act: str):
             )
             return
 
-        # ===== 🎯 使用状态模型获取准确的班次信息 =====
+        # 确定班次详情（用于日志）
+        shift_config = await db.get_shift_config(chat_id)
+        day_end_str = shift_config.get("day_end", "21:00")
+        day_end_hour, day_end_min = map(int, day_end_str.split(":"))
+
+        # ===== ⭐ 修复：使用班次开始时间判断归属，而不是当前时间 =====
+        day_end_dt = shift_start_time.replace(
+            hour=day_end_hour, minute=day_end_min, second=0, microsecond=0
+        )
+
+        if current_shift == "day":
+            shift_detail = "day"
+        else:  # night
+            # 使用班次开始时间判断是昨晚还是今晚夜班
+            if shift_start_time >= day_end_dt:
+                shift_detail = "night_tonight"  # 今晚夜班
+            else:
+                shift_detail = "night_last"  # 昨晚夜班
+
+        shift_text = "白班" if current_shift == "day" else "夜班"
+        logger.info(
+            f"🔄 [开始活动] 使用班次状态: {shift_text}, "
+            f"详情={shift_detail}, 记录日期={record_date}, "
+            f"班次开始时间={shift_start_time.strftime('%Y-%m-%d %H:%M:%S')}"
+        )
+
+        # ===== ⭐ 可选：使用 determine_shift_for_time 验证，但不覆盖用户状态 =====
         shift_info = await db.determine_shift_for_time(
             chat_id=chat_id,
             current_time=now,
             checkin_type="activity",
-            active_shift=user_shift_state["shift"],
-            active_record_date=user_shift_state["record_date"],
+            active_shift=current_shift,
         )
 
-        current_shift = shift_info["shift"]
-        record_date = shift_info["record_date"]
-        shift_detail = shift_info["shift_detail"]
-        shift_text = "白班" if current_shift == "day" else "夜班"
+        if shift_info:
+            determined_shift = shift_info["shift"]
+            determined_date = shift_info["record_date"]
 
-        logger.info(
-            f"🔄 [开始活动] 使用状态模型: {shift_text}, "
-            f"详情={shift_detail}, 记录日期={record_date}"
-        )
+            # 记录日志但不改变用户状态
+            if determined_shift != current_shift:
+                logger.info(
+                    f"📝 注意: 时间判定与用户状态不一致 - "
+                    f"用户状态={current_shift}, 时间判定={determined_shift}"
+                )
+            if determined_date != record_date:
+                logger.info(
+                    f"📝 注意: 日期不一致 - "
+                    f"用户状态日期={record_date}, 时间判定日期={determined_date}"
+                )
 
         # -----------------------------
         # 活动限制检查
@@ -1435,16 +1448,12 @@ async def start_activity(message: types.Message, act: str):
             chat_id, uid, current_shift, record_date
         )
         if not can_perform:
-            await message.answer(
-                reason,
-                reply_markup=await get_main_keyboard(
-                    chat_id=chat_id, show_admin=await is_admin(uid)
-                ),
-                reply_to_message_id=message.message_id,
-            )
+            await message.answer(reason)
             return
 
+        # -----------------------------
         # 活动人数限制
+        # -----------------------------
         user_limit = await db.get_activity_user_limit(act)
         if user_limit > 0:
             current_users = await db.get_current_activity_users(chat_id, act)
@@ -1462,11 +1471,14 @@ async def start_activity(message: types.Message, act: str):
                 )
                 return
 
+        # -----------------------------
         # 活动次数限制
+        # -----------------------------
         can_start, current_count, max_times = await check_activity_limit_by_shift(
             chat_id, uid, act, current_shift
         )
         if not can_start:
+            shift_text = "白班" if current_shift == "day" else "夜班"
             await message.answer(
                 f"❌ {shift_text}的 '<code>{act}</code>' 次数已达上限\n\n"
                 f"📊 当前次数：<code>{current_count}</code> / <code>{max_times}</code>",
@@ -1483,7 +1495,13 @@ async def start_activity(message: types.Message, act: str):
         # -----------------------------
         await db.update_user_activity(chat_id, uid, act, str(now), name, current_shift)
 
-        # 启动计时器
+        # 🆕 更新用户最后一次活动时间（如果数据库有这个方法）
+        if hasattr(db, "update_user_activity_time"):
+            await db.update_user_activity_time(chat_id, uid, current_shift)
+
+        # -----------------------------
+        # 活动时长限制 & 启动计时器
+        # -----------------------------
         time_limit = await db.get_activity_time_limit(act)
         await timer_manager.start_timer(
             chat_id, uid, act, time_limit, shift=current_shift
@@ -1514,27 +1532,36 @@ async def start_activity(message: types.Message, act: str):
         await db.update_user_checkin_message(chat_id, uid, sent_message.message_id)
 
         # -----------------------------
-        # 日志和推送
+        # 日志
         # -----------------------------
+        shift_text = "白班" if current_shift == "day" else "夜班"
         logger.info(
             f"📝 用户 {uid} 开始活动 {act}（{shift_text}），消息ID: {sent_message.message_id}, "
             f"记录日期: {record_date}, 班次详情: {shift_detail}"
         )
 
-        # 吃饭推送
-        if act == "吃饭":
-            try:
+        # -----------------------------
+        # 🚨 推送通知（完整版）
+        # -----------------------------
+        try:
+            notification_text = None
+
+            if act == "吃饭":
                 notification_text = (
                     f"🍽️ <b>吃饭通知</b> <code>{shift_text}</code>\n"
                     f" {MessageFormatter.format_user_link(uid, name)} 去吃饭了\n"
                     f"⏰ 时间：<code>{now.strftime('%H:%M:%S')}</code>\n"
                 )
+            # 上班/下班通知已经在 process_work_checkin 中处理，这里不需要重复
+
+            if notification_text:
                 asyncio.create_task(
                     notification_service.send_notification(chat_id, notification_text)
                 )
                 logger.info(f"📣 已触发用户 {uid}（{shift_text}）的 {act} 推送")
-            except Exception as e:
-                logger.error(f"❌ {act} 推送失败: {e}")
+
+        except Exception as e:
+            logger.error(f"❌ {act} 推送失败: {e}")
 
 
 # ========== 回座功能 ==========
@@ -2043,7 +2070,7 @@ async def send_overtime_notification_async(
 
 # ========== 上下班打卡功能 ==========
 async def process_work_checkin(message: types.Message, checkin_type: str):
-    """智能化上下班打卡系统 - 统一版（完整修复版）"""
+    """智能化上下班打卡系统 - 统一版（状态模型优先）"""
 
     chat_id = message.chat.id
     uid = message.from_user.id
@@ -2104,109 +2131,117 @@ async def process_work_checkin(message: types.Message, checkin_type: str):
         # ========== 模式判断 ==========
         is_dual_mode = shift_config.get("dual_mode", False) if shift_config else False
 
-        # ========== ⭐ 统一使用 determine_shift_for_time 进行基础判定 ==========
+        # ========== 🎯 获取用户当前活跃班次状态 ==========
+        user_shift_state = await db.get_user_active_shift(chat_id, uid)
+
+        # ========== 🎯 统一调用班次判定函数 ==========
         shift_info = await db.determine_shift_for_time(
             chat_id=chat_id,
             current_time=now,
             checkin_type=checkin_type,
-            active_shift=None,
+            active_shift=user_shift_state["shift"] if user_shift_state else None,
+            active_record_date=(
+                user_shift_state["record_date"] if user_shift_state else None
+            ),
         )
 
-        # 验证是否在窗口内
-        if shift_info is None or shift_info.get("shift_detail") is None:
-            # 获取友好的时间窗口描述
+        # ========== 🎯 检查班次判定结果 ==========
+        if shift_info is None:
+            logger.error(f"[{trace_id}] ❌ 班次判定返回 None")
+            await message.answer(
+                "❌ 系统班次判定失败，请稍后重试",
+                reply_to_message_id=message.message_id,
+                reply_markup=await get_main_keyboard(chat_id, await is_admin_task),
+            )
+            return
+
+        # 检查是否在窗口内
+        if not shift_info.get("in_window", False):
+            # 从 shift_info 获取信息构建错误消息
+            shift = shift_info["shift"]
+            shift_detail = shift_info["shift_detail"]
+            record_date = shift_info["record_date"]
+            window_info = shift_info.get("window_info", {})
+
+            shift_text = "白班" if shift == "day" else "夜班"
+
+            # 构建错误消息
             if checkin_type == "work_start":
-                day_start = shift_config.get("day_start", "09:00")
-                day_end = shift_config.get("day_end", "21:00")
-                grace_before = shift_config.get("grace_before", 120)
-                grace_after = shift_config.get("grace_after", 360)
-
-                # 白班上班窗口
-                day_start_h, day_start_m = map(int, day_start.split(":"))
-                day_start_dt = now.replace(
-                    hour=day_start_h, minute=day_start_m, second=0
-                )
-                day_work_start_start = (
-                    day_start_dt - timedelta(minutes=grace_before)
-                ).strftime("%H:%M")
-                day_work_start_end = (
-                    day_start_dt + timedelta(minutes=grace_after)
-                ).strftime("%H:%M")
-
-                # 夜班上班窗口（对应昨晚下班）
-                day_end_h, day_end_m = map(int, day_end.split(":"))
-                day_end_dt = now.replace(hour=day_end_h, minute=day_end_m, second=0)
-                night_work_start_start = (
-                    day_end_dt - timedelta(days=1) - timedelta(minutes=grace_before)
-                ).strftime("%H:%M")
-                night_work_start_end = (
-                    day_end_dt - timedelta(days=1) + timedelta(minutes=grace_after)
-                ).strftime("%H:%M")
-
-                await message.answer(
-                    f"❌ 当前时间不在{action_text}打卡窗口内\n\n"
-                    f"📊 <b>允许的上班时间：</b>\n"
-                    f"• 白班上班：<code>{day_work_start_start} ~ {day_work_start_end}</code>\n"
-                    f"• 夜班上班：<code>{night_work_start_start} ~ {night_work_start_end}</code>（次日凌晨）\n\n"
-                    f"⏰ 当前时间：<code>{current_time}</code>\n"
-                    f"💡 请等待对班时间窗口或联系管理员调整时间设置",
-                    reply_to_message_id=message.message_id,
-                    reply_markup=await get_main_keyboard(chat_id, await is_admin_task),
-                    parse_mode="HTML",
-                )
-                return
+                # 获取窗口信息
+                if shift == "day":
+                    day_window = window_info.get("day_window", {}).get("work_start", {})
+                    window_start = day_window.get("start", now)
+                    window_end = day_window.get("end", now)
+                else:
+                    if shift_detail == "night_last":
+                        night_window = window_info.get("night_window", {})
+                        last_night = night_window.get("last_night", {}).get(
+                            "work_start", {}
+                        )
+                        window_start = last_night.get("start", now)
+                        window_end = last_night.get("end", now)
+                    else:  # night_tonight
+                        night_window = window_info.get("night_window", {})
+                        tonight = night_window.get("tonight", {}).get("work_start", {})
+                        window_start = tonight.get("start", now)
+                        window_end = tonight.get("end", now)
             else:  # work_end
-                day_start = shift_config.get("day_start", "09:00")
-                day_end = shift_config.get("day_end", "21:00")
-                workend_grace_before = shift_config.get("workend_grace_before", 120)
-                workend_grace_after = shift_config.get("workend_grace_after", 360)
+                if shift == "day":
+                    day_window = window_info.get("day_window", {}).get("work_end", {})
+                    window_start = day_window.get("start", now)
+                    window_end = day_window.get("end", now)
+                else:
+                    if shift_detail == "night_last":
+                        night_window = window_info.get("night_window", {})
+                        last_night = night_window.get("last_night", {}).get(
+                            "work_end", {}
+                        )
+                        window_start = last_night.get("start", now)
+                        window_end = last_night.get("end", now)
+                    else:  # night_tonight
+                        night_window = window_info.get("night_window", {})
+                        tonight = night_window.get("tonight", {}).get("work_end", {})
+                        window_start = tonight.get("start", now)
+                        window_end = tonight.get("end", now)
 
-                # 白班下班窗口
-                day_end_h, day_end_m = map(int, day_end.split(":"))
-                day_end_dt = now.replace(hour=day_end_h, minute=day_end_m, second=0)
-                day_work_end_start = (
-                    day_end_dt - timedelta(minutes=workend_grace_before)
-                ).strftime("%H:%M")
-                day_work_end_end = (
-                    day_end_dt + timedelta(minutes=workend_grace_after)
-                ).strftime("%H:%M")
+            window_start_str = (
+                window_start.strftime("%H:%M")
+                if hasattr(window_start, "strftime")
+                else "未知"
+            )
+            window_end_str = (
+                window_end.strftime("%H:%M")
+                if hasattr(window_end, "strftime")
+                else "未知"
+            )
 
-                # 夜班下班窗口（对应第二天早上）
-                day_start_h, day_start_m = map(int, day_start.split(":"))
-                day_start_dt = now.replace(
-                    hour=day_start_h, minute=day_start_m, second=0
+            date_desc = f"（基于{record_date}）"
+            if shift == "night" and checkin_type == "work_end":
+                date_desc = (
+                    f"（基于{record_date}，下班日期{record_date + timedelta(days=1)}）"
                 )
-                night_work_end_start = (
-                    day_start_dt
-                    + timedelta(days=1)
-                    - timedelta(minutes=workend_grace_before)
-                ).strftime("%H:%M")
-                night_work_end_end = (
-                    day_start_dt
-                    + timedelta(days=1)
-                    + timedelta(minutes=workend_grace_after)
-                ).strftime("%H:%M")
 
-                await message.answer(
-                    f"❌ 当前时间不在{action_text}打卡窗口内\n\n"
-                    f"📊 <b>允许的下班时间：</b>\n"
-                    f"• 白班下班：<code>{day_work_end_start} ~ {day_work_end_end}</code>\n"
-                    f"• 夜班下班：<code>{night_work_end_start} ~ {night_work_end_end}</code>（次日早上）\n\n"
-                    f"⏰ 当前时间：<code>{current_time}</code>\n"
-                    f"💡 请等待对班时间窗口或联系管理员调整时间设置",
-                    reply_to_message_id=message.message_id,
-                    reply_markup=await get_main_keyboard(chat_id, await is_admin_task),
-                    parse_mode="HTML",
-                )
-                return
+            await message.answer(
+                f"❌ 当前时间不在{shift_text}{action_text}窗口内{date_desc}\n\n"
+                f"📊 允许的{shift_text}{action_text}时间：<code>{window_start_str} ~ {window_end_str}</code>\n"
+                f"⏰ 当前时间：<code>{current_time}</code>\n"
+                f"💡 请等待正确的打卡时间窗口",
+                reply_to_message_id=message.message_id,
+                reply_markup=await get_main_keyboard(chat_id, await is_admin_task),
+                parse_mode="HTML",
+            )
+            return
 
-        # 从 shift_info 获取基础值
-        shift = shift_info["shift"]  # "day" 或 "night"
-        shift_detail = shift_info[
-            "shift_detail"
-        ]  # "day", "night_last", "night_tonight"
+        # ========== 从 shift_info 获取基础值 ==========
+        shift = shift_info["shift"]
+        shift_detail = shift_info["shift_detail"]
         record_date = shift_info["record_date"]
-        business_date = shift_info.get("business_date", record_date)
+        using_state = shift_info.get("using_state", False)
+
+        logger.info(
+            f"[{trace_id}] 📌 {'状态模型' if using_state else '时间模型'}: "
+            f"{shift} (详情: {shift_detail}), 记录日期: {record_date}"
+        )
 
         # ========== 班次文本映射 ==========
         shift_text_map = {
@@ -2233,7 +2268,7 @@ async def process_work_checkin(message: types.Message, checkin_type: str):
                 )
                 return
 
-            # 🎯 修复1：检查班次切换，自动结束旧班次的活动
+            # 🎯 检查班次切换，自动结束旧班次的活动
             user_data = await db.get_user_cached(chat_id, uid)
             if user_data and user_data.get("current_activity"):
                 current_shift = user_data.get("shift", "day")
@@ -2727,7 +2762,8 @@ async def process_work_checkin(message: types.Message, checkin_type: str):
                                         async def send_end_notification():
                                             try:
                                                 await message.answer(
-                                                    f"📢 <b>{shift_text}班次结束</b> 所有用户已完成下班打卡",
+                                                    f"📢 <b>{shift_text}班次结束</b>\n"
+                                                    f"所有用户已完成下班打卡",
                                                     parse_mode="HTML",
                                                 )
                                             except Exception as e:
@@ -3157,56 +3193,35 @@ async def send_work_notification(
         # 如果是下班通知，添加上班时间和工作时长
         if action_text == "下班":
             try:
-                business_date = await db.get_business_date(chat_id)
-
-                # 使用 shift_text 保持兼容
-                shift_value = shift if shift else shift_text
-
-                if shift_value in ["night", "夜班"]:
-                    start_date = business_date - timedelta(days=1)
-                    logger.info(
-                        f"[{trace_id}] 🌙 夜班下班，查询日期范围: {start_date} 到 {business_date}"
-                    )
-                else:
-                    start_date = business_date
-                    logger.info(f"[{trace_id}] ☀️ 白班下班，查询日期: {business_date}")
-
-                end_date = business_date
-
+                # 获取今天的上班记录
                 work_records = await db.get_work_records_by_shift(
-                    chat_id,
-                    user_id,
-                    shift_value,
-                    start_date,
-                    end_date,
+                    chat_id, user_id, shift_text
                 )
-
-                work_start_time = None
-
                 if work_records and work_records.get("work_start"):
+                    # 获取上班时间
                     work_start_time = work_records["work_start"][0]["checkin_time"]
-                    logger.info(f"[{trace_id}] 📝 找到上班记录: {work_start_time}")
 
-                if work_start_time:
+                    # 计算工作时长
                     start_dt = datetime.strptime(work_start_time, "%H:%M")
                     end_dt = datetime.strptime(checkin_time, "%H:%M")
 
+                    # 处理跨天（如果下班时间小于上班时间，说明跨天了）
                     if end_dt < start_dt:
                         end_dt += timedelta(days=1)
-                        logger.info(f"[{trace_id}] 🔄 跨天工作: {start_dt} -> {end_dt}")
 
                     work_duration = int((end_dt - start_dt).total_seconds())
                     work_duration_str = MessageFormatter.format_duration(work_duration)
 
                     # 获取今日活动总时长
+                    business_date = await db.get_business_date(chat_id)
                     async with db.pool.acquire() as conn:
                         activity_total = (
                             await conn.fetchval(
                                 """
-                                SELECT SUM(accumulated_time) 
-                                FROM user_activities 
-                                WHERE chat_id = $1 AND user_id = $2 AND activity_date = $3
-                                """,
+                            SELECT SUM(accumulated_time) 
+                            FROM user_activities 
+                            WHERE chat_id = $1 AND user_id = $2 AND activity_date = $3
+                            """,
                                 chat_id,
                                 user_id,
                                 business_date,
@@ -3235,9 +3250,6 @@ async def send_work_notification(
                     channel_notif_text += (
                         f"💪 实际工作时间：<code>{actual_work_str}</code>\n"
                     )
-                else:
-                    logger.warning(f"[{trace_id}] ⚠️ 未找到上班记录")
-
             except Exception as e:
                 logger.error(f"[{trace_id}] ❌ 计算工作时长失败: {e}")
 
@@ -3246,18 +3258,8 @@ async def send_work_notification(
         # ========= 额外群组文案 ==========
         extra_notif_text = f"<code>{shift_text}</code> {MessageFormatter.format_user_link(user_id, user_name)} {action_text} 了！\n"
 
-        # 只显示迟到/早退的罚款信息
         if fine_amount > 0:
-            if action_text == "上班" and diff_seconds > 0:  # 上班迟到
-                extra_notif_text += (
-                    f"⚠️ 迟到 {MessageFormatter.format_duration(diff_seconds)}，"
-                    f"💰扣除绩效：<code>{fine_amount}</code> 分"
-                )
-            elif action_text == "下班" and diff_seconds < 0:  # 下班早退
-                extra_notif_text += (
-                    f"⚠️ 早退 {MessageFormatter.format_duration(abs(diff_seconds))}，"
-                    f"💰扣除绩效：<code>{fine_amount}</code> 分"
-                )
+            extra_notif_text += f"\n💰 扣除绩效：<code>{fine_amount}</code> 分"
 
         # ========= 调试日志 ==========
         logger.info(
@@ -3674,8 +3676,7 @@ async def cmd_admin(message: types.Message):
 @admin_required
 @rate_limit(rate=3, per=30)
 async def cmd_setdualmode(message: types.Message):
-    """设置双班模式 - 保留今天状态"""
-
+    """设置双班模式"""
     args = message.text.split()
     chat_id = message.chat.id
 
@@ -3694,12 +3695,6 @@ async def cmd_setdualmode(message: types.Message):
     mode = args[1].lower()
 
     try:
-        # ✅ 获取业务日期
-        business_date = await db.get_business_date(chat_id)
-
-        # ============================
-        # 开启双班模式
-        # ============================
         if mode == "on":
             if len(args) != 4:
                 await message.answer(
@@ -3712,162 +3707,93 @@ async def cmd_setdualmode(message: types.Message):
             day_start = args[2]
             day_end = args[3]
 
+            # 验证时间格式
             import re
 
             time_pattern = re.compile(r"^([0-1]?[0-9]|2[0-3]):([0-5][0-9])$")
 
             if not time_pattern.match(day_start) or not time_pattern.match(day_end):
                 await message.answer(
-                    "❌ 时间格式错误，请使用 HH:MM 格式",
+                    "❌ 时间格式错误！请使用 HH:MM 格式（24小时制）",
                     reply_to_message_id=message.message_id,
                 )
                 return
 
+            await db.update_group_dual_mode(chat_id, True, day_start, day_end)
+
+            # 清除可能的班次状态
+            # 🆕 开启双班模式时，也应该清除旧的状态
             async with db.pool.acquire() as conn:
-                async with conn.transaction():
-                    # ✅ 只删除历史状态（< 今天）
-                    delete_result = await conn.execute(
-                        """
-                        DELETE FROM group_shift_state
-                        WHERE chat_id = $1
-                        AND record_date < $2
-                        """,
-                        chat_id,
-                        business_date,
-                    )
-                    deleted_count = _parse_delete_count(delete_result)
+                result = await conn.execute(
+                    "DELETE FROM group_shift_state WHERE chat_id = $1", chat_id
+                )
+                deleted_count = 0
+                if result and result.startswith("DELETE"):
+                    try:
+                        deleted_count = int(result.split()[-1])
+                    except (ValueError, IndexError):
+                        pass
 
-                    # 获取今天活跃的班次状态
-                    active_count = (
-                        await conn.fetchval(
-                            """
-                        SELECT COUNT(*)
-                        FROM group_shift_state
-                        WHERE chat_id = $1
-                        AND record_date = $2
-                        """,
-                            chat_id,
-                            business_date,
-                        )
-                        or 0
-                    )
-
-                    # 更新群组配置
-                    await db.update_group_dual_mode(chat_id, True, day_start, day_end)
-
-            # ✅ 清理历史缓存
-            if deleted_count > 0:
-                business_date_str = str(business_date)
-                keys_to_remove = []
-
-                for key in list(db._cache.keys()):
-                    if not key.startswith(f"shift_state:{chat_id}:"):
-                        continue
-
-                    # key结构：shift_state:chat_id:user_id:shift
-                    # 需要从对应的值获取 record_date
-                    cache_key = key
-                    if cache_key in db._cache_ttl:
-                        keys_to_remove.append(cache_key)
-
-                for key in keys_to_remove:
-                    db._cache.pop(key, None)
-                    db._cache_ttl.pop(key, None)
-
-                logger.info(f"✅ 已清理 {len(keys_to_remove)} 个历史缓存")
+                if deleted_count > 0:
+                    # 清理相关缓存
+                    keys_to_remove = [
+                        key
+                        for key in db._cache.keys()
+                        if key.startswith(f"shift_state:{chat_id}:")
+                    ]
+                    for key in keys_to_remove:
+                        db._cache.pop(key, None)
+                        db._cache_ttl.pop(key, None)
 
             await message.answer(
                 f"✅ 双班模式已开启\n\n"
                 f"📊 配置信息:\n"
                 f"• 白班时间: <code>{day_start} - {day_end}</code>\n"
-                f"• 夜班时间: 自动推算\n\n"
-                f"📈 状态清理:\n"
-                f"• 清除历史状态: <code>{deleted_count}</code> 个\n"
-                f"• 保留今天状态: <code>{active_count}</code> 个\n\n"
+                f"• 夜班时间: 自动推算\n"
+                f"• 时间窗口: 上班前 {Config.DEFAULT_GRACE_BEFORE} 分钟, "
+                f"下班后 {Config.DEFAULT_GRACE_AFTER} 分钟\n\n"
                 f"💡 注意事项:\n"
-                f"• 一个账号可支持两人轮班\n"
-                f"• 上班行为创建班次状态\n"
-                f"• 下班行为结束当前班次",
+                f"1. 一个 Telegram 账号可支持两个人轮班使用\n"
+                f"2. 班次状态由上班行为创建\n"
+                f"3. 下班行为结束当前班次\n"
+                f"4. 活动永远跟随当前班次"
+                f"{f'\n\n🔄 已清除 {deleted_count} 个旧的班次状态' if deleted_count > 0 else ''}",
                 parse_mode="HTML",
                 reply_to_message_id=message.message_id,
             )
 
-        # ============================
-        # 关闭双班模式
-        # ============================
         elif mode == "off":
+            await db.update_group_dual_mode(chat_id, False, None, None)
+
+            # 🆕 清除所有用户的班次状态
             async with db.pool.acquire() as conn:
-                async with conn.transaction():
-                    # ✅ 只删除历史状态
-                    delete_result = await conn.execute(
-                        """
-                        DELETE FROM group_shift_state
-                        WHERE chat_id = $1
-                        AND record_date < $2
-                        """,
-                        chat_id,
-                        business_date,
-                    )
-                    deleted_count = _parse_delete_count(delete_result)
-
-                    # 今天活跃的状态会被保留（因为要提醒用户）
-                    active_count = (
-                        await conn.fetchval(
-                            """
-                        SELECT COUNT(*)
-                        FROM group_shift_state
-                        WHERE chat_id = $1
-                        AND record_date = $2
-                        """,
-                            chat_id,
-                            business_date,
-                        )
-                        or 0
-                    )
-
-                    # 更新群组配置（关闭双班模式）
-                    await db.update_group_dual_mode(chat_id, False, None, None)
-
-            # ✅ 清理历史缓存
-            if deleted_count > 0:
-                business_date_str = str(business_date)
-                keys_to_remove = []
-
-                for key in list(db._cache.keys()):
-                    if not key.startswith(f"shift_state:{chat_id}:"):
-                        continue
-
-                    cache_key = key
-                    if cache_key in db._cache_ttl:
-                        keys_to_remove.append(cache_key)
-
-                for key in keys_to_remove:
-                    db._cache.pop(key, None)
-                    db._cache_ttl.pop(key, None)
-
-                logger.info(f"✅ 已清理 {len(keys_to_remove)} 个历史缓存")
-
-            # 如果有今天的活跃状态，需要提醒用户
-            if active_count > 0:
-                await message.answer(
-                    f"✅ 双班模式已关闭\n\n"
-                    f"📈 状态清理:\n"
-                    f"• 清除历史状态: <code>{deleted_count}</code> 个\n"
-                    f"• <b>⚠️ 发现 {active_count} 个今天的活跃班次</b>\n"
-                    f"• 这些班次会被保留，但切换到单班模式后可能需要手动结束\n\n"
-                    f"💡 建议用户手动结束今天的班次，或等待系统自动清理",
-                    parse_mode="HTML",
-                    reply_to_message_id=message.message_id,
+                result = await conn.execute(
+                    "DELETE FROM group_shift_state WHERE chat_id = $1", chat_id
                 )
-            else:
-                await message.answer(
-                    f"✅ 双班模式已关闭\n\n"
-                    f"📈 状态清理:\n"
-                    f"• 清除历史状态: <code>{deleted_count}</code> 个\n"
-                    f"• 没有今天的活跃状态",
-                    parse_mode="HTML",
-                    reply_to_message_id=message.message_id,
-                )
+                deleted_count = 0
+                if result and result.startswith("DELETE"):
+                    try:
+                        deleted_count = int(result.split()[-1])
+                    except (ValueError, IndexError):
+                        pass
+
+                # 清理相关缓存
+                if deleted_count > 0:
+                    keys_to_remove = [
+                        key
+                        for key in db._cache.keys()
+                        if key.startswith(f"shift_state:{chat_id}:")
+                    ]
+                    for key in keys_to_remove:
+                        db._cache.pop(key, None)
+                        db._cache_ttl.pop(key, None)
+
+            await message.answer(
+                f"✅ 双班模式已关闭，恢复单班模式\n"
+                f"已清除 {deleted_count} 个用户班次状态",
+                reply_to_message_id=message.message_id,
+                parse_mode="HTML",
+            )
 
         else:
             await message.answer(
@@ -3876,24 +3802,10 @@ async def cmd_setdualmode(message: types.Message):
             )
 
     except Exception as e:
-        logger.exception(f"设置双班模式失败: {e}")
+        logger.error(f"设置双班模式失败: {e}")
         await message.answer(
-            f"❌ 设置失败: {str(e)[:200]}",
-            reply_to_message_id=message.message_id,
+            f"❌ 设置失败: {e}", reply_to_message_id=message.message_id
         )
-
-
-def _parse_delete_count(result: str) -> int:
-    """解析 DELETE 语句返回的行数"""
-    if not result or not isinstance(result, str):
-        return 0
-    try:
-        parts = result.split()
-        if len(parts) >= 2 and parts[0] == "DELETE":
-            return int(parts[-1])
-    except (ValueError, IndexError):
-        pass
-    return 0
 
 
 @admin_required
@@ -7504,65 +7416,59 @@ async def daily_reset_task():
     async def process_dual_mode_reset(
         chat_id: int, now: datetime, reset_hour: int, reset_minute: int
     ):
-        """处理双班模式重置 - 完整修复版"""
-        from dual_shift_reset import handle_hard_reset
-        from database import db
+        """处理双班模式重置 - 5分钟执行窗口"""
+        from dual_shift_reset import handle_hard_reset  # 内部导入避免循环
 
-        # ===== 1. 获取业务日期 =====
-        business_today = await db.get_business_date(chat_id, now)
-        business_yesterday = business_today - timedelta(days=1)
+        # 计算今天的重置时间点
+        reset_time_today = now.replace(
+            hour=reset_hour, minute=reset_minute, second=0, microsecond=0
+        )
 
-        natural_today = now.date()
+        # 计算两个执行窗口（重置时间+2小时）
+        execute_windows = [
+            (reset_time_today - timedelta(days=1))
+            + timedelta(hours=2),  # 昨天的重置+2小时
+            reset_time_today + timedelta(hours=2),  # 今天的重置+2小时
+        ]
 
-        # ===== 2. 计算执行时间 =====
-        reset_time_today = datetime.combine(
-            natural_today, dt_time(reset_hour, reset_minute)  # ✅ 更简洁
-        ).replace(tzinfo=now.tzinfo)
+        # 检查是否在任意执行窗口内（5分钟）
+        execute_time = None
+        target_date = None
+        period_info = None
 
-        execute_time_today = reset_time_today + timedelta(hours=2)
+        for i, wt in enumerate(execute_windows):
+            time_diff = abs((now - wt).total_seconds())
+            if time_diff <= 300:  # 5分钟窗口
+                execute_time = wt
+                target_date = wt.date()
+                period_info = "昨天" if i == 0 else "今天"
+                break
 
-        reset_time_yesterday = datetime.combine(
-            natural_today - timedelta(days=1), dt_time(reset_hour, reset_minute)
-        ).replace(tzinfo=now.tzinfo)
+        if not execute_time:
+            return  # 不在执行窗口
 
-        execute_time_yesterday = reset_time_yesterday + timedelta(hours=2)
-
-        # ===== 3. 判断执行窗口 =====
-        EXECUTION_WINDOW = 300
-
-        time_to_today = abs((now - execute_time_today).total_seconds())
-        time_to_yesterday = abs((now - execute_time_yesterday).total_seconds())
-
-        if time_to_today <= EXECUTION_WINDOW:
-            target_date = business_yesterday
-            period_info = "正常执行"
-        elif time_to_yesterday <= EXECUTION_WINDOW:
-            target_date = business_yesterday - timedelta(days=1)
-            period_info = "补执行"
-        else:
-            return
-
-        # ===== 4. 幂等性检查 =====
-        reset_flag_key = f"dual_reset:{chat_id}:{business_today.strftime('%Y%m%d')}"
-        from performance import global_cache
-
-        if global_cache.get(reset_flag_key):
-            logger.info(f"⏭️ 群组 {chat_id} 今天已执行")
+        # 统一幂等性检查
+        if not await check_reset_idempotency(chat_id, "dual", target_date):
             return
 
         logger.info(
-            f"🚀 [双班重置] 群组 {chat_id}\n"
-            f"   ├─ 业务今天: {business_today}\n"
-            f"   ├─ 目标日期: {target_date}\n"
-            f"   ├─ 执行类型: {period_info}"
+            f"🎯 [双班重置] 群组 {chat_id}\n"
+            f"   • 当前时间: {now.strftime('%H:%M:%S')}\n"
+            f"   • 执行时间: {execute_time.strftime('%H:%M:%S')} ({period_info})\n"
+            f"   • 重置时间: {reset_hour:02d}:{reset_minute:02d}\n"
+            f"   • 目标日期: {target_date}"
         )
 
-        # ===== 5. 执行重置 =====
-        result = await handle_hard_reset(chat_id, None, target_date=target_date)
+        # 执行双班重置
+        result = await handle_hard_reset(chat_id, None)
 
         if result is True:
-            global_cache.set(reset_flag_key, True, ttl=86400)
-            logger.info(f"✅ 成功")
+            await set_reset_idempotency(chat_id, "dual", target_date)
+            logger.info(f"✅ [双班重置] 群组 {chat_id} 执行成功")
+        elif result is False:
+            logger.error(f"❌ [双班重置] 群组 {chat_id} 执行失败")
+        else:  # None
+            logger.warning(f"⚠️ [双班重置] 群组 {chat_id} 返回None，可能是配置问题")
 
     async def process_single_mode_reset(
         chat_id: int, now: datetime, reset_hour: int, reset_minute: int
