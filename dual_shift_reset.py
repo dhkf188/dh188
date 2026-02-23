@@ -104,6 +104,7 @@ async def _dual_shift_hard_reset(
         reset_minute = group_data.get("reset_minute", 0)
 
         # ==================== 🎯 修复：用自然日期计算执行时间 ====================
+        # 今天的重置时间（自然日期）
         reset_time_natural_today = datetime.combine(
             natural_today,
             datetime.strptime(f"{reset_hour:02d}:{reset_minute:02d}", "%H:%M").time(),
@@ -139,38 +140,27 @@ async def _dual_shift_hard_reset(
         )
 
         if time_to_today <= EXECUTION_WINDOW:
-            # ✅ 正常执行：今天 11:00，清理业务昨天的数据
+            # 正常执行：清理业务昨天的数据
             target_date = business_yesterday
             execute_time = execute_time_today
             period_info = "正常执行"
-            logger.info(
-                f"📅 正常执行窗口\n"
-                f"   • 目标日期: {target_date} (业务昨天)\n"
-                f"   • 业务今天: {business_today}"
-            )
-
+            logger.info(f"📅 使用今天执行窗口，目标日期: {target_date}")
         elif time_to_yesterday <= EXECUTION_WINDOW:
-            # ✅ 补执行：昨天没执行，今天补执行
-            # 应该清理的还是业务昨天的数据！
-            target_date = business_yesterday  # ✅ 修复：用 business_yesterday
+            # 补执行：昨天没执行，今天补执行
+            target_date = business_day_before
             execute_time = execute_time_yesterday
             period_info = "补执行"
             logger.warning(
                 f"⚠️ 补执行场景\n"
-                f"   • 当前时间: {now.strftime('%Y-%m-%d %H:%M')}\n"
-                f"   • 本应执行: {execute_time_yesterday.strftime('%Y-%m-%d %H:%M')}\n"
-                f"   • 目标日期: {target_date} (业务昨天)"
+                f"   • 本应清理: {business_yesterday}\n"
+                f"   • 实际清理: {business_day_before}"
             )
-
         else:
             # 不在执行窗口
             logger.debug(
                 f"⏳ 不在执行窗口内\n"
                 f"   • 当前时间: {now.strftime('%H:%M:%S')}\n"
-                f"   • 今天执行: {execute_time_today.strftime('%H:%M')}\n"
-                f"   • 距离今天: {time_to_today/60:.1f}分钟\n"
-                f"   • 昨天执行: {execute_time_yesterday.strftime('%H:%M')}\n"
-                f"   • 距离昨天: {time_to_yesterday/60:.1f}分钟"
+                f"   • 今天执行: {execute_time_today.strftime('%H:%M')}"
             )
             return False
 
