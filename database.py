@@ -1042,7 +1042,7 @@ class PostgreSQLDatabase:
             target_date = await self.get_business_date(chat_id)
             # 🚨 夜班特殊处理：如果没有传入日期，根据当前时间自动调整
             if shift == "night":
-                current_hour = self.get_beijing_time().hour 
+                current_hour = self.get_beijing_time().hour
                 if current_hour < 12:
                     target_date = target_date - timedelta(days=1)
                     logger.info(
