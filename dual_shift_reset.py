@@ -146,7 +146,7 @@ async def _dual_shift_hard_reset(
                 return False
 
         # ==================== 幂等性检查 ====================
-        reset_flag_key = f"dual_reset:{chat_id}:{business_today.strftime('%Y%m%d')}"
+        reset_flag_key = f"dual_reset:{chat_id}:{target_date.strftime('%Y%m%d')}"
         if global_cache.get(reset_flag_key):
             logger.info(f"⏭️ 群组 {chat_id} 今天已完成双班重置，跳过")
             return True
