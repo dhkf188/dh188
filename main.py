@@ -730,9 +730,21 @@ async def check_activity_limit_by_shift(
     if not shift_config or not shift_config.get("dual_mode", False):
         shift = None
 
-    # ✅ 统一调用，shift 可以是 None
+    # 🚨 核心修复：计算夜班需要的正确查询日期
+    query_date = None
+    if shift == "night":
+        business_date = await db.get_business_date(chat_id)
+        current_hour = get_beijing_time().hour
+        if current_hour < 12:  # 凌晨查询夜班
+            query_date = business_date - timedelta(days=1)
+            logger.info(
+                f"🌙 [次数检查-夜班] 凌晨查询: "
+                f"业务日期={business_date}, 查询日期={query_date}"
+            )
+
+    # ✅ 调用修改后的方法，传入查询日期
     current_count = await db.get_user_activity_count_by_shift(
-        chat_id, user_id, activity, shift
+        chat_id, user_id, activity, shift, query_date=query_date
     )
 
     max_times = await db.get_activity_max_times(activity)
