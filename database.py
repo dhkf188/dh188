@@ -2896,23 +2896,41 @@ class PostgreSQLDatabase:
         self._cache.pop("push_settings", None)
 
     # ========== 统计和导出相关 ==========
-
     async def get_group_statistics(
         self, chat_id: int, target_date: Optional[date] = None
     ) -> List[Dict]:
-        """获取群组统计信息 - 修复版：添加班次字段"""
+        """获取群组统计信息 - 修复版：包含所有用户（包括未打卡）"""
 
         if target_date is None:
             target_date = await self.get_business_date(chat_id)
 
         self._ensure_pool_initialized()
         async with self.pool.acquire() as conn:
+            # ===== 1. 先获取群组所有成员 =====
+            all_users = await conn.fetch(
+                """
+                SELECT user_id, nickname 
+                FROM users 
+                WHERE chat_id = $1
+                """,
+                chat_id,
+            )
+
+            if not all_users:
+                logger.info(f"群组 {chat_id} 没有用户")
+                return []
+
+            # ===== 2. 提前获取班次配置（只查一次）=====
+            shift_config = await self.get_shift_config(chat_id)
+            has_dual_mode = shift_config.get("dual_mode", False)
+
+            # ===== 3. 获取有活动记录的用户统计（原有复杂查询保持不变）=====
             rows = await conn.fetch(
                 """
                 WITH user_stats AS (
                     SELECT 
                         ds.user_id,
-                        ds.shift,  -- ✅ 1. 添加班次字段
+                        ds.shift,
                         ds.is_soft_reset,
                         MAX(u.nickname) as nickname,
                         
@@ -2949,13 +2967,13 @@ class PostgreSQLDatabase:
                         AND ds.user_id = u.user_id
                     WHERE ds.chat_id = $1 
                       AND ds.record_date = $2
-                    GROUP BY ds.user_id, ds.shift, ds.is_soft_reset  -- ✅ 2. GROUP BY添加shift
+                    GROUP BY ds.user_id, ds.shift, ds.is_soft_reset
                 ),
                 
                 activity_details AS (
                     SELECT
                         ds.user_id,
-                        ds.shift,  -- ✅ 3. 添加班次字段
+                        ds.shift,
                         ds.is_soft_reset,
                         ds.activity_name,
                         SUM(ds.activity_count) AS total_count,
@@ -2968,13 +2986,13 @@ class PostgreSQLDatabase:
                             'work_fines','work_start_fines','work_end_fines',
                             'overtime_count','overtime_time','total_fines'
                       )
-                    GROUP BY ds.user_id, ds.shift, ds.is_soft_reset, ds.activity_name  -- ✅ 4. GROUP BY添加shift
+                    GROUP BY ds.user_id, ds.shift, ds.is_soft_reset, ds.activity_name
                 ),
                 
                 work_stats AS (
                     SELECT
                         ds.user_id,
-                        ds.shift,  -- ✅ 5. 添加班次字段
+                        ds.shift,
                         ds.is_soft_reset,
                         MAX(CASE WHEN ds.activity_name = 'work_days'
                                  THEN ds.activity_count ELSE 0 END) AS work_days,
@@ -2984,13 +3002,21 @@ class PostgreSQLDatabase:
                     WHERE ds.chat_id = $1 
                       AND ds.record_date = $2
                       AND ds.activity_name IN ('work_days','work_hours')
-                    GROUP BY ds.user_id, ds.shift, ds.is_soft_reset  -- ✅ 6. GROUP BY添加shift
+                    GROUP BY ds.user_id, ds.shift, ds.is_soft_reset
                 )
                 
                 SELECT 
-                    us.*,
-                    COALESCE(ws.work_days, 0) AS final_work_days,
-                    COALESCE(ws.work_hours, 0) AS final_work_hours,
+                    us.user_id,
+                    us.shift,
+                    us.is_soft_reset,
+                    us.nickname,
+                    COALESCE(us.total_activity_count, 0) AS total_activity_count,
+                    COALESCE(us.total_accumulated_time, 0) AS total_accumulated_time,
+                    COALESCE(us.total_fines, 0) AS total_fines,
+                    COALESCE(us.overtime_count, 0) AS overtime_count,
+                    COALESCE(us.total_overtime_time, 0) AS total_overtime_time,
+                    COALESCE(ws.work_days, 0) AS work_days,
+                    COALESCE(ws.work_hours, 0) AS work_hours,
                     
                     jsonb_object_agg(
                         ad.activity_name,
@@ -3003,65 +3029,125 @@ class PostgreSQLDatabase:
                 FROM user_stats us
                 LEFT JOIN activity_details ad
                     ON us.user_id = ad.user_id
-                    AND us.shift = ad.shift  -- ✅ 7. JOIN条件添加shift
+                    AND us.shift = ad.shift
                     AND us.is_soft_reset = ad.is_soft_reset
                 LEFT JOIN work_stats ws
                     ON us.user_id = ws.user_id
-                    AND us.shift = ws.shift  -- ✅ 8. JOIN条件添加shift
+                    AND us.shift = ws.shift
                     AND us.is_soft_reset = ws.is_soft_reset
                     
-                GROUP BY us.user_id, us.shift, us.is_soft_reset, us.nickname,  -- ✅ 9. GROUP BY添加shift
+                GROUP BY us.user_id, us.shift, us.is_soft_reset, us.nickname,
                          us.total_activity_count, us.total_accumulated_time,
                          us.total_fines, us.overtime_count, us.total_overtime_time,
                          ws.work_days, ws.work_hours
                          
-                ORDER BY us.user_id ASC, us.shift ASC, us.is_soft_reset ASC  -- ✅ 10. ORDER BY添加shift
+                ORDER BY us.user_id ASC, us.shift ASC, us.is_soft_reset ASC
                 """,
                 chat_id,
                 target_date,
             )
 
-            result = []
+            # ===== 4. 将查询结果转为字典方便查找 =====
+            stats_dict = {}
             for row in rows:
-                data = dict(row)
+                user_id = row["user_id"]
+                if user_id not in stats_dict:
+                    stats_dict[user_id] = []
+                stats_dict[user_id].append(dict(row))
 
-                data["work_days"] = data.pop("final_work_days", 0)
-                data["work_hours"] = data.pop("final_work_hours", 0)
+            # ===== 5. 为每个用户构建统计数据 =====
+            result = []
+            for user in all_users:
+                user_id = user["user_id"]
+                base_nickname = user["nickname"] or f"用户{user_id}"
 
-                # ✅ 11. 确保班次字段存在
-                if "shift" not in data or data["shift"] is None:
-                    data["shift"] = "day"
+                if user_id in stats_dict:
+                    # 有活动记录的用户，使用查询结果（可能有多个班次）
+                    for stat in stats_dict[user_id]:
+                        data = stat.copy()  # 复制一份避免修改原数据
 
-                # 确保布尔值转换
-                is_soft_reset = data.get("is_soft_reset", False)
-                if isinstance(is_soft_reset, str):
-                    data["is_soft_reset"] = is_soft_reset.lower() in (
-                        "true",
-                        "t",
-                        "1",
-                        "yes",
-                    )
+                        # 确保 nickname 使用最新的
+                        data["nickname"] = base_nickname
+
+                        # 确保班次字段存在
+                        if "shift" not in data or data["shift"] is None:
+                            data["shift"] = "day"
+
+                        # 确保布尔值转换
+                        is_soft_reset = data.get("is_soft_reset", False)
+                        if isinstance(is_soft_reset, str):
+                            data["is_soft_reset"] = is_soft_reset.lower() in (
+                                "true",
+                                "t",
+                                "1",
+                                "yes",
+                            )
+                        else:
+                            data["is_soft_reset"] = bool(is_soft_reset)
+
+                        # JSON 解析
+                        raw_activities = data.get("activities")
+                        parsed_activities = {}
+
+                        if raw_activities:
+                            if isinstance(raw_activities, str):
+                                try:
+                                    parsed_activities = json.loads(raw_activities)
+                                except Exception as e:
+                                    self.logger.error(f"JSON解析失败: {e}")
+                            elif isinstance(raw_activities, dict):
+                                parsed_activities = raw_activities
+
+                        data["activities"] = parsed_activities
+                        result.append(data)
                 else:
-                    data["is_soft_reset"] = bool(is_soft_reset)
+                    # ===== 6. 没有活动记录的用户，根据模式创建空数据 =====
+                    if has_dual_mode:
+                        # 双班模式：为白班和夜班各创建一条记录
+                        for shift in ["day", "night"]:
+                            empty_data = {
+                                "user_id": user_id,
+                                "nickname": base_nickname,
+                                "shift": shift,
+                                "is_soft_reset": False,
+                                "total_activity_count": 0,
+                                "total_accumulated_time": 0,
+                                "total_fines": 0,
+                                "overtime_count": 0,
+                                "total_overtime_time": 0,
+                                "work_days": 0,
+                                "work_hours": 0,
+                                "activities": {},
+                            }
+                            result.append(empty_data)
+                    else:
+                        # 单班模式：只创建一条白班记录
+                        empty_data = {
+                            "user_id": user_id,
+                            "nickname": base_nickname,
+                            "shift": "day",
+                            "is_soft_reset": False,
+                            "total_activity_count": 0,
+                            "total_accumulated_time": 0,
+                            "total_fines": 0,
+                            "overtime_count": 0,
+                            "total_overtime_time": 0,
+                            "work_days": 0,
+                            "work_hours": 0,
+                            "activities": {},
+                        }
+                        result.append(empty_data)
 
-                # JSON 解析
-                raw_activities = data.get("activities")
-                parsed_activities = {}
+            # ===== 7. 按 user_id 和 shift 排序 =====
+            result.sort(key=lambda x: (x["user_id"], x["shift"]))
 
-                if raw_activities:
-                    if isinstance(raw_activities, str):
-                        try:
-                            parsed_activities = json.loads(raw_activities)
-                        except Exception as e:
-                            self.logger.error(f"JSON解析失败: {e}")
-                    elif isinstance(raw_activities, dict):
-                        parsed_activities = raw_activities
-
-                data["activities"] = parsed_activities
-
-                result.append(data)
-
-            logger.info(f"数据库查询返回 {len(result)} 条记录（含班次信息）")
+            active_users = len(stats_dict)
+            total_users = len(all_users)
+            logger.info(
+                f"数据库查询返回 {len(result)} 条记录 "
+                f"（包含所有 {total_users} 个用户，其中 {active_users} 个有活动记录，"
+                f"{total_users - active_users} 个未打卡）"
+            )
             return result
 
     async def get_all_groups(self) -> List[int]:
