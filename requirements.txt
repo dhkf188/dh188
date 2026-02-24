@@ -5,5 +5,4 @@ python-dotenv==1.0.1
 pytz==2024.1
 aiohttp==3.9.5
 psutil==5.9.8
-asyncache==0.3.1
-cachetools==5.3.3
+
