@@ -394,5 +394,59 @@ def message_deduplicate_decorator(ttl: int = 60):
     return decorator
 
 
+# ========== 缓存装饰器 ==========
+def cached(ttl: int = 60):
+    """
+    缓存装饰器 - 用于缓存函数返回值
+    Args:
+        ttl: 缓存生存时间（秒）
+    """
+
+    def decorator(func):
+        @wraps(func)
+        async def async_wrapper(*args, **kwargs):
+            # 生成缓存键
+            cache_key = f"cache:{func.__name__}:"
+            cache_key += ":".join(str(arg) for arg in args if arg is not None)
+            if kwargs:
+                sorted_kwargs = sorted(kwargs.items())
+                cache_key += ":" + ":".join(f"{k}={v}" for k, v in sorted_kwargs)
+
+            # 尝试从缓存获取
+            cached_result = global_cache.get(cache_key)
+            if cached_result is not None:
+                return cached_result
+
+            # 执行原函数
+            result = await func(*args, **kwargs)
+
+            # 存入缓存
+            if result is not None:
+                global_cache.set(cache_key, result, ttl=ttl)
+
+            return result
+
+        @wraps(func)
+        def sync_wrapper(*args, **kwargs):
+            cache_key = f"cache:{func.__name__}:"
+            cache_key += ":".join(str(arg) for arg in args if arg is not None)
+            if kwargs:
+                sorted_kwargs = sorted(kwargs.items())
+                cache_key += ":" + ":".join(f"{k}={v}" for k, v in sorted_kwargs)
+
+            cached_result = global_cache.get(cache_key)
+            if cached_result is not None:
+                return cached_result
+
+            result = func(*args, **kwargs)
+            if result is not None:
+                global_cache.set(cache_key, result, ttl=ttl)
+            return result
+
+        return async_wrapper if asyncio.iscoroutinefunction(func) else sync_wrapper
+
+    return decorator
+
+
 # 简写
 message_deduplicate = message_deduplicate_decorator()
