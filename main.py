@@ -6603,7 +6603,7 @@ async def show_history(message: types.Message, shift: str = None):
             if current_time_decimal < day_start_decimal:
                 # 白班还没开始：还在上一个业务周期，查前一天的所有数据
                 query_date = business_date - timedelta(days=1)
-                logger.info(
+                logger.debug(
                     f"🌙 [我的记录-全部] 凌晨查询前一天所有数据: "
                     f"当前时间={current_hour:02d}:{current_minute:02d}, "
                     f"白班开始={day_start_str}, 查询日期={query_date}"
@@ -6915,7 +6915,7 @@ async def show_rank(message: types.Message, shift: str = None):
                 if current_time_decimal < day_start_decimal:
                     # 白班还没开始：还在上一个业务周期，查前一天的所有数据
                     query_date = business_date - timedelta(days=1)
-                    logger.info(
+                    logger.debug(
                         f"🌙 [排行榜-全部] 凌晨查询前一天所有数据: "
                         f"当前时间={current_hour:02d}:{current_minute:02d}, "
                         f"白班开始={day_start_str}, 查询日期={query_date}"
@@ -6947,7 +6947,7 @@ async def show_rank(message: types.Message, shift: str = None):
                     params = [act, chat_id, query_date, act]
                 else:
                     # 白班已开始：查当天的所有数据
-                    logger.info(f"☀️ [排行榜-全部] 正常查询当天: {business_date}")
+                    logger.debug(f"☀️ [排行榜-全部] 正常查询当天: {business_date}")
 
                     query = """
                         SELECT 
@@ -7270,6 +7270,8 @@ async def export_and_push_csv(
         day_start_decimal = day_start_hour + day_start_minute / 60
 
         # ========== 4. 规范日期与文件名 ==========
+
+        # 1. 规范 target_date
         if target_date is not None:
             if hasattr(target_date, "date"):
                 target_date = target_date.date()
@@ -7277,37 +7279,33 @@ async def export_and_push_csv(
                 try:
                     if isinstance(target_date, str):
                         target_date = datetime.strptime(target_date, "%Y-%m-%d").date()
-                except Exception as e:
+                except Exception:
                     logger.warning(
                         f"⚠️ [{operation_id}] 无法解析target_date: {target_date}"
                     )
                     target_date = None
 
+        # 2. 自动计算
         if target_date is None:
             business_date = await db.get_business_date(chat_id)
 
-            # 🚨 核心修复：根据当前时间决定导出哪一天的数据
             if current_time_decimal < day_start_decimal:
-                # 9点前：导出前一天的数据（包含夜班）
                 export_date = business_date - timedelta(days=1)
-                logger.info(
-                    f"🌙 [{operation_id}] 凌晨导出前一天数据: "
-                    f"当前时间={current_hour:02d}:{current_minute:02d}, "
-                    f"白班开始={day_start_str}, 导出日期={export_date}"
-                )
+                logger.info(f"🌙 [{operation_id}] 凌晨导出前一天数据: {export_date}")
             else:
-                # 9点后：导出当天的数据
                 export_date = business_date
                 logger.info(f"☀️ [{operation_id}] 正常导出当天数据: {export_date}")
-            target_date = export_date
 
+            target_date = export_date
+        else:
+            logger.info(f"📅 [{operation_id}] 使用指定的目标日期: {target_date}")
+
+        # 3. 文件名
         if not file_name:
             if is_daily_reset:
-                file_name = (
-                    f"daily_backup_{chat_id}_{target_date.strftime('%Y%m%d')}.csv"
-                )
+                file_name = f"daily_backup_{chat_id}_{target_date:%Y%m%d}.csv"
             else:
-                file_name = f"manual_export_{chat_id}_{beijing_now.strftime('%Y%m%d_%H%M%S')}.csv"
+                file_name = f"manual_export_{chat_id}_{beijing_now:%Y%m%d_%H%M%S}.csv"
 
         # ========== 5. 获取统计数据 ==========
         logger.info(
