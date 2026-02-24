@@ -61,7 +61,6 @@ from utils import (
     calculate_cross_day_time_diff,
     rate_limit,
     send_reset_notification,
-    get_batch_config,
 )
 
 from bot_manager import bot_manager
@@ -629,7 +628,7 @@ async def recover_expired_activities():
 
 # ========== 每日重置逻辑 =========
 async def reset_daily_data_if_needed(chat_id: int, uid: int):
-    """业务日期统一版每日重置（完全对齐业务日期体系）- 优化版"""
+    """业务日期统一版每日重置（完全对齐业务日期体系）"""
     try:
         now = db.get_beijing_time()
 
@@ -643,100 +642,72 @@ async def reset_daily_data_if_needed(chat_id: int, uid: int):
             await db.update_user_last_updated(chat_id, uid, business_date)
             return
 
-        # ===== 优化1：快速解析 last_updated =====
         last_updated_raw = user_data.get("last_updated")
 
-        # 快速路径：如果已经是 date 对象
-        if isinstance(last_updated_raw, date):
-            last_updated = last_updated_raw
-        # 如果是 datetime 对象
-        elif isinstance(last_updated_raw, datetime):
+        # 解析 last_updated
+        if isinstance(last_updated_raw, datetime):
             last_updated = last_updated_raw.date()
-        # 如果是字符串
         elif isinstance(last_updated_raw, str):
             try:
-                # 尝试 ISO 格式
                 last_updated = datetime.fromisoformat(
                     last_updated_raw.replace("Z", "+00:00")
                 ).date()
             except Exception:
                 try:
-                    # 尝试简单日期格式
                     last_updated = datetime.strptime(
                         last_updated_raw, "%Y-%m-%d"
                     ).date()
                 except Exception:
-                    # 解析失败，使用业务日期
                     last_updated = business_date
         else:
             last_updated = business_date
 
-        # ===== 优化2：提前返回，减少缩进 =====
-        if last_updated >= business_date:
-            return
+        # 🎯 唯一重置规则：是否跨了业务日期
+        if last_updated < business_date:
+            logger.info(f"🔄 重置用户数据: {chat_id}-{uid} | 业务日期 {business_date}")
 
-        # ===== 到这里才需要重置 =====
-        logger.info(f"🔄 重置用户数据: {chat_id}-{uid} | 业务日期 {business_date}")
+            # ⚠️ 关键修复：如果用户有进行中的活动，先自动结束
+            if user_data.get("current_activity"):
+                act = user_data["current_activity"]
+                start_time_str = user_data["activity_start_time"]
+                try:
+                    start_time = datetime.fromisoformat(start_time_str)
+                    elapsed = int((now - start_time).total_seconds())
 
-        # ===== 优化3：如果用户有进行中的活动，先自动结束 =====
-        if user_data.get("current_activity"):
-            act = user_data["current_activity"]
-            start_time_str = user_data["activity_start_time"]
+                    # 获取班次
+                    shift = user_data.get("shift", "day")
 
-            # 使用 try-except 保护单个用户的活动结束
-            try:
-                start_time = datetime.fromisoformat(start_time_str)
-                elapsed = int((now - start_time).total_seconds())
-                shift = user_data.get("shift", "day")
+                    # 完成活动（强制归到 business_date 前一天）
+                    forced_date = business_date - timedelta(days=1)
 
-                # 完成活动（强制归到 business_date 前一天）
-                forced_date = business_date - timedelta(days=1)
+                    await db.complete_user_activity(
+                        chat_id=chat_id,
+                        user_id=uid,
+                        activity=act,
+                        elapsed_time=elapsed,
+                        fine_amount=0,
+                        is_overtime=False,
+                        shift=shift,
+                        forced_date=forced_date,
+                    )
 
-                await db.complete_user_activity(
-                    chat_id=chat_id,
-                    user_id=uid,
-                    activity=act,
-                    elapsed_time=elapsed,
-                    fine_amount=0,
-                    is_overtime=False,
-                    shift=shift,
-                    forced_date=forced_date,
-                )
+                    logger.info(
+                        f"🔄 自动结束跨期活动: {uid} - {act} (归到 {forced_date})"
+                    )
+                except Exception as e:
+                    logger.error(f"自动结束活动失败: {e}")
 
-                logger.info(
-                    f"🔄 自动结束跨期活动: {uid} - {act} "
-                    f"(班次: {shift}, 归到: {forced_date})"
-                )
-            except Exception as e:
-                logger.error(f"自动结束活动失败 {uid}-{act}: {e}")
-                # 继续执行重置，不阻断流程
-
-        # ===== 优化4：执行重置（带重试机制）=====
-        max_retries = 2
-        for attempt in range(max_retries):
-            try:
-                await db.reset_user_daily_data(chat_id, uid, business_date)
-                await db.update_user_last_updated(chat_id, uid, business_date)
-                break  # 成功就退出循环
-            except Exception as e:
-                if attempt == max_retries - 1:  # 最后一次重试失败
-                    logger.error(f"重置失败 {chat_id}-{uid} 重试{max_retries}次后: {e}")
-                    raise  # 抛出异常让外层处理
-                logger.warning(f"重置失败 {chat_id}-{uid}，第{attempt + 2}次重试: {e}")
-                await asyncio.sleep(1 * (2**attempt))  # 指数退避
+            # 执行重置
+            await db.reset_user_daily_data(chat_id, uid, business_date)
+            await db.update_user_last_updated(chat_id, uid, business_date)
 
     except Exception as e:
         logger.error(f"重置检查失败 {chat_id}-{uid}: {e}")
-
-        # ===== 优化5：降级处理 =====
         try:
-            # 尝试重新初始化用户
             await db.init_user(chat_id, uid, "用户")
             await db.update_user_last_updated(chat_id, uid, datetime.now().date())
-            logger.info(f"✅ 降级处理成功: 重新初始化用户 {chat_id}-{uid}")
         except Exception as init_error:
-            logger.error(f"降级处理也失败 {chat_id}-{uid}: {init_error}")
-            # 这里不再抛出异常，避免影响主流程
+            logger.error(f"用户初始化也失败: {init_error}")
 
 
 async def check_activity_limit_by_shift(
@@ -796,39 +767,41 @@ async def can_perform_activities(
 ) -> tuple[bool, str]:
     """
     检查用户是否可以执行活动
-    基于 user_shift_state 表 - 优化版
+    基于 user_shift_state 表
     """
 
     logger.info(f"🔍 [活动检查] 用户={uid}, 班次={current_shift}")
 
-    # ===== 优化1：使用缓存的上下班功能检查 =====
-    if not await db.has_work_hours_enabled_cached(chat_id):
+    # 如果没有启用上下班功能，直接允许
+    if not await db.has_work_hours_enabled(chat_id):
         return True, ""
 
     now = db.get_beijing_time()
 
-    # ===== 优化2：合并用户活跃班次获取 =====
-    # 先尝试获取用户当前活跃班次（带缓存）
-    user_current_shift = await db.get_user_current_shift_cached(chat_id, uid)
+    # ===== 🎯 新增：先尝试获取用户当前活跃班次 =====
+    user_current_shift = await db.get_user_current_shift(chat_id, uid)
 
-    # ===== 3. 确定要检查的班次（保持原逻辑）=====
+    # ===== 1. 确定要检查的班次 =====
     check_shift = current_shift
 
     if not check_shift:
+        # 优先使用用户当前活跃班次
         if user_current_shift:
             check_shift = user_current_shift["shift"]
             logger.info(f"📌 使用用户当前活跃班次: {check_shift}")
         else:
+            # 从用户数据获取当前班次
             user_data = await db.get_user_cached(chat_id, uid)
             if user_data and user_data.get("shift"):
                 check_shift = user_data["shift"]
                 logger.info(f"📌 使用用户数据班次: {check_shift}")
             else:
+                # 默认白班
                 check_shift = "day"
                 logger.info(f"📌 使用默认班次: {check_shift}")
 
-    # ===== 4. 检查用户是否有该班次的活跃状态（带缓存）=====
-    shift_state = await db.get_user_shift_state_cached(chat_id, uid, check_shift)
+    # ===== 2. 检查用户是否有该班次的活跃状态 =====
+    shift_state = await db.get_user_shift_state(chat_id, uid, check_shift)
 
     if not shift_state:
         shift_text = "白班" if check_shift == "day" else "夜班"
@@ -837,7 +810,7 @@ async def can_perform_activities(
             f"❌ 您当前没有进行中的{shift_text}班次，请先打{shift_text}上班卡！",
         )
 
-    # ===== 5. 检查是否已过期（16小时）=====
+    # ===== 3. 检查是否已过期（16小时）=====
     shift_start_time = shift_state["shift_start_time"]
     if isinstance(shift_start_time, str):
         try:
@@ -855,7 +828,7 @@ async def can_perform_activities(
         shift_text = "白班" if check_shift == "day" else "夜班"
         return False, f"❌ 您的{shift_text}班次已过期（超过16小时），请重新上班打卡！"
 
-    # ===== 6. 检查时间窗口 =====
+    # ===== 4. 检查时间窗口 =====
     shift_info = await db.determine_shift_for_time(
         chat_id=chat_id,
         current_time=now,
@@ -864,7 +837,7 @@ async def can_perform_activities(
     )
 
     if shift_info is None or shift_info.get("shift_detail") is None:
-        shift_config = await db.get_shift_config_cached(chat_id)  # 使用缓存
+        shift_config = await db.get_shift_config(chat_id)
         day_start = shift_config.get("day_start", "09:00")
         day_end = shift_config.get("day_end", "21:00")
 
@@ -882,14 +855,7 @@ async def can_perform_activities(
             f"💡 请等待{shift_text}的正常活动时间"
         )
 
-    # ===== 7. 优化：合并 record_date 处理 =====
-    # 优先使用传入的 record_date，如果没有则从 shift_state 获取
-    target_record_date = record_date or shift_state.get("record_date")
-    if not target_record_date:
-        target_record_date = now.date()
-        logger.warning(f"⚠️ 未找到 record_date，使用当前日期: {target_record_date}")
-
-    # ===== 8. 检查是否已下班 =====
+    # ===== 5. 检查是否已下班 =====
     async with db.pool.acquire() as conn:
         has_work_end = await conn.fetchval(
             """
@@ -904,16 +870,21 @@ async def can_perform_activities(
             chat_id,
             uid,
             check_shift,
-            target_record_date,  # 使用合并后的日期
+            shift_state["record_date"],
         )
 
         if has_work_end:
             shift_text = "白班" if check_shift == "day" else "夜班"
             return False, f"❌ 您本{shift_text}已下班，无法进行活动！"
 
+    # ===== 🆕 可选：更新用户最后活动时间 =====
+    # 如果数据库有这个方法，可以取消注释
+    # await db.update_user_activity_time(chat_id, uid, check_shift)
+
     shift_text = "白班" if check_shift == "day" else "夜班"
     logger.info(f"✅ [活动检查] 用户={uid} 允许执行活动（班次：{shift_text}）")
     return True, ""
+
 
 async def calculate_fine(activity: str, overtime_minutes: float) -> int:
     """计算罚款金额"""
@@ -1377,51 +1348,23 @@ async def activity_timer(
 
 # ========== 核心打卡功能 ==========
 async def start_activity(message: types.Message, act: str):
-    """开始活动 - 完整优化版（包含初始化）"""
+    """开始活动 - 优化版（使用班次判定）"""
     chat_id = message.chat.id
     uid = message.from_user.id
 
-    # ===== 1. 🚨 关键修复：先初始化群组和用户 =====
-    try:
-        await db.init_group(chat_id)
-        await db.init_user(chat_id, uid, message.from_user.full_name)
-    except Exception as e:
-        logger.error(f"❌ 初始化失败 {chat_id}-{uid}: {e}")
-        await message.answer(
-            "⚠️ 系统初始化失败，请稍后重试", reply_to_message_id=message.message_id
-        )
-        return
+    user_lock = user_lock_manager.get_lock(chat_id, uid)
+    async with user_lock:
+        await reset_daily_data_if_needed(chat_id, uid)
 
-    # ===== 2. 获取批量配置（无锁）=====
-    config = await get_batch_config(chat_id, uid, act)
-
-    # ===== 3. 活动存在性检查 =====
-    activity_limits = config.get("activity_limits", {})
-
-    if not activity_limits or act not in activity_limits:
-        # 额外检查数据库确保准确
-        exists = await db.activity_exists(act)
-        if not exists:
+        # -----------------------------
+        # 基础检查
+        # -----------------------------
+        if not await db.activity_exists(act):
             await message.answer(
-                f"❌ 活动 '{act}' 不存在\n\n"
-                f"💡 可用活动：{', '.join(activity_limits.keys()) if activity_limits else '无'}",
-                reply_to_message_id=message.message_id,
+                f"❌ 活动 '{act}' 不存在", reply_to_message_id=message.message_id
             )
             return
 
-    now = db.get_beijing_time()
-    name = message.from_user.full_name
-
-    # ===== 4. 使用用户锁保护需要互斥的操作 =====
-    user_lock = user_lock_manager.get_lock(chat_id, uid)
-    async with user_lock:
-        # 重置检查
-        await reset_daily_data_if_needed(chat_id, uid)
-
-        # 重新获取最新的用户数据
-        user_data = await db.get_user_cached(chat_id, uid)
-
-        # 完整的已有活动检查
         has_active, current_act = await has_active_activity(chat_id, uid)
         if has_active:
             await message.answer(
@@ -1433,7 +1376,13 @@ async def start_activity(message: types.Message, act: str):
             )
             return
 
-        # ===== 5. 完整的班次检查 =====
+        # -----------------------------
+        # 获取用户信息和当前时间
+        # -----------------------------
+        name = message.from_user.full_name
+        now = db.get_beijing_time()
+
+        # ===== ⭐ 获取用户班次状态 =====
         user_shift_state = await db.get_user_active_shift(chat_id, uid)
         if not user_shift_state:
             await message.answer(
@@ -1445,7 +1394,7 @@ async def start_activity(message: types.Message, act: str):
             )
             return
 
-        # 检查班次是否过期
+        # 解析班次开始时间（用于过期检查）
         shift_start_time = user_shift_state["shift_start_time"]
         if isinstance(shift_start_time, str):
             try:
@@ -1457,6 +1406,7 @@ async def start_activity(message: types.Message, act: str):
                     shift_start_time, "%Y-%m-%d %H:%M:%S.%f%z"
                 )
 
+        # 检查班次是否过期（16小时）
         if now - shift_start_time > timedelta(hours=16):
             await db.clear_user_shift_state(chat_id, uid, user_shift_state["shift"])
             await message.answer(
@@ -1468,7 +1418,7 @@ async def start_activity(message: types.Message, act: str):
             )
             return
 
-        # ===== 6. 获取班次信息（包含 shift_detail）=====
+        # ===== 🎯 使用状态模型获取准确的班次信息 =====
         shift_info = await db.determine_shift_for_time(
             chat_id=chat_id,
             current_time=now,
@@ -1483,12 +1433,13 @@ async def start_activity(message: types.Message, act: str):
         shift_text = "白班" if current_shift == "day" else "夜班"
 
         logger.info(
-            f"🔄 [开始活动] 用户={uid}, 活动={act}, 班次={shift_text}, "
+            f"🔄 [开始活动] 使用状态模型: {shift_text}, "
             f"详情={shift_detail}, 记录日期={record_date}"
         )
 
-        # ===== 7. 活动限制检查 =====
-        # 7.1 检查是否可以执行活动
+        # -----------------------------
+        # 活动限制检查
+        # -----------------------------
         can_perform, reason = await can_perform_activities(
             chat_id, uid, current_shift, record_date
         )
@@ -1502,17 +1453,16 @@ async def start_activity(message: types.Message, act: str):
             )
             return
 
-        # 7.2 活动人数限制
-        user_limit = config.get("user_limit", 0)
+        # 活动人数限制
+        user_limit = await db.get_activity_user_limit(act)
         if user_limit > 0:
             current_users = await db.get_current_activity_users(chat_id, act)
             if current_users >= user_limit:
-                remaining = max(0, user_limit - current_users)
                 await message.answer(
                     f"❌ 活动 '<code>{act}</code>' 人数已满！\n\n"
                     f"📊 限制人数：<code>{user_limit}</code> 人\n"
                     f"• 当前进行：<code>{current_users}</code> 人\n"
-                    f"• 剩余名额：<code>{remaining}</code> 人",
+                    f"• 剩余名额：<code>0</code> 人",
                     reply_markup=await get_main_keyboard(
                         chat_id=chat_id, show_admin=await is_admin(uid)
                     ),
@@ -1521,7 +1471,7 @@ async def start_activity(message: types.Message, act: str):
                 )
                 return
 
-        # 7.3 活动次数限制
+        # 活动次数限制
         can_start, current_count, max_times = await check_activity_limit_by_shift(
             chat_id, uid, act, current_shift
         )
@@ -1537,16 +1487,20 @@ async def start_activity(message: types.Message, act: str):
             )
             return
 
-        # ===== 8. 更新用户活动状态（包含 shift）=====
+        # -----------------------------
+        # 更新用户活动状态
+        # -----------------------------
         await db.update_user_activity(chat_id, uid, act, str(now), name, current_shift)
 
-        # 启动计时器（传入 shift）
-        time_limit = config.get("time_limit", 30)
+        # 启动计时器
+        time_limit = await db.get_activity_time_limit(act)
         await timer_manager.start_timer(
             chat_id, uid, act, time_limit, shift=current_shift
         )
 
-        # ===== 9. 发送打卡消息 =====
+        # -----------------------------
+        # 发送打卡消息
+        # -----------------------------
         sent_message = await message.answer(
             MessageFormatter.format_activity_message(
                 uid,
@@ -1568,7 +1522,15 @@ async def start_activity(message: types.Message, act: str):
         # 保存打卡消息ID
         await db.update_user_checkin_message(chat_id, uid, sent_message.message_id)
 
-        # ===== 10. 吃饭推送（带异常处理）=====
+        # -----------------------------
+        # 日志和推送
+        # -----------------------------
+        logger.info(
+            f"📝 用户 {uid} 开始活动 {act}（{shift_text}），消息ID: {sent_message.message_id}, "
+            f"记录日期: {record_date}, 班次详情: {shift_detail}"
+        )
+
+        # 吃饭推送
         if act == "吃饭":
             try:
                 notification_text = (
@@ -1582,13 +1544,6 @@ async def start_activity(message: types.Message, act: str):
                 logger.info(f"📣 已触发用户 {uid}（{shift_text}）的 {act} 推送")
             except Exception as e:
                 logger.error(f"❌ {act} 推送失败: {e}")
-
-        # ===== 11. 完整的日志信息 =====
-        logger.info(
-            f"📝 用户 {uid} 开始活动 {act}（{shift_text}），消息ID: {sent_message.message_id}, "
-            f"记录日期: {record_date}, 班次详情: {shift_detail}, "
-            f"当前次数: {current_count + 1}/{max_times}"
-        )
 
 
 # ========== 回座功能 ==========
