@@ -8,6 +8,8 @@ from typing import Dict, Any, List, Optional, Union
 from config import Config, beijing_tz
 import asyncpg
 from asyncpg.pool import Pool
+from asyncache import cached
+from cachetools import TTLCache  # 如果需要自定义缓存
 
 logger = logging.getLogger("GroupCheckInBot")
 
@@ -4963,6 +4965,27 @@ class PostgreSQLDatabase:
         except Exception as e:
             logger.debug(f"数据库连接健康检查失败: {e}")
             return False
+
+    # 在现有方法后面添加
+    @cached(ttl=30)
+    async def get_shift_config_cached(self, chat_id: int):
+        """缓存的班次配置获取"""
+        return await self.get_shift_config(chat_id)
+
+    @cached(ttl=30)
+    async def get_user_active_shift_cached(self, chat_id: int, user_id: int):
+        """缓存的用户活跃班次获取"""
+        return await self.get_user_active_shift(chat_id, user_id)
+
+    @cached(ttl=10)
+    async def get_current_activity_users_cached(self, chat_id: int, activity: str):
+        """缓存的当前活动人数获取"""
+        return await self.get_current_activity_users(chat_id, activity)
+
+    @cached(ttl=5)
+    async def has_work_hours_enabled_cached(self, chat_id: int):
+        """缓存的上下班功能状态"""
+        return await self.has_work_hours_enabled(chat_id)
 
 
 # 全局数据库实例
