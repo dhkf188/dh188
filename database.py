@@ -8,8 +8,7 @@ from typing import Dict, Any, List, Optional, Union
 from config import Config, beijing_tz
 import asyncpg
 from asyncpg.pool import Pool
-from asyncache import cached
-from cachetools import TTLCache  # 如果需要自定义缓存
+from performance import cached
 
 logger = logging.getLogger("GroupCheckInBot")
 
