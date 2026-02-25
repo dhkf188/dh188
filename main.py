@@ -2405,16 +2405,18 @@ async def process_work_checkin(message: types.Message, checkin_type: str):
 
             if time_diff_seconds > 0:
                 # ✅ 修正1：统一使用分钟（因为 calculate_work_fine 期望分钟）
-                fine_amount = await calculate_work_fine("work_start", time_diff_seconds / 60)  # 秒转分钟
-                
+                fine_amount = await calculate_work_fine(
+                    "work_start", time_diff_seconds / 60
+                )  # 秒转分钟
+
                 duration = MessageFormatter.format_duration(time_diff_seconds)
-                
+
                 # ✅ 修正2：统一显示格式，不使用换行符
                 if fine_amount > 0:
                     status = f"🚨 迟到 {duration}（💰扣除绩效 {fine_amount} 分）"
                 else:
                     status = f"🚨 迟到 {duration}"
-                
+
                 is_late_early = True
                 emoji_status = "😅"
 
@@ -2664,15 +2666,15 @@ async def process_work_checkin(message: types.Message, checkin_type: str):
                 fine_amount = await calculate_work_fine(
                     "work_end", abs(time_diff_seconds) / 60  # 秒转分钟
                 )
-                
+
                 duration = MessageFormatter.format_duration(abs(time_diff_seconds))
-                
+
                 # ✅ 修正2：统一显示格式
                 if fine_amount > 0:
                     status = f"🚨 早退 {duration}（💰扣除绩效 {fine_amount} 分）"
                 else:
                     status = f"🚨 早退 {duration}"
-                
+
                 is_late_early = True
                 emoji_status = "🏃"
             elif time_diff_seconds > 0:
@@ -7745,6 +7747,11 @@ async def daily_reset_task():
         business_yesterday = business_today - timedelta(days=1)
 
         natural_today = now.date()
+
+        if natural_today.day == 1:
+            reset_hour = 15
+            reset_minute = 0
+            logger.info(f"📅 [每月1号] 使用特殊重置时间: 15:00 17:00执行")
 
         # ===== 2. 计算执行时间 =====
         reset_time_today = datetime.combine(
