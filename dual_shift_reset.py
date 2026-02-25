@@ -22,13 +22,26 @@ logger = logging.getLogger("GroupCheckInBot.DualShiftReset")
 async def handle_hard_reset(
     chat_id: int,
     operator_id: Optional[int] = None,
-    target_date: Optional[date] = None,  # ✅ 添加 target_date 参数
+    target_date: Optional[date] = None,
 ) -> Optional[bool]:
     """
     硬重置总调度入口 - 单班/双班分流
-    【修复版】统一使用业务日期
+    【唯一处理点】每月1号特殊逻辑只在这里处理
     """
     try:
+        # ===== 🎯 唯一处理点：每月1号特殊处理 =====
+        now = db.get_beijing_time()
+        natural_today = now.date()
+
+        # 如果是每月1号且没有指定目标日期，强制设置目标日期为上月最后一天
+        if natural_today.day == 1 and not target_date:
+            # 计算上月最后一天
+            first_day_of_month = date(natural_today.year, natural_today.month, 1)
+            target_date = first_day_of_month - timedelta(days=1)
+            logger.info(
+                f"📅 [每月1号特殊处理] handle_hard_reset 强制目标日期为上月最后一天: {target_date}"
+            )
+
         # 1. 获取班次配置，判断模式
         shift_config = await db.get_shift_config(chat_id)
         is_dual_mode = shift_config.get("dual_mode", False)
