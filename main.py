@@ -6566,7 +6566,7 @@ async def show_history(message: types.Message, shift: str = None):
             # 单班次查询
             if shift == "night":
                 # 夜班：永远查前一天
-                query_date = business_date - timedelta(days=1)
+                query_date = business_date
                 logger.info(
                     f"🌙 [我的记录-夜班] 查询日期: "
                     f"业务日期={business_date}, 查询日期={query_date}"
@@ -6865,7 +6865,7 @@ async def show_rank(message: types.Message, shift: str = None):
                 # 🚨 单班次排行榜
                 if shift == "night":
                     # 夜班：永远查前一天
-                    query_date = business_date - timedelta(days=1)
+                    query_date = business_date
                     logger.info(
                         f"🌙 [排行榜-夜班] 查询日期: "
                         f"业务日期={business_date}, 查询日期={query_date}"
@@ -7600,7 +7600,9 @@ async def export_and_push_csv(
             send_to_group_success = True
 
         # ========== 15. 推送到通知服务（只在需要推送时）==========
-        if to_admin_if_no_group and notification_service and push_file:  # 添加 push_file 判断
+        if (
+            to_admin_if_no_group and notification_service and push_file
+        ):  # 添加 push_file 判断
             try:
                 # 注意：这里需要重新创建 input_file，因为前面的可能已经被消耗
                 input_file_for_notification = FSInputFile(temp_file, filename=file_name)
@@ -7617,7 +7619,6 @@ async def export_and_push_csv(
                 os.remove(temp_file)
 
         asyncio.create_task(cleanup_background())
-
 
         # ========== 17. 性能统计 ==========
         duration = time.time() - start_time
