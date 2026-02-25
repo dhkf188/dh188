@@ -4240,8 +4240,9 @@ class PostgreSQLDatabase:
             current_dt = self.get_beijing_time()
 
         today = current_dt.date()
+        yesterday = today - timedelta(days=1)
 
-        # ===== 🎯 状态模型优先（最高优先级）=====
+        # ===== 🎯 第1优先级：状态模型优先（完全不变）=====
         if record_date is not None:
             # 有状态：直接使用状态的日期
             if shift == "night" and checkin_type == "work_end":
@@ -4268,9 +4269,38 @@ class PostgreSQLDatabase:
         # ===== 判断双班模式 =====
         is_dual = await self.is_dual_mode_enabled(chat_id)
 
-        # =====================================================
-        # 🎯 双班模式
-        # =====================================================
+        # ===== 🎯 第2优先级：每月1号特殊处理（仅当无状态时）=====
+        if is_dual and today.day == 1:
+            current_hour = current_dt.hour
+
+            # 情况1：凌晨0-15点 - 上月夜班
+            if current_hour < 15 and shift == "night":
+                business_date = yesterday
+                logger.info(
+                    f"📅 [每月1号特殊处理] 夜班时段 ({current_hour}:00)，"
+                    f"业务日期={business_date}（上月最后一天）"
+                )
+                return business_date
+
+            # 情况2：15点之后 - 新白班
+            elif current_hour >= 15 and shift == "day":
+                business_date = today
+                logger.info(
+                    f"📅 [每月1号特殊处理] 白班时段 ({current_hour}:00)，"
+                    f"业务日期={business_date}（本月1号）"
+                )
+                return business_date
+
+            # 情况3：夜班下班打卡（15点）
+            elif current_hour >= 15 and checkin_type == "work_end" and shift == "night":
+                business_date = yesterday
+                logger.info(
+                    f"📅 [每月1号特殊处理] 夜班下班 ({current_hour}:00)，"
+                    f"业务日期={business_date}（上月最后一天）"
+                )
+                return yesterday
+
+        # ===== 🎯 第3优先级：原有的双班模式逻辑（完全不变）=====
         if is_dual:
             # ===== 1️⃣ shift_detail 判定（业务参数优先）=====
             if shift_detail in ("night_last", "night_tonight", "day"):
@@ -4345,9 +4375,7 @@ class PostgreSQLDatabase:
             logger.debug(f"📅 [双班-fallback] chat={chat_id}, 日期={today}")
             return today
 
-        # =====================================================
-        # 单班模式（完全不变）
-        # =====================================================
+        # ===== 🎯 第4优先级：原有的单班模式逻辑（完全不变）=====
         group_data = await self.get_group_cached(chat_id)
 
         if group_data:
@@ -4390,7 +4418,6 @@ class PostgreSQLDatabase:
         企业级终极班次判定函数
 
         特性：
-
         状态模型优先
         夜班跨天绝对正确
         record_date 永远正确
@@ -4398,39 +4425,14 @@ class PostgreSQLDatabase:
         """
 
         now = current_time or self.get_beijing_time()
+        today = now.date()
+        yesterday = today - timedelta(days=1)
 
         shift_config = await self.get_shift_config(chat_id) or {}
-
         is_dual = shift_config.get("dual_mode", False)
 
-        # ============================================================
-        # 单班模式
-        # ============================================================
-
-        if not is_dual:
-
-            business_date = await self.get_business_date(
-                chat_id=chat_id,
-                current_dt=now,
-            )
-
-            return dict(
-                shift="day",
-                shift_detail="day",
-                business_date=business_date,
-                record_date=business_date,
-                is_dual=False,
-                in_window=True,
-                window_info=None,
-                using_state=False,
-            )
-
-        # ============================================================
-        # 🎯 状态模型（最高优先级）
-        # ============================================================
-
+        # ===== 🎯 第1优先级：状态模型（最高优先级）- 完全不变 =====
         if active_shift and active_record_date:
-
             if active_shift not in ("day", "night"):
                 raise ValueError(f"非法 shift: {active_shift}")
 
@@ -4438,42 +4440,25 @@ class PostgreSQLDatabase:
                 raise TypeError("active_record_date 必须是 date")
 
             shift = active_shift
-
             record_date = active_record_date
 
-            # =====================================================
             # 正确计算 shift_detail（关键修复）
-            # =====================================================
-
             if shift == "day":
-
                 shift_detail = "day"
-
             else:
-
                 day_end_str = shift_config.get("day_end", "21:00")
-
                 day_end_time = datetime.strptime(day_end_str, "%H:%M").time()
-
-                night_start = datetime.combine(
-                    record_date,
-                    day_end_time,
-                ).replace(tzinfo=now.tzinfo)
-
+                night_start = datetime.combine(record_date, day_end_time).replace(
+                    tzinfo=now.tzinfo
+                )
                 night_end = night_start + timedelta(days=1)
 
                 if night_start <= now < night_end:
-
                     shift_detail = "night_tonight"
-
                 else:
-
                     shift_detail = "night_last"
 
-            # =====================================================
             # 获取窗口
-            # =====================================================
-
             window_info = (
                 self.calculate_shift_window(
                     shift_config=shift_config,
@@ -4485,28 +4470,15 @@ class PostgreSQLDatabase:
                 or {}
             )
 
-            # =====================================================
             # activity 永远允许
-            # =====================================================
-
             if checkin_type == "activity":
-
                 in_window = True
-
             else:
-
                 in_window = self._is_time_in_window(
-                    now,
-                    shift,
-                    shift_detail,
-                    checkin_type,
-                    window_info,
+                    now, shift, shift_detail, checkin_type, window_info
                 )
 
-            # =====================================================
             # 业务日期
-            # =====================================================
-
             business_date = await self.get_business_date(
                 chat_id=chat_id,
                 current_dt=now,
@@ -4528,9 +4500,124 @@ class PostgreSQLDatabase:
             )
 
         # ============================================================
-        # 无状态模式
+        # 单班模式 - 移到前面，因为不需要特殊处理
         # ============================================================
+        if not is_dual:
+            business_date = await self.get_business_date(
+                chat_id=chat_id,
+                current_dt=now,
+            )
+            return dict(
+                shift="day",
+                shift_detail="day",
+                business_date=business_date,
+                record_date=business_date,
+                is_dual=False,
+                in_window=True,
+                window_info=None,
+                using_state=False,
+            )
 
+        # ===== 🎯 第2优先级：每月1号特殊处理（仅当双班模式且无状态时）=====
+        if today.day == 1:
+            current_hour = now.hour
+
+            # ✅ 获取完整的窗口信息，传入所有可能的参数
+            window_info = (
+                self.calculate_shift_window(
+                    shift_config=shift_config,
+                    checkin_type=checkin_type,
+                    now=now,
+                )
+                or {}
+            )
+
+            # 情况1：凌晨0-15点 - 上月夜班
+            if current_hour < 15:
+                # ✅ 正确设置班次信息
+                shift = "night"
+                shift_detail = "night_last"
+                record_date = yesterday
+
+                # ✅ 正确计算 in_window
+                if checkin_type == "activity":
+                    in_window = True
+                else:
+                    in_window = self._is_time_in_window(
+                        now, shift, shift_detail, checkin_type, window_info
+                    )
+
+                # ✅ 获取业务日期
+                business_date = await self.get_business_date(
+                    chat_id=chat_id,
+                    current_dt=now,
+                    shift=shift,
+                    checkin_type=checkin_type,
+                    shift_detail=shift_detail,
+                    record_date=record_date,
+                )
+
+                logger.info(
+                    f"📅 [每月1号特殊处理] {current_hour}:00 在夜班时段，"
+                    f"shift={shift}, detail={shift_detail}, record_date={record_date}, "
+                    f"business_date={business_date}, in_window={in_window}"
+                )
+
+                return {
+                    "shift": shift,
+                    "shift_detail": shift_detail,
+                    "business_date": business_date,
+                    "record_date": record_date,
+                    "is_dual": True,
+                    "in_window": in_window,
+                    "window_info": window_info,
+                    "using_state": False,
+                    "is_special": True,
+                }
+
+            # 情况2：15点之后 - 新白班开始
+            elif current_hour >= 15:
+                shift = "day"
+                shift_detail = "day"
+                record_date = today
+
+                if checkin_type == "activity":
+                    in_window = True
+                else:
+                    in_window = self._is_time_in_window(
+                        now, shift, shift_detail, checkin_type, window_info
+                    )
+
+                business_date = await self.get_business_date(
+                    chat_id=chat_id,
+                    current_dt=now,
+                    shift=shift,
+                    checkin_type=checkin_type,
+                    shift_detail=shift_detail,
+                    record_date=record_date,
+                )
+
+                logger.info(
+                    f"📅 [每月1号特殊处理] {current_hour}:00 在白班时段，"
+                    f"shift={shift}, detail={shift_detail}, record_date={record_date}, "
+                    f"business_date={business_date}, in_window={in_window}"
+                )
+
+                return {
+                    "shift": shift,
+                    "shift_detail": shift_detail,
+                    "business_date": business_date,
+                    "record_date": record_date,
+                    "is_dual": True,
+                    "in_window": in_window,
+                    "window_info": window_info,
+                    "using_state": False,
+                    "is_special": True,
+                }
+
+        # ============================================================
+        # 第3优先级：无状态模式（原有双班逻辑）- 完全不变
+        # ============================================================
         window_info = (
             self.calculate_shift_window(
                 shift_config=shift_config,
@@ -4542,41 +4629,21 @@ class PostgreSQLDatabase:
 
         shift_detail = window_info.get("current_shift")
 
-        # =====================================================
         # fallback 安全计算
-        # =====================================================
-
         if shift_detail is None:
-
-            shift_detail = self._fallback_shift_detail(
-                now,
-                shift_config,
-            )
+            shift_detail = self._fallback_shift_detail(now, shift_config)
 
         shift = "night" if shift_detail.startswith("night") else "day"
 
-        # =====================================================
         # 判断窗口
-        # =====================================================
-
         if checkin_type == "activity":
-
             in_window = True
-
         else:
-
             in_window = self._is_time_in_window(
-                now,
-                shift,
-                shift_detail,
-                checkin_type,
-                window_info,
+                now, shift, shift_detail, checkin_type, window_info
             )
 
-        # =====================================================
         # record_date 正确计算
-        # =====================================================
-
         record_date = await self.get_business_date(
             chat_id=chat_id,
             current_dt=now,
