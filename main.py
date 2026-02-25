@@ -2404,11 +2404,17 @@ async def process_work_checkin(message: types.Message, checkin_type: str):
             emoji_status = "👍"
 
             if time_diff_seconds > 0:
-                fine_amount = await calculate_work_fine("work_start", time_diff_minutes)
+                # ✅ 修正1：统一使用分钟（因为 calculate_work_fine 期望分钟）
+                fine_amount = await calculate_work_fine("work_start", time_diff_seconds / 60)  # 秒转分钟
+                
                 duration = MessageFormatter.format_duration(time_diff_seconds)
-                status = f"🚨 迟到 {duration}"
-                if fine_amount:
-                    status += f"\n💰扣除绩效: {fine_amount} 分"
+                
+                # ✅ 修正2：统一显示格式，不使用换行符
+                if fine_amount > 0:
+                    status = f"🚨 迟到 {duration}（💰扣除绩效 {fine_amount} 分）"
+                else:
+                    status = f"🚨 迟到 {duration}"
+                
                 is_late_early = True
                 emoji_status = "😅"
 
@@ -2654,13 +2660,19 @@ async def process_work_checkin(message: types.Message, checkin_type: str):
             emoji_status = "👍"
 
             if time_diff_seconds < 0:
+                # ✅ 修正1：统一使用分钟
                 fine_amount = await calculate_work_fine(
-                    "work_end", abs(time_diff_minutes)
+                    "work_end", abs(time_diff_seconds) / 60  # 秒转分钟
                 )
+                
                 duration = MessageFormatter.format_duration(abs(time_diff_seconds))
-                status = f"🚨 早退 {duration}"
-                if fine_amount:
-                    status += f"（💰扣除绩效 {fine_amount} 分）"
+                
+                # ✅ 修正2：统一显示格式
+                if fine_amount > 0:
+                    status = f"🚨 早退 {duration}（💰扣除绩效 {fine_amount} 分）"
+                else:
+                    status = f"🚨 早退 {duration}"
+                
                 is_late_early = True
                 emoji_status = "🏃"
             elif time_diff_seconds > 0:
