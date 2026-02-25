@@ -2249,25 +2249,24 @@ class PostgreSQLDatabase:
         shift_detail: str = None,
     ):
         """
-        添加上下班记录 - 完整同步版（包含班次计数器）
-        支持：
-        - 多班次判定
-        - 四表实时同步
-        - 软重置(soft_reset)兼容
-        - 跨天时长计算
-        - ⭐ 班次计数器管理
+        添加上下班记录 - 企业级完整版
+        特性：
+        - 支持统计修正（更新时自动调整）
+        - 原子性操作
+        - 完整的错误处理
+        - 无作用域问题
         """
 
-        # ========= 0. 统一业务日期与月份统计点 =========
+        # ========= 0. 初始化 =========
         business_date = await self.get_business_date(chat_id)
         statistic_date = business_date.replace(day=1)
         now = self.get_beijing_time()
+        work_duration_seconds = 0  # ✅ 提前初始化，避免作用域问题
 
         # ========= 1. 自动判定班次 =========
         if shift is None:
             try:
                 checkin_time_obj = datetime.strptime(checkin_time, "%H:%M").time()
-                # 班次判定基于业务日期，不依赖当前北京时间
                 full_datetime = datetime.combine(business_date, checkin_time_obj)
                 shift = (
                     await self.determine_shift_for_time(
@@ -2283,7 +2282,7 @@ class PostgreSQLDatabase:
 
         async with self.pool.acquire() as conn:
             async with conn.transaction():
-
+                
                 # ========= 2. 读取当前 soft reset 状态 =========
                 current_soft_reset = False
                 soft_reset_row = await conn.fetchrow(
@@ -2301,7 +2300,50 @@ class PostgreSQLDatabase:
                 if soft_reset_row:
                     current_soft_reset = soft_reset_row["is_soft_reset"]
 
-                # ========= 3. 更新 work_records =========
+                # ========= 3. 获取现有记录（用于统计修正） =========
+                old_record = await conn.fetchrow(
+                    """
+                    SELECT fine_amount, checkin_time 
+                    FROM work_records 
+                    WHERE chat_id = $1 AND user_id = $2 
+                      AND record_date = $3 AND checkin_type = $4 AND shift = $5
+                    """,
+                    chat_id, user_id, record_date, checkin_type, shift
+                )
+                
+                old_fine = old_record["fine_amount"] if old_record else 0
+                old_checkin_time = old_record["checkin_time"] if old_record else None
+
+                # ========= 4. 计算工作时长（如果是下班打卡） =========
+                if checkin_type == "work_end":
+                    start_row = await conn.fetchrow(
+                        """
+                        SELECT checkin_time FROM work_records
+                        WHERE chat_id=$1 AND user_id=$2
+                          AND record_date=$3
+                          AND checkin_type='work_start'
+                          AND shift=$4
+                        """,
+                        chat_id,
+                        user_id,
+                        business_date,
+                        shift,
+                    )
+
+                    if start_row:
+                        try:
+                            start_dt = datetime.strptime(
+                                start_row["checkin_time"], "%H:%M"
+                            )
+                            end_dt = datetime.strptime(checkin_time, "%H:%M")
+                            diff_minutes = (end_dt - start_dt).total_seconds() / 60
+                            if diff_minutes < 0:
+                                diff_minutes += 1440
+                            work_duration_seconds = int(diff_minutes * 60)
+                        except Exception as e:
+                            logger.error(f"工时计算失败: {e}")
+
+                # ========= 5. 插入/更新 work_records =========
                 await conn.execute(
                     """
                     INSERT INTO work_records
@@ -2330,9 +2372,11 @@ class PostgreSQLDatabase:
                     shift_detail,
                 )
 
-                # ========= 4. 更新 daily_statistics =========
-                activity_name = "work_fines"
-                if fine_amount > 0:
+                # ========= 6. 计算需要调整的差值（用于统计修正） =========
+                fine_delta = fine_amount - old_fine
+
+                # ========= 7. 更新 daily_statistics（使用差值） =========
+                if fine_delta != 0:
                     activity_name = (
                         "work_start_fines"
                         if checkin_type == "work_start"
@@ -2359,88 +2403,85 @@ class PostgreSQLDatabase:
                         user_id,
                         business_date,
                         activity_name,
-                        fine_amount,
+                        fine_delta,  # ✅ 使用差值，支持修正
                         current_soft_reset,
                         shift,
                     )
 
-                work_duration_seconds = 0
+                # ========= 8. 下班打卡特殊处理 =========
                 if checkin_type == "work_end":
-                    await conn.execute(
-                        """
-                        INSERT INTO daily_statistics
-                        (chat_id, user_id, record_date, activity_name,
-                         activity_count, is_soft_reset, shift)
-                        VALUES ($1,$2,$3,'work_days',1,$4,$5)
-                        ON CONFLICT (chat_id, user_id, record_date,
-                                     activity_name, is_soft_reset, shift)
-                        DO UPDATE SET
-                            activity_count = daily_statistics.activity_count + 1,
-                            updated_at = CURRENT_TIMESTAMP
-                        """,
-                        chat_id,
-                        user_id,
-                        business_date,
-                        current_soft_reset,
-                        shift,
-                    )
+                    # 8.1 工作天数（总是+1，因为是新记录或更新都算一天）
+                    if not old_record:  # 只有新记录才加工作天数
+                        await conn.execute(
+                            """
+                            INSERT INTO daily_statistics
+                            (chat_id, user_id, record_date, activity_name,
+                             activity_count, is_soft_reset, shift)
+                            VALUES ($1,$2,$3,'work_days',1,$4,$5)
+                            ON CONFLICT (chat_id, user_id, record_date,
+                                         activity_name, is_soft_reset, shift)
+                            DO UPDATE SET
+                                activity_count = daily_statistics.activity_count + 1,
+                                updated_at = CURRENT_TIMESTAMP
+                            """,
+                            chat_id,
+                            user_id,
+                            business_date,
+                            current_soft_reset,
+                            shift,
+                        )
 
-                    start_row = await conn.fetchrow(
-                        """
-                        SELECT checkin_time FROM work_records
-                        WHERE chat_id=$1 AND user_id=$2
-                          AND record_date=$3
-                          AND checkin_type='work_start'
-                          AND shift=$4
-                        """,
-                        chat_id,
-                        user_id,
-                        business_date,
-                        shift,
-                    )
-
-                    if start_row:
+                    # 8.2 工作时长（需要计算旧值差值）
+                    if old_checkin_time:
+                        # 如果有旧记录，需要重新计算旧的工作时长
                         try:
-                            start_dt = datetime.strptime(
-                                start_row["checkin_time"], "%H:%M"
+                            old_start_dt = datetime.strptime(
+                                start_row["checkin_time"] if start_row else "00:00", "%H:%M"
                             )
-                            end_dt = datetime.strptime(checkin_time, "%H:%M")
-                            diff_minutes = (end_dt - start_dt).total_seconds() / 60
-                            if diff_minutes < 0:
-                                diff_minutes += 1440
-                            work_duration_seconds = int(diff_minutes * 60)
+                            old_end_dt = datetime.strptime(old_checkin_time, "%H:%M")
+                            old_diff = (old_end_dt - old_start_dt).total_seconds() / 60
+                            if old_diff < 0:
+                                old_diff += 1440
+                            old_duration = int(old_diff * 60)
+                        except:
+                            old_duration = 0
+                        
+                        work_duration_delta = work_duration_seconds - old_duration
+                    else:
+                        work_duration_delta = work_duration_seconds
 
-                            await conn.execute(
-                                """
-                                INSERT INTO daily_statistics
-                                (chat_id, user_id, record_date,
-                                 activity_name, accumulated_time,
-                                 is_soft_reset, shift)
-                                VALUES ($1,$2,$3,'work_hours',$4,$5,$6)
-                                ON CONFLICT (chat_id, user_id, record_date,
-                                             activity_name, is_soft_reset, shift)
-                                DO UPDATE SET
-                                    accumulated_time = daily_statistics.accumulated_time + EXCLUDED.accumulated_time,
-                                    updated_at = CURRENT_TIMESTAMP
-                                """,
-                                chat_id,
-                                user_id,
-                                business_date,
-                                work_duration_seconds,
-                                current_soft_reset,
-                                shift,
-                            )
-                        except Exception as e:
-                            logger.error(f"工时计算失败: {e}")
+                    if work_duration_delta != 0:
+                        await conn.execute(
+                            """
+                            INSERT INTO daily_statistics
+                            (chat_id, user_id, record_date,
+                             activity_name, accumulated_time,
+                             is_soft_reset, shift)
+                            VALUES ($1,$2,$3,'work_hours',$4,$5,$6)
+                            ON CONFLICT (chat_id, user_id, record_date,
+                                         activity_name, is_soft_reset, shift)
+                            DO UPDATE SET
+                                accumulated_time = daily_statistics.accumulated_time + EXCLUDED.accumulated_time,
+                                updated_at = CURRENT_TIMESTAMP
+                            """,
+                            chat_id,
+                            user_id,
+                            business_date,
+                            work_duration_delta,  # ✅ 使用差值
+                            current_soft_reset,
+                            shift,
+                        )
 
-                # ========= 6. 更新 monthly_statistics =========
-                if checkin_type == "work_end":
+                # ========= 9. 更新 monthly_statistics（同样使用差值） =========
+                # 9.1 记录上班/下班次数（只有新记录才加次数）
+                if not old_record:
+                    count_activity = "work_start_count" if checkin_type == "work_start" else "work_end_count"
                     await conn.execute(
                         """
                         INSERT INTO monthly_statistics
-                        (chat_id, user_id, statistic_date,
-                         activity_name, activity_count, shift)
-                        VALUES ($1,$2,$3,'work_days',1,$4)
+                        (chat_id, user_id, statistic_date, activity_name,
+                         activity_count, shift)
+                        VALUES ($1,$2,$3,$4,1,$5)
                         ON CONFLICT (chat_id, user_id, statistic_date, activity_name, shift)
                         DO UPDATE SET
                             activity_count = monthly_statistics.activity_count + 1,
@@ -2449,10 +2490,33 @@ class PostgreSQLDatabase:
                         chat_id,
                         user_id,
                         statistic_date,
+                        count_activity,
                         shift,
                     )
 
-                    if work_duration_seconds > 0:
+                # 9.2 下班打卡特殊处理
+                if checkin_type == "work_end":
+                    # 工作天数（只有新记录才加）
+                    if not old_record:
+                        await conn.execute(
+                            """
+                            INSERT INTO monthly_statistics
+                            (chat_id, user_id, statistic_date,
+                             activity_name, activity_count, shift)
+                            VALUES ($1,$2,$3,'work_days',1,$4)
+                            ON CONFLICT (chat_id, user_id, statistic_date, activity_name, shift)
+                            DO UPDATE SET
+                                activity_count = monthly_statistics.activity_count + 1,
+                                updated_at = CURRENT_TIMESTAMP
+                            """,
+                            chat_id,
+                            user_id,
+                            statistic_date,
+                            shift,
+                        )
+
+                    # 工作时长（使用差值）
+                    if work_duration_delta != 0:
                         await conn.execute(
                             """
                             INSERT INTO monthly_statistics
@@ -2467,11 +2531,17 @@ class PostgreSQLDatabase:
                             chat_id,
                             user_id,
                             statistic_date,
-                            work_duration_seconds,
+                            work_duration_delta,
                             shift,
                         )
 
-                if fine_amount > 0:
+                # 9.3 罚款（使用差值）
+                if fine_delta != 0:
+                    activity_name = (
+                        "work_start_fines" if checkin_type == "work_start" else
+                        "work_end_fines" if checkin_type == "work_end" else
+                        "work_fines"
+                    )
                     await conn.execute(
                         """
                         INSERT INTO monthly_statistics
@@ -2487,29 +2557,30 @@ class PostgreSQLDatabase:
                         user_id,
                         statistic_date,
                         activity_name,
-                        fine_amount,
+                        fine_delta,
                         shift,
                     )
 
-                # ========= 7. 更新 users 表罚款总计 =========
-                if fine_amount > 0:
+                # ========= 10. 更新 users 表罚款总计 =========
+                if fine_delta != 0:
                     await conn.execute(
                         """
                         UPDATE users
                         SET total_fines = total_fines + $1
                         WHERE chat_id = $2 AND user_id = $3
                         """,
-                        fine_amount,
+                        fine_delta,
                         chat_id,
                         user_id,
                     )
 
-        # ========= 8. 清理缓存 =========
+        # ========= 11. 清理缓存 =========
         self._cache.pop(f"user:{chat_id}:{user_id}", None)
 
-        logger.debug(
-            f"✅ [四表同步完成] 用户:{user_id} | 业务日期:{business_date} | "
-            f"班次:{shift} | 罚款:{fine_amount} | 工时:{work_duration_seconds}s"
+        logger.info(
+            f"✅ [上下班记录完成] 用户:{user_id} | 类型:{checkin_type} | "
+            f"班次:{shift} | 罚款:{fine_amount}(Δ:{fine_delta}) | "
+            f"工时:{work_duration_seconds}s | 新记录:{not old_record}"
         )
 
     async def get_work_records_by_shift(
@@ -3375,9 +3446,9 @@ class PostgreSQLDatabase:
                 night_work_hours = 0
 
                 # 计算本月内的夜班工时
-                month_start_dt = datetime.combine(month_start, time(0, 0)).replace(
-                    tzinfo=beijing_tz
-                )
+                month_start_dt = datetime.combine(
+                    month_start, datetime.min.time()
+                ).replace(tzinfo=beijing_tz)
                 month_end_dt = datetime.combine(month_end, time(0, 0)).replace(
                     tzinfo=beijing_tz
                 )
