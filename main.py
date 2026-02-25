@@ -7570,38 +7570,47 @@ async def export_and_push_csv(
             f"💾 包含完整的工作记录统计（上班迟到/下班早退）"
         )
 
-        # ========== 13. 发送到当前群组 ==========
+        # ========== 13. 创建文件对象 ==========
         input_file = FSInputFile(temp_file, filename=file_name)
         send_to_group_success = False
 
-        try:
-            success = await bot_manager.send_document_with_retry(
-                chat_id=chat_id,
-                document=input_file,
-                caption=caption,
-                parse_mode="HTML",
-            )
-            if success:
-                send_to_group_success = True
-                logger.info(f"✅ [{operation_id}] CSV文件已发送到群组 {chat_id}")
-            else:
-                logger.error(f"❌ [{operation_id}] bot_manager 发送文档失败")
-        except Exception as e:
-            logger.error(f"❌ [{operation_id}] 发送到群组失败: {e}")
-            await bot_manager.send_message_with_retry(
-                chat_id, f"❌ 数据导出失败: {str(e)[:100]}"
-            )
-
-        # ========== 14. 推送到通知服务 ==========
-        if to_admin_if_no_group and notification_service:
+        # ========== 14. 根据 push_file 参数决定是否推送 ==========
+        if push_file:  # 新增判断：只在需要推送时发送
             try:
+                success = await bot_manager.send_document_with_retry(
+                    chat_id=chat_id,
+                    document=input_file,
+                    caption=caption,
+                    parse_mode="HTML",
+                )
+                if success:
+                    send_to_group_success = True
+                    logger.info(f"✅ [{operation_id}] CSV文件已发送到群组 {chat_id}")
+                else:
+                    logger.error(f"❌ [{operation_id}] bot_manager 发送文档失败")
+            except Exception as e:
+                logger.error(f"❌ [{operation_id}] 发送到群组失败: {e}")
+                if not is_daily_reset:  # 只在非自动重置时提示用户
+                    await bot_manager.send_message_with_retry(
+                        chat_id, f"❌ 数据导出失败: {str(e)[:100]}"
+                    )
+        else:
+            logger.debug(f"⏭️ [{operation_id}] push_file=False，跳过文件发送")
+            # 即使不推送，也认为文件生成成功
+            send_to_group_success = True
+
+        # ========== 15. 推送到通知服务（只在需要推送时）==========
+        if to_admin_if_no_group and notification_service and push_file:  # 添加 push_file 判断
+            try:
+                # 注意：这里需要重新创建 input_file，因为前面的可能已经被消耗
+                input_file_for_notification = FSInputFile(temp_file, filename=file_name)
                 await notification_service.send_document(
-                    chat_id, input_file, caption=caption
+                    chat_id, input_file_for_notification, caption=caption
                 )
             except Exception as e:
                 logger.warning(f"⚠️ [{operation_id}] 推送到通知服务失败: {e}")
 
-        # ========== 15. 后台清理 ==========
+        # ========== 16. 后台清理 ==========
         async def cleanup_background():
             await asyncio.sleep(2)
             if temp_file and os.path.exists(temp_file):
@@ -7609,7 +7618,8 @@ async def export_and_push_csv(
 
         asyncio.create_task(cleanup_background())
 
-        # ========== 16. 性能统计 ==========
+
+        # ========== 17. 性能统计 ==========
         duration = time.time() - start_time
         logger.info(
             f"✅ [{operation_id}] 数据导出完成\n"
