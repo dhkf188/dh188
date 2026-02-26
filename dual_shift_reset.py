@@ -140,22 +140,51 @@ async def _dual_shift_hard_reset(
             # 昨天的执行时间
             execute_time_yesterday = reset_time_natural_yesterday + timedelta(hours=2)
 
-            # 判断应该用哪个执行窗口（5分钟窗口）
-            EXECUTION_WINDOW = 300
+            # ===== 🎯 修改点：使用 >= 判断，保留30分钟窗口用于补执行 =====
+            EXECUTION_WINDOW = 1800  # 30分钟窗口（用于补执行判断）
 
-            time_to_today = abs((now - execute_time_today).total_seconds())
-            time_to_yesterday = abs((now - execute_time_yesterday).total_seconds())
-
-            if time_to_today <= EXECUTION_WINDOW:
+            # 情况1：已经过了今天的执行时间
+            if now >= execute_time_today:
                 target_date = business_yesterday
-                period_info = "正常执行"
-                logger.info(f"📅 正常执行窗口，目标日期: {target_date}")
-            elif time_to_yesterday <= EXECUTION_WINDOW:
-                target_date = business_yesterday
-                period_info = "补执行"
-                logger.warning(f"⚠️ 补执行场景，目标日期: {target_date}")
+                period_info = "正常执行（延迟）"
+                logger.info(f"📅 已过执行时间，立即执行，目标日期: {target_date}")
+                
+            # 情况2：还没到今天的执行时间，但可能是在补执行昨天的
             else:
-                logger.debug(f"⏳ 不在执行窗口内")
+                time_to_yesterday = abs((now - execute_time_yesterday).total_seconds())
+                if time_to_yesterday <= EXECUTION_WINDOW:
+                    target_date = business_yesterday - timedelta(days=1)  # 前天
+                    period_info = "补执行"
+                    logger.warning(f"⚠️ 补执行场景，目标日期: {target_date}")
+                else:
+                    logger.debug(f"⏳ 不在执行窗口内")
+                    return False
+
+            # ===== 后续代码保持不变 =====
+            # 幂等性检查
+            reset_flag_key = f"dual_reset:{chat_id}:{target_date.strftime('%Y%m%d')}"
+            from performance import global_cache
+
+            if global_cache.get(reset_flag_key):
+                logger.info(f"⏭️ 群组 {chat_id} 今天已执行")
+                return False
+
+            logger.info(
+                f"🚀 [双班重置] 群组 {chat_id}\n"
+                f"   ├─ 业务今天: {business_today}\n"
+                f"   ├─ 目标日期: {target_date}\n"
+                f"   ├─ 执行类型: {period_info}"
+            )
+
+            # 执行重置
+            result = await handle_hard_reset(chat_id, None, target_date=target_date)
+
+            if result is True:
+                global_cache.set(reset_flag_key, True, ttl=86400)
+                logger.info(f"✅ 成功")
+                return True
+            else:
+                logger.error(f"❌ 失败")
                 return False
 
         # ==================== 幂等性检查 ====================
