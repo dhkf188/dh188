@@ -148,7 +148,7 @@ async def _dual_shift_hard_reset(
                 target_date = business_yesterday
                 period_info = "正常执行（延迟）"
                 logger.info(f"📅 已过执行时间，立即执行，目标日期: {target_date}")
-                
+
             # 情况2：还没到今天的执行时间，但可能是在补执行昨天的
             else:
                 time_to_yesterday = abs((now - execute_time_yesterday).total_seconds())
@@ -161,9 +161,7 @@ async def _dual_shift_hard_reset(
                     return False
 
             # ===== 后续代码保持不变 =====
-            # 幂等性检查
             reset_flag_key = f"dual_reset:{chat_id}:{target_date.strftime('%Y%m%d')}"
-            from performance import global_cache
 
             if global_cache.get(reset_flag_key):
                 logger.info(f"⏭️ 群组 {chat_id} 今天已执行")
