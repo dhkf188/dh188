@@ -1,8 +1,8 @@
 import logging
 import asyncio
-import time
+import time as system_time
 import json
-from datetime import datetime, timedelta, date, time
+from datetime import datetime, timedelta, date
 from config import beijing_tz
 from typing import Dict, Any, List, Optional, Union
 from config import Config, beijing_tz
@@ -39,7 +39,7 @@ class PostgreSQLDatabase:
     # ========== 重连机制 ==========
     async def _ensure_healthy_connection(self):
         """确保连接健康"""
-        current_time = time.time()
+        current_time = system_time.time()
         if current_time - self._last_connection_check < self._connection_check_interval:
             return True
 
@@ -112,7 +112,7 @@ class PostgreSQLDatabase:
             raise ValueError("只能指定一种查询类型: fetch, fetchrow 或 fetchval")
 
         for attempt in range(max_retries + 1):
-            start_time = time.time()
+            start_time = system_time.time()
             try:
                 async with self.pool.acquire() as conn:
                     await conn.execute(f"SET statement_timeout = {timeout * 1000}")
@@ -126,7 +126,7 @@ class PostgreSQLDatabase:
                     else:
                         result = await conn.execute(query, *args)
 
-                    execution_time = time.time() - start_time
+                    execution_time = system_time.time() - start_time
 
                     # 🆕 动态慢查询日志
                     if execution_time > slow_threshold:
@@ -215,7 +215,7 @@ class PostgreSQLDatabase:
                 await self.cleanup_cache()
 
                 # 定期清理月度数据（可选）
-                current_time = time.time()
+                current_time = system_time.time()
                 if current_time % 3600 < 60:  # 每小时执行一次
                     try:
                         await self.cleanup_old_data(days=Config.DATA_RETENTION_DAYS)
@@ -713,7 +713,7 @@ class PostgreSQLDatabase:
     # ========== 缓存管理 ==========
     def _get_cached(self, key: str):
         """获取缓存数据"""
-        if key in self._cache_ttl and time.time() < self._cache_ttl[key]:
+        if key in self._cache_ttl and system_time.time() < self._cache_ttl[key]:
             return self._cache.get(key)
         else:
             # 清理过期缓存
@@ -726,11 +726,11 @@ class PostgreSQLDatabase:
     def _set_cached(self, key: str, value: Any, ttl: int = 60):
         """设置缓存数据"""
         self._cache[key] = value
-        self._cache_ttl[key] = time.time() + ttl
+        self._cache_ttl[key] = system_time.time() + ttl
 
     async def cleanup_cache(self):
         """🆕 增强的缓存清理 - 过期清理 + LRU清理"""
-        current_time = time.time()
+        current_time = system_time.time()
         expired_keys = [
             key for key, expiry in self._cache_ttl.items() if current_time >= expiry
         ]
