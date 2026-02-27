@@ -3,7 +3,7 @@ import asyncio
 import time as system_time
 import json
 from datetime import datetime, timedelta, date
-from config import beijing_tz
+from datetime import time as dt_time
 from typing import Dict, Any, List, Optional, Union
 from config import Config, beijing_tz
 import asyncpg
@@ -3442,7 +3442,7 @@ class PostgreSQLDatabase:
                 month_start_dt = datetime.combine(
                     month_start, datetime.min.time()
                 ).replace(tzinfo=beijing_tz)
-                month_end_dt = datetime.combine(month_end, time(0, 0)).replace(
+                month_end_dt = datetime.combine(month_end, dt_time(0, 0)).replace(
                     tzinfo=beijing_tz
                 )
 
