@@ -2,7 +2,7 @@ import logging
 import asyncio
 import time
 import json
-from datetime import datetime, timedelta, date
+from datetime import datetime, timedelta, date, time
 from config import beijing_tz
 from typing import Dict, Any, List, Optional, Union
 from config import Config, beijing_tz
