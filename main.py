@@ -88,12 +88,16 @@ active_back_processing: Dict[str, bool] = {}
 # ========== 日志中间件 ==========
 class LoggingMiddleware(BaseMiddleware):
     async def __call__(self, handler, event: types.Message, data):
+        # ===== 第三步修复：每次收到消息更新健康时间戳 =====
+        if hasattr(bot_manager, "_last_successful_connection"):
+            bot_manager._last_successful_connection = time.time()
+        # ===== 第三步修复结束 =====
+        
         if event.text:
             logger.info(
                 f"📨 收到消息: chat_id={event.chat.id}, uid={event.from_user.id}, text='{event.text}'"
             )
         return await handler(event, data)
-
 
 # ========== 上下班打卡辅助函数 ==========
 def get_user_lock(chat_id: int, uid: int):
@@ -7765,7 +7769,7 @@ async def on_startup():
     logger.info("🎯 机器人启动中...")
 
     await bot_manager.initialize()
-    
+
     try:
         await bot_manager.bot.delete_webhook(drop_pending_updates=True)
 
