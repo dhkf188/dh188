@@ -1,16 +1,95 @@
-# render.yaml
+# render.yaml - 优化版
 services:
   - type: web
-    name: telegram-bot
+    name: group-checkin-bot
     env: docker
-    docker:
-      dockerfile: Dockerfile
+    plan: free  # 明确指定免费计划
+    dockerfilePath: ./Dockerfile
+    autoDeploy: true  # 自动部署
+    healthCheckPath: /health
+    numInstances: 1  # 免费版只能单实例
+    
     envVars:
+      # 必需配置
       - key: BOT_TOKEN
-        value: your_bot_token_here
+        sync: false  # 在 Render Dashboard 手动设置，避免明文
       - key: DATABASE_URL
-        value: your_postgresql_url_here
+        sync: false  # 在 Render Dashboard 手动设置
+        
+      # 管理员配置
       - key: ADMIN_IDS
         value: "8356418002,6607669683"
+        
+      # 运行模式 - 免费版必须用 polling
       - key: BOT_MODE
-        value: "polling" # Render 免费版必须用 polling
+        value: "polling"
+        
+      # 数据库连接池配置 - 免费版优化
+      - key: DB_MIN_CONNECTIONS
+        value: "1"  # 免费版降低连接数
+      - key: DB_MAX_CONNECTIONS
+        value: "3"  # 免费版降低连接数
+      - key: DB_POOL_RECYCLE
+        value: "1800"
+      - key: DB_CONNECTION_TIMEOUT
+        value: "30"
+        
+      # 时间配置
+      - key: DAILY_RESET_HOUR
+        value: "0"
+      - key: DAILY_RESET_MINUTE
+        value: "0"
+        
+      # 双班模式配置
+      - key: SHIFT_GRACE_BEFORE
+        value: "120"
+      - key: SHIFT_GRACE_AFTER
+        value: "360"
+      - key: WORKEND_GRACE_BEFORE
+        value: "120"
+      - key: WORKEND_GRACE_AFTER
+        value: "360"
+        
+      # 数据保留配置 - 免费版缩短保留时间
+      - key: DATA_RETENTION_DAYS
+        value: "15"  # 从30天改为15天
+      - key: MONTHLY_DATA_RETENTION_DAYS
+        value: "30"  # 从40天改为30天
+        
+      # 月度导出配置
+      - key: MONTHLY_EXPORT_ENABLED
+        value: "true"
+      - key: MONTHLY_EXPORT_HOUR
+        value: "2"
+      - key: MONTHLY_EXPORT_MINUTE
+        value: "0"
+        
+      # 自动清理配置
+      - key: AUTO_CLEANUP_ENABLED
+        value: "true"
+      - key: CLEANUP_HOUR
+        value: "3"
+      - key: CLEANUP_MINUTE
+        value: "0"
+        
+      # 清理间隔
+      - key: CLEANUP_INTERVAL
+        value: "600"
+        
+      # 保活配置 - 免费版必须
+      - key: KEEPALIVE_ENABLED
+        value: "true"
+      - key: KEEPALIVE_INTERVAL
+        value: "300"  # 5分钟，免费版保活
+        
+      # 日志级别
+      - key: LOG_LEVEL
+        value: "INFO"
+        
+      # 性能监控
+      - key: ENABLE_PERFORMANCE_MONITOR
+        value: "true"
+        
+      # 消息长度限制
+      - key: MAX_MESSAGE_LENGTH
+        value: "4096"
