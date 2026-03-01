@@ -7,6 +7,18 @@ services:
     autoDeploy: true
     healthCheckPath: /health
     numInstances: 1
+    
+    # ===== 新增：滚动更新策略 =====
+    deploy:
+      strategy: rolling
+      rollingConfig:
+        maxSurge: 0        # 不允许启动新实例后再停止旧实例
+        maxUnavailable: 1  # 允许停止旧实例后再启动新实例
+    # ===== 新增结束 =====
+    
+    # ===== 新增：优雅关闭设置 =====
+    gracefulStopTimeout: 30  # 给容器30秒完成清理
+    # ===== 新增结束 =====
 
     envVars:
       # 必需配置 - 在 Dashboard 手动设置
@@ -44,6 +56,10 @@ services:
         value: "120"
       - key: SHIFT_GRACE_AFTER
         value: "360"
+      - key: WORKEND_GRACE_BEFORE  # 新增：下班专用宽容窗口
+        value: "120"
+      - key: WORKEND_GRACE_AFTER   # 新增
+        value: "360"
 
       # 数据保留 - 免费版优化
       - key: DATA_RETENTION_DAYS
@@ -57,6 +73,16 @@ services:
       - key: KEEPALIVE_INTERVAL
         value: "300"
 
+      # ===== 新增：启动延迟配置 =====
+      - key: STARTUP_DELAY
+        value: "10"  # 启动延迟10秒，让旧容器完全退出
+      # ===== 新增结束 =====
+
       # 日志级别
       - key: LOG_LEVEL
         value: "INFO"
+      
+      # ===== 新增：实例标识 =====
+      - key: RENDER_INSTANCE_ID  # Render 会自动设置这个变量
+        value: "{{RENDER_INSTANCE_ID}}"
+      # ===== 新增结束 =====
