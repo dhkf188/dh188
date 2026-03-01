@@ -7,22 +7,22 @@ services:
     autoDeploy: true
     healthCheckPath: /health
     numInstances: 1
-    
+
     envVars:
       # 必需配置 - 在 Dashboard 手动设置
       - key: BOT_TOKEN
         sync: false
       - key: DATABASE_URL
         sync: false
-        
+
       # 管理员配置
       - key: ADMIN_IDS
         value: "8356418002,6607669683"
-        
+
       # 运行模式 - 免费版必须用 polling
       - key: BOT_MODE
         value: "polling"
-        
+
       # 数据库连接池 - 免费版优化
       - key: DB_MIN_CONNECTIONS
         value: "1"
@@ -32,31 +32,31 @@ services:
         value: "1800"
       - key: DB_CONNECTION_TIMEOUT
         value: "30"
-        
+
       # 时间配置
       - key: DAILY_RESET_HOUR
         value: "0"
       - key: DAILY_RESET_MINUTE
         value: "0"
-        
+
       # 双班模式配置
       - key: SHIFT_GRACE_BEFORE
         value: "120"
       - key: SHIFT_GRACE_AFTER
         value: "360"
-        
+
       # 数据保留 - 免费版优化
       - key: DATA_RETENTION_DAYS
         value: "15"
       - key: MONTHLY_DATA_RETENTION_DAYS
         value: "30"
-        
+
       # 保活配置
       - key: KEEPALIVE_ENABLED
         value: "true"
       - key: KEEPALIVE_INTERVAL
         value: "300"
-        
+
       # 日志级别
       - key: LOG_LEVEL
         value: "INFO"
