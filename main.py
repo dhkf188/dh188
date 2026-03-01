@@ -7763,6 +7763,9 @@ async def keepalive_loop():
 async def on_startup():
     """启动时执行"""
     logger.info("🎯 机器人启动中...")
+
+    await bot_manager.initialize()
+    
     try:
         await bot_manager.bot.delete_webhook(drop_pending_updates=True)
 
