@@ -263,6 +263,12 @@ class RobustBotManager:
         self._conflict_count = 0
         force_resolve_attempted = False
 
+        # ===== 第二步修复：在进入循环前初始化时间戳 =====
+        # 这表示轮询即将开始，Bot 是健康的
+        self._last_successful_connection = time.time()
+        logger.info(f"[{self._instance_id}] ✅ Bot准备开始轮询，健康时间戳已初始化")
+        # ===== 第二步修复结束 =====
+
         while self._is_running and self._current_retry < self._max_retries:
             try:
                 if self._shutdown_event.is_set():
@@ -281,18 +287,18 @@ class RobustBotManager:
                     if self._shutdown_event.is_set():
                         break
 
+                # ===== 重要：在每次轮询尝试前也更新时间戳 =====
+                self._last_successful_connection = time.time()
+                # ===== 结束 =====
+
                 await self.dispatcher.start_polling(
                     self.bot, skip_updates=True, **polling_config
                 )
 
-                # 成功
-                self._last_successful_connection = time.time()
-                self._current_retry = 0
-                consecutive_errors = 0
-                self._conflict_count = 0
-                force_resolve_attempted = False
-                logger.info(f"[{self._instance_id}] ✅ Bot轮询成功")
-                break
+                # 这里的代码永远不会执行，因为 start_polling 会阻塞
+                # 成功后的处理实际上永远不会到达这里
+                # 但保留这部分代码以防未来版本变化
+                logger.info(f"[{self._instance_id}] ⚠️ start_polling 意外退出")
 
             except asyncio.CancelledError:
                 logger.info(f"[{self._instance_id}] Bot轮询被取消")
