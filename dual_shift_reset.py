@@ -96,14 +96,33 @@ async def _dual_shift_hard_reset(
             time_to_today = abs((now - execute_time_today).total_seconds())
             time_to_yesterday = abs((now - execute_time_yesterday).total_seconds())
 
+            logger.info(
+                f"📅 重置窗口检查:\n"
+                f"   ├─ 当前时间: {now.strftime('%H:%M:%S')}\n"
+                f"   ├─ 今日执行窗口: {execute_time_today.strftime('%H:%M')} ±{EXECUTION_WINDOW/60}分钟\n"
+                f"   ├─ 昨日执行窗口: {execute_time_yesterday.strftime('%H:%M')} ±{EXECUTION_WINDOW/60}分钟\n"
+                f"   ├─ 今日时间差: {time_to_today:.0f}秒\n"
+                f"   └─ 昨日时间差: {time_to_yesterday:.0f}秒"
+            )
+
             if time_to_today <= EXECUTION_WINDOW:
                 target_date = business_yesterday
                 period_info = "正常执行"
                 logger.info(f"📅 正常执行窗口，目标日期: {target_date}")
+
             elif time_to_yesterday <= EXECUTION_WINDOW:
-                target_date = business_yesterday
-                period_info = "补执行"
-                logger.warning(f"⚠️ 补执行场景，目标日期: {target_date}")
+                # 改进补执行逻辑：检查昨天是否真的执行过
+                is_completed = await db.is_reset_completed(chat_id, business_yesterday)
+
+                if not is_completed:
+                    target_date = business_yesterday  # 补执行昨天的
+                    period_info = "补执行"
+                    logger.warning(
+                        f"⚠️ 补执行场景，目标日期: {target_date}（昨天未执行）"
+                    )
+                else:
+                    logger.info(f"✅ 昨天已执行，跳过补执行")
+                    return False
             else:
                 logger.debug(f"⏳ 不在执行窗口内")
                 return False
@@ -259,6 +278,10 @@ async def _dual_shift_hard_reset(
             logger.error(f"❌ [发送通知] 失败: {e}")
 
         global_cache.set(reset_flag_key, True, ttl=86400)
+
+        # ===== 新增：持久化到数据库 =====
+        await db.mark_reset_completed(chat_id, target_date)
+
         logger.info(f"✅ [双班重置] 群组 {chat_id} 执行成功，已设置幂等标记")
 
         total_time = time.time() - total_start_time
@@ -1055,3 +1078,79 @@ async def recover_shift_states():
     except Exception as e:
         logger.error(f"❌ 用户班次状态恢复过程失败: {e}")
         return 0
+
+
+# ========== 10. 新增：启动时检查未完成重置 ==========
+async def check_missed_resets_on_startup():
+    """系统启动时检查是否有错过的重置"""
+    logger.info("🔍 开始检查是否有未完成的重置...")
+
+    try:
+        now = db.get_beijing_time()
+        all_groups = await db.get_all_groups()
+
+        if not all_groups:
+            logger.info("没有需要检查的群组")
+            return
+
+        # 使用信号量控制并发
+        sem = asyncio.Semaphore(5)
+
+        async def check_group(chat_id):
+            async with sem:
+                try:
+                    group_data = await db.get_group_cached(chat_id)
+                    if not group_data:
+                        return
+
+                    reset_hour = group_data.get("reset_hour", 0)
+                    reset_minute = group_data.get("reset_minute", 0)
+
+                    date_range = await db.get_business_date_range(chat_id, now)
+                    business_today = date_range["business_today"]
+                    business_yesterday = date_range["business_yesterday"]
+
+                    # 检查昨天的重置
+                    is_completed = await db.is_reset_completed(
+                        chat_id, business_yesterday
+                    )
+
+                    if not is_completed:
+                        reset_time = now.replace(
+                            hour=reset_hour,
+                            minute=reset_minute,
+                            second=0,
+                            microsecond=0,
+                        )
+                        hours_since = (now - reset_time).total_seconds() / 3600
+
+                        logger.warning(
+                            f"⚠️ 未完成重置: 群组={chat_id}, 日期={business_yesterday}, "
+                            f"已过{hours_since:.1f}小时"
+                        )
+
+                        # 只在4小时内自动执行
+                        if 0 <= hours_since <= 4:
+                            cache_key = f"dual_reset:{chat_id}:{business_yesterday.strftime('%Y%m%d')}"
+                            if not global_cache.get(cache_key):
+                                logger.info(f"🔄 自动执行错过的重置: 群组 {chat_id}")
+                                result = await handle_hard_reset(
+                                    chat_id, None, target_date=business_yesterday
+                                )
+                                if result:
+                                    logger.info(f"✅ 自动执行成功")
+                                    return 1
+                        return 0
+                except Exception as e:
+                    logger.error(f"检查群组 {chat_id} 失败: {e}")
+                    return 0
+
+        # 并发检查所有群组
+        tasks = [check_group(cid) for cid in all_groups]
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+
+        executed = sum(1 for r in results if r == 1)
+        logger.info(f"📊 启动检查完成: 自动执行 {executed} 个重置")
+
+    except Exception as e:
+        logger.error(f"❌ 启动检查失败: {e}")
