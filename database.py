@@ -202,19 +202,30 @@ class PostgreSQLDatabase:
 
         while self._maintenance_running:
             try:
+                # 每一分钟检查一次基础健康状态
                 await asyncio.sleep(60)
 
+                # 1. 确保连接池健康，如果不健康则尝试恢复
                 if not await self._ensure_healthy_connection():
                     logger.warning("连接维护: 数据库连接不健康")
+                    continue
 
+                # 2. 清理内存缓存，释放不再需要的资源
                 await self.cleanup_cache()
 
+                # 3. 监控连接池内部状态（死锁、慢查询、连接数）
                 await self._monitor_pool_health()
 
+                # 4. 定期任务：每小时执行一次深度数据清理
                 current_time = time.time()
-                if current_time % 3600 < 60:
+                if int(current_time) % 3600 < 60:  # 每小时执行一次
                     try:
+                        # 清理常规业务旧数据
                         await self.cleanup_old_data(days=Config.DATA_RETENTION_DAYS)
+
+                        # ===== 新增：清理旧的重置日志 (保持 90 天) =====
+                        await self.cleanup_old_reset_logs(days=90)
+
                         logger.debug("定期数据清理完成")
                     except Exception as e:
                         logger.error(f"定期数据清理失败: {e}")
@@ -224,6 +235,7 @@ class PostgreSQLDatabase:
                 break
             except Exception as e:
                 logger.error(f"连接维护任务异常: {e}")
+                # 发生异常时增加额外等待，防止循环过快导致 CPU 占用或日志刷屏
                 await asyncio.sleep(30)
 
     async def _monitor_pool_health(self):
@@ -245,14 +257,16 @@ class PostgreSQLDatabase:
             # ===== 2. 检查是否有死锁 =====
             try:
                 async with self.pool.acquire() as conn:
-                    deadlocks = await conn.fetch("""
+                    deadlocks = await conn.fetch(
+                        """
                         SELECT pid, query, age(now(), query_start) as duration,
                                datname, usename, application_name
                         FROM pg_stat_activity
                         WHERE state = 'active' 
                           AND wait_event_type = 'Lock'
                           AND pid != pg_backend_pid()
-                    """)
+                    """
+                    )
 
                     if deadlocks:
                         logger.error(f"🔒 检测到 {len(deadlocks)} 个死锁:")
@@ -271,19 +285,23 @@ class PostgreSQLDatabase:
             # ===== 3. 检查长时间运行的事务 =====
             try:
                 async with self.pool.acquire() as conn:
-                    long_tx = await conn.fetch("""
+                    long_tx = await conn.fetch(
+                        """
                         SELECT pid, query, age(now(), xact_start) as duration
                         FROM pg_stat_activity
                         WHERE state = 'active' 
                           AND xact_start < now() - interval '5 minutes'
                           AND pid != pg_backend_pid()
                         LIMIT 10
-                    """)
+                    """
+                    )
 
                     if long_tx:
                         logger.warning(f"⏱️ 检测到 {len(long_tx)} 个长时间运行的事务:")
                         for tx in long_tx[:3]:
-                            logger.warning(f"  • PID: {tx['pid']}, 时长: {tx['duration']}")
+                            logger.warning(
+                                f"  • PID: {tx['pid']}, 时长: {tx['duration']}"
+                            )
             except Exception as e:
                 logger.debug(f"长时间事务检查失败: {e}")
 
@@ -291,7 +309,8 @@ class PostgreSQLDatabase:
             try:
                 async with self.pool.acquire() as conn:
                     # 使用 SQL 查询获取连接统计，完全不依赖内部属性
-                    stats = await conn.fetchrow("""
+                    stats = await conn.fetchrow(
+                        """
                         SELECT 
                             COUNT(*) as total_connections,
                             COUNT(*) FILTER (WHERE state = 'active') as active_connections,
@@ -301,15 +320,16 @@ class PostgreSQLDatabase:
                             MAX(EXTRACT(EPOCH FROM (now() - query_start))) FILTER (WHERE state = 'active') as max_query_seconds
                         FROM pg_stat_activity
                         WHERE datname = current_database()
-                    """)
+                    """
+                    )
 
                     if stats:
-                        total = stats['total_connections'] or 0
-                        active = stats['active_connections'] or 0
-                        idle = stats['idle_connections'] or 0
-                        idle_tx = stats['idle_in_transaction'] or 0
-                        waiting = stats['waiting_connections'] or 0
-                        max_query_sec = stats['max_query_seconds'] or 0
+                        total = stats["total_connections"] or 0
+                        active = stats["active_connections"] or 0
+                        idle = stats["idle_connections"] or 0
+                        idle_tx = stats["idle_in_transaction"] or 0
+                        waiting = stats["waiting_connections"] or 0
+                        max_query_sec = stats["max_query_seconds"] or 0
 
                         # 记录统计信息
                         logger.debug(
@@ -342,7 +362,9 @@ class PostgreSQLDatabase:
 
             # ===== 5. 可选：获取连接池配置信息（如果可用）=====
             try:
-                if hasattr(self.pool, '_holders') and isinstance(self.pool._holders, list):
+                if hasattr(self.pool, "_holders") and isinstance(
+                    self.pool._holders, list
+                ):
                     # _holders 是列表，可以获取长度
                     holder_count = len(self.pool._holders)
                     logger.debug(f"📦 连接池内部: 持有 {holder_count} 个连接")
@@ -736,6 +758,16 @@ class PostgreSQLDatabase:
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                     UNIQUE(chat_id, user_id, handover_date, shift_type, cycle_number)
+                )
+                """,
+                """
+                CREATE TABLE IF NOT EXISTS reset_logs (
+                    id SERIAL PRIMARY KEY,
+                    chat_id BIGINT NOT NULL,
+                    reset_date DATE NOT NULL,
+                    completed_at TIMESTAMP NOT NULL DEFAULT NOW(),
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    UNIQUE(chat_id, reset_date)
                 )
                 """,
             ]
@@ -4561,6 +4593,69 @@ class PostgreSQLDatabase:
 
         logger.info(f"🧹 清理了 {deleted_count} 个长期未活动的用户以及他们的所有记录")
         return deleted_count
+
+    # ========== 重置日志管理 ==========
+    async def mark_reset_completed(self, chat_id: int, target_date: date) -> bool:
+        """标记重置已完成（持久化到数据库）"""
+        try:
+            async with self.pool.acquire() as conn:
+                await conn.execute(
+                    """
+                    INSERT INTO reset_logs (chat_id, reset_date, completed_at)
+                    VALUES ($1, $2, NOW())
+                    ON CONFLICT (chat_id, reset_date) DO NOTHING
+                """,
+                    chat_id,
+                    target_date,
+                )
+            logger.debug(f"✅ 已持久化重置标记: 群组 {chat_id}, 日期 {target_date}")
+            return True
+        except Exception as e:
+            logger.error(f"❌ 持久化重置标记失败: {e}")
+            return False
+
+    async def is_reset_completed(self, chat_id: int, target_date: date) -> bool:
+        """检查重置是否已完成"""
+        try:
+            async with self.pool.acquire() as conn:
+                result = await conn.fetchval(
+                    """
+                    SELECT 1 FROM reset_logs
+                    WHERE chat_id = $1 AND reset_date = $2
+                """,
+                    chat_id,
+                    target_date,
+                )
+                return result is not None
+        except Exception as e:
+            logger.error(f"❌ 检查重置标记失败: {e}")
+            return False
+
+    async def cleanup_old_reset_logs(self, days: int = 90):
+        """清理旧的 reset_logs（保留90天）"""
+        try:
+            cutoff_date = (self.get_beijing_time() - timedelta(days=days)).date()
+            async with self.pool.acquire() as conn:
+                result = await conn.execute(
+                    """
+                    DELETE FROM reset_logs WHERE reset_date < $1
+                """,
+                    cutoff_date,
+                )
+
+                deleted = 0
+                if result and result.startswith("DELETE"):
+                    try:
+                        deleted = int(result.split()[-1])
+                    except (ValueError, IndexError):
+                        pass
+
+                if deleted > 0:
+                    logger.info(f"🧹 清理了 {deleted} 条旧重置日志")
+                return deleted
+        except Exception as e:
+            logger.error(f"清理重置日志失败: {e}")
+            return 0
 
     # ========== 活动人数限制 ==========
     async def set_activity_user_limit(self, activity: str, max_users: int):
