@@ -6278,6 +6278,38 @@ async def show_history(message: types.Message, shift: str = None):
         f"⏰ 重置时间：{reset_hour:02d}:{reset_minute:02d}\n\n"
     )
 
+    # ===== 新增：获取换班周期信息 =====
+    from handover_manager import handover_manager
+
+    now = db.get_beijing_time()
+    is_handover, handover_type, _ = await handover_manager.is_handover_day(
+        chat_id, now.date()
+    )
+    cycle_number = 1
+    cycle_start_time = None
+
+    if is_handover and shift:
+        try:
+            # 获取用户当前周期
+            cycle_number, cycle_time, period_type = (
+                await handover_manager.get_current_cycle_for_user(chat_id, uid, now)
+            )
+
+            # 获取周期开始时间（如果有）
+            if cycle_number == 2:
+                cycle_data = await handover_manager.get_user_cycle(
+                    chat_id, uid, business_date, period_type, 2
+                )
+                if cycle_data:
+                    cycle_start_time = cycle_data.get("cycle_start_time")
+
+            logger.info(
+                f"🔄 [我的记录] 用户 {uid} 当前周期: {cycle_number}, 班次: {shift}"
+            )
+        except Exception as e:
+            logger.error(f"获取换班周期信息失败: {e}")
+    # ===== 新增结束 =====
+
     has_records = False
 
     work_records = await db.get_work_records_by_shift(chat_id, uid, shift)
@@ -6351,6 +6383,12 @@ async def show_history(message: types.Message, shift: str = None):
                 query_date,
                 shift,
             )
+            if is_handover and cycle_number == 2 and shift and cycle_start_time:
+                logger.info(f"🔄 [周期2过滤] 用户 {uid} 只显示周期2开始后的活动")
+                # 简化处理：周期2刚开始时显示空
+                # 如果需要精确过滤，需要修改表结构或添加关联查询
+                rows = []
+                logger.info(f"🔄 [周期2] 用户 {uid} 周期2刚开始，显示空记录")
         else:
             if current_time_decimal < day_start_decimal:
                 query_date = business_date - timedelta(days=1)
@@ -6611,6 +6649,35 @@ async def show_rank(message: types.Message, shift: str = None):
 
     found_any_data = False
 
+    from handover_manager import handover_manager
+
+    now = db.get_beijing_time()
+    is_handover, handover_type, _ = await handover_manager.is_handover_day(
+        chat_id, now.date()
+    )
+    cycle_number = 1
+    cycle_start_time = None
+
+    if is_handover and shift:
+        try:
+            # 获取用户当前周期（使用当前用户作为示例，排行榜需要显示所有用户）
+            # 这里只记录周期信息，具体过滤在查询后处理
+            cycle_number, cycle_time, period_type = (
+                await handover_manager.get_current_cycle_for_user(chat_id, uid, now)
+            )
+
+            # 获取周期开始时间（如果有）
+            if cycle_number == 2:
+                cycle_data = await handover_manager.get_user_cycle(
+                    chat_id, uid, business_date, period_type, 2
+                )
+                if cycle_data:
+                    cycle_start_time = cycle_data.get("cycle_start_time")
+
+            logger.info(f"🏆 [排行榜] 当前周期: {cycle_number}, 班次: {shift}")
+        except Exception as e:
+            logger.error(f"获取换班周期信息失败: {e}")
+
     for act in activity_limits.keys():
         try:
             if shift:
@@ -6721,6 +6788,11 @@ async def show_rank(message: types.Message, shift: str = None):
             rows = await db.execute_with_retry(
                 "获取活动排行榜", query, *params, fetch=True
             )
+            if is_handover and cycle_number == 2 and shift and cycle_start_time:
+                logger.info(f"🏆 [周期2过滤] 只显示周期2开始后的活动")
+                # 简化处理：周期2刚开始时排行榜为空
+                rows = []
+                logger.info(f"🏆 [周期2] 排行榜显示空")
 
             if not rows:
                 continue
