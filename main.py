@@ -341,7 +341,7 @@ async def generate_monthly_report(chat_id: int, year: int = None, month: int = N
         f"• 总活动次数：<code>{total_activity_count}</code> 次\n"
         f"• 总工作天数：<code>{total_work_days}</code> 天\n"
         f"• 总工作时长：<code>{MessageFormatter.format_time(int(total_work_hours))}</code>\n"
-        f"• 总扣除绩效：<code>{total_fines}</code> 分\n\n"
+        f"• 总扣罚款金额：<code>{total_fines}</code> 泰铢\n\n"
     )
 
     total_work_start = sum(stat.get("work_start_count", 0) for stat in work_stats)
@@ -356,7 +356,7 @@ async def generate_monthly_report(chat_id: int, year: int = None, month: int = N
             f"🕒 <b>上下班统计</b>\n"
             f"• 上班打卡：<code>{total_work_start}</code> 次\n"
             f"• 下班打卡：<code>{total_work_end}</code> 次\n"
-            f"• 上下班罚款：<code>{total_work_fines}</code> 分\n\n"
+            f"• 上下班罚款：<code>{total_work_fines}</code> 泰铢\n\n"
         )
 
     if monthly_stats:
@@ -560,7 +560,7 @@ async def handle_expired_activity(
         )
 
         if fine_amount > 0:
-            timeout_msg += f"\n💰 超时扣除绩效：<code>{fine_amount}</code> 分"
+            timeout_msg += f"\n💰 超时罚款金额：<code>{fine_amount}</code> 泰铢"
 
         await bot.send_message(chat_id, timeout_msg, parse_mode="HTML")
 
@@ -1107,7 +1107,7 @@ async def activity_timer(
                     f"⏰ 自动回座时间：<code>{db.get_beijing_time().strftime('%m/%d %H:%M:%S')}</code>\n"
                     f"⏱️ 总活动时长：<code>{MessageFormatter.format_time(elapsed)}</code>\n"
                     f"⚠️ 系统自动回座原因：超时超过2小时\n"
-                    f"💰 本次扣除绩效：<code>{fine_amount}</code> 分"
+                    f"💰 本次罚款金额：<code>{fine_amount}</code> 泰铢"
                 )
 
                 if not notification_service.bot and bot_manager.bot:
@@ -1241,7 +1241,7 @@ async def activity_timer(
                     f"📝 活动：<code>{act}</code>\n"
                     f"📊 班次：<code>{shift_text}</code>\n"
                     f"⚠️ 超时超过2小时，系统已自动回座\n"
-                    f"💰 本次扣除绩效：<code>{break_data['fine_amount']}</code> 分数"
+                    f"💰 本次罚款金额：<code>{break_data['fine_amount']}</code> 泰铢"
                 )
                 await send_group_message(msg)
 
@@ -1939,7 +1939,7 @@ async def send_overtime_notification_async(
             f"📝 活动：<code>{act}</code>\n"
             f"⏰ 回座时间：<code>{now.strftime('%m/%d %H:%M:%S')}</code>\n"
             f"⏱️ 超时时长：<code>{overtime_str}</code>\n"
-            f"💰 扣除绩效：<code>{fine_amount}</code> 分"
+            f"💰 罚款金额：<code>{fine_amount}</code> 泰铢"
         )
 
         await notification_service.send_notification(chat_id, notif_text)
@@ -2276,7 +2276,7 @@ async def process_work_checkin(message: types.Message, checkin_type: str):
                 duration = MessageFormatter.format_duration(time_diff_seconds)
                 status = f"🚨 迟到 {duration}"
                 if fine_amount:
-                    status += f"\n💰扣除绩效: {fine_amount} 分"
+                    status += f"\n💰罚款金额: {fine_amount} 泰铢"
                 is_late_early = True
                 emoji_status = "😅"
 
@@ -2513,7 +2513,7 @@ async def process_work_checkin(message: types.Message, checkin_type: str):
                 duration = MessageFormatter.format_duration(abs(time_diff_seconds))
                 status = f"🚨 早退 {duration} \n"
                 if fine_amount:
-                    status += f"💰扣除绩效 {fine_amount} 分"
+                    status += f"💰罚款金额 {fine_amount} 泰铢"
                 is_late_early = True
                 emoji_status = "🏃"
             elif time_diff_seconds > 0:
@@ -3126,12 +3126,12 @@ async def send_work_notification(
             if action_text == "上班" and diff_seconds > 0:
                 extra_notif_text += (
                     f"⚠️ 迟到 {MessageFormatter.format_duration(diff_seconds)}，"
-                    f"💰扣除绩效：<code>{fine_amount}</code> 分"
+                    f"💰罚款金额：<code>{fine_amount}</code> 泰铢"
                 )
             elif action_text == "下班" and diff_seconds < 0:
                 extra_notif_text += (
                     f"⚠️ 早退 {MessageFormatter.format_duration(abs(diff_seconds))}，\n"
-                    f"💰扣除绩效：<code>{fine_amount}</code> 分"
+                    f"💰罚款金额：<code>{fine_amount}</code> 泰铢"
                 )
 
         logger.info(
@@ -5390,7 +5390,7 @@ async def cmd_setfine(message: types.Message):
         )
 
         logger.info(
-            f"群 {message.chat.id} 已设置活动罚款: {activity} {time_segment} -> {amount}分"
+            f"群 {message.chat.id} 已设置活动罚款: {activity} {time_segment} -> {amount} 泰铢"
         )
 
     except ValueError:
@@ -6825,9 +6825,9 @@ async def show_history(message: types.Message, shift: str = None):
     if fine_total > 0:
         if shift:
             shift_text = "白班" if shift == "day" else "夜班"
-            text += f"💰 {shift_text}累计罚款：<code>{fine_total}</code> 分\n"
+            text += f"💰 {shift_text}累计罚款：<code>{fine_total}</code> 泰铢\n"
         else:
-            text += f"💰 累计罚款：<code>{fine_total}</code> 分\n"
+            text += f"💰 累计罚款：<code>{fine_total}</code> 泰铢\n"
 
     if is_dual_mode and not shift:
         text += (
@@ -8077,6 +8077,7 @@ async def initialize_services():
         logger.info(f"✅ 班次状态恢复完成: {shift_recovered} 个群组")
 
         from dual_shift_reset import check_missed_resets_on_startup
+
         asyncio.create_task(check_missed_resets_on_startup())
 
         health_status = await check_services_health()
