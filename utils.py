@@ -155,7 +155,7 @@ class MessageFormatter:
             message += f"\n⚠️ 超时提醒\n"
             message += f"▫️ 超时时长：{MessageFormatter.format_copyable_text(overtime_time)} 🚨\n"
             if fine_amount > 0:
-                message += f"▫️ 扣除绩效：{MessageFormatter.format_copyable_text(str(fine_amount))} 分 💸\n"
+                message += f"▫️ 罚款金额：{MessageFormatter.format_copyable_text(str(fine_amount))} 泰铢 💸\n"
 
         message += f"{dashed_line}\n"
         message += f"📊 今日总计\n"
