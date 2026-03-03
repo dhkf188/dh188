@@ -227,19 +227,18 @@ class PostgreSQLDatabase:
                 await asyncio.sleep(30)
 
     async def _monitor_pool_health(self):
-        """监控数据库健康状态（安全版）"""
+        """监控数据库健康状态（修复版）"""
         if not self.pool:
             return
 
         try:
-            # ===== 1. 首先测试连接是否正常 =====
+            # ===== 1. 基础连接测试 =====
             try:
                 async with self.pool.acquire() as conn:
                     await conn.fetchval("SELECT 1")
                 logger.debug("✅ 数据库连接正常")
             except Exception as e:
                 logger.error(f"❌ 数据库连接异常: {e}")
-                # 触发重连
                 self._last_connection_check = 0
                 return
 
@@ -263,7 +262,11 @@ class PostgreSQLDatabase:
                                 f"时长: {dl['duration']}, 查询: {dl['query'][:100]}..."
                             )
             except Exception as e:
-                logger.debug(f"死锁检查失败（可能权限不足）: {e}")
+                # 权限不足时降级
+                if "permission denied" in str(e).lower():
+                    logger.debug("死锁检测需要更高权限，已跳过")
+                else:
+                    logger.debug(f"死锁检查失败: {e}")
 
             # ===== 3. 检查长时间运行的事务 =====
             try:
@@ -274,6 +277,7 @@ class PostgreSQLDatabase:
                         WHERE state = 'active' 
                           AND xact_start < now() - interval '5 minutes'
                           AND pid != pg_backend_pid()
+                        LIMIT 10
                     """)
 
                     if long_tx:
@@ -283,46 +287,72 @@ class PostgreSQLDatabase:
             except Exception as e:
                 logger.debug(f"长时间事务检查失败: {e}")
 
-            # ===== 4. 检查空闲连接（使用数据库系统视图，而不是内部属性）=====
+            # ===== 4. 获取连接统计（安全方式）=====
             try:
                 async with self.pool.acquire() as conn:
-                    pool_stats = await conn.fetch("""
+                    # 使用 SQL 查询获取连接统计，完全不依赖内部属性
+                    stats = await conn.fetchrow("""
                         SELECT 
-                            count(*) as total_connections,
-                            count(*) filter (where state = 'idle') as idle_connections,
-                            count(*) filter (where state = 'active') as active_connections,
-                            count(*) filter (where wait_event_type = 'Lock') as waiting_connections
+                            COUNT(*) as total_connections,
+                            COUNT(*) FILTER (WHERE state = 'active') as active_connections,
+                            COUNT(*) FILTER (WHERE state = 'idle') as idle_connections,
+                            COUNT(*) FILTER (WHERE state = 'idle in transaction') as idle_in_transaction,
+                            COUNT(*) FILTER (WHERE wait_event_type = 'Lock') as waiting_connections,
+                            MAX(EXTRACT(EPOCH FROM (now() - query_start))) FILTER (WHERE state = 'active') as max_query_seconds
                         FROM pg_stat_activity
                         WHERE datname = current_database()
                     """)
 
-                    if pool_stats:
-                        stats = pool_stats[0]
+                    if stats:
                         total = stats['total_connections'] or 0
-                        idle = stats['idle_connections'] or 0
                         active = stats['active_connections'] or 0
+                        idle = stats['idle_connections'] or 0
+                        idle_tx = stats['idle_in_transaction'] or 0
                         waiting = stats['waiting_connections'] or 0
+                        max_query_sec = stats['max_query_seconds'] or 0
 
+                        # 记录统计信息
                         logger.debug(
-                            f"📊 数据库连接状态: 总计={total}, 空闲={idle}, "
-                            f"活跃={active}, 等待={waiting}"
+                            f"📊 数据库连接状态:\n"
+                            f"    ├─ 总计: {total}\n"
+                            f"    ├─ 活跃: {active}\n"
+                            f"    ├─ 空闲: {idle}\n"
+                            f"    ├─ 空闲事务: {idle_tx}\n"
+                            f"    ├─ 等待锁: {waiting}\n"
+                            f"    └─ 最长查询: {max_query_sec:.1f}秒"
                         )
 
-                        # 如果活跃连接太多，发出警告
+                        # 阈值告警
                         if active > Config.DB_MAX_CONNECTIONS * 0.8:
                             logger.warning(
                                 f"⚠️ 活跃连接数过高: {active}/{Config.DB_MAX_CONNECTIONS}"
                             )
 
-                        # 如果有等待的查询，发出警告
                         if waiting > 0:
                             logger.warning(f"⚠️ 有 {waiting} 个查询在等待锁")
+
+                        if idle_tx > 5:
+                            logger.warning(f"⚠️ 有 {idle_tx} 个连接在事务中空闲")
+
+                        if max_query_sec > 30:
+                            logger.warning(f"⚠️ 存在超过30秒的慢查询")
+
             except Exception as e:
                 logger.debug(f"获取连接统计失败: {e}")
 
+            # ===== 5. 可选：获取连接池配置信息（如果可用）=====
+            try:
+                if hasattr(self.pool, '_holders') and isinstance(self.pool._holders, list):
+                    # _holders 是列表，可以获取长度
+                    holder_count = len(self.pool._holders)
+                    logger.debug(f"📦 连接池内部: 持有 {holder_count} 个连接")
+            except Exception as e:
+                # 忽略内部属性访问错误
+                pass
+
         except Exception as e:
-            # 使用 debug 级别避免刷屏
-            logger.debug(f"连接池监控临时失败: {e}")
+            # 最外层异常处理
+            logger.error(f"连接池监控失败: {e}")
 
     async def _connection_maintenance_loop(self):
         """连接维护循环"""
