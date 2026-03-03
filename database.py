@@ -232,32 +232,60 @@ class PostgreSQLDatabase:
             return
 
         try:
-            # 获取连接池统计
-            free_connections = (
-                self.pool._queue.qsize() if hasattr(self.pool, "_queue") else 0
-            )
-            total_connections = (
-                self.pool._holders.qsize() if hasattr(self.pool, "_holders") else 0
-            )
+            # ===== 修复：安全地获取连接池统计信息 =====
+            # 尝试不同的方法来获取连接池信息
+            free_connections = 0
+            total_connections = 0
 
-            # 记录连接池状态
-            logger.debug(f"📊 连接池状态: 空闲 {free_connections}/{total_connections}")
+            # 方法1：尝试使用 _queue（适用于某些版本的 asyncpg）
+            if hasattr(self.pool, "_queue") and hasattr(self.pool._queue, "qsize"):
+                try:
+                    free_connections = self.pool._queue.qsize()
+                except:
+                    pass
 
-            # 预警：空闲连接太少
-            if free_connections < 2:
+            # 方法2：尝试使用 _holders（内部连接列表）
+            if hasattr(self.pool, "_holders"):
+                if isinstance(self.pool._holders, list):
+                    total_connections = len(self.pool._holders)
+                elif hasattr(self.pool._holders, "qsize"):
+                    try:
+                        total_connections = self.pool._holders.qsize()
+                    except:
+                        pass
+
+            # 方法3：如果都没有，尝试使用公共API
+            if total_connections == 0 and hasattr(self.pool, "_pool"):
+                # 某些版本的 asyncpg 使用 _pool
+                if isinstance(self.pool._pool, list):
+                    total_connections = len(self.pool._pool)
+                elif hasattr(self.pool._pool, "qsize"):
+                    try:
+                        total_connections = self.pool._pool.qsize()
+                    except:
+                        pass
+
+            # 方法4：使用当前已知连接数（从配置）
+            if total_connections == 0:
+                total_connections = Config.DB_MAX_CONNECTIONS
+
+            # 记录连接池状态（即使无法获取具体数字）
+            if total_connections > 0:
+                logger.debug(
+                    f"📊 连接池状态: 空闲约 {free_connections}/{total_connections} 连接"
+                )
+            else:
+                logger.debug(
+                    f"📊 连接池状态: 无法获取详细信息，最大连接数: {Config.DB_MAX_CONNECTIONS}"
+                )
+
+            # 预警：空闲连接太少（如果能够获取）
+            if free_connections > 0 and free_connections < 2:
                 logger.warning(
                     f"⚠️ 连接池即将耗尽: 空闲 {free_connections}/{total_connections}"
                 )
 
-                # 如果空闲连接为0，可能是连接泄漏，尝试自动扩容
-                if (
-                    free_connections == 0
-                    and total_connections < Config.DB_MAX_CONNECTIONS
-                ):
-                    logger.info("🔄 尝试自动扩容连接池")
-                    # 可以在这里添加扩容逻辑
-
-            # 检查是否有死锁
+            # ===== 检查是否有死锁 =====
             try:
                 async with self.pool.acquire() as conn:
                     deadlocks = await conn.fetch(
@@ -268,7 +296,7 @@ class PostgreSQLDatabase:
                         WHERE state = 'active' 
                           AND wait_event_type = 'Lock'
                           AND pid != pg_backend_pid()
-                    """
+                        """
                     )
 
                     if deadlocks:
@@ -281,7 +309,7 @@ class PostgreSQLDatabase:
             except Exception as e:
                 logger.debug(f"死锁检查失败（可能权限不足）: {e}")
 
-            # 可选：检查长时间运行的事务
+            # ===== 检查长时间运行的事务 =====
             try:
                 async with self.pool.acquire() as conn:
                     long_tx = await conn.fetch(
@@ -291,7 +319,7 @@ class PostgreSQLDatabase:
                         WHERE state = 'active' 
                           AND xact_start < now() - interval '5 minutes'
                           AND pid != pg_backend_pid()
-                    """
+                        """
                     )
 
                     if long_tx:
@@ -304,8 +332,28 @@ class PostgreSQLDatabase:
             except Exception as e:
                 logger.debug(f"长时间事务检查失败: {e}")
 
+            # ===== 添加：检查连接池的等待队列 =====
+            try:
+                async with self.pool.acquire() as conn:
+                    waiting_queries = await conn.fetch(
+                        """
+                        SELECT COUNT(*) as waiting_count
+                        FROM pg_stat_activity
+                        WHERE wait_event_type = 'Lock'
+                        AND state = 'active'
+                        """
+                    )
+                    if waiting_queries and waiting_queries[0]["waiting_count"] > 0:
+                        logger.warning(
+                            f"⏳ 有 {waiting_queries[0]['waiting_count']} 个查询在等待锁"
+                        )
+
+            except Exception as e:
+                logger.debug(f"等待队列检查失败: {e}")
+
         except Exception as e:
-            logger.error(f"连接池监控失败: {e}")
+            # 避免错误日志刷屏，降低日志级别
+            logger.debug(f"连接池监控临时失败: {e}")
 
     async def _connection_maintenance_loop(self):
         """连接维护循环"""
