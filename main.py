@@ -6528,37 +6528,39 @@ async def show_history(message: types.Message, shift: str = None):
         f"⏰ 重置时间：{reset_hour:02d}:{reset_minute:02d}\n\n"
     )
 
-    # ===== 新增：获取换班周期信息 =====
+    # ===== 获取换班周期信息 =====
     from handover_manager import handover_manager
 
     now = db.get_beijing_time()
-    is_handover, handover_type, _ = await handover_manager.is_handover_day(
-        chat_id, now.date()
-    )
-    cycle_number = 1
+    period = await handover_manager.determine_current_period(chat_id, now)
+    is_handover = period["is_handover"]
+    handover_type = period["period_type"]
+    cycle_number = period["cycle"]  # 从 period 获取正确的 cycle
     cycle_start_time = None
+    period_type = period["period_type"]
 
     if is_handover and shift:
         try:
-            # 获取用户当前周期
-            cycle_number, cycle_time, period_type = (
-                await handover_manager.get_current_cycle_for_user(chat_id, uid, now)
+            # 获取用户当前周期的累计时间
+            cycle_data = await handover_manager.get_user_cycle(
+                chat_id, uid, period["business_date"], period_type, cycle_number
             )
 
-            # 获取周期开始时间（如果有）
-            if cycle_number == 2:
-                cycle_data = await handover_manager.get_user_cycle(
-                    chat_id, uid, business_date, period_type, 2
+            if cycle_data and cycle_number == 2:
+                cycle_start_time = cycle_data.get("cycle_start_time")
+                # 可以记录周期累计时间用于显示
+                cycle_total_minutes = cycle_data.get("total_work_seconds", 0) // 60
+                logger.info(
+                    f"🔄 [我的记录] 用户 {uid} 周期{cycle_number} 已累计 {cycle_total_minutes} 分钟"
                 )
-                if cycle_data:
-                    cycle_start_time = cycle_data.get("cycle_start_time")
+            else:
+                logger.info(
+                    f"🔄 [我的记录] 用户 {uid} 当前周期: {cycle_number}, 班次: {shift}"
+                )
 
-            logger.info(
-                f"🔄 [我的记录] 用户 {uid} 当前周期: {cycle_number}, 班次: {shift}"
-            )
         except Exception as e:
             logger.error(f"获取换班周期信息失败: {e}")
-    # ===== 新增结束 =====
+    # ===== 获取换班周期信息结束 =====
 
     has_records = False
 
@@ -6902,31 +6904,31 @@ async def show_rank(message: types.Message, shift: str = None):
     from handover_manager import handover_manager
 
     now = db.get_beijing_time()
-    is_handover, handover_type, _ = await handover_manager.is_handover_day(
-        chat_id, now.date()
-    )
-    cycle_number = 1
+    period = await handover_manager.determine_current_period(chat_id, now)
+    is_handover = period["is_handover"]
+    handover_type = period["period_type"]
+    cycle_number = period["cycle"]  # 从 period 获取正确的 cycle
     cycle_start_time = None
+    period_type = period["period_type"]
 
     if is_handover and shift:
         try:
-            # 获取用户当前周期（使用当前用户作为示例，排行榜需要显示所有用户）
-            # 这里只记录周期信息，具体过滤在查询后处理
-            cycle_number, cycle_time, period_type = (
-                await handover_manager.get_current_cycle_for_user(chat_id, uid, now)
+            # 获取当前用户的周期信息（作为示例）
+            cycle_data = await handover_manager.get_user_cycle(
+                chat_id,
+                uid,
+                period["business_date"],
+                period_type,
+                cycle_number
             )
+            
+            if cycle_data and cycle_number == 2:
+                cycle_start_time = cycle_data.get("cycle_start_time")
+                logger.info(f"🏆 [排行榜] 当前周期: {cycle_number}, 班次: {shift}")
 
-            # 获取周期开始时间（如果有）
-            if cycle_number == 2:
-                cycle_data = await handover_manager.get_user_cycle(
-                    chat_id, uid, business_date, period_type, 2
-                )
-                if cycle_data:
-                    cycle_start_time = cycle_data.get("cycle_start_time")
-
-            logger.info(f"🏆 [排行榜] 当前周期: {cycle_number}, 班次: {shift}")
         except Exception as e:
             logger.error(f"获取换班周期信息失败: {e}")
+
 
     for act in activity_limits.keys():
         try:
