@@ -285,11 +285,43 @@ async def _dual_shift_hard_reset(
         return False
 
 
-# ========== 3. 统一强制结束所有未完成活动 ==========
+# ========== 新增：批量获取活动配置 ==========
+async def _get_activity_configs_batch(activities: List[str]) -> Dict[str, Dict]:
+    """
+    批量获取活动配置
+    返回格式: {
+        '活动名': {
+            'time_limit_seconds': int,
+            'fine_rates': Dict[str, int]
+        }
+    }
+    """
+    if not activities:
+        return {}
+
+    # 从缓存获取所有活动配置（只查询一次数据库）
+    all_limits = await db.get_activity_limits_cached()
+    all_fines = await db.get_fine_rates()
+
+    result = {}
+    unique_activities = set(activities)
+
+    for activity in unique_activities:
+        time_limit_min = all_limits.get(activity, {}).get("time_limit", 0)
+        result[activity] = {
+            "time_limit_seconds": time_limit_min * 60,
+            "fine_rates": all_fines.get(activity, {}),
+        }
+
+    logger.debug(f"📊 批量加载活动配置: {len(result)} 个活动: {list(result.keys())}")
+    return result
+
+
+# ========== 3. 统一强制结束所有未完成活动（优化版）==========
 async def _force_end_all_unfinished_shifts(
     chat_id: int, now: datetime, target_date: date, business_today: date
 ) -> Dict[str, Any]:
-    """强制结束所有进行中的活动（只结束业务昨天及之前开始的活动）"""
+    """强制结束所有进行中的活动（优化版，批量加载配置）"""
     stats = {
         "total": 0,
         "success": 0,
@@ -302,7 +334,8 @@ async def _force_end_all_unfinished_shifts(
     try:
         if not db.pool or not db._initialized:
             logger.error("数据库连接池未初始化")
-            return
+            return stats
+
         async with db.pool.acquire() as conn:
             rows = await conn.fetch(
                 """
@@ -321,13 +354,23 @@ async def _force_end_all_unfinished_shifts(
                 logger.info(f"📊 群组 {chat_id} 没有进行中的活动")
                 return stats
 
+            # ===== 批量获取活动配置 =====
+            activities = list(set(row["current_activity"] for row in rows))
+            activity_configs = await _get_activity_configs_batch(activities)
+
             logger.info(f"📊 发现 {len(rows)} 个进行中的活动，开始并发处理...")
 
             tasks = []
             for row in rows:
                 task = asyncio.create_task(
-                    _force_end_single_activity(
-                        conn, chat_id, row, now, target_date, business_today
+                    _force_end_single_activity_optimized(
+                        conn,
+                        chat_id,
+                        row,
+                        now,
+                        target_date,
+                        business_today,
+                        activity_configs,
                     )
                 )
                 tasks.append(task)
@@ -371,15 +414,17 @@ async def _force_end_all_unfinished_shifts(
     return stats
 
 
-async def _force_end_single_activity(
+# ========== 新增：优化版的强制结束单个活动 ==========
+async def _force_end_single_activity_optimized(
     conn,
     chat_id: int,
     user_row: dict,
     now: datetime,
     target_date: date,
     business_today: date,
+    activity_configs: Dict[str, Dict],
 ) -> Dict[str, Any]:
-    """强制结束单个活动"""
+    """强制结束单个活动（优化版，使用预加载配置）"""
     result = {
         "user_id": user_row["user_id"],
         "shift": user_row["shift"],
@@ -407,33 +452,32 @@ async def _force_end_single_activity(
 
         elapsed = int((now - start_time).total_seconds())
 
-        time_limit = await db.get_activity_time_limit(activity)
-        time_limit_seconds = time_limit * 60
+        # 使用预加载的配置
+        config = activity_configs.get(activity, {})
+        time_limit_seconds = config.get("time_limit_seconds", 0)
+        fine_rates = config.get("fine_rates", {})
+
         is_overtime = elapsed > time_limit_seconds
         overtime_seconds = max(0, elapsed - time_limit_seconds)
         overtime_minutes = overtime_seconds / 60
 
         fine_amount = 0
-        if is_overtime and overtime_seconds > 0:
-            fine_rates = await db.get_fine_rates_for_activity(activity)
-            if fine_rates:
-                segments = []
-                for k in fine_rates.keys():
-                    try:
-                        v = int(str(k).lower().replace("min", ""))
-                        segments.append(v)
-                    except:
-                        pass
-                segments.sort()
-                for s in segments:
-                    if overtime_minutes <= s:
-                        fine_amount = fine_rates.get(
-                            str(s), fine_rates.get(f"{s}min", 0)
-                        )
-                        break
-                if fine_amount == 0 and segments:
-                    m = segments[-1]
-                    fine_amount = fine_rates.get(str(m), fine_rates.get(f"{m}min", 0))
+        if is_overtime and overtime_seconds > 0 and fine_rates:
+            segments = []
+            for k in fine_rates.keys():
+                try:
+                    v = int(str(k).lower().replace("min", ""))
+                    segments.append(v)
+                except:
+                    pass
+            segments.sort()
+            for s in segments:
+                if overtime_minutes <= s:
+                    fine_amount = fine_rates.get(str(s), fine_rates.get(f"{s}min", 0))
+                    break
+            if fine_amount == 0 and segments:
+                m = segments[-1]
+                fine_amount = fine_rates.get(str(m), fine_rates.get(f"{m}min", 0))
 
         result["elapsed"] = elapsed
         result["fine"] = fine_amount
@@ -465,11 +509,30 @@ async def _force_end_single_activity(
     return result
 
 
-# ========== 4. 补全未打卡的下班记录 ==========
+# ========== 保留原版强制结束单个活动（兼容性）==========
+async def _force_end_single_activity(
+    conn,
+    chat_id: int,
+    user_row: dict,
+    now: datetime,
+    target_date: date,
+    business_today: date,
+) -> Dict[str, Any]:
+    """强制结束单个活动（保留原版，用于兼容性）"""
+    # 调用优化版，但需要临时获取配置
+    activities = [user_row["current_activity"]]
+    activity_configs = await _get_activity_configs_batch(activities)
+
+    return await _force_end_single_activity_optimized(
+        conn, chat_id, user_row, now, target_date, business_today, activity_configs
+    )
+
+
+# ========== 4. 补全未打卡的下班记录（优化版）==========
 async def _complete_missing_work_ends(
     chat_id: int, target_date: date, business_today: date
 ) -> Dict[str, Any]:
-    """为昨天有上班记录但没有下班记录的用户补全下班记录"""
+    """为昨天有上班记录但没有下班记录的用户补全下班记录（优化版）"""
     stats = {
         "total": 0,
         "success": 0,
@@ -482,7 +545,8 @@ async def _complete_missing_work_ends(
     try:
         if not db.pool or not db._initialized:
             logger.error("数据库连接池未初始化")
-            return
+            return stats
+
         async with db.pool.acquire() as conn:
             rows = await conn.fetch(
                 """
@@ -525,11 +589,20 @@ async def _complete_missing_work_ends(
 
             shift_config = await db.get_shift_config(chat_id)
 
+            # ===== 批量获取工作罚款配置 =====
+            work_fine_rates = await db.get_work_fine_rates_for_type("work_end")
+
             tasks = []
             for row in rows:
                 task = asyncio.create_task(
-                    _complete_single_work_end(
-                        conn, chat_id, row, target_date, auto_end_time, shift_config
+                    _complete_single_work_end_optimized(
+                        conn,
+                        chat_id,
+                        row,
+                        target_date,
+                        auto_end_time,
+                        shift_config,
+                        work_fine_rates,
                     )
                 )
                 tasks.append(task)
@@ -575,15 +648,17 @@ async def _complete_missing_work_ends(
     return stats
 
 
-async def _complete_single_work_end(
+# ========== 新增：优化版补全单个下班记录 ==========
+async def _complete_single_work_end_optimized(
     conn,
     chat_id: int,
     row: dict,
     target_date: date,
     auto_end_time: str,
     shift_config: dict,
+    work_fine_rates: Dict[str, int],
 ) -> Dict[str, Any]:
-    """补单单个用户的下班记录"""
+    """优化版：补全单个用户的下班记录"""
     result = {
         "user_id": row["user_id"],
         "shift": row["shift"],
@@ -616,13 +691,11 @@ async def _complete_single_work_end(
         time_diff_minutes = time_diff_seconds / 60
 
         fine_amount = 0
-        if time_diff_seconds < 0:
-            fine_rates = await db.get_work_fine_rates_for_type("work_end")
-            if fine_rates:
-                thresholds = sorted([int(k) for k in fine_rates.keys()])
-                for threshold in thresholds:
-                    if abs(time_diff_minutes) >= threshold:
-                        fine_amount = fine_rates[str(threshold)]
+        if time_diff_seconds < 0 and work_fine_rates:
+            thresholds = sorted([int(k) for k in work_fine_rates.keys()])
+            for threshold in thresholds:
+                if abs(time_diff_minutes) >= threshold:
+                    fine_amount = work_fine_rates[str(threshold)]
 
         work_duration = int((auto_end_dt - work_start_dt).total_seconds())
 
@@ -677,6 +750,22 @@ async def _complete_single_work_end(
         raise
 
     return result
+
+
+# ========== 保留原版补全单个下班记录（兼容性）==========
+async def _complete_single_work_end(
+    conn,
+    chat_id: int,
+    row: dict,
+    target_date: date,
+    auto_end_time: str,
+    shift_config: dict,
+) -> Dict[str, Any]:
+    """保留原版函数，但内部调用优化版"""
+    work_fine_rates = await db.get_work_fine_rates_for_type("work_end")
+    return await _complete_single_work_end_optimized(
+        conn, chat_id, row, target_date, auto_end_time, shift_config, work_fine_rates
+    )
 
 
 # ========== 5. 导出数据 ==========
@@ -768,7 +857,8 @@ async def _cleanup_old_data(
     try:
         if not db.pool or not db._initialized:
             logger.error("数据库连接池未初始化")
-            return
+            return stats
+
         async with db.pool.acquire() as conn:
             async with conn.transaction():
                 result = await conn.execute(
@@ -918,6 +1008,7 @@ async def recover_shift_states():
                 if not db.pool or not db._initialized:
                     logger.error("数据库连接池未初始化")
                     return
+
                 async with db.pool.acquire() as conn:
                     rows = await conn.fetch(
                         """
