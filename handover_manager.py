@@ -19,6 +19,11 @@ class HandoverManager:
         self._cache_ttl = {}
         self._user_cycle_cache = {}  # 用户周期缓存
 
+        self._period_cache = {}
+        self._period_cache_ttl = {}
+        self._handover_cache = {}
+        self._handover_cache_ttl = {}
+
     # ========== 配置管理 ==========
 
     async def init_handover_config(self, chat_id: int) -> bool:
@@ -87,30 +92,54 @@ class HandoverManager:
         }
 
     # ========== 核心时间判定 ==========
-
     async def determine_current_period(
         self,
         chat_id: int,
         current_time: Optional[datetime] = None,
+        use_cache: bool = True,
     ) -> Dict[str, Any]:
         """
-        根据时间判定当前属于哪个时期
+        根据时间判定当前属于哪个时期（支持自定义换班日期）
 
-        返回: {
-            'period_type': 'handover_night'|'handover_day'|'normal_night'|'normal_day',
-            'business_date': date,      # 业务日期（用于计数）
-            'actual_date': date,         # 实际日期（用于存储）
-            'cycle': 1|2,                # 当前周期
-            'hours_elapsed': float,      # 已过小时数
-            'total_hours': int,          # 总工作时长
-            'is_handover': bool,          # 是否是换班日
-            'next_reset_time': datetime   # 下次重置时间
-        }
+        参数:
+            chat_id: 群组ID
+            current_time: 当前时间（默认北京时间）
+            use_cache: 是否使用缓存（默认True）
+
+        返回:
+            {
+                'period_type': 'handover_night'|'handover_day'|'normal_night'|'normal_day',
+                'business_date': date,      # 业务日期（用于计数）
+                'actual_date': date,         # 实际日期（用于存储）
+                'cycle': 1|2,                # 当前周期
+                'hours_elapsed': float,      # 已过小时数
+                'total_hours': int,          # 总工作时长
+                'is_handover': bool,          # 是否是换班日
+                'next_reset_time': datetime   # 下次重置时间
+            }
         """
         if current_time is None:
             current_time = db.get_beijing_time()
 
+        # ===== 1. 缓存检查 =====
+        cache_key = f"period:{chat_id}:{current_time.strftime('%Y%m%d%H')}"
+        if use_cache:
+            cached = await self._get_period_cache(cache_key)
+            if cached:
+                logger.debug(f"📊 周期缓存命中: {cache_key}")
+                return cached
+
+        # ===== 2. 获取配置 =====
         config = await self.get_handover_config(chat_id)
+
+        # ===== 3. 快速路径：非换班日直接返回 =====
+        if not config.get("handover_enabled", True):
+            result = await self._get_normal_period(chat_id, current_time, config)
+            if use_cache:
+                await self._set_period_cache(cache_key, result)
+            return result
+
+        # ===== 4. 预计算时间值（避免重复计算） =====
         night_start = config.get("night_start_time", "21:00")
         day_start = config.get("day_start_time", "09:00")
 
@@ -118,155 +147,277 @@ class HandoverManager:
         day_h, day_m = map(int, day_start.split(":"))
 
         current_date = current_time.date()
-        current_hour = current_time.hour
-        current_minute = current_time.minute
-        current_decimal = current_hour + current_minute / 60
+        current_decimal = current_time.hour + current_time.minute / 60
+        night_decimal = night_h + night_m / 60
+        day_decimal = day_h + day_m / 60
 
-        # 获取本月最后一天
-        if current_date.month == 12:
-            next_month = date(current_date.year + 1, 1, 1)
+        # ===== 5. 判断是否是换班日（批量计算） =====
+        is_handover, is_next_handover = await self._check_handover_days(
+            chat_id, current_date, config
+        )
+
+        # ===== 6. 换班夜班判定 =====
+        if is_handover and current_decimal >= night_decimal:
+            result = await self._calculate_handover_night(
+                current_time, current_date, night_h, night_m, config
+            )
+        elif is_next_handover and current_decimal < 15:
+            result = await self._calculate_handover_night_cross(
+                current_time, current_date, night_h, night_m, config
+            )
+        # ===== 7. 换班白班判定 =====
+        elif is_next_handover and current_decimal >= 15:
+            result = await self._calculate_handover_day(
+                current_time, current_date, config
+            )
+        # ===== 8. 正常班次 =====
         else:
-            next_month = date(current_date.year, current_date.month + 1, 1)
-        last_day = (next_month - timedelta(days=1)).day
-
-        # 是否是月末最后一天
-        is_last_day = current_date.day == last_day
-        # 是否是月初第一天
-        is_first_day = current_date.day == 1
-        # 是否是月初第二天
-        is_second_day = current_date.day == 2
-
-        # ========== 换班夜班判定 ==========
-
-        # 场景1：月末最后一天 21:00 之后
-        if is_last_day and current_decimal >= night_h + night_m / 60:
-            start_dt = datetime.combine(
-                current_date, dt_time(night_h, night_m)
-            ).replace(tzinfo=current_time.tzinfo)
-
-            elapsed_hours = (current_time - start_dt).total_seconds() / 3600
-
-            cycle = 1 if elapsed_hours < 12 else 2
-            next_reset = (
-                start_dt + timedelta(hours=12)
-                if cycle == 1
-                else start_dt + timedelta(hours=18)
+            result = await self._calculate_normal_period(
+                current_time, current_date, night_decimal, day_decimal, config
             )
 
-            logger.info(
-                f"🌙 [换班夜班] 场景1: 已过{elapsed_hours:.1f}小时, 周期{cycle}"
+        # ===== 9. 缓存结果 =====
+        if use_cache:
+            await self._set_period_cache(cache_key, result)
+
+        return result
+
+    async def _check_handover_days(
+        self, chat_id: int, current_date: date, config: dict
+    ) -> tuple[bool, bool]:
+        """批量判断换班日（使用缓存）"""
+        cache_key = f"handover_check:{chat_id}:{current_date}"
+
+        # 尝试从缓存获取
+        cached = await self._get_handover_check_cache(cache_key)
+        if cached:
+            logger.debug(f"📊 换班日缓存命中: {cache_key}")
+            return cached
+
+        handover_day = config.get("handover_day", 31)
+        handover_month = config.get("handover_month", 0)
+
+        # 批量计算今天和明天
+        is_handover = self._is_handover_date(current_date, handover_day, handover_month)
+        is_next_handover = self._is_handover_date(
+            current_date + timedelta(days=1), handover_day, handover_month
+        )
+
+        result = (is_handover, is_next_handover)
+
+        # 缓存结果（24小时）
+        await self._set_handover_check_cache(cache_key, result, ttl=86400)
+
+        return result
+
+    def _is_handover_date(
+        self, check_date: date, handover_day: int, handover_month: int
+    ) -> bool:
+        """判断指定日期是否是换班日"""
+        if handover_day == 0:  # 月末最后一天
+            if check_date.month == 12:
+                next_month = date(check_date.year + 1, 1, 1)
+            else:
+                next_month = date(check_date.year, check_date.month + 1, 1)
+            last_day = (next_month - timedelta(days=1)).day
+            return check_date.day == last_day
+        else:
+            if handover_month == 0:  # 每月
+                return check_date.day == handover_day
+            else:  # 指定月份
+                return (
+                    check_date.month == handover_month
+                    and check_date.day == handover_day
+                )
+
+    async def _calculate_normal_period(
+        self,
+        current_time: datetime,
+        current_date: date,
+        night_decimal: float,
+        day_decimal: float,
+        config: dict,
+    ) -> Dict[str, Any]:
+        """计算正常班次"""
+        from datetime import time as dt_time
+
+        current_decimal = current_time.hour + current_time.minute / 60
+
+        # 正常夜班
+        if current_decimal >= night_decimal or current_decimal < day_decimal:
+            if current_decimal >= night_decimal:
+                business_date = current_date
+                start_dt = datetime.combine(
+                    current_date, self._time_from_decimal(night_decimal)
+                ).replace(tzinfo=current_time.tzinfo)
+            else:
+                business_date = current_date - timedelta(days=1)
+                start_dt = datetime.combine(
+                    current_date - timedelta(days=1),
+                    self._time_from_decimal(night_decimal),
+                ).replace(tzinfo=current_time.tzinfo)
+
+            elapsed_hours = (current_time - start_dt).total_seconds() / 3600
+            next_reset = start_dt + timedelta(
+                hours=config.get("normal_night_hours", 12)
             )
 
             return {
-                "period_type": "handover_night",
-                "business_date": current_date,
+                "period_type": "normal_night",
+                "business_date": business_date,
                 "actual_date": current_date,
-                "cycle": cycle,
+                "cycle": 1,
                 "hours_elapsed": elapsed_hours,
-                "total_hours": config.get("handover_night_hours", 18),
-                "is_handover": True,
+                "total_hours": config.get("normal_night_hours", 12),
+                "is_handover": False,
                 "next_reset_time": next_reset,
             }
 
-        # 场景2：次月第一天 00:00 - 15:00（夜班跨天）
-        if is_first_day and current_decimal < 15:
-            last_day_date = current_date - timedelta(days=1)
-            start_dt = datetime.combine(
-                last_day_date, dt_time(night_h, night_m)
-            ).replace(tzinfo=current_time.tzinfo)
+        # 正常白班
+        start_dt = datetime.combine(
+            current_date, self._time_from_decimal(day_decimal)
+        ).replace(tzinfo=current_time.tzinfo)
 
-            elapsed_hours = (current_time - start_dt).total_seconds() / 3600
+        elapsed_hours = (current_time - start_dt).total_seconds() / 3600
+        next_reset = start_dt + timedelta(hours=config.get("normal_day_hours", 12))
 
-            cycle = 1 if elapsed_hours < 12 else 2
-            next_reset = (
-                start_dt + timedelta(hours=12)
-                if cycle == 1
-                else start_dt + timedelta(hours=18)
-            )
+        return {
+            "period_type": "normal_day",
+            "business_date": current_date,
+            "actual_date": current_date,
+            "cycle": 1,
+            "hours_elapsed": elapsed_hours,
+            "total_hours": config.get("normal_day_hours", 12),
+            "is_handover": False,
+            "next_reset_time": next_reset,
+        }
 
-            logger.info(
-                f"🌙 [换班夜班跨天] 场景2: 已过{elapsed_hours:.1f}小时, 周期{cycle}"
-            )
+    async def _calculate_handover_night(
+        self,
+        current_time: datetime,
+        current_date: date,
+        night_h: int,
+        night_m: int,
+        config: dict,
+    ) -> Dict[str, Any]:
+        """计算换班夜班"""
+        from datetime import time as dt_time
 
-            return {
-                "period_type": "handover_night",
-                "business_date": last_day_date,  # 业务日期是上月最后一天
-                "actual_date": current_date,
-                "cycle": cycle,
-                "hours_elapsed": elapsed_hours,
-                "total_hours": config.get("handover_night_hours", 18),
-                "is_handover": True,
-                "next_reset_time": next_reset,
-            }
+        start_dt = datetime.combine(current_date, dt_time(night_h, night_m)).replace(
+            tzinfo=current_time.tzinfo
+        )
 
-        # ========== 换班白班判定 ==========
+        elapsed_hours = (current_time - start_dt).total_seconds() / 3600
+        cycle = 1 if elapsed_hours < 12 else 2
+        next_reset = (
+            start_dt + timedelta(hours=12)
+            if cycle == 1
+            else start_dt + timedelta(hours=18)
+        )
 
-        # 场景3：次月第一天 15:00 之后
-        if is_first_day and current_decimal >= 15:
-            start_dt = datetime.combine(current_date, dt_time(15, 0)).replace(
-                tzinfo=current_time.tzinfo
-            )
+        return {
+            "period_type": "handover_night",
+            "business_date": current_date,
+            "actual_date": current_date,
+            "cycle": cycle,
+            "hours_elapsed": elapsed_hours,
+            "total_hours": config.get("handover_night_hours", 18),
+            "is_handover": True,
+            "next_reset_time": next_reset,
+        }
 
-            elapsed_hours = (current_time - start_dt).total_seconds() / 3600
+    async def _calculate_handover_night_cross(
+        self,
+        current_time: datetime,
+        current_date: date,
+        night_h: int,
+        night_m: int,
+        config: dict,
+    ) -> Dict[str, Any]:
+        """计算跨天换班夜班"""
+        from datetime import time as dt_time
 
-            cycle = 1 if elapsed_hours < 12 else 2
-            next_reset = (
-                start_dt + timedelta(hours=12)
-                if cycle == 1
-                else start_dt + timedelta(hours=18)
-            )
+        handover_date = current_date - timedelta(days=1)
+        start_dt = datetime.combine(handover_date, dt_time(night_h, night_m)).replace(
+            tzinfo=current_time.tzinfo
+        )
 
-            logger.info(f"☀️ [换班白班] 场景3: 已过{elapsed_hours:.1f}小时, 周期{cycle}")
+        elapsed_hours = (current_time - start_dt).total_seconds() / 3600
+        cycle = 1 if elapsed_hours < 12 else 2
+        next_reset = (
+            start_dt + timedelta(hours=12)
+            if cycle == 1
+            else start_dt + timedelta(hours=18)
+        )
 
-            return {
-                "period_type": "handover_day",
-                "business_date": current_date,
-                "actual_date": current_date,
-                "cycle": cycle,
-                "hours_elapsed": elapsed_hours,
-                "total_hours": config.get("handover_day_hours", 18),
-                "is_handover": True,
-                "next_reset_time": next_reset,
-            }
+        return {
+            "period_type": "handover_night",
+            "business_date": handover_date,
+            "actual_date": current_date,
+            "cycle": cycle,
+            "hours_elapsed": elapsed_hours,
+            "total_hours": config.get("handover_night_hours", 18),
+            "is_handover": True,
+            "next_reset_time": next_reset,
+        }
 
-        # 场景4：次月第二天 00:00 - 09:00（白班跨天）
-        if is_second_day and current_decimal < 9:
-            first_day_date = current_date - timedelta(days=1)
-            start_dt = datetime.combine(first_day_date, dt_time(15, 0)).replace(
-                tzinfo=current_time.tzinfo
-            )
+    async def _calculate_handover_day(
+        self, current_time: datetime, current_date: date, config: dict
+    ) -> Dict[str, Any]:
+        """计算换班白班"""
+        from datetime import time as dt_time
 
-            elapsed_hours = (current_time - start_dt).total_seconds() / 3600
+        start_dt = datetime.combine(current_date, dt_time(15, 0)).replace(
+            tzinfo=current_time.tzinfo
+        )
 
-            cycle = 1 if elapsed_hours < 12 else 2
-            next_reset = (
-                start_dt + timedelta(hours=12)
-                if cycle == 1
-                else start_dt + timedelta(hours=18)
-            )
+        elapsed_hours = (current_time - start_dt).total_seconds() / 3600
+        cycle = 1 if elapsed_hours < 12 else 2
+        next_reset = (
+            start_dt + timedelta(hours=12)
+            if cycle == 1
+            else start_dt + timedelta(hours=18)
+        )
 
-            logger.info(
-                f"☀️ [换班白班跨天] 场景4: 已过{elapsed_hours:.1f}小时, 周期{cycle}"
-            )
+        return {
+            "period_type": "handover_day",
+            "business_date": current_date,
+            "actual_date": current_date,
+            "cycle": cycle,
+            "hours_elapsed": elapsed_hours,
+            "total_hours": config.get("handover_day_hours", 18),
+            "is_handover": True,
+            "next_reset_time": next_reset,
+        }
 
-            return {
-                "period_type": "handover_day",
-                "business_date": first_day_date,  # 业务日期是次月第一天
-                "actual_date": current_date,
-                "cycle": cycle,
-                "hours_elapsed": elapsed_hours,
-                "total_hours": config.get("handover_day_hours", 18),
-                "is_handover": True,
-                "next_reset_time": next_reset,
-            }
+    def _time_from_decimal(self, decimal_hours: float):
+        """将小数小时转换为时间对象"""
+        from datetime import time as dt_time
 
-        # ========== 正常班次 ==========
+        hours = int(decimal_hours)
+        minutes = int((decimal_hours - hours) * 60)
+        return dt_time(hours, minutes)
 
-        # 正常夜班：每天21:00 - 次日09:00
-        if (current_decimal >= night_h + night_m / 60) or (
-            current_decimal < day_h + day_m / 60
-        ):
-            if current_decimal >= night_h + night_m / 60:
+    async def _get_normal_period(
+        self, chat_id: int, current_time: datetime, config: dict
+    ) -> Dict[str, Any]:
+        """获取正常班次时期（兼容原版逻辑）"""
+        from datetime import time as dt_time
+
+        night_start = config.get("night_start_time", "21:00")
+        day_start = config.get("day_start_time", "09:00")
+
+        night_h, night_m = map(int, night_start.split(":"))
+        day_h, day_m = map(int, day_start.split(":"))
+
+        current_date = current_time.date()
+        current_decimal = current_time.hour + current_time.minute / 60
+        night_decimal = night_h + night_m / 60
+        day_decimal = day_h + day_m / 60
+
+        # 正常夜班
+        if (current_decimal >= night_decimal) or (current_decimal < day_decimal):
+            if current_decimal >= night_decimal:
                 business_date = current_date
                 start_dt = datetime.combine(
                     current_date, dt_time(night_h, night_m)
@@ -282,8 +433,6 @@ class HandoverManager:
                 hours=config.get("normal_night_hours", 12)
             )
 
-            logger.debug(f"🌙 [正常夜班] 业务日期: {business_date}")
-
             return {
                 "period_type": "normal_night",
                 "business_date": business_date,
@@ -295,14 +444,12 @@ class HandoverManager:
                 "next_reset_time": next_reset,
             }
         else:
-            # 正常白班：每天09:00 - 21:00
+            # 正常白班
             start_dt = datetime.combine(current_date, dt_time(day_h, day_m)).replace(
                 tzinfo=current_time.tzinfo
             )
             elapsed_hours = (current_time - start_dt).total_seconds() / 3600
             next_reset = start_dt + timedelta(hours=config.get("normal_day_hours", 12))
-
-            logger.debug(f"☀️ [正常白班] 业务日期: {current_date}")
 
             return {
                 "period_type": "normal_day",
@@ -314,6 +461,55 @@ class HandoverManager:
                 "is_handover": False,
                 "next_reset_time": next_reset,
             }
+
+    # ===== 缓存方法 =====
+    async def _get_period_cache(self, key: str):
+        """获取周期缓存"""
+        import time
+
+        if hasattr(self, "_period_cache") and key in self._period_cache_ttl:
+            if time.time() < self._period_cache_ttl[key]:
+                return self._period_cache.get(key)
+            else:
+                # 清理过期缓存
+                self._period_cache.pop(key, None)
+                self._period_cache_ttl.pop(key, None)
+        return None
+
+    async def _set_period_cache(self, key: str, value: dict, ttl: int = 3600):
+        """设置周期缓存（1小时）"""
+        import time
+
+        if not hasattr(self, "_period_cache"):
+            self._period_cache = {}
+            self._period_cache_ttl = {}
+
+        self._period_cache[key] = value
+        self._period_cache_ttl[key] = time.time() + ttl
+
+    async def _get_handover_check_cache(self, key: str):
+        """获取换班日检查缓存"""
+        import time
+
+        if hasattr(self, "_handover_cache") and key in self._handover_cache_ttl:
+            if time.time() < self._handover_cache_ttl[key]:
+                return self._handover_cache.get(key)
+            else:
+                # 清理过期缓存
+                self._handover_cache.pop(key, None)
+                self._handover_cache_ttl.pop(key, None)
+        return None
+
+    async def _set_handover_check_cache(self, key: str, value: tuple, ttl: int = 86400):
+        """设置换班日检查缓存（24小时）"""
+        import time
+
+        if not hasattr(self, "_handover_cache"):
+            self._handover_cache = {}
+            self._handover_cache_ttl = {}
+
+        self._handover_cache[key] = value
+        self._handover_cache_ttl[key] = time.time() + ttl
 
     # ========== 用户周期管理 ==========
 
@@ -633,6 +829,129 @@ class HandoverManager:
         cache_key = f"handover_config:{chat_id}"
         self._cache.pop(cache_key, None)
         self._cache_ttl.pop(cache_key, None)
+
+    async def update_handover_config(self, chat_id: int, **kwargs) -> bool:
+        """
+        更新换班配置（带参数验证和事务支持）
+
+        参数:
+            chat_id: 群组ID
+            **kwargs: 要更新的字段
+
+        支持的字段:
+            - handover_enabled: bool
+            - night_start_time: str (HH:MM)
+            - day_start_time: str (HH:MM)
+            - handover_night_hours: int (1-24)
+            - handover_day_hours: int (1-24)
+            - normal_night_hours: int (1-24)
+            - normal_day_hours: int (1-24)
+            - handover_day: int (1-31, 0表示月末)
+            - handover_month: int (1-12, 0表示每月)
+
+        返回:
+            bool: 是否更新成功
+        """
+        try:
+            # ===== 1. 参数验证 =====
+            if not kwargs:
+                logger.warning(f"没有提供要更新的参数: {chat_id}")
+                return False
+
+            # 定义允许的字段及其验证规则
+            allowed_fields = {
+                "handover_enabled": lambda v: isinstance(v, bool),
+                "night_start_time": lambda v: self._validate_time_format(v),
+                "day_start_time": lambda v: self._validate_time_format(v),
+                "handover_night_hours": lambda v: isinstance(v, int) and 1 <= v <= 24,
+                "handover_day_hours": lambda v: isinstance(v, int) and 1 <= v <= 24,
+                "normal_night_hours": lambda v: isinstance(v, int) and 1 <= v <= 24,
+                "normal_day_hours": lambda v: isinstance(v, int) and 1 <= v <= 24,
+                "handover_day": lambda v: isinstance(v, int) and 0 <= v <= 31,
+                "handover_month": lambda v: isinstance(v, int) and 0 <= v <= 12,
+            }
+
+            # 验证并过滤参数
+            valid_updates = {}
+            for key, value in kwargs.items():
+                if key not in allowed_fields:
+                    logger.warning(f"忽略未知字段: {key}")
+                    continue
+
+                if not allowed_fields[key](value):
+                    logger.error(f"字段 {key} 的值无效: {value}")
+                    return False
+
+                valid_updates[key] = value
+
+            if not valid_updates:
+                logger.warning(f"没有有效的更新参数: {chat_id}")
+                return False
+
+            # ===== 2. 构建更新语句 =====
+            set_clauses = []
+            values = []
+            param_index = 2  # chat_id 是 $1
+
+            for key, value in valid_updates.items():
+                set_clauses.append(f"{key} = ${param_index}")
+                values.append(value)
+                param_index += 1
+
+            # ===== 3. 执行更新（带事务）=====
+            updated = 0
+            async with db.pool.acquire() as conn:
+                async with conn.transaction():
+                    # 先检查记录是否存在
+                    exists = await conn.fetchval(
+                        """
+                        SELECT 1 FROM shift_handover_configs 
+                        WHERE chat_id = $1
+                    """,
+                        chat_id,
+                    )
+
+                    if not exists:
+                        # 如果不存在，先插入默认配置
+                        await conn.execute(
+                            """
+                            INSERT INTO shift_handover_configs (chat_id)
+                            VALUES ($1)
+                            ON CONFLICT (chat_id) DO NOTHING
+                        """,
+                            chat_id,
+                        )
+
+                    # 执行更新
+                    query = f"""
+                        UPDATE shift_handover_configs 
+                        SET {', '.join(set_clauses)}, updated_at = CURRENT_TIMESTAMP
+                        WHERE chat_id = $1
+                    """
+
+                    result = await conn.execute(query, chat_id, *values)
+
+                    # 解析更新结果
+                    if result and result.startswith("UPDATE"):
+                        try:
+                            updated = int(result.split()[-1])
+                        except (ValueError, IndexError):
+                            pass
+
+            # ===== 4. 清除缓存 =====
+            if updated > 0:
+                self._invalidate_cache(chat_id)
+                logger.info(
+                    f"✅ 更新换班配置成功: {chat_id}, 字段: {list(valid_updates.keys())}"
+                )
+                return True
+            else:
+                logger.warning(f"⚠️ 没有更新任何配置: {chat_id}")
+                return False
+
+        except Exception as e:
+            logger.error(f"❌ 更新换班配置失败 {chat_id}: {e}")
+            return False
 
 
 # 全局实例
