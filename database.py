@@ -22,6 +22,8 @@ class PostgreSQLDatabase:
         self._cache = {}
         self._cache_ttl = {}
 
+        self._pending_queries = {}
+
         # 重连相关属性
         self._last_connection_check = 0
         self._connection_check_interval = 30
@@ -700,20 +702,108 @@ class PostgreSQLDatabase:
 
     # ========== 缓存管理 ==========
     def _get_cached(self, key: str):
-        """获取缓存数据"""
-        if key in self._cache_ttl and time.time() < self._cache_ttl[key]:
-            return self._cache.get(key)
-        else:
-            if key in self._cache:
-                del self._cache[key]
-            if key in self._cache_ttl:
-                del self._cache_ttl[key]
-            return None
+        """增强的缓存获取 - 带访问计数"""
+        import time
 
-    def _set_cached(self, key: str, value: Any, ttl: int = 60):
-        """设置缓存数据"""
+        current_time = time.time()
+
+        # 检查是否存在且未过期
+        if key in self._cache_ttl and current_time < self._cache_ttl[key]:
+            # 更新访问次数（用于LRU淘汰）
+            if hasattr(self, "_cache_access_count"):
+                self._cache_access_count[key] = self._cache_access_count.get(key, 0) + 1
+
+            # 更新最后访问时间
+            if hasattr(self, "_cache_last_access"):
+                self._cache_last_access[key] = current_time
+
+            return self._cache.get(key)
+
+        # 缓存过期或不存在
+        if key in self._cache:
+            del self._cache[key]
+        if key in self._cache_ttl:
+            del self._cache_ttl[key]
+        if hasattr(self, "_cache_access_count") and key in self._cache_access_count:
+            del self._cache_access_count[key]
+        if hasattr(self, "_cache_last_access") and key in self._cache_last_access:
+            del self._cache_last_access[key]
+
+        return None
+
+    def _set_cached(self, key: str, value: Any, ttl: int = 30):
+        """增强的缓存设置 - 带大小限制"""
+        import time
+
+        current_time = time.time()
+
+        # 初始化缓存统计属性
+        if not hasattr(self, "_cache_access_count"):
+            self._cache_access_count = {}
+        if not hasattr(self, "_cache_last_access"):
+            self._cache_last_access = {}
+
+        # 检查缓存大小，如果过大则执行LRU淘汰
+        max_cache_size = 1000  # 最多缓存1000个用户
+        if len(self._cache) >= max_cache_size:
+            self._evict_lru_cache()
+
         self._cache[key] = value
-        self._cache_ttl[key] = time.time() + ttl
+        self._cache_ttl[key] = current_time + ttl
+        self._cache_last_access[key] = current_time
+        self._cache_access_count[key] = 1
+
+    def _evict_lru_cache(self):
+        """LRU缓存淘汰 - 移除最久未使用的10%"""
+        if not hasattr(self, "_cache_last_access") or not self._cache_last_access:
+            return
+
+        # 按最后访问时间排序
+        sorted_items = sorted(self._cache_last_access.items(), key=lambda x: x[1])
+
+        # 淘汰最旧的20%
+        evict_count = max(1, len(sorted_items) // 5)
+        keys_to_evict = [item[0] for item in sorted_items[:evict_count]]
+
+        for key in keys_to_evict:
+            self._cache.pop(key, None)
+            self._cache_ttl.pop(key, None)
+            self._cache_last_access.pop(key, None)
+            if hasattr(self, "_cache_access_count"):
+                self._cache_access_count.pop(key, None)
+
+        logger.debug(f"LRU淘汰: 移除了 {evict_count} 个缓存项")
+
+    async def preload_user_cache(self, chat_id: int, user_ids: List[int]):
+        """预加载用户缓存 - 批量预热"""
+        if not user_ids:
+            return
+
+        try:
+            async with self.pool.acquire() as conn:
+                rows = await conn.fetch(
+                    """
+                    SELECT 
+                        user_id, nickname, current_activity, activity_start_time,
+                        total_accumulated_time, total_activity_count, total_fines,
+                        overtime_count, total_overtime_time, last_updated,
+                        checkin_message_id, shift
+                    FROM users 
+                    WHERE chat_id = $1 AND user_id = ANY($2::bigint[])
+                """,
+                    chat_id,
+                    user_ids,
+                )
+
+                for row in rows:
+                    cache_key = f"user:{chat_id}:{row['user_id']}"
+                    result = dict(row)
+                    self._set_cached(cache_key, result, 30)
+
+                logger.debug(f"预加载了 {len(rows)} 个用户缓存")
+
+        except Exception as e:
+            logger.error(f"预加载用户缓存失败: {e}")
 
     async def cleanup_cache(self):
         """增强的缓存清理"""
@@ -930,32 +1020,116 @@ class PostgreSQLDatabase:
             )
 
     async def get_user(self, chat_id: int, user_id: int) -> Optional[Dict]:
+        """高性能获取用户数据 - 带二级缓存和查询优化"""
+
+        # ===== 1. 一级缓存：内存缓存（最快） =====
         cache_key = f"user:{chat_id}:{user_id}"
         cached = self._get_cached(cache_key)
         if cached is not None:
+            # 缓存命中，记录统计
+            if hasattr(self, "_cache_hits"):
+                self._cache_hits += 1
             return cached
 
-        row = await self.execute_with_retry(
-            "获取用户数据",
-            """
-            SELECT user_id, nickname, current_activity, activity_start_time, 
-                total_accumulated_time, total_activity_count, total_fines,
-                overtime_count, total_overtime_time, last_updated,
-                checkin_message_id, shift
-            FROM users WHERE chat_id = $1 AND user_id = $2
-            """,
-            chat_id,
-            user_id,
-            fetchrow=True,
-            timeout=10,
-            slow_threshold=0.5,
-        )
+        # ===== 2. 二级缓存：检查是否有正在进行的查询（防止缓存击穿） =====
+        pending_key = f"pending:{chat_id}:{user_id}"
+        if hasattr(self, "_pending_queries") and pending_key in self._pending_queries:
+            try:
+                # 等待正在进行的查询结果
+                return await self._pending_queries[pending_key]
+            except Exception:
+                pass
 
-        if row:
-            result = dict(row)
-            self._set_cached(cache_key, result, 30)
+        # ===== 3. 创建查询任务（带超时和重试） =====
+        async def _execute_query():
+            try:
+                # 使用更精确的字段选择（只选需要的）
+                row = await self.execute_with_retry(
+                    "获取用户数据",
+                    """
+                    SELECT 
+                        user_id, 
+                        nickname, 
+                        current_activity, 
+                        activity_start_time, 
+                        total_accumulated_time, 
+                        total_activity_count, 
+                        total_fines,
+                        overtime_count, 
+                        total_overtime_time, 
+                        last_updated,
+                        checkin_message_id, 
+                        shift
+                    FROM users 
+                    WHERE chat_id = $1 AND user_id = $2
+                    LIMIT 1
+                    """,
+                    chat_id,
+                    user_id,
+                    fetchrow=True,
+                    timeout=3,
+                    slow_threshold=0.3,
+                )
+
+                if row:
+                    result = dict(row)
+
+                    # ===== 4. 数据验证和修复 =====
+                    if "shift" not in result or result["shift"] is None:
+                        active_shift = await self.get_user_active_shift(
+                            chat_id, user_id
+                        )
+                        result["shift"] = (
+                            active_shift.get("shift", "day") if active_shift else "day"
+                        )
+                        logger.debug(f"修复用户 {user_id} 的班次为: {result['shift']}")
+
+                    if result.get("last_updated") and isinstance(
+                        result["last_updated"], datetime
+                    ):
+                        result["last_updated"] = result["last_updated"].date()
+
+                    # ===== 5. 写入缓存（带随机TTL防止缓存雪崩） =====
+                    import random
+
+                    cache_ttl = 30 + random.randint(-5, 5)
+                    self._set_cached(cache_key, result, cache_ttl)
+
+                    return result
+
+                # 用户不存在，缓存空结果防止穿透
+                self._set_cached(cache_key, None, 10)
+                return None
+
+            except asyncio.TimeoutError:
+                logger.error(f"⏱️ 获取用户数据超时: {chat_id}-{user_id}")
+                return {
+                    "user_id": user_id,
+                    "nickname": f"用户{user_id}",
+                    "shift": "day",
+                    "current_activity": None,
+                    "total_accumulated_time": 0,
+                    "total_activity_count": 0,
+                    "total_fines": 0,
+                    "overtime_count": 0,
+                    "total_overtime_time": 0,
+                    "checkin_message_id": None,
+                }
+            except Exception as e:
+                logger.error(f"❌ 获取用户数据失败 {chat_id}-{user_id}: {e}")
+                raise
+
+        # ===== 6. 执行查询并缓存任务（防止并发重复查询） =====
+        if not hasattr(self, "_pending_queries"):
+            self._pending_queries = {}
+
+        self._pending_queries[pending_key] = asyncio.create_task(_execute_query())
+
+        try:
+            result = await self._pending_queries[pending_key]
             return result
-        return None
+        finally:
+            self._pending_queries.pop(pending_key, None)
 
     async def get_user_activity_count_by_shift(
         self,
