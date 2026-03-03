@@ -24,6 +24,9 @@ class PostgreSQLDatabase:
 
         self._pending_queries = {}
 
+        self._last_pool_check = 0
+        self._pool_check_interval = 60
+
         # 重连相关属性
         self._last_connection_check = 0
         self._connection_check_interval = 30
@@ -205,6 +208,120 @@ class PostgreSQLDatabase:
                     logger.warning("连接维护: 数据库连接不健康")
 
                 await self.cleanup_cache()
+
+                await self._monitor_pool_health()
+
+                current_time = time.time()
+                if current_time % 3600 < 60:
+                    try:
+                        await self.cleanup_old_data(days=Config.DATA_RETENTION_DAYS)
+                        logger.debug("定期数据清理完成")
+                    except Exception as e:
+                        logger.error(f"定期数据清理失败: {e}")
+
+            except asyncio.CancelledError:
+                logger.info("数据库连接维护任务被取消")
+                break
+            except Exception as e:
+                logger.error(f"连接维护任务异常: {e}")
+                await asyncio.sleep(30)
+
+    async def _monitor_pool_health(self):
+        """监控连接池健康状态"""
+        if not self.pool:
+            return
+
+        try:
+            # 获取连接池统计
+            free_connections = (
+                self.pool._queue.qsize() if hasattr(self.pool, "_queue") else 0
+            )
+            total_connections = (
+                self.pool._holders.qsize() if hasattr(self.pool, "_holders") else 0
+            )
+
+            # 记录连接池状态
+            logger.debug(f"📊 连接池状态: 空闲 {free_connections}/{total_connections}")
+
+            # 预警：空闲连接太少
+            if free_connections < 2:
+                logger.warning(
+                    f"⚠️ 连接池即将耗尽: 空闲 {free_connections}/{total_connections}"
+                )
+
+                # 如果空闲连接为0，可能是连接泄漏，尝试自动扩容
+                if (
+                    free_connections == 0
+                    and total_connections < Config.DB_MAX_CONNECTIONS
+                ):
+                    logger.info("🔄 尝试自动扩容连接池")
+                    # 可以在这里添加扩容逻辑
+
+            # 检查是否有死锁
+            try:
+                async with self.pool.acquire() as conn:
+                    deadlocks = await conn.fetch(
+                        """
+                        SELECT pid, query, age(now(), query_start) as duration,
+                               datname, usename, application_name
+                        FROM pg_stat_activity
+                        WHERE state = 'active' 
+                          AND wait_event_type = 'Lock'
+                          AND pid != pg_backend_pid()
+                    """
+                    )
+
+                    if deadlocks:
+                        logger.error(f"🔒 检测到 {len(deadlocks)} 个死锁:")
+                        for dl in deadlocks:
+                            logger.error(
+                                f"  • PID: {dl['pid']}, 用户: {dl['usename']}, "
+                                f"时长: {dl['duration']}, 查询: {dl['query'][:100]}..."
+                            )
+            except Exception as e:
+                logger.debug(f"死锁检查失败（可能权限不足）: {e}")
+
+            # 可选：检查长时间运行的事务
+            try:
+                async with self.pool.acquire() as conn:
+                    long_tx = await conn.fetch(
+                        """
+                        SELECT pid, query, age(now(), xact_start) as duration
+                        FROM pg_stat_activity
+                        WHERE state = 'active' 
+                          AND xact_start < now() - interval '5 minutes'
+                          AND pid != pg_backend_pid()
+                    """
+                    )
+
+                    if long_tx:
+                        logger.warning(f"⏱️ 检测到 {len(long_tx)} 个长时间运行的事务:")
+                        for tx in long_tx[:3]:  # 只显示前3个
+                            logger.warning(
+                                f"  • PID: {tx['pid']}, 时长: {tx['duration']}"
+                            )
+
+            except Exception as e:
+                logger.debug(f"长时间事务检查失败: {e}")
+
+        except Exception as e:
+            logger.error(f"连接池监控失败: {e}")
+
+    async def _connection_maintenance_loop(self):
+        """连接维护循环"""
+        logger.info("开始数据库连接维护循环...")
+
+        while self._maintenance_running:
+            try:
+                await asyncio.sleep(60)
+
+                if not await self._ensure_healthy_connection():
+                    logger.warning("连接维护: 数据库连接不健康")
+
+                await self.cleanup_cache()
+
+                # ===== 新增：监控连接池健康 =====
+                await self._monitor_pool_health()
 
                 current_time = time.time()
                 if current_time % 3600 < 60:
@@ -547,6 +664,8 @@ class PostgreSQLDatabase:
                 CREATE TABLE IF NOT EXISTS shift_handover_configs (
                     chat_id BIGINT PRIMARY KEY,
                     handover_enabled BOOLEAN DEFAULT TRUE,
+                    handover_day INTEGER DEFAULT 31,
+                    handover_month INTEGER DEFAULT 0,
                     night_start_time TEXT DEFAULT '21:00',
                     day_start_time TEXT DEFAULT '09:00',
                     handover_night_hours INTEGER DEFAULT 18,
