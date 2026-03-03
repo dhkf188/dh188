@@ -8076,6 +8076,9 @@ async def initialize_services():
         shift_recovered = await recover_shift_states()
         logger.info(f"✅ 班次状态恢复完成: {shift_recovered} 个群组")
 
+        from dual_shift_reset import check_missed_resets_on_startup
+        asyncio.create_task(check_missed_resets_on_startup())
+
         health_status = await check_services_health()
         if all(health_status.values()):
             logger.info("🎉 所有服务初始化完成且健康")
