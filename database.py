@@ -197,46 +197,67 @@ class PostgreSQLDatabase:
         logger.info("数据库连接维护任务已停止")
 
     async def _connection_maintenance_loop(self):
-        """连接维护循环"""
-        logger.info("开始数据库连接维护循环...")
+        """连接维护循环 - 优化版"""
+        logger.info("🚀 数据库连接维护循环已启动")
+
+        # 记录上次执行清理的时间，避免在一个小时内重复执行
+        last_cleanup_hour = -1
 
         while self._maintenance_running:
             try:
-                # 每一分钟检查一次基础健康状态
+                # ===== 每 60 秒执行一次的基础检查 =====
                 await asyncio.sleep(60)
 
-                # 1. 确保连接池健康，如果不健康则尝试恢复
+                # 1. 确保连接池健康
                 if not await self._ensure_healthy_connection():
-                    logger.warning("连接维护: 数据库连接不健康")
+                    logger.warning("⚠️ 连接维护: 数据库连接不健康，跳过本轮检查")
                     continue
 
-                # 2. 清理内存缓存，释放不再需要的资源
+                # 2. 清理内存缓存
+                cache_before = len(self._cache)
                 await self.cleanup_cache()
+                cache_after = len(self._cache)
+                if cache_before != cache_after:
+                    logger.debug(f"🧹 缓存清理: {cache_before} -> {cache_after}")
 
-                # 3. 监控连接池内部状态（死锁、慢查询、连接数）
+                # 3. 监控连接池状态（SQL 视图层面的统计）
                 await self._monitor_pool_health()
 
-                # 4. 定期任务：每小时执行一次深度数据清理
-                current_time = time.time()
-                if int(current_time) % 3600 < 60:  # 每小时执行一次
+                # ===== 每小时执行一次的深度维护 =====
+                current_hour = datetime.now().hour
+                if current_hour != last_cleanup_hour:
+                    last_cleanup_hour = current_hour
+
                     try:
                         # 清理常规业务旧数据
-                        await self.cleanup_old_data(days=Config.DATA_RETENTION_DAYS)
+                        daily_deleted = await self.cleanup_old_data(
+                            days=Config.DATA_RETENTION_DAYS
+                        )
 
-                        # ===== 新增：清理旧的重置日志 (保持 90 天) =====
-                        await self.cleanup_old_reset_logs(days=90)
+                        # 清理旧的重置日志（保留 90 天）
+                        logs_deleted = await self.cleanup_old_reset_logs(days=90)
 
-                        logger.debug("定期数据清理完成")
+                        if daily_deleted > 0 or logs_deleted > 0:
+                            logger.info(
+                                f"🧹 每小时清理完成: "
+                                f"业务数据={daily_deleted}, 重置日志={logs_deleted}"
+                            )
+                        else:
+                            logger.debug("✅ 每小时清理完成，无数据需要清理")
+
                     except Exception as e:
-                        logger.error(f"定期数据清理失败: {e}")
+                        logger.error(f"❌ 每小时数据清理失败: {e}")
 
             except asyncio.CancelledError:
-                logger.info("数据库连接维护任务被取消")
+                logger.info("🛑 数据库连接维护任务被取消")
                 break
+
             except Exception as e:
-                logger.error(f"连接维护任务异常: {e}")
-                # 发生异常时增加额外等待，防止循环过快导致 CPU 占用或日志刷屏
+                logger.error(f"❌ 连接维护任务异常: {e}")
+                # 发生异常时等待 30 秒，避免疯狂重试造成日志刷屏
                 await asyncio.sleep(30)
+
+        logger.info("🏁 数据库连接维护循环已结束")
 
     async def _monitor_pool_health(self):
         """监控数据库健康状态（修复版）"""
