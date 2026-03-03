@@ -5584,6 +5584,256 @@ async def cmd_handover_status(message: types.Message):
 
 @admin_required
 @rate_limit(rate=2, per=60)
+async def cmd_set_handover_day(message: types.Message):
+    """设置换班日期
+
+    用法:
+    /sethandoverday <日期> [月份]
+
+    示例:
+    /sethandoverday 15         - 每月15号换班
+    /sethandoverday 31         - 每月最后一天换班
+    /sethandoverday 15 12      - 只在12月15号换班
+    /sethandoverday off        - 关闭换班功能
+    /sethandoverday status     - 查看当前设置
+    """
+    chat_id = message.chat.id
+    args = message.text.split()
+
+    from handover_manager import handover_manager
+
+    if len(args) < 2:
+        await message.answer(
+            "❌ 用法错误\n\n"
+            "📝 正确用法：\n"
+            "• `/sethandoverday 15` - 每月15号换班\n"
+            "• `/sethandoverday 31` - 每月最后一天换班\n"
+            "• `/sethandoverday 15 12` - 只在12月15号换班\n"
+            "• `/sethandoverday off` - 关闭换班功能\n"
+            "• `/sethandoverday status` - 查看当前设置\n\n"
+            "💡 提示：日期为1-31，0表示每月最后一天",
+            parse_mode="HTML",
+            reply_to_message_id=message.message_id,
+        )
+        return
+
+    action = args[1].lower()
+
+    # 查看状态
+    if action == "status":
+        config = await handover_manager.get_handover_config(chat_id)
+
+        if not config.get("handover_enabled"):
+            status_text = "❌ 换班功能已关闭"
+        else:
+            handover_day = config.get("handover_day", 31)
+            handover_month = config.get("handover_month", 0)
+
+            if handover_day == 0:
+                day_desc = "月末最后一天"
+            else:
+                day_desc = f"每月{handover_day}号"
+
+            if handover_month > 0:
+                month_desc = f"只在{handover_month}月"
+                day_desc = f"{handover_month}月{handover_day}号"
+            else:
+                month_desc = "每月"
+
+            status_text = (
+                f"📊 当前换班配置\n\n"
+                f"• 状态: {'✅ 已开启' if config.get('handover_enabled') else '❌ 已关闭'}\n"
+                f"• 换班日期: {day_desc}\n"
+                f"• 周期: {month_desc}\n"
+                f"• 夜班开始: {config.get('night_start_time')}\n"
+                f"• 白班开始: {config.get('day_start_time')}\n"
+                f"• 换班夜班时长: {config.get('handover_night_hours')}小时\n"
+                f"• 换班白班时长: {config.get('handover_day_hours')}小时"
+            )
+
+        await message.answer(
+            status_text, parse_mode="HTML", reply_to_message_id=message.message_id
+        )
+        return
+
+    # 关闭换班
+    if action == "off":
+        await handover_manager.update_handover_config(chat_id, handover_enabled=False)
+        await message.answer(
+            "✅ 换班功能已关闭\n\n"
+            "💡 如需重新开启，请使用 `/sethandoverday <日期>` 命令",
+            parse_mode="HTML",
+            reply_to_message_id=message.message_id,
+        )
+        return
+
+    # 设置换班日期
+    try:
+        handover_day = int(action)
+
+        # 验证日期
+        if handover_day < 0 or handover_day > 31:
+            await message.answer(
+                "❌ 日期必须为1-31之间的数字（0表示月末最后一天）",
+                reply_to_message_id=message.message_id,
+            )
+            return
+
+        handover_month = 0  # 默认每月
+        month_desc = "每月"
+
+        # 如果提供了月份参数
+        if len(args) >= 3:
+            handover_month = int(args[2])
+            if handover_month < 1 or handover_month > 12:
+                await message.answer(
+                    "❌ 月份必须为1-12之间的数字",
+                    reply_to_message_id=message.message_id,
+                )
+                return
+            month_desc = f"{handover_month}月"
+
+        # 更新配置
+        await handover_manager.update_handover_config(
+            chat_id,
+            handover_enabled=True,
+            handover_day=handover_day,
+            handover_month=handover_month,
+        )
+
+        # 生成响应消息
+        if handover_day == 0:
+            day_desc = "月末最后一天"
+            examples = "例如：1月31日、2月28/29日、3月31日"
+        else:
+            day_desc = f"{handover_day}号"
+            examples = f"例如：{month_desc}{handover_day}号"
+
+        success_msg = (
+            f"✅ 换班日期设置成功！\n\n"
+            f"📅 设置详情：\n"
+            f"• 换班日期：{day_desc}\n"
+            f"• 周期：{month_desc}\n"
+            f"• 状态：已开启\n\n"
+            f"📌 示例说明：\n"
+            f"{examples} 21:00开始换班夜班\n"
+            f"次日15:00开始换班白班\n\n"
+            f"💡 其他命令：\n"
+            f"• `/sethandoverday status` - 查看当前设置\n"
+            f"• `/sethandoverday off` - 关闭换班功能\n"
+            f"• `/sethour` - 设置工作时长"
+        )
+
+        await message.answer(
+            success_msg, parse_mode="HTML", reply_to_message_id=message.message_id
+        )
+
+    except ValueError:
+        await message.answer(
+            "❌ 日期必须是数字\n\n" "正确用法：/sethandoverday 15",
+            reply_to_message_id=message.message_id,
+        )
+    except Exception as e:
+        logger.error(f"设置换班日期失败: {e}")
+        await message.answer(
+            f"❌ 设置失败：{e}", reply_to_message_id=message.message_id
+        )
+
+
+@admin_required
+@rate_limit(rate=2, per=60)
+async def cmd_set_handover_hours(message: types.Message):
+    """设置换班工作时长
+
+    用法:
+    /sethour <类型> <小时数>
+
+    类型:
+    handover_night - 换班夜班时长
+    handover_day   - 换班白班时长
+    normal_night   - 正常夜班时长
+    normal_day     - 正常白班时长
+
+    示例:
+    /sethour handover_night 18
+    /sethour normal_day 12
+    """
+    chat_id = message.chat.id
+    args = message.text.split()
+
+    if len(args) != 3:
+        await message.answer(
+            "❌ 用法错误\n\n"
+            "正确用法：/sethour <类型> <小时数>\n\n"
+            "类型说明：\n"
+            "• `handover_night` - 换班夜班时长（默认18）\n"
+            "• `handover_day` - 换班白班时长（默认18）\n"
+            "• `normal_night` - 正常夜班时长（默认12）\n"
+            "• `normal_day` - 正常白班时长（默认12）\n\n"
+            "示例：\n"
+            "• `/sethour handover_night 18`\n"
+            "• `/sethour normal_day 12`",
+            parse_mode="HTML",
+            reply_to_message_id=message.message_id,
+        )
+        return
+
+    hour_type = args[1].lower()
+    try:
+        hours = int(args[2])
+
+        if hours <= 0 or hours > 24:
+            await message.answer(
+                "❌ 小时数必须在1-24之间", reply_to_message_id=message.message_id
+            )
+            return
+
+        from handover_manager import handover_manager
+
+        update_kwargs = {}
+        type_names = {
+            "handover_night": "换班夜班",
+            "handover_day": "换班白班",
+            "normal_night": "正常夜班",
+            "normal_day": "正常白班",
+        }
+
+        if hour_type == "handover_night":
+            update_kwargs["handover_night_hours"] = hours
+        elif hour_type == "handover_day":
+            update_kwargs["handover_day_hours"] = hours
+        elif hour_type == "normal_night":
+            update_kwargs["normal_night_hours"] = hours
+        elif hour_type == "normal_day":
+            update_kwargs["normal_day_hours"] = hours
+        else:
+            await message.answer(
+                "❌ 无效的类型，请使用：handover_night、handover_day、normal_night、normal_day",
+                reply_to_message_id=message.message_id,
+            )
+            return
+
+        await handover_manager.update_handover_config(chat_id, **update_kwargs)
+
+        type_name = type_names.get(hour_type, hour_type)
+        await message.answer(
+            f"✅ 已设置{type_name}时长为 {hours} 小时",
+            reply_to_message_id=message.message_id,
+        )
+
+    except ValueError:
+        await message.answer(
+            "❌ 小时数必须是数字", reply_to_message_id=message.message_id
+        )
+    except Exception as e:
+        logger.error(f"设置工作时长失败: {e}")
+        await message.answer(
+            f"❌ 设置失败：{e}", reply_to_message_id=message.message_id
+        )
+
+
+@admin_required
+@rate_limit(rate=2, per=60)
 async def cmd_handover_config(message: types.Message):
     """查看/设置换班配置"""
     chat_id = message.chat.id
@@ -7947,6 +8197,8 @@ async def register_handlers():
     dp.message.register(cmd_setworkendgrace, Command("setworkendgrace"))
     dp.message.register(cmd_handover_status, Command("handover"))
     dp.message.register(cmd_handover_config, Command("handoverconfig"))
+    dp.message.register(cmd_set_handover_day, Command("sethandoverday"))
+    dp.message.register(cmd_set_handover_hours, Command("sethour"))
 
     dp.message.register(
         handle_back_command,
