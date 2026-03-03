@@ -1082,7 +1082,7 @@ async def recover_shift_states():
 
 # ========== 10. 新增：启动时检查未完成重置 ==========
 async def check_missed_resets_on_startup():
-    """系统启动时检查是否有错过的重置"""
+    """系统启动时检查是否有错过的重置（高性能并发版）"""
     logger.info("🔍 开始检查是否有未完成的重置...")
 
     try:
@@ -1090,67 +1090,118 @@ async def check_missed_resets_on_startup():
         all_groups = await db.get_all_groups()
 
         if not all_groups:
-            logger.info("没有需要检查的群组")
+            logger.info("✅ 没有需要检查的群组")
             return
 
-        # 使用信号量控制并发
+        # ===== 1. 统计变量 =====
+        stats = {
+            "total": len(all_groups),
+            "completed": 0,  # 已完成的
+            "executed": 0,  # 自动执行的
+            "missed": 0,  # 需手动处理的
+            "skipped": 0,  # 无配置的
+            "errors": 0,  # 检查失败的
+            "failed": 0,  # 执行失败的
+        }
+
+        # ===== 2. 并发控制 =====
         sem = asyncio.Semaphore(5)
 
         async def check_group(chat_id):
             async with sem:
                 try:
+                    # 获取群组配置
                     group_data = await db.get_group_cached(chat_id)
                     if not group_data:
+                        stats["skipped"] += 1
                         return
 
                     reset_hour = group_data.get("reset_hour", 0)
                     reset_minute = group_data.get("reset_minute", 0)
 
+                    # 获取业务日期
                     date_range = await db.get_business_date_range(chat_id, now)
-                    business_today = date_range["business_today"]
                     business_yesterday = date_range["business_yesterday"]
 
-                    # 检查昨天的重置
-                    is_completed = await db.is_reset_completed(
-                        chat_id, business_yesterday
+                    # 检查是否已完成
+                    if await db.is_reset_completed(chat_id, business_yesterday):
+                        stats["completed"] += 1
+                        return
+
+                    # 计算时间差
+                    reset_time_today = now.replace(
+                        hour=reset_hour, minute=reset_minute, second=0, microsecond=0
+                    )
+                    hours_since = (now - reset_time_today).total_seconds() / 3600
+
+                    logger.warning(
+                        f"⚠️ 未完成重置: 群组={chat_id}, 日期={business_yesterday}, "
+                        f"已过{hours_since:.1f}小时"
                     )
 
-                    if not is_completed:
-                        reset_time = now.replace(
-                            hour=reset_hour,
-                            minute=reset_minute,
-                            second=0,
-                            microsecond=0,
-                        )
-                        hours_since = (now - reset_time).total_seconds() / 3600
+                    # ===== 3. 阈值判断 =====
+                    if 0 <= hours_since <= 4:
+                        cache_key = f"dual_reset:{chat_id}:{business_yesterday.strftime('%Y%m%d')}"
 
-                        logger.warning(
-                            f"⚠️ 未完成重置: 群组={chat_id}, 日期={business_yesterday}, "
-                            f"已过{hours_since:.1f}小时"
+                        # 检查缓存
+                        if global_cache.get(cache_key):
+                            logger.debug(f"⏭️ 缓存已标记: {chat_id}")
+                            stats["completed"] += 1
+                            return
+
+                        # 执行重置
+                        logger.info(f"🔄 自动执行重置: 群组 {chat_id}")
+                        success = await handle_hard_reset(
+                            chat_id, None, target_date=business_yesterday
                         )
 
-                        # 只在4小时内自动执行
-                        if 0 <= hours_since <= 4:
-                            cache_key = f"dual_reset:{chat_id}:{business_yesterday.strftime('%Y%m%d')}"
-                            if not global_cache.get(cache_key):
-                                logger.info(f"🔄 自动执行错过的重置: 群组 {chat_id}")
-                                result = await handle_hard_reset(
-                                    chat_id, None, target_date=business_yesterday
-                                )
-                                if result:
-                                    logger.info(f"✅ 自动执行成功")
-                                    return 1
-                        return 0
+                        if success:
+                            stats["executed"] += 1
+                            logger.info(f"✅ 自动执行成功")
+                        else:
+                            stats["failed"] += 1
+                            logger.error(f"❌ 自动执行失败")
+
+                    elif hours_since > 4:
+                        stats["missed"] += 1
+                        logger.info(f"⏭️ 超过4小时，需手动处理")
+                    else:
+                        stats["completed"] += 1  # 未来时间视为已完成
+
                 except Exception as e:
-                    logger.error(f"检查群组 {chat_id} 失败: {e}")
-                    return 0
+                    stats["errors"] += 1
+                    logger.error(f"❌ 检查群组 {chat_id} 失败: {e}")
 
-        # 并发检查所有群组
+        # ===== 4. 并发执行 =====
         tasks = [check_group(cid) for cid in all_groups]
-        results = await asyncio.gather(*tasks, return_exceptions=True)
+        await asyncio.gather(*tasks, return_exceptions=True)
 
-        executed = sum(1 for r in results if r == 1)
-        logger.info(f"📊 启动检查完成: 自动执行 {executed} 个重置")
+        # ===== 5. 生成报告 =====
+        report = (
+            f"📊 **启动自检报告**\n"
+            f"━━━━━━━━━━━━━━━━\n"
+            f"📈 总计检查: {stats['total']} 个群组\n"
+            f"✅ 已完成: {stats['completed']} 个\n"
+            f"🔄 自动执行: {stats['executed']} 个\n"
+            f"⚠️ 需手动处理: {stats['missed']} 个\n"
+            f"⏭️ 跳过: {stats['skipped']} 个\n"
+            f"❌ 执行失败: {stats['failed']} 个\n"
+            f"❗ 检查失败: {stats['errors']} 个\n"
+            f"━━━━━━━━━━━━━━━━"
+        )
+
+        logger.info(f"\n{report}")
+
+        # ===== 6. 如果有失败，发送通知给管理员 =====
+        if stats["failed"] > 0 or stats["errors"] > 0:
+            from utils import notification_service
+
+            await notification_service.send_notification(
+                chat_id=None,  # 发送给所有管理员
+                text=f"⚠️ **启动自检警告**\n{stats['failed']} 个重置失败，{stats['errors']} 个检查失败",
+                notification_type="admin",
+            )
 
     except Exception as e:
-        logger.error(f"❌ 启动检查失败: {e}")
+        logger.error(f"❌ 启动检查异常: {e}")
+        logger.error(traceback.format_exc())
