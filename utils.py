@@ -77,6 +77,11 @@ class MessageFormatter:
         return f"<code>{text}</code>"
 
     @staticmethod
+    def format_bold_code(text: str) -> str:
+        """格式化可复制加粗文本"""
+        return f"<b><code>{text}</code></b>"
+
+    @staticmethod
     def format_activity_message(
         user_id: int,
         user_name: str,
@@ -87,58 +92,37 @@ class MessageFormatter:
         time_limit: int,
         shift: str = None,
     ) -> str:
-        """格式化打卡消息 - 详细优化版"""
+        """格式化打卡消息 - 保持原样式，仅加粗关键信息"""
 
         first_line = f"👤 用户：{MessageFormatter.format_user_link(user_id, user_name)}"
         dashed_line = MessageFormatter.create_dashed_line()
-
-        # 定义辅助函数
         bold_code = MessageFormatter.format_bold_code
-
-        # 计算剩余次数
-        remaining = max_times - count
 
         message = (
             f"{first_line}\n"
-            f"✅ <b>打卡成功</b>\n"
-            f"📌 活动信息\n"
-            f"├─ 活动类型：{bold_code(activity)}\n"
-            f"├─ 打卡时间：{bold_code(time_str)}\n"
+            f"✅ 打卡成功：{bold_code(activity)} - {bold_code(time_str)}\n"
         )
 
         if shift:
             shift_text = "白班" if shift == "day" else "夜班"
-            message += f"├─ 当前班次：{bold_code(shift_text)}\n"
+            message += f"📊 班次：{bold_code(shift_text)}\n"
 
         message += (
-            f"├─ 单次限制：{bold_code(str(time_limit))}分钟\n"
-            f"└─ 今日次数：{bold_code(str(count))}/{bold_code(str(max_times))} 次\n"
-            f"\n"
-            f"📊 次数统计\n"
+            f"▫️ 本次活动类型：{bold_code(activity)}\n"
+            f"⏰ 单次时长限制：{bold_code(str(time_limit))}分钟 \n"
+            f"📈 今日{activity}次数：第 {bold_code(str(count))} 次（上限 {bold_code(str(max_times))} 次）\n"
         )
 
-        if remaining > 0:
-            message += f"├─ 已用次数：{bold_code(str(count))}次\n"
-            message += f"├─ 剩余次数：{bold_code(str(remaining))}次\n"
-            message += f"└─ 状态：{'🟢 正常' if remaining > 2 else '🟡 即将达到上限'}\n"
-        else:
-            message += f"└─ ⚠️ <b>今日次数已用完！</b>\n"
-
         if count >= max_times:
-            message += f"\n🚨 <b>⚠️ 警告：今日次数已达上限！</b>\n"
+            message += f"🚨 警告：本次结束后，您今日的{activity}次数将达到上限，请留意！\n"
 
         message += (
-            f"\n{dashed_line}\n"
-            f"💡 <b>操作提示</b>\n"
-            f"活动结束后请及时点击 👉<b>【✅ 回座】</b>👈按钮结束活动。"
+            f"{dashed_line}\n"
+            f"💡 操作提示\n"
+            f"活动结束后请及时点击 👉【✅ 回座】👈按钮。"
         )
 
         return message
-
-    @staticmethod
-    def format_bold_code(text: str) -> str:
-        """格式化可复制加粗文本"""
-        return f"<b><code>{text}</code></b>"
 
     @staticmethod
     def format_back_message(
@@ -155,7 +139,7 @@ class MessageFormatter:
         overtime_seconds: int = 0,
         fine_amount: int = 0,
     ) -> str:
-        """格式化回座消息 - 可复制加粗版"""
+        """格式化回座消息 - 保持原样式，仅加粗关键信息"""
         first_line = f"👤 用户：{MessageFormatter.format_user_link(user_id, user_name)}"
         dashed_line = MessageFormatter.create_dashed_line()
         bold_code = MessageFormatter.format_bold_code
@@ -175,18 +159,18 @@ class MessageFormatter:
 
         if is_overtime:
             overtime_time = MessageFormatter.format_time(int(overtime_seconds))
-            message += f"\n⚠️ <b>超时提醒</b>\n"
+            message += f"\n⚠️ 超时提醒\n"
             message += f"▫️ 超时时长：{bold_code(overtime_time)} 🚨\n"
             if fine_amount > 0:
                 message += f"▫️ 罚款金额：{bold_code(str(fine_amount))} 泰铢 💸\n"
-            message += f"{dashed_line}\n"
 
-        message += f"📊 <b>今日总计</b>\n"
+        message += f"{dashed_line}\n"
+        message += f"📊 今日总计\n"
         message += f"▫️ 活动详情\n"
 
         for act, count in activity_counts.items():
             if count > 0:
-                message += f"   ➤ {bold_code(act)}：{bold_code(str(count))} 次 📝\n"
+                message += f"    ➤ {bold_code(act)}：{bold_code(str(count))} 次 📝\n"
 
         message += f"▫️ 总活动次数：{bold_code(str(total_count))}次\n"
         message += f"▫️ 总活动时长：{bold_code(total_time)}"
