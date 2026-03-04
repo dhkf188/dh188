@@ -490,22 +490,30 @@ class UserLockManager:
         self._cleanup_old_locks()
 
     def _cleanup_old_locks(self):
-        """清理长时间未使用的锁"""
+        """清理长时间未使用的锁对象，释放内存"""
         now = time.time()
         max_age = 86400
 
+        # 找出正在使用的锁（排除处于 locked 状态的锁）
+        in_use_keys = set()
+        for key, lock in self._locks.items():
+            if lock.locked():
+                in_use_keys.add(key)
+
+        # 筛选出既不在使用中，且最后使用时间超过 24 小时的 key
         old_keys = [
             key
             for key, last_used in self._access_times.items()
-            if now - last_used > max_age
+            if key not in in_use_keys and now - last_used > max_age  # ✅ 排除正在使用的
         ]
 
+        # 执行清理
         for key in old_keys:
             self._locks.pop(key, None)
             self._access_times.pop(key, None)
 
         if old_keys:
-            logger.info(f"用户锁清理: 移除了 {len(old_keys)} 个过期锁")
+            logger.info(f"🧹 清理了 {len(old_keys)} 个过期的非活动锁对象")
 
     async def force_cleanup(self):
         """强制立即清理"""
@@ -551,6 +559,7 @@ class ActivityTimerManager:
     def __init__(self):
         self._timers = {}
         self.active_timers = {}
+        self._lock = asyncio.Lock()
         self._cleanup_interval = 300
         self._last_cleanup = time.time()
         self.activity_timer_callback = None
@@ -595,41 +604,66 @@ class ActivityTimerManager:
         return True
 
     async def cancel_timer(self, timer_key: str, preserve_message: bool = False):
-        """取消并清理指定的定时器"""
+        """取消并清理指定的定时器 - 修复版"""
+        # 先获取需要取消的key列表（在锁外获取，避免死锁）
         keys_to_cancel = [
             k for k in self.active_timers.keys() if k.startswith(timer_key)
         ]
 
         for key in keys_to_cancel:
-            timer_info = self.active_timers.pop(key, None)
-            if not timer_info:
+            # 使用临时变量保存需要的信息
+            task_to_cancel = None
+            chat_id_to_clean = None
+            uid_to_clean = None
+
+            # 第1步：在锁保护下获取任务信息并从字典移除
+            async with self._lock:  # 需要先在 __init__ 中添加 self._lock = asyncio.Lock()
+                timer_info = self.active_timers.pop(key, None)
+                if timer_info:
+                    task_to_cancel = timer_info.get("task")
+                    if not preserve_message:
+                        chat_id_to_clean = timer_info.get("chat_id")
+                        uid_to_clean = timer_info.get("uid")
+
+            # 如果没有找到定时器信息，继续下一个
+            if not task_to_cancel:
                 continue
 
-            task = timer_info.get("task")
-            if task and not task.done():
-                if hasattr(task, "preserve_message"):
-                    task.preserve_message = preserve_message
-
-                task.cancel()
-                try:
-                    await task
-                except asyncio.CancelledError:
-                    logger.info(f"⏹️ 定时器任务已取消: {key}")
-                except Exception as e:
-                    logger.error(f"❌ 定时器任务取消异常 ({key}): {e}")
-
+            # 第2步：在锁外执行耗时操作（任务取消和数据库操作）
             try:
-                if not preserve_message:
-                    chat_id = timer_info.get("chat_id")
-                    uid = timer_info.get("uid")
-                    if chat_id and uid:
-                        await db.clear_user_checkin_message(chat_id, uid)
-                        logger.debug(f"🧹 定时器消息ID已清理: {key}")
-                else:
-                    logger.debug(f"⏭️ 保留消息ID，定时器已取消: {key}")
-            except Exception as e:
-                logger.error(f"❌ 定时器消息清理异常 ({key}): {e}")
+                # 设置取消标志（如果需要）
+                if hasattr(task_to_cancel, "preserve_message"):
+                    task_to_cancel.preserve_message = preserve_message
 
+                # 取消任务
+                if not task_to_cancel.done():
+                    task_to_cancel.cancel()
+                    try:
+                        await task_to_cancel
+                        logger.info(f"⏹️ 定时器任务已取消: {key}")
+                    except asyncio.CancelledError:
+                        logger.info(f"⏹️ 定时器任务已取消: {key}")
+                    except Exception as e:
+                        logger.error(f"❌ 定时器任务取消异常 ({key}): {e}")
+                else:
+                    logger.debug(f"定时器任务已完成: {key}")
+
+                # 清理消息ID（如果不保留）
+                if not preserve_message and chat_id_to_clean and uid_to_clean:
+                    try:
+                        await db.clear_user_checkin_message(
+                            chat_id_to_clean, uid_to_clean
+                        )
+                        logger.debug(f"🧹 定时器消息ID已清理: {key}")
+                    except Exception as e:
+                        logger.error(f"❌ 定时器消息清理异常 ({key}): {e}")
+                elif preserve_message:
+                    logger.debug(f"⏭️ 保留消息ID，定时器已取消: {key}")
+
+            except Exception as e:
+                logger.error(f"❌ 处理定时器取消时出错 ({key}): {e}")
+
+            # 记录日志
             msg = f"🗑️ 定时器已取消: {key}"
             if preserve_message:
                 msg += " (保留消息ID)"
