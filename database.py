@@ -34,8 +34,6 @@ class PostgreSQLDatabase:
         self._max_reconnect_attempts = 5
         self._reconnect_base_delay = 1.0
 
-        self._connection_check_lock = asyncio.Lock()
-
         self._maintenance_running = False
         self._maintenance_task = None
         self._connection_maintenance_task = None
@@ -45,77 +43,52 @@ class PostgreSQLDatabase:
 
     # ========== 重连机制 ==========
     async def _ensure_healthy_connection(self):
-        """确保数据库连接健康 - 修复并发重连问题"""
-        async with self._connection_check_lock:  # 1. 加锁防止并发检查和重连
-            current_time = time.time()
-            # 如果在检查间隔时间内，直接判定为健康，减少性能损耗
-            if (
-                current_time - self._last_connection_check
-                < self._connection_check_interval
-            ):
-                return True
-
-            try:
-                is_healthy = await self.connection_health_check()
-                if not is_healthy:
-                    logger.warning("🚨 数据库连接不健康，尝试重连...")
-                    await self._reconnect()
-
-                # 2. 更新检查时间戳（使用完成后的时间）
-                self._last_connection_check = time.time()
-                return True
-            except Exception as e:
-                logger.error(f"❌ 数据库连接检查或重连失败: {e}")
-                # 3. 即使失败也更新时间戳，防止在故障期间每条指令都触发重连尝试
-                self._last_connection_check = time.time()
-                return False
-
-    async def _reconnect(self):
-        """重新建立数据库连接 - 修复版"""
-        self._reconnect_attempts += 1
-
-        # 1. 检查重连尝试次数，防止无限循环
-        if self._reconnect_attempts > self._max_reconnect_attempts:
-            logger.error(
-                f"❌ 数据库重连尝试次数超过上限 ({self._max_reconnect_attempts})，停止重连"
-            )
-            raise ConnectionError("数据库重连失败，达到最大尝试次数")
+        """确保连接健康"""
+        current_time = time.time()
+        if current_time - self._last_connection_check < self._connection_check_interval:
+            return True
 
         try:
-            # 2. 计算延迟时间（指数退避：1s, 2s, 4s, 8s...）
-            delay = self._reconnect_base_delay * (2 ** (self._reconnect_attempts - 1))
-            logger.info(
-                f"🔄 {delay}秒后尝试第{self._reconnect_attempts}次数据库重连..."
+            is_healthy = await self.connection_health_check()
+            if not is_healthy:
+                logger.warning("数据库连接不健康，尝试重连...")
+                await self._reconnect()
+
+            self._last_connection_check = current_time
+            return True
+        except Exception as e:
+            logger.error(f"数据库连接检查失败: {e}")
+            return False
+
+    async def _reconnect(self):
+        """重新建立数据库连接"""
+        self._reconnect_attempts += 1
+
+        if self._reconnect_attempts > self._max_reconnect_attempts:
+            logger.error(
+                f"数据库重连尝试次数超过上限 ({self._max_reconnect_attempts})，停止重连"
             )
+            raise ConnectionError("数据库重连失败")
+
+        try:
+            delay = self._reconnect_base_delay * (2 ** (self._reconnect_attempts - 1))
+            logger.info(f"{delay}秒后尝试第{self._reconnect_attempts}次数据库重连...")
             await asyncio.sleep(delay)
 
             if self.pool:
-                # 3. ===== 修复：确保旧连接池彻底释放 =====
-                try:
-                    # 使用 wait_closed 的思想，先尝试关闭
-                    await asyncio.wait_for(self.pool.close(), timeout=5.0)
-                    # 给系统内核一点时间处理 socket 释放
-                    await asyncio.sleep(0.5)
-                    logger.debug("旧数据库连接池已清理")
-                except asyncio.TimeoutError:
-                    logger.warning("等待连接池关闭超时，强制继续初始化")
-                except Exception as e:
-                    logger.error(f"清理旧连接池出错: {e}")
-                # ===== 修复结束 =====
+                await self.pool.close()
 
-            # 4. 重置状态并重新初始化
             self.pool = None
             self._initialized = False
             await self._initialize_impl()
 
-            # 5. 重连成功，重置计数器
             self._reconnect_attempts = 0
             logger.info("✅ 数据库重连成功")
 
         except Exception as e:
-            logger.error(f"❌ 数据库第{self._reconnect_attempts}次重连失败: {e}")
+            logger.error(f"数据库第{self._reconnect_attempts}次重连失败: {e}")
             if self._reconnect_attempts >= self._max_reconnect_attempts:
-                logger.critical("🚨 数据库重连最终失败，服务可能无法正常工作")
+                logger.critical("数据库重连最终失败，服务可能无法正常工作")
             raise
 
     async def execute_with_retry(
@@ -1265,7 +1238,7 @@ class PostgreSQLDatabase:
             )
 
     async def get_user(self, chat_id: int, user_id: int) -> Optional[Dict]:
-        """高性能获取用户数据 - 带二级缓存和查询优化 - 修复版"""
+        """高性能获取用户数据 - 带二级缓存和查询优化"""
 
         # ===== 1. 一级缓存：内存缓存（最快） =====
         cache_key = f"user:{chat_id}:{user_id}"
@@ -1276,21 +1249,19 @@ class PostgreSQLDatabase:
                 self._cache_hits += 1
             return cached
 
-        # ===== 2. 二级缓存：检查是否有正在进行的查询（防止缓存击穿/Singleflight） =====
+        # ===== 2. 二级缓存：检查是否有正在进行的查询（防止缓存击穿） =====
         pending_key = f"pending:{chat_id}:{user_id}"
         if hasattr(self, "_pending_queries") and pending_key in self._pending_queries:
             try:
-                # 多个相同请求共享同一个正在执行的任务
-                logger.debug(f"🔗 合并重复查询请求: {pending_key}")
+                # 等待正在进行的查询结果
                 return await self._pending_queries[pending_key]
             except Exception:
-                # 如果共享任务失败，后续流程会重新尝试发起新查询
                 pass
 
-        # ===== 3. 定义查询任务逻辑 =====
+        # ===== 3. 创建查询任务（带超时和重试） =====
         async def _execute_query():
             try:
-                # 执行带重试机制的数据库查询
+                # 使用更精确的字段选择（只选需要的）
                 row = await self.execute_with_retry(
                     "获取用户数据",
                     """
@@ -1321,7 +1292,7 @@ class PostgreSQLDatabase:
                 if row:
                     result = dict(row)
 
-                    # 数据补全：如果字段缺失，尝试修复班次信息
+                    # ===== 4. 数据验证和修复 =====
                     if "shift" not in result or result["shift"] is None:
                         active_shift = await self.get_user_active_shift(
                             chat_id, user_id
@@ -1331,13 +1302,12 @@ class PostgreSQLDatabase:
                         )
                         logger.debug(f"修复用户 {user_id} 的班次为: {result['shift']}")
 
-                    # 类型转换：将 last_updated 规范化为日期对象
                     if result.get("last_updated") and isinstance(
                         result["last_updated"], datetime
                     ):
                         result["last_updated"] = result["last_updated"].date()
 
-                    # 写入缓存：增加随机抖动 (Jitter) 延长 25s-35s，防止缓存集体失效引起雪崩
+                    # ===== 5. 写入缓存（带随机TTL防止缓存雪崩） =====
                     import random
 
                     cache_ttl = 30 + random.randint(-5, 5)
@@ -1345,13 +1315,12 @@ class PostgreSQLDatabase:
 
                     return result
 
-                # 用户不存在：缓存空结果（Negative Caching）防止数据库被恶意穿透
+                # 用户不存在，缓存空结果防止穿透
                 self._set_cached(cache_key, None, 10)
                 return None
 
             except asyncio.TimeoutError:
                 logger.error(f"⏱️ 获取用户数据超时: {chat_id}-{user_id}")
-                # 超时兜底数据，保证系统可用性
                 return {
                     "user_id": user_id,
                     "nickname": f"用户{user_id}",
@@ -1368,28 +1337,16 @@ class PostgreSQLDatabase:
                 logger.error(f"❌ 获取用户数据失败 {chat_id}-{user_id}: {e}")
                 raise
 
-        # ===== 4. 执行并管理查询任务 - 修复版 =====
+        # ===== 6. 执行查询并缓存任务（防止并发重复查询） =====
         if not hasattr(self, "_pending_queries"):
             self._pending_queries = {}
 
-        # 创建异步任务并注册到 pending 字典
-        task = asyncio.create_task(_execute_query())
-        self._pending_queries[pending_key] = task
+        self._pending_queries[pending_key] = asyncio.create_task(_execute_query())
 
         try:
-            result = await task
+            result = await self._pending_queries[pending_key]
             return result
-        except Exception as e:
-            # 异常处理：确保取消未完成的任务
-            if not task.done():
-                task.cancel()
-                try:
-                    await task
-                except asyncio.CancelledError:
-                    pass
-            raise
         finally:
-            # 最终清理：无论成败，必须移除正在进行的任务记录，允许后续请求再次查询
             self._pending_queries.pop(pending_key, None)
 
     async def get_user_activity_count_by_shift(
