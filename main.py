@@ -2024,6 +2024,7 @@ async def process_work_checkin(message: types.Message, checkin_type: str):
                 grace_before = shift_config.get("grace_before", 120)
                 grace_after = shift_config.get("grace_after", 360)
 
+                # 白班上班窗口（不变）
                 day_start_h, day_start_m = map(int, day_start.split(":"))
                 day_start_dt = now.replace(
                     hour=day_start_h, minute=day_start_m, second=0
@@ -2035,14 +2036,17 @@ async def process_work_checkin(message: types.Message, checkin_type: str):
                     day_start_dt + timedelta(minutes=grace_after)
                 ).strftime("%H:%M")
 
+                # 夜班上班窗口（修复）
                 day_end_h, day_end_m = map(int, day_end.split(":"))
                 day_end_dt = now.replace(hour=day_end_h, minute=day_end_m, second=0)
+                
+                # ✅ 正确计算：基于当天的 21:00
                 night_work_start_start = (
-                    day_end_dt - timedelta(days=1) - timedelta(minutes=grace_before)
-                ).strftime("%H:%M")
+                    day_end_dt - timedelta(minutes=grace_before)
+                ).strftime("%H:%M")  # 当天 19:00
                 night_work_start_end = (
-                    day_end_dt - timedelta(days=1) + timedelta(minutes=grace_after)
-                ).strftime("%H:%M")
+                    day_end_dt + timedelta(minutes=grace_after)
+                ).strftime("%H:%M")  # 次日 03:00
 
                 await message.answer(
                     f"❌ 当前时间不在{action_text}打卡窗口内\n\n"
