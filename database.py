@@ -500,7 +500,7 @@ class PostgreSQLDatabase:
             max_size=Config.DB_MAX_CONNECTIONS,
             max_inactive_connection_lifetime=Config.DB_POOL_RECYCLE,
             command_timeout=Config.DB_CONNECTION_TIMEOUT,
-            timeout=60,
+            timeout=30,
         )
         logger.info("PostgreSQL连接池创建成功")
 
