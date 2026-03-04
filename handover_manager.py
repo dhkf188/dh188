@@ -566,13 +566,20 @@ class HandoverManager:
         cycle: int,
         start_time: Optional[datetime] = None,
     ) -> bool:
-        """创建用户新周期"""
+        """创建用户新周期 - 修复时区问题"""
         if start_time is None:
+            # 获取当前北京时间
             start_time = db.get_beijing_time()
 
+        # 转换为无时区时间（数据库期望 TIMESTAMP WITHOUT TIME ZONE）
+        if start_time.tzinfo is not None:
+            start_time = start_time.replace(tzinfo=None)
+
+        # 根据 period_type 判定 shift_type (day/night)
         shift_type = "night" if "night" in period_type else "day"
 
         try:
+            # 执行数据库插入，带冲突检测
             await db.execute_with_retry(
                 "创建用户周期",
                 """
@@ -588,17 +595,22 @@ class HandoverManager:
                 business_date,
                 shift_type,
                 cycle,
-                start_time,
+                start_time,  # 传入已规范化的无时区时间
             )
 
+            # 构造缓存键并清理过期缓存，确保下次读取时能从数据库获取最新状态
             cache_key = (
                 f"user_cycle:{chat_id}:{user_id}:{business_date}:{period_type}:{cycle}"
             )
             self._user_cycle_cache.pop(cache_key, None)
 
+            logger.info(
+                f"✅ 创建用户周期成功: 用户 {user_id}, 业务日期 {business_date}, 班次 {shift_type}"
+            )
             return True
+
         except Exception as e:
-            logger.error(f"创建用户周期失败 {chat_id}-{user_id}: {e}")
+            logger.error(f"❌ 创建用户周期失败 {chat_id}-{user_id}: {e}")
             return False
 
     async def update_user_cycle_time(
