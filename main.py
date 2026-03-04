@@ -83,6 +83,8 @@ dp = None
 start_time = time.time()
 
 active_back_processing: Dict[str, bool] = {}
+active_back_processing: Dict[str, float] = {}
+active_back_processing_lock = asyncio.Lock()
 
 
 # ========== 日志中间件 ==========
@@ -1492,25 +1494,29 @@ async def _process_back_locked(
     uid: int,
     shift: str = None,
 ):
-    """线程安全的回座逻辑"""
+    """线程安全的回座逻辑 - 完全修复版"""
     start_time = time.time()
     key = f"{chat_id}:{uid}"
+    had_lock = False  # 标记是否成功获取了处理锁
 
-    if key in active_back_processing:
-        lock_time = active_back_processing.get(key)
-        if isinstance(lock_time, (int, float)) and time.time() - lock_time > 30:
-            logger.warning(
-                f"⚠️ [回座] 强制释放过期锁: {key} (持有时间: {time.time()-lock_time:.1f}秒)"
-            )
-            active_back_processing.pop(key, None)
-        else:
-            await message.answer(
-                "⚠️ 您的回座请求正在处理中，请稍候。",
-                reply_to_message_id=message.message_id,
-            )
-            return
+    # 使用锁保护字典操作
+    async with active_back_processing_lock:
+        if key in active_back_processing:
+            lock_time = active_back_processing.get(key)
+            if isinstance(lock_time, (int, float)) and time.time() - lock_time > 30:
+                logger.warning(
+                    f"⚠️ [回座] 强制释放过期锁: {key} (持有时间: {time.time()-lock_time:.1f}秒)"
+                )
+                active_back_processing.pop(key, None)
+            else:
+                await message.answer(
+                    "⚠️ 您的回座请求正在处理中，请稍候。",
+                    reply_to_message_id=message.message_id,
+                )
+                return
 
-    active_back_processing[key] = time.time()
+        active_back_processing[key] = time.time()
+        had_lock = True  # 成功获取处理锁
 
     try:
         now = db.get_beijing_time()
@@ -1862,14 +1868,23 @@ async def _process_back_locked(
         )
 
     finally:
-        # 先保存key状态
-        had_lock = key in active_back_processing
+        # ===== 修复：使用外部的 had_lock 变量，不再重新定义 =====
+        async with active_back_processing_lock:
+            if had_lock:  # 使用外部的 had_lock 变量
+                # 双重检查，确保 key 还在字典中
+                if key in active_back_processing:
+                    active_back_processing.pop(key, None)
+                    logger.info(f"✅ [回座锁释放] key={key}")
+                else:
+                    logger.warning(
+                        f"⚠️ [回座锁状态异常] key={key} 不在字典中但 had_lock=True"
+                    )
+        # ===== 修复结束 =====
 
-        # 清理消息ID（可能和定时器冲突，但日志重要）
+        # 清理消息ID...
         try:
             current_message_id = await db.get_user_checkin_message_id(chat_id, uid)
             if current_message_id:
-                # 快速检查用户是否还有活动
                 final_user_data = await db.get_user_cached(chat_id, uid)
                 if not final_user_data or not final_user_data.get("current_activity"):
                     await db.clear_user_checkin_message(chat_id, uid)
@@ -1878,11 +1893,6 @@ async def _process_back_locked(
                     logger.debug(f"用户 {uid} 活动仍在进行，保留消息ID")
         except Exception as e:
             logger.warning(f"⚠️ finally 清理失败: {e}")
-
-        # 释放处理锁
-        if had_lock:
-            active_back_processing.pop(key, None)
-            logger.info(f"✅ [回座锁释放] key={key}")
 
         duration = round(time.time() - start_time, 2)
         logger.info(f"✅ [回座结束] key={key}，总耗时 {duration}s")
@@ -2039,14 +2049,18 @@ async def process_work_checkin(message: types.Message, checkin_type: str):
                 # 夜班上班窗口（修复）
                 day_end_h, day_end_m = map(int, day_end.split(":"))
                 day_end_dt = now.replace(hour=day_end_h, minute=day_end_m, second=0)
-                
+
                 # ✅ 正确计算：基于当天的 21:00
                 night_work_start_start = (
                     day_end_dt - timedelta(minutes=grace_before)
-                ).strftime("%H:%M")  # 当天 19:00
+                ).strftime(
+                    "%H:%M"
+                )  # 当天 19:00
                 night_work_start_end = (
                     day_end_dt + timedelta(minutes=grace_after)
-                ).strftime("%H:%M")  # 次日 03:00
+                ).strftime(
+                    "%H:%M"
+                )  # 次日 03:00
 
                 await message.answer(
                     f"❌ 当前时间不在{action_text}打卡窗口内\n\n"
