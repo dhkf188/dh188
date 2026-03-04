@@ -165,14 +165,23 @@ class GlobalCache:
         self.default_ttl = default_ttl
 
     def get(self, key: str) -> Any:
-        """获取缓存值"""
-        if key in self._cache_ttl and time.time() < self._cache_ttl[key]:
-            self._hits += 1
-            return self._cache.get(key)
+        """从缓存获取数据，支持 TTL 自动过期检查"""
+        # 1. 检查 key 是否存在于过期时间字典中
+        if key in self._cache_ttl:
+            # 2. 检查当前时间是否小于过期时间
+            if time.time() < self._cache_ttl[key]:
+                # 缓存命中：更新命中统计并返回结果
+                self._hits += 1
+                return self._cache.get(key)
+            else:
+                # 缓存过期：从主缓存和过期字典中清理该 key
+                self._cache.pop(key, None)
+                self._cache_ttl.pop(key, None)
+                self._misses += 1
+                return None
         else:
+            # key 不存在：更新错过统计
             self._misses += 1
-            self._cache.pop(key, None)
-            self._cache_ttl.pop(key, None)
             return None
 
     def set(self, key: str, value: Any, ttl: int = None):
