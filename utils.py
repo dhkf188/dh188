@@ -3,7 +3,6 @@ import time
 import asyncio
 import logging
 import gc
-import hashlib
 import psutil
 
 from datetime import datetime, timedelta, date
@@ -213,11 +212,7 @@ class NotificationService:
             logger.warning("NotificationService: bot_manager 和 bot 都未初始化")
             return False
 
-        # ===== 修复：使用 MD5 替代 hash() =====
-        text_hash = hashlib.md5(text.encode()).hexdigest()
-        notification_key = f"{chat_id}:{text_hash}"
-        # ===== 修复结束 =====
-
+        notification_key = f"{chat_id}:{hash(text)}"
         current_time = time.time()
         if (
             notification_key in self._last_notification_time
@@ -460,7 +455,7 @@ class NotificationService:
 
 
 class UserLockManager:
-    """用户锁管理器 - 修复版"""
+    """用户锁管理器"""
 
     def __init__(self):
         self._locks = {}
@@ -468,17 +463,13 @@ class UserLockManager:
         self._cleanup_interval = 3600
         self._last_cleanup = time.time()
         self._max_locks = 5000
-        # ===== 新增：添加全局锁 =====
-        self._global_lock = asyncio.Lock()
-        # ===== 新增结束 =====
 
     def get_lock(self, chat_id: int, uid: int):
         """获取用户级锁"""
         key = f"{chat_id}-{uid}"
 
         if len(self._locks) >= self._max_locks:
-            # 紧急清理在异步上下文中调用，需要特殊处理
-            asyncio.create_task(self._emergency_cleanup_async())
+            self._emergency_cleanup()
 
         self._access_times[key] = time.time()
 
@@ -503,26 +494,18 @@ class UserLockManager:
         now = time.time()
         max_age = 86400
 
-        # ===== 修复：使用快照代替直接遍历 =====
-        # 创建锁的快照
-        locks_snapshot = list(self._locks.items())
-
-        # 找出正在使用的锁
+        # 找出正在使用的锁（排除处于 locked 状态的锁）
         in_use_keys = set()
-        for key, lock in locks_snapshot:
+        for key, lock in self._locks.items():
             if lock.locked():
                 in_use_keys.add(key)
-
-        # 创建访问时间的快照
-        access_snapshot = list(self._access_times.items())
 
         # 筛选出既不在使用中，且最后使用时间超过 24 小时的 key
         old_keys = [
             key
-            for key, last_used in access_snapshot
-            if key not in in_use_keys and now - last_used > max_age
+            for key, last_used in self._access_times.items()
+            if key not in in_use_keys and now - last_used > max_age  # ✅ 排除正在使用的
         ]
-        # ===== 修复结束 =====
 
         # 执行清理
         for key in old_keys:
@@ -547,43 +530,31 @@ class UserLockManager:
             "last_cleanup": self._last_cleanup,
         }
 
-    async def _emergency_cleanup_async(self):
-        """异步紧急清理"""
-        async with self._global_lock:
-            self._emergency_cleanup()
-
     def _emergency_cleanup(self):
-        """紧急清理 - 修复版"""
+        """紧急清理 - 简化修复版，增加被跳过锁统计"""
         now = time.time()
         max_age = 3600
 
-        # ===== 修复：使用快照 =====
-        # 创建锁的快照
-        locks_snapshot = list(self._locks.items())
-
         # 找出正在使用的锁
         in_use_keys = set()
-        for key, lock in locks_snapshot:
+        for key, lock in self._locks.items():
             if lock.locked():
                 in_use_keys.add(key)
-
-        # 创建访问时间的快照
-        access_snapshot = list(self._access_times.items())
-        # ===== 修复结束 =====
-
         skipped_count = len(in_use_keys)
 
         # 1. 筛选出超过 1 小时未使用的非活动锁
         old_keys = [
             key
-            for key, last_used in access_snapshot
+            for key, last_used in self._access_times.items()
             if key not in in_use_keys and now - last_used > max_age
         ]
 
         # 2. 如果锁总数扣除使用中的部分后仍然超过 80% 的容量限制，强制清理最旧的非活动锁
         if len(self._locks) - skipped_count >= self._max_locks * 0.8:
-            # 获取所有非活动锁（基于快照）
-            inactive_keys = [key for key, _ in locks_snapshot if key not in in_use_keys]
+            # 获取所有非活动锁
+            inactive_keys = [
+                key for key in self._locks.keys() if key not in in_use_keys
+            ]
             # 按最后使用时间排序（时间戳越小说明越久没用）
             inactive_with_time = [
                 (key, self._access_times.get(key, 0)) for key in inactive_keys
