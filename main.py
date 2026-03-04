@@ -39,7 +39,7 @@ from performance import (
     global_cache,
     track_performance,
     with_retry,
-    message_deduplicate,
+    message_deduplicate_decorator,
     handle_database_errors,
     handle_telegram_errors,
     distributed_lock,
@@ -3225,7 +3225,7 @@ def admin_required(func):
 
 # ========== 消息处理器 ==========
 @rate_limit(rate=5, per=60)
-@message_deduplicate
+@message_deduplicate_decorator()
 async def cmd_start(message: types.Message):
     """开始命令"""
     uid = message.from_user.id
@@ -3455,7 +3455,7 @@ async def handle_ranking_night_command(message: types.Message):
 
 
 @rate_limit(rate=10, per=60)
-@message_deduplicate
+@message_deduplicate_decorator()
 @with_retry("cmd_ci", max_retries=2)
 @track_performance("cmd_ci")
 async def cmd_ci(message: types.Message):
@@ -3497,7 +3497,7 @@ async def cmd_ci(message: types.Message):
 
 
 @rate_limit(rate=10, per=60)
-@message_deduplicate
+@message_deduplicate_decorator()
 @with_retry("cmd_at", max_retries=2)
 @track_performance("cmd_at")
 async def cmd_at(message: types.Message):
@@ -3506,7 +3506,7 @@ async def cmd_at(message: types.Message):
 
 
 @rate_limit(rate=5, per=60)
-@message_deduplicate
+@message_deduplicate_decorator()
 @with_retry("work_start", max_retries=2)
 @track_performance("work_start")
 async def cmd_workstart(message: types.Message):
@@ -3515,7 +3515,7 @@ async def cmd_workstart(message: types.Message):
 
 
 @rate_limit(rate=5, per=60)
-@message_deduplicate
+@message_deduplicate_decorator()
 @with_retry("work_end", max_retries=2)
 @track_performance("work_end")
 async def cmd_workend(message: types.Message):
@@ -6444,7 +6444,7 @@ async def handle_all_text_messages(message: types.Message):
 
 
 @rate_limit(rate=10, per=60)
-@message_deduplicate
+@message_deduplicate_decorator()
 @with_retry("fixed_activity", max_retries=2)
 @track_performance("fixed_activity")
 async def handle_fixed_activity(message: types.Message):
