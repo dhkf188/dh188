@@ -155,7 +155,7 @@ class RetryManager:
 
 
 class GlobalCache:
-    """全局缓存管理器 - 修复版"""
+    """全局缓存管理器"""
 
     def __init__(self, default_ttl: int = 300):
         self._cache: Dict[str, Any] = {}
@@ -163,35 +163,20 @@ class GlobalCache:
         self._hits = 0
         self._misses = 0
         self.default_ttl = default_ttl
-        # ===== 新增：添加统计锁 =====
-        self._stats_lock = asyncio.Lock()
-        # ===== 新增结束 =====
 
-    async def get(self, key: str) -> Any:  # 改为 async 方法
-        """从缓存获取数据，支持 TTL 自动过期检查"""
-        # 1. 检查 key 是否存在于过期时间字典中
-        if key in self._cache_ttl:
-            # 2. 检查当前时间是否小于过期时间
-            if time.time() < self._cache_ttl[key]:
-                # 缓存命中：更新命中统计并返回结果
-                async with self._stats_lock:  # ===== 新增：锁保护 =====
-                    self._hits += 1
-                return self._cache.get(key)
-            else:
-                # 缓存过期：从主缓存和过期字典中清理该 key
-                self._cache.pop(key, None)
-                self._cache_ttl.pop(key, None)
-                async with self._stats_lock:  # ===== 新增：锁保护 =====
-                    self._misses += 1
-                return None
+    def get(self, key: str) -> Any:
+        """获取缓存值"""
+        if key in self._cache_ttl and time.time() < self._cache_ttl[key]:
+            self._hits += 1
+            return self._cache.get(key)
         else:
-            # key 不存在：更新错过统计
-            async with self._stats_lock:  # ===== 新增：锁保护 =====
-                self._misses += 1
+            self._misses += 1
+            self._cache.pop(key, None)
+            self._cache_ttl.pop(key, None)
             return None
 
     def set(self, key: str, value: Any, ttl: int = None):
-        """设置缓存值（不需要锁，因为字典操作是原子的）"""
+        """设置缓存值"""
         if ttl is None:
             ttl = self.default_ttl
 
@@ -204,7 +189,7 @@ class GlobalCache:
         self._cache_ttl.pop(key, None)
 
     def clear_expired(self):
-        """清理过期缓存（不需要锁，因为是只读操作）"""
+        """清理过期缓存"""
         current_time = time.time()
         expired_keys = [
             key for key, expiry in self._cache_ttl.items() if current_time >= expiry
@@ -222,19 +207,18 @@ class GlobalCache:
         self._cache_ttl.clear()
         logger.info("所有缓存已清理")
 
-    async def get_stats(self) -> Dict[str, Any]:  # 改为 async 方法
+    def get_stats(self) -> Dict[str, Any]:
         """获取缓存统计"""
-        async with self._stats_lock:  # ===== 新增：锁保护 =====
-            total = self._hits + self._misses
-            hit_rate = self._hits / total if total > 0 else 0
+        total = self._hits + self._misses
+        hit_rate = self._hits / total if total > 0 else 0
 
-            return {
-                "size": len(self._cache),
-                "hits": self._hits,
-                "misses": self._misses,
-                "hit_rate": hit_rate,
-                "total_operations": total,
-            }
+        return {
+            "size": len(self._cache),
+            "hits": self._hits,
+            "misses": self._misses,
+            "hit_rate": hit_rate,
+            "total_operations": total,
+        }
 
 
 class TaskManager:
