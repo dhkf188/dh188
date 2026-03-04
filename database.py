@@ -3932,6 +3932,16 @@ class PostgreSQLDatabase:
             ),
         }
 
+    async def is_dual_mode_enabled(self, chat_id: int) -> bool:
+        """检查群组是否启用了双班模式"""
+        try:
+            group_data = await self.get_group_cached(chat_id)
+            if not group_data:
+                return True  # 默认开启双班模式
+            return bool(group_data.get("dual_mode", True))
+        except Exception as e:
+            logger.error(f"检查双班模式失败 {chat_id}: {e}")
+
     def calculate_shift_window(
         self,
         shift_config: Dict[str, Any],
