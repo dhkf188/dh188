@@ -531,26 +531,55 @@ class UserLockManager:
         }
 
     def _emergency_cleanup(self):
-        """紧急清理"""
+        """紧急清理 - 简化修复版，增加被跳过锁统计"""
         now = time.time()
         max_age = 3600
 
+        # 找出正在使用的锁
+        in_use_keys = set()
+        for key, lock in self._locks.items():
+            if lock.locked():
+                in_use_keys.add(key)
+        skipped_count = len(in_use_keys)
+
+        # 1. 筛选出超过 1 小时未使用的非活动锁
         old_keys = [
             key
             for key, last_used in self._access_times.items()
-            if now - last_used > max_age
+            if key not in in_use_keys and now - last_used > max_age
         ]
 
-        if len(self._locks) >= self._max_locks:
-            sorted_keys = sorted(self._access_times.items(), key=lambda x: x[1])
-            additional_cleanup = max(100, len(sorted_keys) // 5)
-            old_keys.extend([key for key, _ in sorted_keys[:additional_cleanup]])
+        # 2. 如果锁总数扣除使用中的部分后仍然超过 80% 的容量限制，强制清理最旧的非活动锁
+        if len(self._locks) - skipped_count >= self._max_locks * 0.8:
+            # 获取所有非活动锁
+            inactive_keys = [
+                key for key in self._locks.keys() if key not in in_use_keys
+            ]
+            # 按最后使用时间排序（时间戳越小说明越久没用）
+            inactive_with_time = [
+                (key, self._access_times.get(key, 0)) for key in inactive_keys
+            ]
+            inactive_with_time.sort(key=lambda x: x[1])
 
-        for key in set(old_keys):
-            self._locks.pop(key, None)
-            self._access_times.pop(key, None)
+            # 强制清理最旧的 20% 非活动锁，最少清理 100 个
+            additional = max(100, len(inactive_with_time) // 5)
+            old_keys.extend([key for key, _ in inactive_with_time[:additional]])
 
-        logger.warning(f"紧急锁清理: 移除了 {len(old_keys)} 个锁")
+        # 3. 执行物理清理
+        unique_keys = set(old_keys)
+        removed_count = 0
+        for key in unique_keys:
+            # 再次确认：必须存在于字典中且未被锁定（二次校验增强鲁棒性）
+            if key in self._locks and key not in in_use_keys:
+                self._locks.pop(key, None)
+                self._access_times.pop(key, None)
+                removed_count += 1
+
+        # 4. 记录日志
+        if unique_keys or skipped_count:
+            logger.warning(
+                f"🚨 紧急锁清理: 移除了 {removed_count} 个锁，跳过 {skipped_count} 个正在使用的锁"
+            )
 
 
 class ActivityTimerManager:
