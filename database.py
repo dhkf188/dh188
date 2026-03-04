@@ -43,22 +43,30 @@ class PostgreSQLDatabase:
 
     # ========== 重连机制 ==========
     async def _ensure_healthy_connection(self):
-        """确保连接健康"""
-        current_time = time.time()
-        if current_time - self._last_connection_check < self._connection_check_interval:
-            return True
+        """确保数据库连接健康 - 修复并发重连问题"""
+        async with self._connection_check_lock:  # 1. 加锁防止并发检查和重连
+            current_time = time.time()
+            # 如果在检查间隔时间内，直接判定为健康，减少性能损耗
+            if (
+                current_time - self._last_connection_check
+                < self._connection_check_interval
+            ):
+                return True
 
-        try:
-            is_healthy = await self.connection_health_check()
-            if not is_healthy:
-                logger.warning("数据库连接不健康，尝试重连...")
-                await self._reconnect()
+            try:
+                is_healthy = await self.connection_health_check()
+                if not is_healthy:
+                    logger.warning("🚨 数据库连接不健康，尝试重连...")
+                    await self._reconnect()
 
-            self._last_connection_check = current_time
-            return True
-        except Exception as e:
-            logger.error(f"数据库连接检查失败: {e}")
-            return False
+                # 2. 更新检查时间戳（使用完成后的时间）
+                self._last_connection_check = time.time()
+                return True
+            except Exception as e:
+                logger.error(f"❌ 数据库连接检查或重连失败: {e}")
+                # 3. 即使失败也更新时间戳，防止在故障期间每条指令都触发重连尝试
+                self._last_connection_check = time.time()
+                return False
 
     async def _reconnect(self):
         """重新建立数据库连接"""
