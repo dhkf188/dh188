@@ -24,8 +24,6 @@ class HandoverManager:
         self._handover_cache = {}
         self._handover_cache_ttl = {}
 
-        self._cache_lock = asyncio.Lock()
-
     # ========== 配置管理 ==========
 
     async def init_handover_config(self, chat_id: int) -> bool:
@@ -843,71 +841,6 @@ class HandoverManager:
         cache_key = f"handover_config:{chat_id}"
         self._cache.pop(cache_key, None)
         self._cache_ttl.pop(cache_key, None)
-
-        # ===== 新增：清理相关周期缓存 =====
-        # 清理 period_cache
-        period_keys_to_remove = [
-            k for k in self._period_cache.keys() if k.startswith(f"period:{chat_id}:")
-        ]
-        for k in period_keys_to_remove:
-            self._period_cache.pop(k, None)
-            self._period_cache_ttl.pop(k, None)
-
-        # 清理 handover_cache
-        handover_keys_to_remove = [
-            k
-            for k in self._handover_cache.keys()
-            if k.startswith(f"handover_check:{chat_id}:")
-        ]
-        for k in handover_keys_to_remove:
-            self._handover_cache.pop(k, None)
-            self._handover_cache_ttl.pop(k, None)
-
-        # 清理用户周期缓存（包含该群组的所有用户）
-        user_cycle_keys_to_remove = [
-            k
-            for k in self._user_cycle_cache.keys()
-            if k.startswith(f"user_cycle:{chat_id}:")
-        ]
-        for k in user_cycle_keys_to_remove:
-            self._user_cycle_cache.pop(k, None)
-
-        if (
-            period_keys_to_remove
-            or handover_keys_to_remove
-            or user_cycle_keys_to_remove
-        ):
-            logger.debug(
-                f"🧹 清理了群组 {chat_id} 的 {len(period_keys_to_remove)} 个周期缓存, "
-                f"{len(handover_keys_to_remove)} 个换班缓存, "
-                f"{len(user_cycle_keys_to_remove)} 个用户周期缓存"
-            )
-
-    # ===== 新增：带锁的缓存操作方法 =====
-    async def _get_period_cache_safe(self, key: str):
-        """安全获取周期缓存"""
-        async with self._cache_lock:
-            import time
-
-            if hasattr(self, "_period_cache") and key in self._period_cache_ttl:
-                if time.time() < self._period_cache_ttl[key]:
-                    return self._period_cache.get(key)
-                else:
-                    self._period_cache.pop(key, None)
-                    self._period_cache_ttl.pop(key, None)
-            return None
-
-    async def _set_period_cache_safe(self, key: str, value: dict, ttl: int = 3600):
-        """安全设置周期缓存"""
-        async with self._cache_lock:
-            import time
-
-            if not hasattr(self, "_period_cache"):
-                self._period_cache = {}
-                self._period_cache_ttl = {}
-
-            self._period_cache[key] = value
-            self._period_cache_ttl[key] = time.time() + ttl
 
     async def update_handover_config(self, chat_id: int, **kwargs) -> bool:
         """
