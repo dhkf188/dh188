@@ -1862,21 +1862,27 @@ async def _process_back_locked(
         )
 
     finally:
-        if key in active_back_processing:
-            active_back_processing.pop(key, None)
-            logger.info(f"✅ [回座锁释放] key={key}")
-        else:
-            logger.warning(f"⚠️ [回座锁释放] key={key} 已不存在")
+        # 先保存key状态
+        had_lock = key in active_back_processing
 
+        # 清理消息ID（可能和定时器冲突，但日志重要）
         try:
             current_message_id = await db.get_user_checkin_message_id(chat_id, uid)
             if current_message_id:
-                await db.clear_user_checkin_message(chat_id, uid)
-                logger.info(f"🧹 finally 清理用户 {uid} 的打卡消息ID")
-            else:
-                logger.debug(f"用户 {uid} 的打卡消息ID已不存在，无需清理")
+                # 快速检查用户是否还有活动
+                final_user_data = await db.get_user_cached(chat_id, uid)
+                if not final_user_data or not final_user_data.get("current_activity"):
+                    await db.clear_user_checkin_message(chat_id, uid)
+                    logger.info(f"🧹 finally 清理用户 {uid} 的打卡消息ID")
+                else:
+                    logger.debug(f"用户 {uid} 活动仍在进行，保留消息ID")
         except Exception as e:
-            logger.warning(f"⚠️ finally 清理失败 chat_id={chat_id}, uid={uid}: {e}")
+            logger.warning(f"⚠️ finally 清理失败: {e}")
+
+        # 释放处理锁
+        if had_lock:
+            active_back_processing.pop(key, None)
+            logger.info(f"✅ [回座锁释放] key={key}")
 
         duration = round(time.time() - start_time, 2)
         logger.info(f"✅ [回座结束] key={key}，总耗时 {duration}s")
