@@ -1144,7 +1144,7 @@ async def check_missed_resets_on_startup():
                         cache_key = f"dual_reset:{chat_id}:{business_yesterday.strftime('%Y%m%d')}"
 
                         # 检查缓存
-                        if global_cache.get(cache_key):
+                        if await global_cache.get(cache_key):
                             logger.debug(f"⏭️ 缓存已标记: {chat_id}")
                             stats["completed"] += 1
                             return
