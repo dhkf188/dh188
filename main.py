@@ -4675,11 +4675,25 @@ async def cmd_setworktime(message: types.Message):
         chat_id = message.chat.id
         await db.update_group_work_time(chat_id, work_start, work_end)
 
+        # ===== 新增：强制刷新缓存 =====
+        # 清除群组缓存，确保下次获取最新配置
+        cache_key = f"work_time:{chat_id}"
+        db._cache.pop(cache_key, None)
+        db._cache_ttl.pop(cache_key, None)
+
+        # 清除群组主缓存
+        db._cache.pop(f"group:{chat_id}", None)
+        db._cache_ttl.pop(f"group:{chat_id}", None)
+
+        logger.info(f"✅ 已清除工作时间缓存: {chat_id}")
+        # ===== 新增结束 =====
+
+        # 发送成功消息时，立即生成带有上班/下班按钮的键盘
         await message.answer(
             f"✅ 上下班时间设置成功！\n\n"
             f"🟢 上班时间：<code>{work_start}</code>\n"
             f"🔴 下班时间：<code>{work_end}</code>\n\n"
-            f"💡 上下班打卡功能已启用",
+            f"💡 上下班打卡功能已启用，按钮将在下次操作时显示",
             reply_markup=await get_main_keyboard(
                 chat_id=message.chat.id, show_admin=True
             ),
