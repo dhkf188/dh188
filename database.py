@@ -3186,7 +3186,7 @@ class PostgreSQLDatabase:
         self, chat_id: int, target_date: Optional[date] = None
     ) -> List[Dict]:
         """获取群组统计信息 - 企业级终极版本（修复并发问题）"""
-        
+
         start_time = time.time()
 
         try:
@@ -3216,7 +3216,7 @@ class PostgreSQLDatabase:
                 # ===== 4. 使用两个连接实现真正的并行查询 =====
                 # acquire 两个连接可以同时在数据库端执行两个耗时任务
                 async with self.pool.acquire() as conn1, self.pool.acquire() as conn2:
-                    
+
                     # 任务 A：获取所有用户的基础信息（连接1）
                     users_task = conn1.fetch(
                         """
@@ -3330,19 +3330,21 @@ class PostgreSQLDatabase:
                     # 如果用户没记录，按班次模式补全 0 数据
                     shifts = ["day", "night"] if has_dual_mode else ["day"]
                     for shift in shifts:
-                        result.append({
-                            "user_id": user_id,
-                            "nickname": nickname,
-                            "shift": shift,
-                            "total_activity_count": 0,
-                            "total_accumulated_time": 0,
-                            "total_fines": 0,
-                            "overtime_count": 0,
-                            "total_overtime_time": 0,
-                            "work_days": 0,
-                            "work_hours": 0,
-                            "activities": {},
-                        })
+                        result.append(
+                            {
+                                "user_id": user_id,
+                                "nickname": nickname,
+                                "shift": shift,
+                                "total_activity_count": 0,
+                                "total_accumulated_time": 0,
+                                "total_fines": 0,
+                                "overtime_count": 0,
+                                "total_overtime_time": 0,
+                                "work_days": 0,
+                                "work_hours": 0,
+                                "activities": {},
+                            }
+                        )
 
             # 按用户ID和班次进行最终排序
             result.sort(key=lambda x: (x["user_id"], x["shift"]))
@@ -3351,13 +3353,16 @@ class PostgreSQLDatabase:
             self._set_cached(cache_key, result, 300)
 
             elapsed = (time.time() - start_time) * 1000
-            logger.info(f"📊 群统计完成: chat={chat_id} 用户={len(all_users)} 记录={len(result)} 耗时={elapsed:.1f}ms")
+            logger.info(
+                f"📊 群统计完成: chat={chat_id} 用户={len(all_users)} 记录={len(result)} 耗时={elapsed:.1f}ms"
+            )
 
             return result
 
         except Exception as e:
             logger.error(f"❌ 获取群统计失败 chat={chat_id}: {e}", exc_info=True)
             return []
+
     async def get_all_groups(self) -> List[int]:
         """获取所有群组ID"""
         self._ensure_pool_initialized()
@@ -4815,51 +4820,129 @@ class PostgreSQLDatabase:
                 int(result.split()[-1]) if result and result.startswith("DELETE") else 0
             )
 
-    async def cleanup_inactive_users(self, days: int = 30):
+    async def cleanup_inactive_users(self, days: int = 30) -> int:
         """清理长期未活动用户及其记录（安全版）"""
-
-        cutoff_date = (self.get_beijing_time() - timedelta(days=days)).date()
-
-        async with self.pool.acquire() as conn:
-            async with conn.transaction():
-
-                users_to_delete = await conn.fetch(
-                    """
-                        SELECT user_id 
-                        FROM users
-                        WHERE last_updated < $1
+        
+        # ===== 1. 计算截止日期 =====
+        now = self.get_beijing_time()
+        cutoff_date = (now - timedelta(days=days)).date()
+        recent_threshold = (now - timedelta(days=30)).date()
+        
+        logger.info(f"🧹 开始清理 {days} 天未活动用户，截止日期: {cutoff_date}")
+        
+        try:
+            async with self.pool.acquire() as conn:
+                # 使用事务保证清理过程的原子性，防止出现“删了记录但没删用户”的情况
+                async with conn.transaction():
+                    
+                    # ===== 2. 找出要删除的用户 =====
+                    # 判定标准：last_updated 过期，且在所有业务表中近期都没有活动记录
+                    users_to_delete = await conn.fetch(
+                        """
+                        SELECT u.chat_id, u.user_id, u.nickname
+                        FROM users u
+                        WHERE u.last_updated < $1
                         AND NOT EXISTS (
-                            SELECT 1 FROM monthly_statistics 
-                            WHERE monthly_statistics.chat_id = users.chat_id 
-                            AND monthly_statistics.user_id = users.user_id
+                            SELECT 1 FROM daily_statistics ds 
+                            WHERE ds.chat_id = u.chat_id 
+                            AND ds.user_id = u.user_id
+                            AND ds.record_date > $2
+                        )
+                        AND NOT EXISTS (
+                            SELECT 1 FROM work_records wr 
+                            WHERE wr.chat_id = u.chat_id 
+                            AND wr.user_id = u.user_id
+                            AND wr.record_date > $2
+                        )
+                        AND NOT EXISTS (
+                            SELECT 1 FROM user_activities ua 
+                            WHERE ua.chat_id = u.chat_id 
+                            AND ua.user_id = u.user_id
+                            AND ua.activity_date > $2
+                        )
+                        AND NOT EXISTS (
+                            SELECT 1 FROM monthly_statistics ms 
+                            WHERE ms.chat_id = u.chat_id 
+                            AND ms.user_id = u.user_id
                         )
                         """,
-                    cutoff_date,
-                )
+                        cutoff_date,
+                        recent_threshold
+                    )
+                    
+                    if not users_to_delete:
+                        logger.info("✅ 没有需要清理的用户")
+                        return 0
+                    
+                    user_ids = [u["user_id"] for u in users_to_delete]
+                    chat_ids = list(set([u["chat_id"] for u in users_to_delete]))
+                    
+                    logger.info(
+                        f"📊 发现 {len(users_to_delete)} 个可清理的用户，"
+                        f"分布在 {len(chat_ids)} 个群组"
+                    )
+                    
+                    # ===== 3. 批量删除相关记录 =====
+                    # 使用 ANY($1::bigint[]) 配合 List 传入，比循环 DELETE 快得多
+                    ua_result = await conn.execute(
+                        "DELETE FROM user_activities WHERE user_id = ANY($1::bigint[])",
+                        user_ids,
+                    )
+                    ua_count = self._parse_sql_result(ua_result)
+                    
+                    wr_result = await conn.execute(
+                        "DELETE FROM work_records WHERE user_id = ANY($1::bigint[])",
+                        user_ids,
+                    )
+                    wr_count = self._parse_sql_result(wr_result)
+                    
+                    ds_result = await conn.execute(
+                        "DELETE FROM daily_statistics WHERE user_id = ANY($1::bigint[])",
+                        user_ids,
+                    )
+                    ds_count = self._parse_sql_result(ds_result)
+                    
+                    user_result = await conn.execute(
+                        "DELETE FROM users WHERE user_id = ANY($1::bigint[])",
+                        user_ids,
+                    )
+                    user_count = self._parse_sql_result(user_result)
+                    
+                    # ===== 4. 清理内存缓存 =====
+                    for user in users_to_delete:
+                        cache_key = f"user:{user['chat_id']}:{user['user_id']}"
+                        self._cache.pop(cache_key, None)
+                        self._cache_ttl.pop(cache_key, None)
+                    
+                    # ===== 5. 记录结果 =====
+                    total_deleted = ua_count + wr_count + ds_count + user_count
+                    logger.info(
+                        f"✅ 清理完成:\n"
+                        f"    ├─ 删除用户: {user_count} 个\n"
+                        f"    ├─ 删除活动记录: {ua_count} 条\n"
+                        f"    ├─ 删除工作记录: {wr_count} 条\n"
+                        f"    ├─ 删除日统计: {ds_count} 条\n"
+                        f"    └─ 总计删除: {total_deleted} 条记录"
+                    )
+                    
+                    return user_count
 
-                user_ids = [u["user_id"] for u in users_to_delete]
+        except Exception as e:
+            logger.error(f"❌ 清理用户失败: {e}", exc_info=True)
+            return 0
 
-                if not user_ids:
-                    logger.info("🧹 无需清理用户")
-                    return 0
-
-                await conn.execute(
-                    "DELETE FROM user_activities WHERE user_id = ANY($1)",
-                    user_ids,
-                )
-
-                await conn.execute(
-                    "DELETE FROM work_records WHERE user_id = ANY($1)",
-                    user_ids,
-                )
-
-                deleted_count = await conn.execute(
-                    "DELETE FROM users WHERE user_id = ANY($1)",
-                    user_ids,
-                )
-
-        logger.info(f"🧹 清理了 {deleted_count} 个长期未活动的用户以及他们的所有记录")
-        return deleted_count
+    def _parse_sql_result(self, result: str) -> int:
+        """解析 SQL 执行结果，返回影响的行数"""
+        if not result or not isinstance(result, str):
+            return 0
+        try:
+            parts = result.split()
+            # 兼容 DELETE, UPDATE, INSERT 后的 Command Tag
+            if len(parts) >= 2 and parts[0] in ("DELETE", "UPDATE", "INSERT"):
+                return int(parts[-1])
+        except (ValueError, IndexError):
+            pass
+        return 0
 
     # ========== 重置日志管理 ==========
     async def mark_reset_completed(self, chat_id: int, target_date: date) -> bool:
