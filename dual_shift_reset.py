@@ -128,7 +128,7 @@ async def _dual_shift_hard_reset(
                 return False
 
         reset_flag_key = f"dual_reset:{chat_id}:{target_date.strftime('%Y%m%d')}"
-        if global_cache.get(reset_flag_key):
+        if await global_cache.get(reset_flag_key):
             logger.info(f"⏭️ 群组 {chat_id} 今天已完成双班重置，跳过")
             return True
 
@@ -277,7 +277,7 @@ async def _dual_shift_hard_reset(
         except Exception as e:
             logger.error(f"❌ [发送通知] 失败: {e}")
 
-        global_cache.set(reset_flag_key, True, ttl=86400)
+        await global_cache.set(reset_flag_key, True, ttl=86400)
 
         # ===== 新增：持久化到数据库 =====
         await db.mark_reset_completed(chat_id, target_date)
