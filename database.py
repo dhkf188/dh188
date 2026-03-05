@@ -398,35 +398,75 @@ class PostgreSQLDatabase:
             logger.error(f"连接池监控失败: {e}")
 
     async def _connection_maintenance_loop(self):
-        """连接维护循环"""
-        logger.info("开始数据库连接维护循环...")
+        """连接维护循环 - 最终优化版"""
+        logger.info("🚀 数据库连接维护循环已启动")
+
+        last_monitor_time = 0
+        monitor_interval = 300  # 5分钟
+        last_cleanup_time = 0
+        cleanup_interval = 3600  # 1小时
 
         while self._maintenance_running:
             try:
+                # 每一分钟检查一次基础循环
                 await asyncio.sleep(60)
-
-                if not await self._ensure_healthy_connection():
-                    logger.warning("连接维护: 数据库连接不健康")
-
-                await self.cleanup_cache()
-
-                # ===== 新增：监控连接池健康 =====
-                await self._monitor_pool_health()
-
                 current_time = time.time()
-                if current_time % 3600 < 60:
-                    try:
-                        await self.cleanup_old_data(days=Config.DATA_RETENTION_DAYS)
-                        logger.debug("定期数据清理完成")
-                    except Exception as e:
-                        logger.error(f"定期数据清理失败: {e}")
+
+                # 1. 基础健康检查：若连接已断开则尝试重连
+                if not await self._ensure_healthy_connection():
+                    logger.warning("⚠️ 连接维护: 数据库连接不健康，跳过本轮检查")
+                    continue
+
+                # 2. 缓存清理：定期扫描并移除过期的内存缓存项
+                await self._cleanup_cache_if_needed()
+
+                # 3. 连接池监控（每 5 分钟一次）：记录活跃连接数与空闲连接
+                if current_time - last_monitor_time >= monitor_interval:
+                    await self._monitor_pool_health()
+                    last_monitor_time = current_time
+
+                # 4. 数据清理（每 1 小时一次）：执行归档与历史数据剔除
+                if current_time - last_cleanup_time >= cleanup_interval:
+                    await self._perform_hourly_cleanup()
+                    last_cleanup_time = current_time
 
             except asyncio.CancelledError:
-                logger.info("数据库连接维护任务被取消")
+                # 优雅退出：当应用关闭时捕获取消信号
+                logger.info("🛑 数据库连接维护任务被取消")
                 break
             except Exception as e:
-                logger.error(f"连接维护任务异常: {e}")
+                # 容错处理：记录异常并增加重试间隔，防止日志刷屏
+                logger.error(f"❌ 连接维护任务异常: {e}")
                 await asyncio.sleep(30)
+
+        logger.info("🏁 数据库连接维护循环已结束")
+
+    async def _cleanup_cache_if_needed(self):
+        """按需清理缓存"""
+        cache_before = len(self._cache)
+        # 调用核心清理方法，内部通常实现为遍历过期时间戳
+        await self.cleanup_cache()
+        cache_after = len(self._cache)
+
+        # 仅在有实际清理动作时记录 debug 日志，保持日志整洁
+        if cache_before != cache_after:
+            logger.debug(f"🧹 缓存清理: {cache_before} -> {cache_after} (项)")
+
+    async def _perform_hourly_cleanup(self):
+        """执行每小时清理任务"""
+        try:
+            # 清理过期的业务数据（如 30 天前的临时记录）
+            daily_deleted = await self.cleanup_old_data(days=Config.DATA_RETENTION_DAYS)
+            # 清理过期的重置日志（如 90 天前的管理操作记录）
+            logs_deleted = await self.cleanup_old_reset_logs(days=90)
+
+            if daily_deleted > 0 or logs_deleted > 0:
+                logger.info(
+                    f"🧹 每小时清理完成: "
+                    f"业务数据={daily_deleted}, 重置日志={logs_deleted}"
+                )
+        except Exception as e:
+            logger.error(f"❌ 每小时数据清理失败: {e}")
 
     # ========== 时区相关方法 ==========
     def get_beijing_time(self):
@@ -3054,203 +3094,212 @@ class PostgreSQLDatabase:
     async def get_group_statistics(
         self, chat_id: int, target_date: Optional[date] = None
     ) -> List[Dict]:
-        """获取群组统计信息 - 包含所有用户（包括未打卡）"""
+        """获取群组统计信息 - 企业级终极版本"""
 
-        if target_date is None:
-            target_date = await self.get_business_date(chat_id)
+        start_time = time.time()
 
-        self._ensure_pool_initialized()
-        async with self.pool.acquire() as conn:
-            all_users = await conn.fetch(
-                """
-                SELECT user_id, nickname 
-                FROM users 
-                WHERE chat_id = $1
-                """,
-                chat_id,
-            )
+        try:
+            # ===== 1. 获取业务日期 =====
+            if target_date is None:
+                target_date = await self.get_business_date(chat_id)
 
-            if not all_users:
-                logger.info(f"群组 {chat_id} 没有用户")
-                return []
+            cache_key = f"stats:{chat_id}:{target_date}"
 
-            shift_config = await self.get_shift_config(chat_id)
-            has_dual_mode = shift_config.get("dual_mode", True)
+            # ===== 2. L1 内存缓存：快速响应频繁的排行榜查询 =====
+            cached = self._get_cached(cache_key)
+            if cached is not None:
+                logger.debug(f"✅ 命中统计缓存: {cache_key}")
+                return cached
 
-            rows = await conn.fetch(
-                """
-                WITH user_stats AS (
-                    SELECT 
-                        ds.user_id,
-                        ds.shift,
-                        MAX(u.nickname) as nickname,
-                        
-                        SUM(CASE WHEN ds.activity_name NOT IN (
-                            'work_days','work_hours',
-                            'work_fines','work_start_fines','work_end_fines',
-                            'overtime_count','overtime_time','total_fines'
-                        ) THEN ds.activity_count ELSE 0 END) AS total_activity_count,
-                        
-                        SUM(CASE WHEN ds.activity_name NOT IN (
-                            'work_days','work_hours',
-                            'work_fines','work_start_fines','work_end_fines',
-                            'overtime_count','overtime_time','total_fines'
-                        ) THEN ds.accumulated_time ELSE 0 END) AS total_accumulated_time,
-                        
-                        SUM(CASE WHEN ds.activity_name IN (
-                            'total_fines', 
-                            'work_fines', 
-                            'work_start_fines', 
-                            'work_end_fines'
-                        ) THEN ds.accumulated_time ELSE 0 END) AS total_fines,
-                        
-                        SUM(CASE WHEN ds.activity_name = 'overtime_count'
-                                 THEN ds.activity_count ELSE 0 END) AS overtime_count,
-                        SUM(CASE WHEN ds.activity_name = 'overtime_time'
-                                 THEN ds.accumulated_time ELSE 0 END) AS total_overtime_time
-                        
-                    FROM daily_statistics ds
-                    LEFT JOIN users u 
-                        ON ds.chat_id = u.chat_id 
-                        AND ds.user_id = u.user_id
-                    WHERE ds.chat_id = $1 
-                      AND ds.record_date = $2
-                    GROUP BY ds.user_id, ds.shift
-                ),
-                
-                activity_details AS (
-                    SELECT
-                        ds.user_id,
-                        ds.shift,
-                        ds.activity_name,
-                        SUM(ds.activity_count) AS total_count,
-                        SUM(ds.accumulated_time) AS total_time
-                    FROM daily_statistics ds
-                    WHERE ds.chat_id = $1 
-                      AND ds.record_date = $2
-                      AND ds.activity_name NOT IN (
-                            'work_days','work_hours',
-                            'work_fines','work_start_fines','work_end_fines',
-                            'overtime_count','overtime_time','total_fines'
-                      )
-                    GROUP BY ds.user_id, ds.shift, ds.activity_name
-                ),
-                
-                work_stats AS (
-                    SELECT
-                        ds.user_id,
-                        ds.shift,
-                        MAX(CASE WHEN ds.activity_name = 'work_days'
-                                 THEN ds.activity_count ELSE 0 END) AS work_days,
-                        MAX(CASE WHEN ds.activity_name = 'work_hours'
-                                 THEN ds.accumulated_time ELSE 0 END) AS work_hours
-                    FROM daily_statistics ds
-                    WHERE ds.chat_id = $1 
-                      AND ds.record_date = $2
-                      AND ds.activity_name IN ('work_days','work_hours')
-                    GROUP BY ds.user_id, ds.shift
-                )
-                
-                SELECT 
-                    us.user_id,
-                    us.shift,
-                    us.nickname,
-                    COALESCE(us.total_activity_count, 0) AS total_activity_count,
-                    COALESCE(us.total_accumulated_time, 0) AS total_accumulated_time,
-                    COALESCE(us.total_fines, 0) AS total_fines,
-                    COALESCE(us.overtime_count, 0) AS overtime_count,
-                    COALESCE(us.total_overtime_time, 0) AS total_overtime_time,
-                    COALESCE(ws.work_days, 0) AS work_days,
-                    COALESCE(ws.work_hours, 0) AS work_hours,
-                    
-                    jsonb_object_agg(
-                        ad.activity_name,
-                        jsonb_build_object(
-                            'count', ad.total_count,
-                            'time', ad.total_time
+            # ===== 3. 防缓存击穿锁：确保在高并发下只有一个请求去查数据库 =====
+            lock_key = f"stats_lock:{chat_id}:{target_date}"
+
+            async with self._get_lock(lock_key):
+
+                # 二次检查缓存 (Double-checked locking)
+                cached = self._get_cached(cache_key)
+                if cached is not None:
+                    return cached
+
+                self._ensure_pool_initialized()
+
+                async with self.pool.acquire() as conn:
+
+                    # ===== 4. 并行查询：同时获取用户清单、班次配置和统计聚合数据 =====
+                    users_task = conn.fetch(
+                        """
+                        SELECT user_id, nickname
+                        FROM users
+                        WHERE chat_id = $1
+                        """,
+                        chat_id,
+                    )
+
+                    shift_task = self.get_shift_config(chat_id)
+
+                    stats_task = conn.fetch(
+                        """
+                        WITH agg AS (
+                            SELECT
+                                user_id,
+                                shift,
+                                activity_name,
+                                SUM(activity_count) AS activity_count,
+                                SUM(accumulated_time) AS accumulated_time
+                            FROM daily_statistics
+                            WHERE chat_id = $1
+                            AND record_date = $2
+                            GROUP BY user_id, shift, activity_name
                         )
-                    ) FILTER (WHERE ad.activity_name IS NOT NULL) AS activities
-                    
-                FROM user_stats us
-                LEFT JOIN activity_details ad
-                    ON us.user_id = ad.user_id
-                    AND us.shift = ad.shift
-                LEFT JOIN work_stats ws
-                    ON us.user_id = ws.user_id
-                    AND us.shift = ws.shift
-                    
-                GROUP BY us.user_id, us.shift, us.nickname,
-                         us.total_activity_count, us.total_accumulated_time,
-                         us.total_fines, us.overtime_count, us.total_overtime_time,
-                         ws.work_days, ws.work_hours
-                         
-                ORDER BY us.user_id ASC, us.shift ASC
-                """,
-                chat_id,
-                target_date,
+
+                        SELECT
+                            a.user_id,
+                            a.shift,
+                            MAX(u.nickname) AS nickname,
+
+                            SUM(
+                                CASE WHEN activity_name NOT IN (
+                                    'work_days','work_hours',
+                                    'work_fines','work_start_fines','work_end_fines',
+                                    'overtime_count','overtime_time','total_fines'
+                                )
+                                THEN activity_count ELSE 0 END
+                            ) AS total_activity_count,
+
+                            SUM(
+                                CASE WHEN activity_name NOT IN (
+                                    'work_days','work_hours',
+                                    'work_fines','work_start_fines','work_end_fines',
+                                    'overtime_count','overtime_time','total_fines'
+                                )
+                                THEN accumulated_time ELSE 0 END
+                            ) AS total_accumulated_time,
+
+                            SUM(
+                                CASE WHEN activity_name IN (
+                                    'total_fines',
+                                    'work_fines',
+                                    'work_start_fines',
+                                    'work_end_fines'
+                                )
+                                THEN accumulated_time ELSE 0 END
+                            ) AS total_fines,
+
+                            SUM(
+                                CASE WHEN activity_name='overtime_count'
+                                THEN activity_count ELSE 0 END
+                            ) AS overtime_count,
+
+                            SUM(
+                                CASE WHEN activity_name='overtime_time'
+                                THEN accumulated_time ELSE 0 END
+                            ) AS total_overtime_time,
+
+                            SUM(
+                                CASE WHEN activity_name='work_days'
+                                THEN activity_count ELSE 0 END
+                            ) AS work_days,
+
+                            SUM(
+                                CASE WHEN activity_name='work_hours'
+                                THEN accumulated_time ELSE 0 END
+                            ) AS work_hours,
+
+                            jsonb_object_agg(
+                                activity_name,
+                                jsonb_build_object(
+                                    'count', activity_count,
+                                    'time', accumulated_time
+                                )
+                            ) FILTER (
+                                WHERE activity_name NOT IN (
+                                    'work_days','work_hours',
+                                    'work_fines','work_start_fines','work_end_fines',
+                                    'overtime_count','overtime_time','total_fines'
+                                )
+                            ) AS activities
+
+                        FROM agg a
+
+                        LEFT JOIN users u
+                        ON a.user_id = u.user_id
+                        AND u.chat_id = $1
+
+                        GROUP BY a.user_id, a.shift
+                        ORDER BY a.user_id, a.shift
+                        """,
+                        chat_id,
+                        target_date,
+                    )
+
+                    all_users, shift_config, rows = await asyncio.gather(
+                        users_task, shift_task, stats_task
+                    )
+
+                if not all_users:
+                    return []
+
+                has_dual_mode = shift_config.get("dual_mode", True)
+
+                # ===== 5. 重组统计结果：处理空数据补全，确保排行榜上所有人都在列 =====
+                stats_dict = {}
+                for row in rows:
+                    stats_dict.setdefault(row["user_id"], []).append(dict(row))
+
+                result = []
+
+                for user in all_users:
+                    user_id = user["user_id"]
+                    nickname = user["nickname"] or f"用户{user_id}"
+
+                    if user_id in stats_dict:
+                        for stat in stats_dict[user_id]:
+                            data = stat.copy()
+                            data["nickname"] = nickname
+                            if data.get("activities") is None:
+                                data["activities"] = {}
+                            result.append(data)
+                    else:
+                        # 对于没干活的用户，也需要补全空结果以维持前端列表的一致性
+                        shifts = ["day", "night"] if has_dual_mode else ["day"]
+                        for shift in shifts:
+                            result.append(
+                                {
+                                    "user_id": user_id,
+                                    "nickname": nickname,
+                                    "shift": shift,
+                                    "total_activity_count": 0,
+                                    "total_accumulated_time": 0,
+                                    "total_fines": 0,
+                                    "overtime_count": 0,
+                                    "total_overtime_time": 0,
+                                    "work_days": 0,
+                                    "work_hours": 0,
+                                    "activities": {},
+                                }
+                            )
+
+                result.sort(key=lambda x: (x["user_id"], x["shift"]))
+
+                # ===== 6. 写入缓存：TTL 设置为 300秒 =====
+                self._set_cached(cache_key, result, 300)
+
+                elapsed = (time.time() - start_time) * 1000
+
+                logger.info(
+                    f"📊 群统计完成: chat={chat_id} "
+                    f"用户={len(all_users)} 记录={len(result)} "
+                    f"耗时={elapsed:.1f}ms"
+                )
+
+                return result
+
+        except Exception as e:
+            logger.error(
+                f"❌ 获取群统计失败 chat={chat_id}: {e}",
+                exc_info=True,
             )
-
-            stats_dict = {}
-            for row in rows:
-                user_id = row["user_id"]
-                if user_id not in stats_dict:
-                    stats_dict[user_id] = []
-                stats_dict[user_id].append(dict(row))
-
-            result = []
-            for user in all_users:
-                user_id = user["user_id"]
-                base_nickname = user["nickname"] or f"用户{user_id}"
-
-                if user_id in stats_dict:
-                    for stat in stats_dict[user_id]:
-                        data = stat.copy()
-                        data["nickname"] = base_nickname
-
-                        if "shift" not in data or data["shift"] is None:
-                            data["shift"] = "day"
-
-                        raw_activities = data.get("activities")
-                        parsed_activities = {}
-
-                        if raw_activities:
-                            if isinstance(raw_activities, str):
-                                try:
-                                    parsed_activities = json.loads(raw_activities)
-                                except Exception as e:
-                                    logger.error(f"JSON解析失败: {e}")
-                            elif isinstance(raw_activities, dict):
-                                parsed_activities = raw_activities
-
-                        data["activities"] = parsed_activities
-                        result.append(data)
-                else:
-                    for shift in ["day", "night"]:
-                        empty_data = {
-                            "user_id": user_id,
-                            "nickname": base_nickname,
-                            "shift": shift,
-                            "total_activity_count": 0,
-                            "total_accumulated_time": 0,
-                            "total_fines": 0,
-                            "overtime_count": 0,
-                            "total_overtime_time": 0,
-                            "work_days": 0,
-                            "work_hours": 0,
-                            "activities": {},
-                        }
-                        result.append(empty_data)
-
-            result.sort(key=lambda x: (x["user_id"], x["shift"]))
-
-            active_users = len(stats_dict)
-            total_users = len(all_users)
-            logger.info(
-                f"数据库查询返回 {len(result)} 条记录 "
-                f"（包含所有 {total_users} 个用户，其中 {active_users} 个有活动记录，"
-                f"{total_users - active_users} 个未打卡）"
-            )
-            return result
+            return []
 
     async def get_all_groups(self) -> List[int]:
         """获取所有群组ID"""
