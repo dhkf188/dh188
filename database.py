@@ -404,10 +404,10 @@ class PostgreSQLDatabase:
         # 记录上次执行监控的时间
         last_monitor_time = 0
         monitor_interval = 300  # 5分钟执行一次监控
-        
+
         # 初始化上次清理的小时
         last_cleanup_hour = -1
-        
+
         # 记录上次清理缓存的时间
         last_cache_cleanup = time.time()
         cache_cleanup_interval = 600  # 10分钟清理一次缓存
@@ -435,7 +435,9 @@ class PostgreSQLDatabase:
                         await self.cleanup_cache()
                         cache_after = len(self._cache)
                         if cache_before != cache_after:
-                            logger.debug(f"🧹 缓存清理: {cache_before} -> {cache_after}")
+                            logger.debug(
+                                f"🧹 缓存清理: {cache_before} -> {cache_after}"
+                            )
                         last_cache_cleanup = current_time
                     except Exception as e:
                         logger.error(f"❌ 缓存清理失败: {e}")
@@ -452,7 +454,7 @@ class PostgreSQLDatabase:
                 current_hour = datetime.now().hour
                 if current_hour != last_cleanup_hour:
                     last_cleanup_hour = current_hour
-                    
+
                     try:
                         # 清理常规业务旧数据（根据配置的天数）
                         daily_deleted = await self.cleanup_old_data(
@@ -4651,23 +4653,58 @@ class PostgreSQLDatabase:
             return "night_last"
 
     # ========== 数据清理 ==========
-    async def cleanup_old_data(self, days: int = 30):
-        """清理旧数据"""
-        cutoff_date = (self.get_beijing_time() - timedelta(days=days)).date()
+    async def cleanup_old_data(self, days: int = 30) -> int:
+        """清理旧数据 - 最终极致稳定版"""
+        try:
+            now = self.get_beijing_time()
+            cutoff_date = (now - timedelta(days=days)).date()
+            total_deleted = 0
 
-        self._ensure_pool_initialized()
-        async with self.pool.acquire() as conn:
-            async with conn.transaction():
-                await conn.execute(
-                    "DELETE FROM user_activities WHERE activity_date < $1", cutoff_date
-                )
-                await conn.execute(
-                    "DELETE FROM work_records WHERE record_date < $1", cutoff_date
-                )
-                await conn.execute(
-                    "DELETE FROM users WHERE last_updated < $1", cutoff_date
-                )
+            self._ensure_pool_initialized()
 
+            async with self.pool.acquire() as conn:
+                # 1. 设置语句级的安全超时（60s），防止在大表清理时因锁竞争卡死连接池
+                await conn.execute("SET statement_timeout = '60s'")
+
+                # 定义需要清理的表名及其对应的时间戳字段
+                tables = [
+                    ("user_activities", "activity_date"),
+                    ("work_records", "record_date"),
+                    ("daily_statistics", "record_date"),
+                    ("reset_logs", "reset_date"),  # 补全日志清理
+                ]
+
+                # 2. 采用单条执行模式，而非大事务
+                # 这样做的好处是：删掉一个表就即时生效一个，减少长事务对数据库 Undo Log 的压力
+                for table, col in tables:
+                    try:
+                        # 执行删除操作
+                        result = await conn.execute(
+                            f"DELETE FROM {table} WHERE {col} < $1",
+                            cutoff_date
+                        )
+                        
+                        # 解析受影响的行数
+                        count = self._parse_row_count(result)
+                        total_deleted += count
+
+                        if count > 0:
+                            logger.info(f"🧹 已清理 {table}: {count} 条记录")
+                    except Exception as table_e:
+                        # 局部异常捕获：即使某个表清理失败（如字段改名或表锁），也不影响后续表的清理
+                        logger.error(f"⚠️ 清理表 {table} 时出现局部异常: {table_e}")
+                        continue
+
+            if total_deleted > 0:
+                logger.info(f"✅ 定期数据清理任务完成，总计移除: {total_deleted} 条记录")
+
+            return total_deleted
+
+        except Exception as e:
+            # 全局异常捕获：记录完整堆栈，确保后台维护循环不被中断
+            logger.error(f"❌ 数据清理全局任务失败: {e}", exc_info=True)
+            return 0
+        
     async def cleanup_monthly_data(self, days_or_date=None):
         """清理月度统计数据"""
         import traceback
@@ -4833,18 +4870,28 @@ class PostgreSQLDatabase:
             logger.error(f"❌ 检查重置标记失败: {e}")
             return False
 
-    async def cleanup_old_reset_logs(self, days: int = 90):
-        """清理旧的 reset_logs（保留90天）"""
+    async def cleanup_old_reset_logs(self, days: int = 90) -> int:
+        """清理旧的 reset_logs（保留90天） - 优化版"""
         try:
-            cutoff_date = (self.get_beijing_time() - timedelta(days=days)).date()
+            # 1. 统一北京时间计算：确保与业务逻辑中的 reset_date 统计口径一致
+            now = self.get_beijing_time()
+            cutoff_date = (now - timedelta(days=days)).date()
+
+            # 确保连接池可用，避免连接池未初始化导致的空对象错误
+            self._ensure_pool_initialized()
+
             async with self.pool.acquire() as conn:
+                # 2. 安全防御：设置当前连接的语句超时时间为 30s
+                # 防止在大表 DELETE 锁争用或 IO 繁忙时导致维护协程无限期挂起
+                await conn.execute("SET statement_timeout = '30s'")
+
+                # 执行清理动作
                 result = await conn.execute(
-                    """
-                    DELETE FROM reset_logs WHERE reset_date < $1
-                """,
+                    "DELETE FROM reset_logs WHERE reset_date < $1",
                     cutoff_date,
                 )
 
+                # 3. 解析结果：从 asyncpg 返回的 'DELETE N' 字符串中提取删除数量
                 deleted = 0
                 if result and result.startswith("DELETE"):
                     try:
@@ -4852,11 +4899,17 @@ class PostgreSQLDatabase:
                     except (ValueError, IndexError):
                         pass
 
+                # 仅在有实际删除时记录日志，避免维护循环产生过多的冗余日志
                 if deleted > 0:
-                    logger.info(f"🧹 清理了 {deleted} 条旧重置日志")
+                    logger.info(
+                        f"🧹 清理了 {deleted} 条旧重置日志 (保留截止日期: {cutoff_date})"
+                    )
+
                 return deleted
+
         except Exception as e:
-            logger.error(f"清理重置日志失败: {e}")
+            # 记录详细的异常堆栈，便于排查 SQL 语法或连接超时问题
+            logger.error(f"❌ 清理重置日志失败: {e}", exc_info=True)
             return 0
 
     # ========== 活动人数限制 ==========
