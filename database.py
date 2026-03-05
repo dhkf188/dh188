@@ -16,32 +16,42 @@ class PostgreSQLDatabase:
     """PostgreSQL数据库管理器 - 纯双班模式"""
 
     def __init__(self, database_url: str = None):
+        # 基础连接配置
         self.database_url = database_url or Config.DATABASE_URL
         self.pool: Optional[Pool] = None
         self._initialized = False
+
+        # 一级缓存 (L1 Cache) 属性
         self._cache = {}
         self._cache_ttl = {}
+        self._cache_max_size = 1000
+        self._cache_access_order = []
 
-        self._pending_queries = {}
+        # 并发控制：防击穿与命名锁
+        self._pending_queries = {}  # 用于 Singleflight 模式
         self._locks: Dict[str, asyncio.Lock] = {}
-        self._locks_lock = asyncio.Lock()
+        self._locks_lock = asyncio.Lock()  # 保护 _locks 字典本身的互斥锁
 
+        # 锁清理与统计属性
+        self._lock_cleanup_interval = 3600  # 1小时清理一次空闲锁
+        self._last_lock_cleanup = time.time()
+        self._lock_stats = {"total_created": 0, "peak_count": 0}
+
+        # 连接池健康监测
         self._last_pool_check = 0
         self._pool_check_interval = 60
 
-        # 重连相关属性
+        # 指数退避重连机制
         self._last_connection_check = 0
         self._connection_check_interval = 30
         self._reconnect_attempts = 0
         self._max_reconnect_attempts = 5
         self._reconnect_base_delay = 1.0
 
+        # 后台维护任务句柄
         self._maintenance_running = False
         self._maintenance_task = None
         self._connection_maintenance_task = None
-
-        self._cache_max_size = 1000
-        self._cache_access_order = []
 
     # ========== 重连机制 ==========
     async def _ensure_healthy_connection(self):
@@ -3201,7 +3211,7 @@ class PostgreSQLDatabase:
                 cached = self._get_cached(cache_key)
                 if cached is not None:
                     return cached
-                
+
                 self._ensure_pool_initialized()
 
                 async with self.pool.acquire() as conn:
