@@ -4653,6 +4653,19 @@ class PostgreSQLDatabase:
             return "night_last"
 
     # ========== 数据清理 ==========
+    def _parse_row_count(self, result_str: str) -> int:
+        """解析 PostgreSQL DELETE 结果中的行数"""
+        try:
+            # asyncpg 返回的格式通常是 "DELETE 100"
+            if result_str and result_str.startswith("DELETE"):
+                parts = result_str.split()
+                if len(parts) == 2:
+                    return int(parts[1])
+        except (ValueError, IndexError, AttributeError):
+            # 捕获可能的解析异常，确保维护逻辑不会因为日志解析失败而中断
+            pass
+        return 0
+    
     async def cleanup_old_data(self, days: int = 30) -> int:
         """清理旧数据 - 最终极致稳定版"""
         try:
