@@ -7834,7 +7834,7 @@ async def daily_reset_task():
         reset_flag_key = f"dual_reset:{chat_id}:{target_date.strftime('%Y%m%d')}"
         from performance import global_cache
 
-        if global_cache.get(reset_flag_key):
+        if await global_cache.get(reset_flag_key):
             logger.info(f"⏭️ 群组 {chat_id} 今天已执行")
             return
 
@@ -7848,7 +7848,7 @@ async def daily_reset_task():
         result = await handle_hard_reset(chat_id, None, target_date=target_date)
 
         if result is True:
-            global_cache.set(reset_flag_key, True, ttl=86400)
+            await global_cache.set(reset_flag_key, True, ttl=86400)
             logger.info(f"✅ 成功")
 
     loop_count = 0
@@ -8114,6 +8114,7 @@ async def initialize_services():
 
         from utils import notification_service as utils_notification_service
         from utils import init_notification_service
+        from utils import user_lock_manager  # ✅ 确保导入 user_lock_manager
 
         global notification_service
 
@@ -8149,6 +8150,10 @@ async def initialize_services():
 
         await shift_state_manager.start()
         logger.info("✅ 班次状态管理器已启动")
+
+        # ✅ 在这里添加 user_lock_manager 的启动
+        await user_lock_manager.start()
+        logger.info("✅ 用户锁管理器清理任务已启动")
 
         recovered_count = await recover_expired_activities()
         logger.info(f"✅ 过期活动恢复完成: {recovered_count} 个活动已处理")
