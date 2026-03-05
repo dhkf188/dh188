@@ -1095,51 +1095,76 @@ class PostgreSQLDatabase:
 
         # 1. 一级缓存：内存缓存（LRU/TTL 机制）
         cached = self._get_cached(cache_key)
+        
+        # ✅ 正确修复：缓存的值可能是 None（表示之前查询不到）或字典
+        # 只要 cached 不是 None，就说明缓存命中（即使缓存的是 None 本身）
         if cached is not None:
             return cached
 
-        # 2. 二级缓存：检查是否有正在进行的相同查询（防止缓存击穿）
+        # 2. 二级缓存：检查是否有正在进行的相同查询（Singleflight 模式）
         pending_key = f"pending_group:{chat_id}"
         if hasattr(self, "_pending_queries") and pending_key in self._pending_queries:
             try:
-                # 共享已有的异步查询任务，不发起重复请求
-                return await self._pending_queries[pending_key]
-            except Exception:
-                # 如果共享任务异常，则继续往下执行新的查询
+                # 共享已有的异步查询任务，避免并发击穿数据库
+                result = await self._pending_queries[pending_key]
+                return result  # 直接返回，可能是 None 或字典
+            except Exception as e:
+                logger.warning(f"⚠️ 共享查询任务失败 {chat_id}: {e}")
+                # 共享失败时，继续执行新的查询逻辑
                 pass
 
         # 3. 定义实际的数据库获取逻辑
         async def _fetch_group():
             try:
-                # 确保连接池已准备就绪
-                await self._ensure_pool_initialized()
+                # 确保数据库连接池已准备就绪
+                if not self.pool or not self._initialized:
+                    await self.initialize()
+
+                # 从连接池获取连接并执行查询
                 async with self.pool.acquire() as conn:
                     row = await conn.fetchrow(
                         "SELECT * FROM groups WHERE chat_id = $1", chat_id
                     )
-                    result = dict(row) if row else None
+                    
+                    # 明确处理查询结果
+                    if row:
+                        result = dict(row)
+                        logger.debug(f"✅ 获取群组 {chat_id} 配置成功")
+                    else:
+                        result = None
+                        logger.debug(f"ℹ️ 群组 {chat_id} 在数据库中不存在")
 
-                    # 写入缓存，群组配置相对稳定，TTL 延长到 600秒（10分钟）
-                    # 建议配合 random.randint(-60, 60) 增加抖动防止雪崩
-                    self._set_cached(cache_key, result, 600)
+                    # 4. 写入缓存：应用随机抖动 (Jitter)
+                    import random
+                    if result:
+                        # 正常配置数据：缓存约 10 分钟
+                        ttl = 600 + random.randint(-60, 60)
+                    else:
+                        # 负缓存：对不存在的群组缓存约 1 分钟，防止缓存穿透攻击
+                        ttl = 60 + random.randint(-10, 10)
+                    
+                    self._set_cached(cache_key, result, ttl)
                     return result
+                    
             except Exception as e:
                 logger.error(f"❌ 获取群组配置失败 {chat_id}: {e}")
+                # 异常熔断：出错时缓存 None 60秒，避免故障期间高频重试压垮数据库
+                self._set_cached(cache_key, None, 60)
                 return None
 
-        # 4. 任务调度管理
+        # 5. 任务调度管理
         if not hasattr(self, "_pending_queries"):
             self._pending_queries = {}
 
-        # 创建新任务并注册到 pending 字典
+        # 创建异步任务并注册到 pending 字典中
         task = asyncio.create_task(_fetch_group())
         self._pending_queries[pending_key] = task
 
         try:
             result = await task
-            return result
+            return result  # 这里的返回由 _fetch_group 保证类型安全性
         finally:
-            # 无论成功失败，确保清理 pending 记录，允许后续查询进入
+            # 无论执行成败，必须清理 pending 记录，允许后续请求再次查询
             self._pending_queries.pop(pending_key, None)
 
     async def update_group_channel(self, chat_id: int, channel_id: int):
