@@ -96,9 +96,9 @@ class LoggingMiddleware(BaseMiddleware):
 
 
 # ========== 上下班打卡辅助函数 ==========
-def get_user_lock(chat_id: int, uid: int):
+async def get_user_lock(chat_id: int, uid: int):
     """获取用户锁的便捷函数"""
-    return user_lock_manager.get_lock(chat_id, uid)
+    return await user_lock_manager.get_lock(chat_id, uid)
 
 
 async def auto_end_current_activity(
@@ -1129,7 +1129,7 @@ async def activity_timer(
                 return False
 
         while True:
-            user_lock = user_lock_manager.get_lock(chat_id, uid)
+            user_lock = await user_lock_manager.get_lock(chat_id, uid)
             async with user_lock:
                 user_data = await db.get_user_cached(chat_id, uid)
                 if not user_data or user_data["current_activity"] != act:
@@ -1308,7 +1308,7 @@ async def start_activity(message: types.Message, act: str):
     chat_id = message.chat.id
     uid = message.from_user.id
 
-    user_lock = user_lock_manager.get_lock(chat_id, uid)
+    user_lock = await user_lock_manager.get_lock(chat_id, uid)
     async with user_lock:
         await reset_daily_data_if_needed(chat_id, uid)
 
@@ -1481,7 +1481,7 @@ async def process_back(message: types.Message):
     chat_id = message.chat.id
     uid = message.from_user.id
 
-    user_lock = user_lock_manager.get_lock(chat_id, uid)
+    user_lock = await user_lock_manager.get_lock(chat_id, uid)
     async with user_lock:
         await _process_back_locked(message, chat_id, uid)
 
@@ -2030,7 +2030,7 @@ async def process_work_checkin(message: types.Message, checkin_type: str):
 
     logger.info(f"🟢[{trace_id}] 开始处理{action_text}打卡请求：{name}({uid})")
 
-    user_lock = get_user_lock(chat_id, uid)
+    user_lock = await get_user_lock(chat_id, uid)
     async with user_lock:
         work_hours_task = asyncio.create_task(db.get_group_work_time(chat_id))
         shift_config_task = asyncio.create_task(db.get_shift_config(chat_id))
@@ -3358,7 +3358,7 @@ async def handle_myinfo_command(message: types.Message):
         await handle_myinfo_shift_command(message)
         return
 
-    user_lock = user_lock_manager.get_lock(chat_id, uid)
+    user_lock = await user_lock_manager.get_lock(chat_id, uid)
     async with user_lock:
         await show_history(message)
 
@@ -3395,7 +3395,7 @@ async def handle_myinfo_shift_command(message: types.Message):
         )
         return
 
-    user_lock = user_lock_manager.get_lock(chat_id, uid)
+    user_lock = await user_lock_manager.get_lock(chat_id, uid)
     async with user_lock:
         await show_history(message, shift)
 
@@ -3416,7 +3416,7 @@ async def handle_myinfo_day_command(message: types.Message):
         )
         return
 
-    user_lock = user_lock_manager.get_lock(chat_id, uid)
+    user_lock = await user_lock_manager.get_lock(chat_id, uid)
     async with user_lock:
         await show_history(message, "day")
 
@@ -3437,7 +3437,7 @@ async def handle_myinfo_night_command(message: types.Message):
         )
         return
 
-    user_lock = user_lock_manager.get_lock(chat_id, uid)
+    user_lock = await user_lock_manager.get_lock(chat_id, uid)
     async with user_lock:
         await show_history(message, "night")
 
@@ -3454,7 +3454,7 @@ async def handle_ranking_command(message: types.Message):
         await handle_ranking_shift_command(message)
         return
 
-    user_lock = user_lock_manager.get_lock(chat_id, uid)
+    user_lock = await user_lock_manager.get_lock(chat_id, uid)
     async with user_lock:
         await show_rank(message)
 
@@ -3482,7 +3482,7 @@ async def handle_ranking_shift_command(message: types.Message):
         )
         return
 
-    user_lock = user_lock_manager.get_lock(chat_id, uid)
+    user_lock = await user_lock_manager.get_lock(chat_id, uid)
     async with user_lock:
         await show_rank(message, shift)
 
@@ -3494,7 +3494,7 @@ async def handle_ranking_day_command(message: types.Message):
     chat_id = message.chat.id
     uid = message.from_user.id
 
-    user_lock = user_lock_manager.get_lock(chat_id, uid)
+    user_lock = await user_lock_manager.get_lock(chat_id, uid)
     async with user_lock:
         await show_rank(message, "day")
 
@@ -3506,7 +3506,7 @@ async def handle_ranking_night_command(message: types.Message):
     chat_id = message.chat.id
     uid = message.from_user.id
 
-    user_lock = user_lock_manager.get_lock(chat_id, uid)
+    user_lock = await user_lock_manager.get_lock(chat_id, uid)
     async with user_lock:
         await show_rank(message, "night")
 
@@ -6361,7 +6361,7 @@ async def handle_my_record(message: types.Message):
     chat_id = message.chat.id
     uid = message.from_user.id
 
-    user_lock = user_lock_manager.get_lock(chat_id, uid)
+    user_lock = await user_lock_manager.get_lock(chat_id, uid)
     async with user_lock:
         await show_history(message)
 
@@ -6373,7 +6373,7 @@ async def handle_rank(message: types.Message):
     chat_id = message.chat.id
     uid = message.from_user.id
 
-    user_lock = user_lock_manager.get_lock(chat_id, uid)
+    user_lock = await user_lock_manager.get_lock(chat_id, uid)
     async with user_lock:
         await show_rank(message)
 
@@ -7220,7 +7220,7 @@ async def handle_quick_back(callback_query: types.CallbackQuery):
 
         logger.info(f"🔄 快速回座: 用户{uid}, 群组{chat_id}, 班次{shift}")
 
-        user_lock = user_lock_manager.get_lock(chat_id, uid)
+        user_lock = await user_lock_manager.get_lock(chat_id, uid)
         async with user_lock:
             user_data = await db.get_user_cached(chat_id, uid)
 
