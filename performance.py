@@ -155,70 +155,177 @@ class RetryManager:
 
 
 class GlobalCache:
-    """全局缓存管理器"""
+    """全局缓存管理器 - 原子计数器版（最佳实践）"""
 
     def __init__(self, default_ttl: int = 300):
         self._cache: Dict[str, Any] = {}
         self._cache_ttl: Dict[str, float] = {}
+        # 使用 asyncio 锁
+        self._stats_lock = asyncio.Lock()
         self._hits = 0
         self._misses = 0
         self.default_ttl = default_ttl
+        # 用于缓存写入的锁
+        self._write_lock = asyncio.Lock()
+        # 用于缓存击穿保护
+        self._loading: Dict[str, asyncio.Event] = {}
 
-    def get(self, key: str) -> Any:
-        """获取缓存值"""
-        if key in self._cache_ttl and time.time() < self._cache_ttl[key]:
-            self._hits += 1
-            return self._cache.get(key)
-        else:
+    async def get(self, key: str) -> Optional[Any]:
+        """获取缓存值 - 高性能版"""
+        # 快速路径：直接读取（Python dict get 是原子的）
+        expiry = self._cache_ttl.get(key)
+
+        if expiry is not None:
+            if time.time() < expiry:
+                # 缓存有效
+                value = self._cache.get(key)
+                # 原子更新命中数
+                async with self._stats_lock:
+                    self._hits += 1
+                return value
+            else:
+                # 缓存过期，需要清理
+                async with self._write_lock:
+                    # 双重检查，防止在获得锁前被清理
+                    if key in self._cache_ttl and time.time() >= self._cache_ttl[key]:
+                        self._cache.pop(key, None)
+                        self._cache_ttl.pop(key, None)
+
+        # 缓存未命中
+        async with self._stats_lock:
             self._misses += 1
-            self._cache.pop(key, None)
-            self._cache_ttl.pop(key, None)
-            return None
+        return None
 
-    def set(self, key: str, value: Any, ttl: int = None):
+    async def get_many(self, keys: list) -> Dict[str, Any]:
+        """批量获取缓存 - 减少锁竞争"""
+        result = {}
+        now = time.time()
+        hits = 0
+
+        for key in keys:
+            expiry = self._cache_ttl.get(key)
+            if expiry and now < expiry:
+                result[key] = self._cache.get(key)
+                hits += 1
+
+        # 批量更新统计
+        async with self._stats_lock:
+            self._hits += hits
+            self._misses += len(keys) - hits
+
+        return result
+
+    async def set(self, key: str, value: Any, ttl: int = None):
         """设置缓存值"""
         if ttl is None:
             ttl = self.default_ttl
 
-        self._cache[key] = value
-        self._cache_ttl[key] = time.time() + ttl
+        async with self._write_lock:
+            self._cache[key] = value
+            self._cache_ttl[key] = time.time() + ttl
 
-    def delete(self, key: str):
+    async def set_many(self, items: Dict[str, Any], ttl: int = None):
+        """批量设置缓存"""
+        if ttl is None:
+            ttl = self.default_ttl
+
+        expiry = time.time() + ttl
+        async with self._write_lock:
+            for key, value in items.items():
+                self._cache[key] = value
+                self._cache_ttl[key] = expiry
+
+    async def delete(self, key: str):
         """删除缓存值"""
-        self._cache.pop(key, None)
-        self._cache_ttl.pop(key, None)
-
-    def clear_expired(self):
-        """清理过期缓存"""
-        current_time = time.time()
-        expired_keys = [
-            key for key, expiry in self._cache_ttl.items() if current_time >= expiry
-        ]
-        for key in expired_keys:
+        async with self._write_lock:
             self._cache.pop(key, None)
             self._cache_ttl.pop(key, None)
 
-        if expired_keys:
-            logger.debug(f"清理了 {len(expired_keys)} 个过期缓存")
+    async def delete_many(self, keys: list):
+        """批量删除缓存"""
+        async with self._write_lock:
+            for key in keys:
+                self._cache.pop(key, None)
+                self._cache_ttl.pop(key, None)
 
-    def clear_all(self):
-        """清理所有缓存"""
-        self._cache.clear()
-        self._cache_ttl.clear()
-        logger.info("所有缓存已清理")
+    async def clear_expired(self):
+        """清理过期缓存 - 批量操作"""
+        now = time.time()
+        expired = []
 
-    def get_stats(self) -> Dict[str, Any]:
+        # 收集过期key（无锁）
+        for key, expiry in list(self._cache_ttl.items()):
+            if now >= expiry:
+                expired.append(key)
+
+        # 批量删除（加锁）
+        if expired:
+            async with self._write_lock:
+                for key in expired:
+                    self._cache.pop(key, None)
+                    self._cache_ttl.pop(key, None)
+
+            logger.info(f"🧹 清理了 {len(expired)} 个过期缓存")
+
+    async def get_or_set(self, key: str, factory, ttl: int = None) -> Any:
+        """获取缓存，如果不存在则通过factory创建（带击穿保护）"""
+        # 先尝试获取
+        value = await self.get(key)
+        if value is not None:
+            return value
+
+        # 检查是否正在加载
+        async with self._write_lock:
+            if key in self._loading:
+                # 等待其他协程加载完成
+                event = self._loading[key]
+                async with self._write_lock:
+                    pass  # 释放写锁
+                await event.wait()
+                return await self.get(key)
+
+            # 标记正在加载
+            self._loading[key] = asyncio.Event()
+
+        try:
+            # 创建新值
+            value = await factory()
+            await self.set(key, value, ttl)
+            return value
+        finally:
+            # 加载完成，通知其他等待的协程
+            async with self._write_lock:
+                if key in self._loading:
+                    self._loading[key].set()
+                    del self._loading[key]
+
+    async def get_stats(self) -> Dict[str, Any]:
         """获取缓存统计"""
-        total = self._hits + self._misses
-        hit_rate = self._hits / total if total > 0 else 0
+        async with self._stats_lock:
+            total = self._hits + self._misses
+            hit_rate = self._hits / total if total > 0 else 0
+            hits = self._hits
+            misses = self._misses
 
         return {
             "size": len(self._cache),
-            "hits": self._hits,
-            "misses": self._misses,
-            "hit_rate": hit_rate,
-            "total_operations": total,
+            "hits": hits,
+            "misses": misses,
+            "hit_rate": round(hit_rate * 100, 2),
+            "total_operations": hits + misses,
+            "memory_estimate": self._estimate_memory(),
+            "loading_keys": len(self._loading),
         }
+
+    def _estimate_memory(self) -> str:
+        """估算内存使用"""
+        approx_size = len(self._cache) * 200
+        if approx_size < 1024:
+            return f"{approx_size} B"
+        elif approx_size < 1024 * 1024:
+            return f"{approx_size / 1024:.1f} KB"
+        else:
+            return f"{approx_size / (1024 * 1024):.1f} MB"
 
 
 class TaskManager:
