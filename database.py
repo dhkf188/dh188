@@ -398,46 +398,87 @@ class PostgreSQLDatabase:
             logger.error(f"连接池监控失败: {e}")
 
     async def _connection_maintenance_loop(self):
-        """连接维护循环 - 最终优化版"""
+        """连接维护循环 - 完整优化版"""
         logger.info("🚀 数据库连接维护循环已启动")
 
+        # 记录上次执行监控的时间
         last_monitor_time = 0
-        monitor_interval = 300  # 5分钟
-        last_cleanup_time = 0
-        cleanup_interval = 3600  # 1小时
+        monitor_interval = 300  # 5分钟执行一次监控
+        
+        # 初始化上次清理的小时
+        last_cleanup_hour = -1
+        
+        # 记录上次清理缓存的时间
+        last_cache_cleanup = time.time()
+        cache_cleanup_interval = 600  # 10分钟清理一次缓存
 
         while self._maintenance_running:
             try:
-                # 每一分钟检查一次基础循环
+                # ===== 动态睡眠，基准循环为 60 秒 =====
                 await asyncio.sleep(60)
-                current_time = time.time()
 
-                # 1. 基础健康检查：若连接已断开则尝试重连
-                if not await self._ensure_healthy_connection():
-                    logger.warning("⚠️ 连接维护: 数据库连接不健康，跳过本轮检查")
+                # ===== 1. 快速健康检查：如果连接断开，优先处理重连 =====
+                try:
+                    if not await self.connection_health_check():
+                        logger.warning("⚠️ 数据库连接不健康，尝试重连...")
+                        await self._reconnect()
+                        continue
+                except Exception as e:
+                    logger.error(f"❌ 健康检查失败: {e}")
                     continue
 
-                # 2. 缓存清理：定期扫描并移除过期的内存缓存项
-                await self._cleanup_cache_if_needed()
+                # ===== 2. 定期清理缓存：防止内存泄漏 =====
+                current_time = time.time()
+                if current_time - last_cache_cleanup >= cache_cleanup_interval:
+                    try:
+                        cache_before = len(self._cache)
+                        await self.cleanup_cache()
+                        cache_after = len(self._cache)
+                        if cache_before != cache_after:
+                            logger.debug(f"🧹 缓存清理: {cache_before} -> {cache_after}")
+                        last_cache_cleanup = current_time
+                    except Exception as e:
+                        logger.error(f"❌ 缓存清理失败: {e}")
 
-                # 3. 连接池监控（每 5 分钟一次）：记录活跃连接数与空闲连接
+                # ===== 3. 每 5 分钟执行一次深度监控：记录连接池指标 =====
                 if current_time - last_monitor_time >= monitor_interval:
-                    await self._monitor_pool_health()
+                    try:
+                        await self._monitor_pool_health()
+                    except Exception as e:
+                        logger.error(f"❌ 深度监控失败: {e}")
                     last_monitor_time = current_time
 
-                # 4. 数据清理（每 1 小时一次）：执行归档与历史数据剔除
-                if current_time - last_cleanup_time >= cleanup_interval:
-                    await self._perform_hourly_cleanup()
-                    last_cleanup_time = current_time
+                # ===== 4. 每小时执行一次数据清理：维护数据库体积 =====
+                current_hour = datetime.now().hour
+                if current_hour != last_cleanup_hour:
+                    last_cleanup_hour = current_hour
+                    
+                    try:
+                        # 清理常规业务旧数据（根据配置的天数）
+                        daily_deleted = await self.cleanup_old_data(
+                            days=Config.DATA_RETENTION_DAYS
+                        )
+
+                        # 清理旧的重置日志（固定保留 90 天）
+                        logs_deleted = await self.cleanup_old_reset_logs(days=90)
+
+                        if daily_deleted > 0 or logs_deleted > 0:
+                            logger.info(
+                                f"🧹 每小时清理完成: "
+                                f"业务数据={daily_deleted}, 重置日志={logs_deleted}"
+                            )
+                    except Exception as e:
+                        logger.error(f"❌ 每小时数据清理失败: {e}")
 
             except asyncio.CancelledError:
-                # 优雅退出：当应用关闭时捕获取消信号
+                # 捕获 asyncio 取消信号，确保服务关闭时干净退出
                 logger.info("🛑 数据库连接维护任务被取消")
                 break
             except Exception as e:
-                # 容错处理：记录异常并增加重试间隔，防止日志刷屏
+                # 全局捕获：记录完整堆栈，并进入 60 秒退避期防止异常死循环
                 logger.error(f"❌ 连接维护任务异常: {e}")
-                await asyncio.sleep(30)
+                logger.exception(e)  # 打印完整堆栈到日志
+                await asyncio.sleep(60)
 
         logger.info("🏁 数据库连接维护循环已结束")
 
