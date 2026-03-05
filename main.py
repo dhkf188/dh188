@@ -1795,7 +1795,9 @@ async def _process_back_locked(
             total_activity_time=MessageFormatter.format_time(
                 int(today_activities.get(act, {}).get("time", 0))
             ),
-            total_time=MessageFormatter.format_time(int(today_total_time)),  # 今天的累计时间
+            total_time=MessageFormatter.format_time(
+                int(today_total_time)
+            ),  # 今天的累计时间
             activity_counts=activity_counts,
             total_count=int(today_total_count),  # 今天的活动次数
             is_overtime=is_overtime,
