@@ -1730,15 +1730,60 @@ async def _process_back_locked(
 
         await timer_manager.cancel_timer(f"{chat_id}-{uid}", preserve_message=True)
 
+        # 获取用户总数据
         user_data_task = asyncio.create_task(db.get_user_cached(chat_id, uid))
-        user_activities_task = asyncio.create_task(
-            db.get_user_all_activities(chat_id, uid)
-        )
-        user_data = await user_data_task
-        user_activities = await user_activities_task
 
+        # 获取今天的统计数据（使用强制归档的日期）
+        async with db.pool.acquire() as conn:
+            # 查询今天的所有活动记录（从 user_activities 表）
+            today_activities_rows = await conn.fetch(
+                """
+                SELECT activity_name, activity_count, accumulated_time
+                FROM user_activities
+                WHERE chat_id = $1 AND user_id = $2 AND activity_date = $3
+                """,
+                chat_id,
+                uid,
+                forced_date,  # 使用强制归档的日期
+            )
+
+            # 查询今天的累计时间和次数（从 daily_statistics 表）
+            today_stats_row = await conn.fetchrow(
+                """
+                SELECT 
+                    COALESCE(SUM(accumulated_time), 0) as total_time,
+                    COALESCE(SUM(activity_count), 0) as total_count
+                FROM daily_statistics
+                WHERE chat_id = $1 
+                  AND user_id = $2 
+                  AND record_date = $3
+                  AND activity_name NOT IN ('total_fines', 'work_fines', 
+                                           'work_start_fines', 'work_end_fines')
+                """,
+                chat_id,
+                uid,
+                forced_date,
+            )
+
+        # 等待用户总数据
+        user_data = await user_data_task
+
+        # 构建今天的活动计数
+        today_activities = {}
+        for row in today_activities_rows:
+            act_name = row["activity_name"]
+            today_activities[act_name] = {
+                "count": row["activity_count"],
+                "time": row["accumulated_time"],
+            }
+
+        # 获取今天的总时间和次数
+        today_total_time = today_stats_row["total_time"] if today_stats_row else 0
+        today_total_count = today_stats_row["total_count"] if today_stats_row else 0
+
+        # 用于显示的活动计数（今天的数据）
         activity_counts = {
-            a: info.get("count", 0) for a, info in user_activities.items()
+            act: info.get("count", 0) for act, info in today_activities.items()
         }
 
         back_message = MessageFormatter.format_back_message(
@@ -1748,13 +1793,11 @@ async def _process_back_locked(
             time_str=time_str,
             elapsed_time=elapsed_time_str,
             total_activity_time=MessageFormatter.format_time(
-                int(user_activities.get(act, {}).get("time", 0))
+                int(today_activities.get(act, {}).get("time", 0))
             ),
-            total_time=MessageFormatter.format_time(
-                int(user_data.get("total_accumulated_time", 0))
-            ),
+            total_time=MessageFormatter.format_time(int(today_total_time)),  # 今天的累计时间
             activity_counts=activity_counts,
-            total_count=user_data.get("total_activity_count", 0),
+            total_count=int(today_total_count),  # 今天的活动次数
             is_overtime=is_overtime,
             overtime_seconds=overtime_seconds,
             fine_amount=fine_amount,
@@ -6620,11 +6663,20 @@ async def show_history(message: types.Message, shift: str = None):
     async with db.pool.acquire() as conn:
         if shift:
             if shift == "night":
-                query_date = business_date
-                logger.info(
-                    f"🌙 [我的记录-夜班] 查询日期: "
-                    f"业务日期={business_date}, 查询日期={query_date}"
-                )
+                now = db.get_beijing_time()
+                # 如果是凌晨（0-12点），查询前一天；如果是下午/晚上，查询当天
+                if now.hour < 12:
+                    query_date = business_date - timedelta(days=1)
+                    logger.info(
+                        f"🌙 [我的记录-夜班] 凌晨查询前一天: "
+                        f"业务日期={business_date}, 查询日期={query_date}"
+                    )
+                else:
+                    query_date = business_date
+                    logger.info(
+                        f"🌙 [我的记录-夜班] 正常查询当天: "
+                        f"业务日期={business_date}, 查询日期={query_date}"
+                    )
             else:
                 if current_time_decimal < day_start_decimal:
                     query_date = business_date - timedelta(days=1)
@@ -6774,12 +6826,20 @@ async def show_history(message: types.Message, shift: str = None):
         if shift:
             # 罚款统计使用与活动记录相同的日期逻辑
             if shift == "night":
-                # 夜班：罚款日期 = 活动查询日期 (business_date)
-                fine_query_date = business_date  # ✅ 修复：与活动记录保持一致
-                logger.info(
-                    f"🌙 [罚款统计-夜班] 查询日期: "
-                    f"业务日期={business_date}, 罚款查询日期={fine_query_date}"
-                )
+                now = db.get_beijing_time()
+                # 罚款统计使用与活动记录相同的日期逻辑
+                if now.hour < 12:
+                    fine_query_date = business_date - timedelta(days=1)
+                    logger.info(
+                        f"🌙 [罚款统计-夜班] 凌晨查询前一天: "
+                        f"业务日期={business_date}, 罚款查询日期={fine_query_date}"
+                    )
+                else:
+                    fine_query_date = business_date
+                    logger.info(
+                        f"🌙 [罚款统计-夜班] 正常查询当天: "
+                        f"业务日期={business_date}, 罚款查询日期={fine_query_date}"
+                    )
             else:  # day
                 if current_time_decimal < day_start_decimal:
                     fine_query_date = business_date - timedelta(days=1)
@@ -6943,11 +7003,20 @@ async def show_rank(message: types.Message, shift: str = None):
         try:
             if shift:
                 if shift == "night":
-                    query_date = business_date
-                    logger.info(
-                        f"🌙 [排行榜-夜班] 查询日期: "
-                        f"业务日期={business_date}, 查询日期={query_date}"
-                    )
+                    now = db.get_beijing_time()
+                    # 如果是凌晨（0-12点），查询前一天；如果是下午/晚上，查询当天
+                    if now.hour < 12:
+                        query_date = business_date - timedelta(days=1)
+                        logger.info(
+                            f"🌙 [排行榜-夜班] 凌晨查询前一天: "
+                            f"业务日期={business_date}, 查询日期={query_date}"
+                        )
+                    else:
+                        query_date = business_date
+                        logger.info(
+                            f"🌙 [排行榜-夜班] 正常查询当天: "
+                            f"业务日期={business_date}, 查询日期={query_date}"
+                        )
                 else:
                     if current_time_decimal < day_start_decimal:
                         query_date = business_date - timedelta(days=1)
