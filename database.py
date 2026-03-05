@@ -23,6 +23,8 @@ class PostgreSQLDatabase:
         self._cache_ttl = {}
 
         self._pending_queries = {}
+        self._locks: Dict[str, asyncio.Lock] = {}
+        self._locks_lock = asyncio.Lock()
 
         self._last_pool_check = 0
         self._pool_check_interval = 60
@@ -1143,6 +1145,42 @@ class PostgreSQLDatabase:
         await self.get_activity_limits()
         await self.get_fine_rates()
         logger.info("活动配置缓存已强制刷新")
+
+    # ========== 锁管理 ==========
+    async def _get_lock(self, key: str) -> asyncio.Lock:
+        """获取或创建命名锁，支持细粒度的并发控制"""
+        async with self._locks_lock:
+            if key not in self._locks:
+                self._locks[key] = asyncio.Lock()
+
+            # 触发定期清理旧锁的任务
+            current_time = time.time()
+            if current_time - self._last_lock_cleanup > self._lock_cleanup_interval:
+                # 异步执行，不阻塞当前请求
+                asyncio.create_task(self._cleanup_old_locks())
+
+            return self._locks[key]
+
+    async def _cleanup_old_locks(self):
+        """清理不再使用的锁，防止随着 key 的增加导致内存溢出"""
+        # 更新清理时间，防止多个任务重叠执行
+        self._last_lock_cleanup = time.time()
+
+        try:
+            async with self._locks_lock:
+                keys_to_remove = [
+                    k for k, lock in self._locks.items() if not lock.locked()
+                ]
+
+                for k in keys_to_remove:
+                    del self._locks[k]
+
+                if keys_to_remove:
+                    logger.debug(
+                        f"🧹 锁清理完成: 移除了 {len(keys_to_remove)} 个空闲锁"
+                    )
+        except Exception as e:
+            logger.error(f"❌ 清理旧锁时出现异常: {e}")
 
     # ========== 群组相关操作 ==========
     async def init_group(self, chat_id: int):
@@ -4665,7 +4703,7 @@ class PostgreSQLDatabase:
             # 捕获可能的解析异常，确保维护逻辑不会因为日志解析失败而中断
             pass
         return 0
-    
+
     async def cleanup_old_data(self, days: int = 30) -> int:
         """清理旧数据 - 最终极致稳定版"""
         try:
@@ -4693,10 +4731,9 @@ class PostgreSQLDatabase:
                     try:
                         # 执行删除操作
                         result = await conn.execute(
-                            f"DELETE FROM {table} WHERE {col} < $1",
-                            cutoff_date
+                            f"DELETE FROM {table} WHERE {col} < $1", cutoff_date
                         )
-                        
+
                         # 解析受影响的行数
                         count = self._parse_row_count(result)
                         total_deleted += count
@@ -4709,7 +4746,9 @@ class PostgreSQLDatabase:
                         continue
 
             if total_deleted > 0:
-                logger.info(f"✅ 定期数据清理任务完成，总计移除: {total_deleted} 条记录")
+                logger.info(
+                    f"✅ 定期数据清理任务完成，总计移除: {total_deleted} 条记录"
+                )
 
             return total_deleted
 
@@ -4717,7 +4756,7 @@ class PostgreSQLDatabase:
             # 全局异常捕获：记录完整堆栈，确保后台维护循环不被中断
             logger.error(f"❌ 数据清理全局任务失败: {e}", exc_info=True)
             return 0
-        
+
     async def cleanup_monthly_data(self, days_or_date=None):
         """清理月度统计数据"""
         import traceback
