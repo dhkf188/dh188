@@ -455,131 +455,129 @@ class NotificationService:
 
 
 class UserLockManager:
-    """用户锁管理器"""
+    """用户锁管理器 - 实用版（适合10个群组）"""
 
     def __init__(self):
-        self._locks = {}
-        self._access_times = {}
+        self._locks: Dict[str, asyncio.Lock] = {}
+        self._access_times: Dict[str, float] = {}
+        self._lock = asyncio.Lock()
         self._cleanup_interval = 3600
         self._last_cleanup = time.time()
-        self._max_locks = 5000
+        self._max_locks = 2000
+        self._cleanup_task: Optional[asyncio.Task] = None
+        self._stats = {"hits": 0, "misses": 0, "cleanups": 0}
+        self._start_cleanup_task()
 
-    def get_lock(self, chat_id: int, uid: int):
+    async def get_lock(self, chat_id: int, uid: int) -> asyncio.Lock:
         """获取用户级锁"""
         key = f"{chat_id}-{uid}"
 
-        if len(self._locks) >= self._max_locks:
-            self._emergency_cleanup()
+        # 快速路径
+        lock = self._locks.get(key)
+        if lock is not None:
+            self._stats["hits"] += 1
+            if hash(key) % 10 == 0:
+                asyncio.create_task(self._touch_lock(key))
+            return lock
 
-        self._access_times[key] = time.time()
+        self._stats["misses"] += 1
 
-        self._maybe_cleanup()
+        # 慢速路径
+        async with self._lock:
+            if key not in self._locks:
+                if len(self._locks) >= self._max_locks:
+                    await self._simple_cleanup()
+                self._locks[key] = asyncio.Lock()
 
-        if key not in self._locks:
-            self._locks[key] = asyncio.Lock()
+            self._access_times[key] = time.time()
+            return self._locks[key]
 
-        return self._locks[key]
+    async def _touch_lock(self, key: str):
+        """更新访问时间"""
+        try:
+            async with self._lock:
+                if key in self._locks:
+                    self._access_times[key] = time.time()
+        except Exception:
+            pass
 
-    def _maybe_cleanup(self):
-        """按需清理过期锁"""
-        current_time = time.time()
-        if current_time - self._last_cleanup < self._cleanup_interval:
-            return
-
-        self._last_cleanup = current_time
-        self._cleanup_old_locks()
-
-    def _cleanup_old_locks(self):
-        """清理长时间未使用的锁对象，释放内存"""
+    async def _simple_cleanup(self):
+        """简单的清理：移除最旧的100个非活动锁"""
         now = time.time()
-        max_age = 86400
+        async with self._lock:
+            in_use = {k for k, v in self._locks.items() if v.locked()}
 
-        # 找出正在使用的锁（排除处于 locked 状态的锁）
-        in_use_keys = set()
-        for key, lock in self._locks.items():
-            if lock.locked():
-                in_use_keys.add(key)
-
-        # 筛选出既不在使用中，且最后使用时间超过 24 小时的 key
-        old_keys = [
-            key
-            for key, last_used in self._access_times.items()
-            if key not in in_use_keys and now - last_used > max_age  # ✅ 排除正在使用的
-        ]
-
-        # 执行清理
-        for key in old_keys:
-            self._locks.pop(key, None)
-            self._access_times.pop(key, None)
-
-        if old_keys:
-            logger.info(f"🧹 清理了 {len(old_keys)} 个过期的非活动锁对象")
-
-    async def force_cleanup(self):
-        """强制立即清理"""
-        old_count = len(self._locks)
-        self._cleanup_old_locks()
-        new_count = len(self._locks)
-        logger.info(f"强制用户锁清理: {old_count} -> {new_count}")
-
-    def get_stats(self) -> Dict[str, Any]:
-        """获取锁管理器统计"""
-        return {
-            "active_locks": len(self._locks),
-            "tracked_users": len(self._access_times),
-            "last_cleanup": self._last_cleanup,
-        }
-
-    def _emergency_cleanup(self):
-        """紧急清理 - 简化修复版，增加被跳过锁统计"""
-        now = time.time()
-        max_age = 3600
-
-        # 找出正在使用的锁
-        in_use_keys = set()
-        for key, lock in self._locks.items():
-            if lock.locked():
-                in_use_keys.add(key)
-        skipped_count = len(in_use_keys)
-
-        # 1. 筛选出超过 1 小时未使用的非活动锁
-        old_keys = [
-            key
-            for key, last_used in self._access_times.items()
-            if key not in in_use_keys and now - last_used > max_age
-        ]
-
-        # 2. 如果锁总数扣除使用中的部分后仍然超过 80% 的容量限制，强制清理最旧的非活动锁
-        if len(self._locks) - skipped_count >= self._max_locks * 0.8:
-            # 获取所有非活动锁
-            inactive_keys = [
-                key for key in self._locks.keys() if key not in in_use_keys
+            inactive = [
+                (k, self._access_times.get(k, 0))
+                for k in self._locks.keys()
+                if k not in in_use
             ]
-            # 按最后使用时间排序（时间戳越小说明越久没用）
-            inactive_with_time = [
-                (key, self._access_times.get(key, 0)) for key in inactive_keys
-            ]
-            inactive_with_time.sort(key=lambda x: x[1])
+            inactive.sort(key=lambda x: x[1])
 
-            # 强制清理最旧的 20% 非活动锁，最少清理 100 个
-            additional = max(100, len(inactive_with_time) // 5)
-            old_keys.extend([key for key, _ in inactive_with_time[:additional]])
-
-        # 3. 执行物理清理
-        unique_keys = set(old_keys)
-        removed_count = 0
-        for key in unique_keys:
-            # 再次确认：必须存在于字典中且未被锁定（二次校验增强鲁棒性）
-            if key in self._locks and key not in in_use_keys:
+            removed = 0
+            for key, _ in inactive[:100]:
                 self._locks.pop(key, None)
                 self._access_times.pop(key, None)
-                removed_count += 1
+                removed += 1
 
-        # 4. 记录日志
-        if unique_keys or skipped_count:
-            logger.warning(
-                f"🚨 紧急锁清理: 移除了 {removed_count} 个锁，跳过 {skipped_count} 个正在使用的锁"
-            )
+            if removed:
+                self._stats["cleanups"] += removed
+                logger.info(f"🧹 清理了 {removed} 个旧锁")
+
+    def _start_cleanup_task(self):
+        """启动后台清理"""
+
+        async def _cleanup_loop():
+            while True:
+                await asyncio.sleep(3600)
+                async with self._lock:
+                    now = time.time()
+                    in_use = {k for k, v in self._locks.items() if v.locked()}
+
+                    to_remove = [
+                        k
+                        for k, last in self._access_times.items()
+                        if k not in in_use and now - last > 86400
+                    ]
+
+                    for key in to_remove:
+                        self._locks.pop(key, None)
+                        self._access_times.pop(key, None)
+
+                    if to_remove:
+                        self._stats["cleanups"] += len(to_remove)
+                        logger.info(f"🧹 后台清理了 {len(to_remove)} 个过期锁")
+
+        self._cleanup_task = asyncio.create_task(_cleanup_loop())
+
+    async def get_stats(self) -> Dict[str, Any]:
+        """获取统计信息"""
+        async with self._lock:
+            active = sum(1 for v in self._locks.values() if v.locked())
+            total_ops = self._stats["hits"] + self._stats["misses"]
+            hit_rate = self._stats["hits"] / total_ops if total_ops > 0 else 0
+
+            return {
+                "total_locks": len(self._locks),
+                "active_locks": active,
+                "idle_locks": len(self._locks) - active,
+                "hit_rate": f"{hit_rate*100:.1f}%",
+                "total_cleanups": self._stats["cleanups"],
+            }
+
+    async def close(self):
+        """关闭管理器"""
+        if self._cleanup_task:
+            self._cleanup_task.cancel()
+            try:
+                await self._cleanup_task
+            except asyncio.CancelledError:
+                pass
+
+        async with self._lock:
+            self._locks.clear()
+            self._access_times.clear()
+            logger.info("用户锁管理器已关闭")
 
 
 class ActivityTimerManager:
