@@ -2,6 +2,7 @@
 
 import logging
 import asyncio
+import time
 from datetime import datetime, date, timedelta, time as dt_time
 from typing import Dict, Optional, Tuple, Any, List
 
@@ -15,16 +16,143 @@ class HandoverManager:
     """换班管理器 - 处理月末夜班跨月和月初白班跨日的18小时工作制"""
 
     def __init__(self):
+        # ===== 1. 基础缓存（已有TTL）=====
         self._cache = {}
         self._cache_ttl = {}
-        self._user_cycle_cache = {}  # 用户周期缓存
 
+        # ===== 2. 周期缓存（已有TTL）=====
         self._period_cache = {}
         self._period_cache_ttl = {}
+
+        # ===== 3. 换班日缓存（已有TTL）=====
         self._handover_cache = {}
         self._handover_cache_ttl = {}
 
-    # ========== 配置管理 ==========
+        # ===== 4. 用户周期缓存（需要修复）=====
+        self._user_cycle_cache = {}  # 数据缓存
+        self._user_cycle_cache_ttl = {}  # TTL缓存
+        self._user_cycle_access = {}  # 最后访问时间（用于LRU）
+
+        # ===== 5. 缓存配置 =====
+        self._user_cycle_max_size = 2000  # 最大缓存条目
+        self._user_cycle_default_ttl = 300  # 默认5分钟
+        self._last_cleanup = time.time()
+        self._cleanup_interval = 600  # 10分钟清理一次
+        self._lock = asyncio.Lock()  # 并发控制
+
+    # ========== 用户周期缓存管理（新增）==========
+
+    async def _cleanup_user_cycle_cache(self):
+        """清理过期的用户周期缓存（TTL + LRU）"""
+        now = time.time()
+
+        # 控制清理频率
+        if now - self._last_cleanup < self._cleanup_interval:
+            return
+
+        async with self._lock:
+            # 1. 清理过期缓存（基于TTL）
+            expired = [
+                key
+                for key, expiry in self._user_cycle_cache_ttl.items()
+                if now > expiry
+            ]
+
+            for key in expired:
+                self._user_cycle_cache.pop(key, None)
+                self._user_cycle_cache_ttl.pop(key, None)
+                self._user_cycle_access.pop(key, None)
+
+            # 2. LRU淘汰（如果仍然过大）
+            if len(self._user_cycle_cache) > self._user_cycle_max_size:
+                # 按最后访问时间排序
+                sorted_keys = sorted(
+                    self._user_cycle_access.items(), key=lambda x: x[1]
+                )
+
+                # 淘汰最旧的20%
+                evict_count = max(1, len(sorted_keys) // 5)
+                keys_to_evict = [k for k, _ in sorted_keys[:evict_count]]
+
+                for key in keys_to_evict:
+                    self._user_cycle_cache.pop(key, None)
+                    self._user_cycle_cache_ttl.pop(key, None)
+                    self._user_cycle_access.pop(key, None)
+
+                logger.debug(f"🧹 LRU淘汰: 移除了 {evict_count} 个用户周期缓存")
+
+            if expired:
+                logger.debug(f"🧹 清理了 {len(expired)} 个过期用户周期缓存")
+
+            self._last_cleanup = now
+
+    async def _get_user_cycle_cached(self, key: str) -> Optional[Dict]:
+        """安全获取用户周期缓存"""
+        async with self._lock:
+            now = time.time()
+
+            # 检查TTL
+            if key in self._user_cycle_cache_ttl:
+                if now < self._user_cycle_cache_ttl[key]:
+                    # 更新访问时间
+                    self._user_cycle_access[key] = now
+                    return self._user_cycle_cache.get(key)
+                else:
+                    # 过期删除
+                    self._user_cycle_cache.pop(key, None)
+                    self._user_cycle_cache_ttl.pop(key, None)
+                    self._user_cycle_access.pop(key, None)
+
+            return None
+
+    async def _set_user_cycle_cached(self, key: str, value: Dict, ttl: int = None):
+        """安全设置用户周期缓存"""
+        if ttl is None:
+            ttl = self._user_cycle_default_ttl
+
+        async with self._lock:
+            now = time.time()
+
+            # 检查大小，必要时执行LRU
+            if len(self._user_cycle_cache) >= self._user_cycle_max_size:
+                await self._evict_lru()
+
+            self._user_cycle_cache[key] = value
+            self._user_cycle_cache_ttl[key] = now + ttl
+            self._user_cycle_access[key] = now
+
+    async def _evict_lru(self):
+        """LRU淘汰（内部方法，调用时需持有锁）"""
+        if len(self._user_cycle_access) <= 100:  # 太小就不淘汰
+            return
+
+        # 按最后访问时间排序
+        sorted_keys = sorted(self._user_cycle_access.items(), key=lambda x: x[1])
+
+        # 淘汰最旧的20%
+        evict_count = max(1, len(sorted_keys) // 5)
+        keys_to_evict = [k for k, _ in sorted_keys[:evict_count]]
+
+        for key in keys_to_evict:
+            self._user_cycle_cache.pop(key, None)
+            self._user_cycle_cache_ttl.pop(key, None)
+            self._user_cycle_access.pop(key, None)
+
+    async def _invalidate_user_cycle_cache(self, chat_id: int, user_id: int):
+        """使特定用户的周期缓存失效"""
+        prefix = f"user_cycle:{chat_id}:{user_id}:"
+
+        async with self._lock:
+            keys_to_remove = [
+                key for key in self._user_cycle_cache.keys() if key.startswith(prefix)
+            ]
+
+            for key in keys_to_remove:
+                self._user_cycle_cache.pop(key, None)
+                self._user_cycle_cache_ttl.pop(key, None)
+                self._user_cycle_access.pop(key, None)
+
+    # ========== 配置管理（原样保留）==========
 
     async def init_handover_config(self, chat_id: int) -> bool:
         """初始化换班配置"""
@@ -91,7 +219,8 @@ class HandoverManager:
             "normal_day_hours": 12,
         }
 
-    # ========== 核心时间判定 ==========
+    # ========== 核心时间判定（原样保留）==========
+
     async def determine_current_period(
         self,
         chat_id: int,
@@ -100,23 +229,6 @@ class HandoverManager:
     ) -> Dict[str, Any]:
         """
         根据时间判定当前属于哪个时期（支持自定义换班日期）
-
-        参数:
-            chat_id: 群组ID
-            current_time: 当前时间（默认北京时间）
-            use_cache: 是否使用缓存（默认True）
-
-        返回:
-            {
-                'period_type': 'handover_night'|'handover_day'|'normal_night'|'normal_day',
-                'business_date': date,      # 业务日期（用于计数）
-                'actual_date': date,         # 实际日期（用于存储）
-                'cycle': 1|2,                # 当前周期
-                'hours_elapsed': float,      # 已过小时数
-                'total_hours': int,          # 总工作时长
-                'is_handover': bool,          # 是否是换班日
-                'next_reset_time': datetime   # 下次重置时间
-            }
         """
         if current_time is None:
             current_time = db.get_beijing_time()
@@ -462,7 +574,8 @@ class HandoverManager:
                 "next_reset_time": next_reset,
             }
 
-    # ===== 缓存方法 =====
+    # ========== 缓存方法（原样保留）==========
+
     async def _get_period_cache(self, key: str):
         """获取周期缓存"""
         import time
@@ -511,7 +624,7 @@ class HandoverManager:
         self._handover_cache[key] = value
         self._handover_cache_ttl[key] = time.time() + ttl
 
-    # ========== 用户周期管理 ==========
+    # ========== 用户周期管理（修改后的方法）==========
 
     async def get_user_cycle(
         self,
@@ -521,13 +634,19 @@ class HandoverManager:
         period_type: str,
         cycle: int,
     ) -> Optional[Dict[str, Any]]:
-        """获取用户指定周期的数据"""
+        """获取用户指定周期的数据（带缓存保护）"""
+
+        # 定期清理过期缓存
+        await self._cleanup_user_cycle_cache()
+
         cache_key = (
             f"user_cycle:{chat_id}:{user_id}:{business_date}:{period_type}:{cycle}"
         )
 
-        if cache_key in self._user_cycle_cache:
-            return self._user_cycle_cache[cache_key]
+        # 尝试从缓存获取
+        cached = await self._get_user_cycle_cached(cache_key)
+        if cached:
+            return cached
 
         try:
             shift_type = "night" if "night" in period_type else "day"
@@ -549,7 +668,7 @@ class HandoverManager:
 
             if row:
                 result = dict(row)
-                self._user_cycle_cache[cache_key] = result
+                await self._set_user_cycle_cached(cache_key, result)
                 return result
             return None
 
@@ -566,14 +685,22 @@ class HandoverManager:
         cycle: int,
         start_time: Optional[datetime] = None,
     ) -> bool:
-        """创建用户新周期"""
+        """创建用户新周期（自动使缓存失效）"""
         if start_time is None:
-            start_time = db.get_beijing_time()
+            start_time = self.get_beijing_time()
 
+        # ===== 修复：转换为无时区时间 =====
+        # 确保插入数据库的时间不带 tzinfo，防止 PostgreSQL 驱动进行不必要的时区转换
+        if start_time.tzinfo is not None:
+            # 转换为无时区时间（去除时区信息）
+            start_time = start_time.replace(tzinfo=None)
+
+        # 根据 period_type 判定白班或晚班
         shift_type = "night" if "night" in period_type else "day"
 
         try:
-            await db.execute_with_retry(
+            # 使用带重试机制的执行器
+            await self.execute_with_retry(
                 "创建用户周期",
                 """
                 INSERT INTO user_handover_cycles 
@@ -588,17 +715,15 @@ class HandoverManager:
                 business_date,
                 shift_type,
                 cycle,
-                start_time,
+                start_time,  # 传入已处理的无时区时间
             )
 
-            cache_key = (
-                f"user_cycle:{chat_id}:{user_id}:{business_date}:{period_type}:{cycle}"
-            )
-            self._user_cycle_cache.pop(cache_key, None)
-
+            # 联动操作：使该用户的周期相关缓存失效，确保下次查询时从数据库拉取最新状态
+            await self._invalidate_user_cycle_cache(chat_id, user_id)
             return True
+
         except Exception as e:
-            logger.error(f"创建用户周期失败 {chat_id}-{user_id}: {e}")
+            logger.error(f"❌ 创建用户周期失败 {chat_id}-{user_id}: {e}")
             return False
 
     async def update_user_cycle_time(
@@ -653,14 +778,10 @@ class HandoverManager:
                 cycle,
             )
 
-            # 更新缓存
-            cache_key = (
-                f"user_cycle:{chat_id}:{user_id}:{business_date}:{period_type}:{cycle}"
-            )
-            if cache_key in self._user_cycle_cache:
-                self._user_cycle_cache[cache_key]["total_work_seconds"] = new_total
+            # 使缓存失效（而不是更新，保证一致性）
+            await self._invalidate_user_cycle_cache(chat_id, user_id)
 
-            # 判断是否达到12小时阈值（从小于12小时变为大于等于12小时）
+            # 判断是否达到12小时阈值
             reached_threshold = (
                 cycle_data["total_work_seconds"] < threshold_seconds
                 and new_total >= threshold_seconds
@@ -672,7 +793,7 @@ class HandoverManager:
             logger.error(f"更新用户周期工作时间失败 {chat_id}-{user_id}: {e}")
             return cycle_data["total_work_seconds"], False
 
-    # ========== 对外核心接口 ==========
+    # ========== 对外核心接口（原样保留）==========
 
     async def get_activity_count(
         self,
@@ -810,7 +931,7 @@ class HandoverManager:
 
         return False, period["business_date"], "not_complete"
 
-    # ========== 缓存管理 ==========
+    # ========== 缓存管理（原样保留）==========
 
     def _get_cached(self, key: str):
         import time
@@ -951,6 +1072,17 @@ class HandoverManager:
 
         except Exception as e:
             logger.error(f"❌ 更新换班配置失败 {chat_id}: {e}")
+            return False
+
+    # ========== 辅助方法 ==========
+    def _validate_time_format(self, time_str: str) -> bool:
+        """验证时间格式 HH:MM"""
+        try:
+            if not isinstance(time_str, str):
+                return False
+            datetime.strptime(time_str, "%H:%M")
+            return True
+        except ValueError:
             return False
 
 
