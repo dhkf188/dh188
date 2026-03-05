@@ -820,7 +820,7 @@ class PostgreSQLDatabase:
                 "CREATE INDEX IF NOT EXISTS idx_monthly_stats_main ON monthly_statistics (chat_id, statistic_date, user_id, shift)",
                 "CREATE INDEX IF NOT EXISTS idx_groups_config ON groups (chat_id, dual_mode, reset_hour, reset_minute)",
                 "CREATE INDEX IF NOT EXISTS idx_fine_configs_lookup ON fine_configs (activity_name, time_segment)",
-                "CREATE INDEX IF NOT EXISTS idx_shift_state ON group_shift_state (chat_id, current_shift, shift_start_time)",
+                "CREATE INDEX IF NOT EXISTS idx_shift_state ON group_shift_state (chat_id, shift, shift_start_time)",
             ]
 
             created_count = 0
