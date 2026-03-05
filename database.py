@@ -1090,8 +1090,57 @@ class PostgreSQLDatabase:
             return None
 
     async def get_group_cached(self, chat_id: int) -> Optional[Dict]:
-        """带缓存的获取群组配置"""
-        return await self.get_group(chat_id)
+        """带缓存的获取群组配置 - 加强版"""
+        cache_key = f"group:{chat_id}"
+
+        # 1. 一级缓存：内存缓存（LRU/TTL 机制）
+        cached = self._get_cached(cache_key)
+        if cached is not None:
+            return cached
+
+        # 2. 二级缓存：检查是否有正在进行的相同查询（防止缓存击穿）
+        pending_key = f"pending_group:{chat_id}"
+        if hasattr(self, "_pending_queries") and pending_key in self._pending_queries:
+            try:
+                # 共享已有的异步查询任务，不发起重复请求
+                return await self._pending_queries[pending_key]
+            except Exception:
+                # 如果共享任务异常，则继续往下执行新的查询
+                pass
+
+        # 3. 定义实际的数据库获取逻辑
+        async def _fetch_group():
+            try:
+                # 确保连接池已准备就绪
+                await self._ensure_pool_initialized()
+                async with self.pool.acquire() as conn:
+                    row = await conn.fetchrow(
+                        "SELECT * FROM groups WHERE chat_id = $1", chat_id
+                    )
+                    result = dict(row) if row else None
+
+                    # 写入缓存，群组配置相对稳定，TTL 延长到 600秒（10分钟）
+                    # 建议配合 random.randint(-60, 60) 增加抖动防止雪崩
+                    self._set_cached(cache_key, result, 600)
+                    return result
+            except Exception as e:
+                logger.error(f"❌ 获取群组配置失败 {chat_id}: {e}")
+                return None
+
+        # 4. 任务调度管理
+        if not hasattr(self, "_pending_queries"):
+            self._pending_queries = {}
+
+        # 创建新任务并注册到 pending 字典
+        task = asyncio.create_task(_fetch_group())
+        self._pending_queries[pending_key] = task
+
+        try:
+            result = await task
+            return result
+        finally:
+            # 无论成功失败，确保清理 pending 记录，允许后续查询进入
+            self._pending_queries.pop(pending_key, None)
 
     async def update_group_channel(self, chat_id: int, channel_id: int):
         """更新群组频道ID"""
@@ -1180,19 +1229,36 @@ class PostgreSQLDatabase:
             self._cache.pop(f"group:{chat_id}", None)
 
     async def get_group_work_time(self, chat_id: int) -> Dict[str, str]:
-        """获取群组上下班时间"""
+        """获取群组上下班时间 - 带缓存"""
+        cache_key = f"work_time:{chat_id}"
+
+        # 1. 一级缓存校验
+        cached = self._get_cached(cache_key)
+        if cached is not None:
+            return cached
+
+        # 2. 执行带重试的数据库查询
         row = await self.execute_with_retry(
             "获取工作时间",
             "SELECT work_start_time, work_end_time FROM groups WHERE chat_id = $1",
             chat_id,
             fetchrow=True,
         )
+
+        # 3. 结果解析与兜底策略
+        result = {}
         if row and row["work_start_time"] and row["work_end_time"]:
-            return {
+            result = {
                 "work_start": row["work_start_time"],
                 "work_end": row["work_end_time"],
             }
-        return Config.DEFAULT_WORK_HOURS.copy()
+        else:
+            # 如果数据库未配置，使用 Config 中的全局默认值
+            result = Config.DEFAULT_WORK_HOURS.copy()
+
+        # 4. 写入缓存，TTL 设置为 300秒（5分钟）
+        self._set_cached(cache_key, result, 300)
+        return result
 
     async def has_work_hours_enabled(self, chat_id: int) -> bool:
         """检查是否启用了上下班功能"""
