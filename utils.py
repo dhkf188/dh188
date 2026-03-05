@@ -466,7 +466,13 @@ class UserLockManager:
         self._max_locks = 2000
         self._cleanup_task: Optional[asyncio.Task] = None
         self._stats = {"hits": 0, "misses": 0, "cleanups": 0}
+        # ❌ 不要在 __init__ 中启动任务
+        # self._start_cleanup_task()
+
+    async def start(self):
+        """启动清理任务 - 需要在事件循环运行时调用"""
         self._start_cleanup_task()
+        logger.info("用户锁管理器清理任务已启动")
 
     async def get_lock(self, chat_id: int, uid: int) -> asyncio.Lock:
         """获取用户级锁"""
@@ -525,28 +531,34 @@ class UserLockManager:
                 logger.info(f"🧹 清理了 {removed} 个旧锁")
 
     def _start_cleanup_task(self):
-        """启动后台清理"""
+        """启动后台清理（内部方法）"""
 
         async def _cleanup_loop():
             while True:
-                await asyncio.sleep(3600)
-                async with self._lock:
-                    now = time.time()
-                    in_use = {k for k, v in self._locks.items() if v.locked()}
+                try:
+                    await asyncio.sleep(3600)
+                    async with self._lock:
+                        now = time.time()
+                        in_use = {k for k, v in self._locks.items() if v.locked()}
 
-                    to_remove = [
-                        k
-                        for k, last in self._access_times.items()
-                        if k not in in_use and now - last > 86400
-                    ]
+                        to_remove = [
+                            k
+                            for k, last in self._access_times.items()
+                            if k not in in_use and now - last > 86400
+                        ]
 
-                    for key in to_remove:
-                        self._locks.pop(key, None)
-                        self._access_times.pop(key, None)
+                        for key in to_remove:
+                            self._locks.pop(key, None)
+                            self._access_times.pop(key, None)
 
-                    if to_remove:
-                        self._stats["cleanups"] += len(to_remove)
-                        logger.info(f"🧹 后台清理了 {len(to_remove)} 个过期锁")
+                        if to_remove:
+                            self._stats["cleanups"] += len(to_remove)
+                            logger.info(f"🧹 后台清理了 {len(to_remove)} 个过期锁")
+                except asyncio.CancelledError:
+                    break
+                except Exception as e:
+                    logger.error(f"清理任务出错: {e}")
+                    await asyncio.sleep(60)
 
         self._cleanup_task = asyncio.create_task(_cleanup_loop())
 
@@ -828,8 +840,9 @@ class EnhancedPerformanceOptimizer:
             if memory_mb > self.render_memory_limit:
                 logger.warning(f"🚨 Render 内存过高 {memory_mb:.1f}MB，执行紧急清理")
 
-                old_cache_size = global_cache.get_stats().get("size", 0)
-                global_cache.clear_all()
+                stats = await global_cache.get_stats()
+                old_cache_size = stats.get("size", 0)
+                await global_cache.clear_all()
 
                 await task_manager.cleanup_tasks()
 
@@ -858,7 +871,7 @@ class EnhancedPerformanceOptimizer:
 
             tasks = [
                 task_manager.cleanup_tasks(),
-                global_cache.clear_expired(),
+                await global_cache.clear_expired(),
                 db.cleanup_cache(),
             ]
 
