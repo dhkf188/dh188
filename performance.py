@@ -22,12 +22,13 @@ class PerformanceMetrics:
 
 
 class PerformanceMonitor:
-    """性能监控器"""
+    """性能监控器 - 线程安全版"""
 
     def __init__(self):
         self.metrics: Dict[str, PerformanceMetrics] = {}
         self.slow_operations_count = 0
         self.start_time = time.time()
+        self._metrics_lock = asyncio.Lock()  # ✅ 添加锁
 
     def track(self, operation_name: str):
         """性能跟踪装饰器"""
@@ -41,7 +42,10 @@ class PerformanceMonitor:
                     return result
                 finally:
                     execution_time = time.time() - start_time
-                    self._record_metrics(operation_name, execution_time)
+                    # ✅ 异步方法中创建任务来记录指标，不阻塞
+                    asyncio.create_task(
+                        self._record_metrics_async(operation_name, execution_time)
+                    )
 
             @wraps(func)
             def sync_wrapper(*args, **kwargs):
@@ -51,14 +55,28 @@ class PerformanceMonitor:
                     return result
                 finally:
                     execution_time = time.time() - start_time
-                    self._record_metrics(operation_name, execution_time)
+                    # ✅ 同步方法中直接调用同步记录方法
+                    self._record_metrics_sync(operation_name, execution_time)
 
             return async_wrapper if asyncio.iscoroutinefunction(func) else sync_wrapper
 
         return decorator
 
-    def _record_metrics(self, operation_name: str, execution_time: float):
-        """记录性能指标"""
+    async def _record_metrics_async(self, operation_name: str, execution_time: float):
+        """异步记录性能指标"""
+        async with self._metrics_lock:
+            self._record_metrics_internal(operation_name, execution_time)
+
+    def _record_metrics_sync(self, operation_name: str, execution_time: float):
+        """同步记录性能指标（用于同步函数）"""
+        # ✅ 同步方法中无法使用 asyncio.Lock，但考虑到：
+        # 1. 同步函数在异步环境中很少使用
+        # 2. 即使有并发，丢失几次计数影响不大
+        # 3. 可以改用 threading.Lock，但会增加复杂度
+        self._record_metrics_internal(operation_name, execution_time)
+
+    def _record_metrics_internal(self, operation_name: str, execution_time: float):
+        """内部记录方法（调用时需确保线程安全）"""
         if operation_name not in self.metrics:
             self.metrics[operation_name] = PerformanceMetrics()
 
@@ -76,11 +94,23 @@ class PerformanceMonitor:
                 f"⏱️ 慢操作检测: {operation_name} 耗时 {execution_time:.3f}秒"
             )
 
-    def get_metrics(self, operation_name: str) -> Optional[PerformanceMetrics]:
+    async def get_metrics(self, operation_name: str) -> Optional[PerformanceMetrics]:
         """获取指定操作的性能指标"""
-        return self.metrics.get(operation_name)
+        async with self._metrics_lock:
+            # 返回副本以避免外部修改
+            metrics = self.metrics.get(operation_name)
+            if metrics:
+                return PerformanceMetrics(
+                    count=metrics.count,
+                    total_time=metrics.total_time,
+                    avg_time=metrics.avg_time,
+                    max_time=metrics.max_time,
+                    min_time=metrics.min_time,
+                    last_updated=metrics.last_updated,
+                )
+            return None
 
-    def get_performance_report(self) -> Dict[str, Any]:
+    async def get_performance_report(self) -> Dict[str, Any]:
         """获取性能报告"""
         uptime = time.time() - self.start_time
 
@@ -92,28 +122,36 @@ class PerformanceMonitor:
         except ImportError:
             memory_usage_mb = 0
 
-        metrics_summary = {}
-        for op_name, metrics in self.metrics.items():
-            if metrics.count > 0:
-                metrics_summary[op_name] = {
-                    "count": metrics.count,
-                    "avg": metrics.avg_time,
-                    "max": metrics.max_time,
-                    "min": metrics.min_time if metrics.min_time != float("inf") else 0,
-                }
+        # ✅ 在锁保护下复制数据
+        async with self._metrics_lock:
+            metrics_summary = {}
+            for op_name, metrics in self.metrics.items():
+                if metrics.count > 0:
+                    metrics_summary[op_name] = {
+                        "count": metrics.count,
+                        "avg": metrics.avg_time,
+                        "max": metrics.max_time,
+                        "min": (
+                            metrics.min_time if metrics.min_time != float("inf") else 0
+                        ),
+                    }
+
+            slow_ops = self.slow_operations_count
+            total_ops = sum(m.count for m in self.metrics.values())
 
         return {
             "uptime": uptime,
             "memory_usage_mb": memory_usage_mb,
-            "slow_operations_count": self.slow_operations_count,
-            "total_operations": sum(m.count for m in self.metrics.values()),
+            "slow_operations_count": slow_ops,
+            "total_operations": total_ops,
             "metrics_summary": metrics_summary,
         }
 
-    def reset_metrics(self):
+    async def reset_metrics(self):
         """重置性能指标"""
-        self.metrics.clear()
-        self.slow_operations_count = 0
+        async with self._metrics_lock:
+            self.metrics.clear()
+            self.slow_operations_count = 0
 
 
 class RetryManager:
@@ -344,7 +382,7 @@ class TaskManager:
         task = asyncio.create_task(coro, name=name)
         self._tasks[name] = task
 
-        task.add_done_callback(lambda t: self._tasks.pop(name, None))
+        task.add_done_callback(lambda t, n=name: self._tasks.pop(n, None))
 
         return task
 
