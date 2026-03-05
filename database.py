@@ -3195,13 +3195,13 @@ class PostgreSQLDatabase:
             # ===== 3. 防缓存击穿锁：确保在高并发下只有一个请求去查数据库 =====
             lock_key = f"stats_lock:{chat_id}:{target_date}"
 
-            async with self._get_lock(lock_key):
+            lock = await self._get_lock(lock_key)
+            async with lock:
 
-                # 二次检查缓存 (Double-checked locking)
                 cached = self._get_cached(cache_key)
                 if cached is not None:
                     return cached
-
+                
                 self._ensure_pool_initialized()
 
                 async with self.pool.acquire() as conn:
