@@ -792,139 +792,129 @@ async def _complete_single_work_end(
 
 
 # ========== 5. 导出数据 ==========
+# 每个导出任务独立锁
+_export_locks: Dict[str, asyncio.Lock] = {}
+
+# 创建锁的保护锁
+_export_locks_guard = asyncio.Lock()
+
+# 限制全局并发导出数量（防止数据库压力过大）
+_export_semaphore = asyncio.Semaphore(3)
+
+
+async def _get_export_lock(key: str) -> asyncio.Lock:
+    """获取任务锁（不存在则创建）"""
+    async with _export_locks_guard:
+        lock = _export_locks.get(key)
+        if lock is None:
+            lock = asyncio.Lock()
+            _export_locks[key] = lock
+        return lock
+
+
+async def _cleanup_export_lock(key: str):
+    """清理任务锁（避免字典无限增长）"""
+    async with _export_locks_guard:
+        lock = _export_locks.get(key)
+        if lock and not lock.locked():
+            _export_locks.pop(key, None)
+
+
 async def _export_yesterday_data_concurrent(
-    chat_id: int, target_date: date, from_monthly: bool = False
+    chat_id: int,
+    target_date: date,
+    from_monthly: bool = False,
 ) -> bool:
-    """导出数据，成功一次就推送 - 修复并发查询风暴"""
+    """
+    企业级稳定导出逻辑
+    """
     from main import export_and_push_csv
-    
-    # 使用类变量或全局变量来跟踪正在进行的导出
-    # 注意：需要在文件顶部定义 _active_exports = set() 和 _exports_lock = asyncio.Lock()
-    if not hasattr(_export_yesterday_data_concurrent, "_active_exports"):
-        _export_yesterday_data_concurrent._active_exports = set()
-        _export_yesterday_data_concurrent._exports_lock = asyncio.Lock()
-    
+    from database import db
+
     export_key = f"{chat_id}:{target_date}"
-    
-    # 检查是否已有相同导出在进行
-    async with _export_yesterday_data_concurrent._exports_lock:
-        if export_key in _export_yesterday_data_concurrent._active_exports:
-            logger.info(f"⏭️ [数据导出] 群组{chat_id} 导出任务已存在，等待完成...")
-            # 等待一段时间让已有任务完成
-            for _ in range(30):  # 最多等待30秒
-                await asyncio.sleep(1)
-                async with _export_yesterday_data_concurrent._exports_lock:
-                    if export_key not in _export_yesterday_data_concurrent._active_exports:
-                        logger.info(f"✅ [数据导出] 群组{chat_id} 等待完成")
-                        return True
-            logger.warning(f"⚠️ [数据导出] 群组{chat_id} 等待超时，重新执行")
-        
-        # 标记开始导出
-        _export_yesterday_data_concurrent._active_exports.add(export_key)
-    
-    source = "月度表" if from_monthly else "日常表"
-    
-    try:
-        file_name = f"dual_shift_backup_{chat_id}_{target_date.strftime('%Y%m%d')}.csv"
-        
-        # ===== 1. 先尝试生成数据（不推送）=====
-        logger.info(f"📊 [数据导出] 群组{chat_id} 尝试生成数据...")
-        data_generated = False
-        generated_file = None
-        generation_attempts = 3
-        
-        for attempt in range(generation_attempts):
+    file_name = f"dual_shift_backup_{chat_id}_{target_date.strftime('%Y%m%d')}.csv"
+
+    export_lock = await _get_export_lock(export_key)
+
+    async with export_lock:
+        async with _export_semaphore:
             try:
-                # 先尝试生成数据但不推送
-                result = await export_and_push_csv(
-                    chat_id=chat_id,
-                    target_date=target_date,
-                    file_name=file_name,
-                    is_daily_reset=True,
-                    from_monthly_table=True,
-                    push_file=False,  # 不推送，只生成数据
+                shift_config = await db.get_shift_config(chat_id)
+                day_start = shift_config.get("day_start", "09:00")
+                day_end = shift_config.get("day_end", "21:00")
+
+                logger.info(
+                    f"📊 [数据导出] 群组 {chat_id}\n"
+                    f"   ├─ 目标日期: {target_date}\n"
+                    f"   ├─ 数据来源: {'月度表' if from_monthly else '日常表'}\n"
+                    f"   └─ 白班 {day_start}-{day_end} 夜班 {day_end}-{day_start}"
                 )
-                
-                if result:
-                    data_generated = True
-                    logger.info(f"✅ [数据导出] 群组{chat_id} 第{attempt+1}次尝试生成数据成功")
-                    break
-                else:
-                    logger.warning(f"⚠️ [数据导出] 群组{chat_id} 第{attempt+1}次生成数据失败")
-                    
-            except Exception as e:
-                logger.warning(f"⚠️ [数据导出] 群组{chat_id} 第{attempt+1}次生成数据异常: {e}")
-            
-            if attempt < generation_attempts - 1:
-                delay = 2 ** attempt  # 指数退避：1, 2, 4秒
-                logger.info(f"⏳ {delay}秒后重试...")
-                await asyncio.sleep(delay)
-        
-        if not data_generated:
-            logger.error(f"❌ [数据导出] 群组{chat_id} 生成数据失败，所有{generation_attempts}次尝试均失败")
-            return False
-        
-        # ===== 2. 数据生成成功后，尝试推送 =====
-        logger.info(f"📤 [数据导出] 群组{chat_id} 数据生成成功，尝试推送...")
-        push_success = False
-        push_attempts = 2
-        
-        for attempt in range(push_attempts):
-            try:
-                # 推送数据
-                push_result = await export_and_push_csv(
-                    chat_id=chat_id,
-                    target_date=target_date,
-                    file_name=file_name,
-                    is_daily_reset=True,
-                    from_monthly_table=True,
-                    push_file=True,  # 推送
+
+                max_attempts = 3
+
+                for attempt in range(max_attempts):
+                    try:
+                        logger.info(
+                            f"🔄 [数据导出] 群组{chat_id} 第 {attempt+1}/{max_attempts} 次尝试"
+                        )
+
+                        # ✅ 修正：使用关键字参数确保正确映射
+                        result = await export_and_push_csv(
+                            chat_id=chat_id,
+                            to_admin_if_no_group=True,  # 明确指定
+                            file_name=file_name,
+                            target_date=target_date,
+                            is_daily_reset=True,
+                            from_monthly_table=from_monthly,
+                            push_file=True,
+                        )
+
+                        if result:
+                            logger.info(
+                                f"✅ [数据导出] 群组 {chat_id} 导出成功\n"
+                                f"   ├─ 日期: {target_date}\n"
+                                f"   └─ 文件: {file_name}"
+                            )
+                            return True
+
+                    except Exception as e:
+                        logger.warning(
+                            f"⚠️ [数据导出] 群组{chat_id} 第{attempt+1}次失败: {e}"
+                        )
+                        if attempt < max_attempts - 1:
+                            logger.exception(e)
+
+                    if attempt < max_attempts - 1:
+                        delay = 2**attempt
+                        logger.info(f"⏳ {delay}s 后重试")
+                        await asyncio.sleep(delay)
+
+                logger.error(
+                    f"❌ [数据导出] 群组{chat_id} 导出失败\n"
+                    f"   ├─ 日期: {target_date}\n"
+                    f"   └─ 文件: {file_name}"
                 )
-                
-                if push_result:
-                    push_success = True
-                    logger.info(f"✅ [数据导出] 群组{chat_id} 第{attempt+1}次推送成功")
-                    break
-                else:
-                    logger.warning(f"⚠️ [数据导出] 群组{chat_id} 第{attempt+1}次推送失败")
-                    
-            except Exception as e:
-                logger.warning(f"⚠️ [数据导出] 群组{chat_id} 第{attempt+1}次推送异常: {e}")
-            
-            if attempt < push_attempts - 1:
-                await asyncio.sleep(2)  # 简单延迟
-        
-        if push_success:
-            logger.info(f"✅ [数据导出] 群组{chat_id} 完成（生成数据成功 + 推送成功）")
-            return True
-        else:
-            # 推送失败但数据已生成，记录但不影响重置流程
-            logger.warning(f"⚠️ [数据导出] 群组{chat_id} 数据已生成但推送失败，将在下次尝试")
-            
-            # 尝试通知管理员
-            try:
-                from utils import notification_service
-                await notification_service.send_notification(
-                    chat_id,
-                    f"⚠️ 数据导出警告\n\n"
-                    f"群组 {chat_id} 的 {target_date} 数据已生成但推送失败。\n"
-                    f"请手动检查或稍后重试。",
-                    notification_type="admin"
-                )
-            except Exception as notify_error:
-                logger.error(f"❌ 发送通知失败: {notify_error}")
-            
-            return True  # 仍然返回True，不影响重置流程
-    
-    except Exception as e:
-        logger.error(f"❌ [数据导出] 群组{chat_id} 发生未知错误: {e}")
-        logger.exception(e)
-        return False
-    
-    finally:
-        # 清理导出标记
-        async with _export_yesterday_data_concurrent._exports_lock:
-            _export_yesterday_data_concurrent._active_exports.discard(export_key)
+
+                try:
+                    from utils import notification_service
+
+                    await notification_service.send_notification(
+                        chat_id=None,
+                        text=(
+                            "⚠️ 数据导出失败\n\n"
+                            f"群组 {chat_id}\n"
+                            f"日期 {target_date}\n"
+                            "CSV 导出失败，请检查数据库。"
+                        ),
+                        notification_type="admin",
+                    )
+                except Exception as notify_error:
+                    logger.error(f"❌ 通知发送失败: {notify_error}")
+
+                return False
+
+            finally:
+                await _cleanup_export_lock(export_key)
 
 
 # ========== 6. 数据清理 ==========
