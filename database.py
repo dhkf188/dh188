@@ -785,21 +785,31 @@ class PostgreSQLDatabase:
                 """,
                 # 9. monthly_statistics表
                 """
-                CREATE TABLE IF NOT EXISTS monthly_statistics (
+                CREATE TABLE IF NOT EXISTS daily_statistics(
                     id SERIAL PRIMARY KEY,
                     chat_id BIGINT,
                     user_id BIGINT,
-                    statistic_date DATE,
+                    record_date DATE,
                     activity_name TEXT,
                     activity_count INTEGER DEFAULT 0,
                     accumulated_time INTEGER DEFAULT 0,
-                    shift TEXT DEFAULT 'day',
+                    fine_amount INTEGER DEFAULT 0,
+                    overtime_count INTEGER DEFAULT 0,
+                    overtime_time INTEGER DEFAULT 0,
                     work_days INTEGER DEFAULT 0,
                     work_hours INTEGER DEFAULT 0,
+                    work_start_count INTEGER DEFAULT 0,
+                    work_end_count INTEGER DEFAULT 0,
+                    work_start_fines INTEGER DEFAULT 0,
+                    work_end_fines INTEGER DEFAULT 0,
+                    late_count INTEGER DEFAULT 0,
+                    early_count INTEGER DEFAULT 0,
+                    shift TEXT DEFAULT 'day',
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                    UNIQUE(chat_id, user_id, statistic_date, activity_name, shift)
+                    UNIQUE(chat_id, user_id, record_date, activity_name, shift)
                 )
+
                 """,
                 # 10. activity_user_limits表
                 """
@@ -2337,9 +2347,11 @@ class PostgreSQLDatabase:
             async with self.pool.acquire() as conn:
                 async with conn.transaction():
 
+                    # ===== 1. 处理未完成的活动（跨天结算）=====
                     if user_before and user_before.get("current_activity"):
                         act = user_before["current_activity"]
                         start_str = user_before.get("activity_start_time")
+                        activity_shift = user_before.get("shift", "day")
 
                         if start_str:
                             try:
@@ -2381,30 +2393,33 @@ class PostgreSQLDatabase:
 
                                 activity_month = start.date().replace(day=1)
 
+                                # 插入月度统计
                                 await conn.execute(
                                     """
                                     INSERT INTO monthly_statistics 
-                                    (chat_id, user_id, statistic_date, activity_name, activity_count, accumulated_time)
-                                    VALUES ($1, $2, $3, $4, 1, $5)
-                                    ON CONFLICT (chat_id, user_id, statistic_date, activity_name)
+                                    (chat_id, user_id, statistic_date, activity_name, activity_count, accumulated_time, shift)
+                                    VALUES ($1, $2, $3, $4, 1, $5, $6)
+                                    ON CONFLICT (chat_id, user_id, statistic_date, activity_name, shift)
                                     DO UPDATE SET
                                         activity_count = monthly_statistics.activity_count + 1,
                                         accumulated_time = monthly_statistics.accumulated_time + EXCLUDED.accumulated_time,
                                         updated_at = CURRENT_TIMESTAMP
-                                """,
+                                    """,
                                     chat_id,
                                     user_id,
                                     activity_month,
                                     act,
                                     elapsed,
+                                    activity_shift,
                                 )
 
+                                # 更新用户总数据
                                 if fine > 0:
                                     await conn.execute(
                                         """
                                         UPDATE users SET total_fines = total_fines + $1
                                         WHERE chat_id = $2 AND user_id = $3
-                                    """,
+                                        """,
                                         fine,
                                         chat_id,
                                         user_id,
@@ -2417,7 +2432,7 @@ class PostgreSQLDatabase:
                                             overtime_count = overtime_count + 1,
                                             total_overtime_time = total_overtime_time + $1
                                         WHERE chat_id = $2 AND user_id = $3
-                                    """,
+                                        """,
                                         overtime_sec,
                                         chat_id,
                                         user_id,
@@ -2430,36 +2445,40 @@ class PostgreSQLDatabase:
                             except Exception as e:
                                 logger.error(f"❌ 跨天结算失败: {e}")
 
+                    # ===== 2. 删除 daily_statistics 记录（包含所有统计字段）=====
                     daily_deleted = await conn.execute(
                         """
                         DELETE FROM daily_statistics
                         WHERE chat_id = $1 AND user_id = $2 AND record_date = $3
-                    """,
+                        """,
                         chat_id,
                         user_id,
                         target_date,
                     )
 
+                    # ===== 3. 删除用户活动记录 =====
                     activities_deleted = await conn.execute(
                         """
                         DELETE FROM user_activities
                         WHERE chat_id = $1 AND user_id = $2 AND activity_date = $3
-                    """,
+                        """,
                         chat_id,
                         user_id,
                         target_date,
                     )
 
+                    # ===== 4. 删除工作记录 =====
                     work_deleted = await conn.execute(
                         """
                         DELETE FROM work_records
                         WHERE chat_id = $1 AND user_id = $2 AND record_date = $3
-                    """,
+                        """,
                         chat_id,
                         user_id,
                         target_date,
                     )
 
+                    # ===== 5. 更新用户表 =====
                     users_updated = await conn.execute(
                         """
                         UPDATE users SET
@@ -2482,20 +2501,49 @@ class PostgreSQLDatabase:
                             current_activity IS NOT NULL OR
                             checkin_message_id IS NOT NULL                           
                         )
-                    """,
+                        """,
                         chat_id,
                         user_id,
                         new_date,
                     )
 
+                    # ===== 6. 可选：清理班次状态（如果用户在该日期有班次）=====
+                    try:
+                        await conn.execute(
+                            """
+                            DELETE FROM group_shift_state
+                            WHERE chat_id = $1 AND user_id = $2 AND record_date = $3
+                            """,
+                            chat_id,
+                            user_id,
+                            target_date,
+                        )
+                    except Exception as e:
+                        logger.debug(f"清理班次状态失败（可能表不存在）: {e}")
+
+            # ===== 7. 清理缓存 =====
             for key in (
                 f"user:{chat_id}:{user_id}",
                 f"group:{chat_id}",
                 "activity_limits",
+                f"stats:{chat_id}:{target_date}",
+                f"stats:{chat_id}:{target_date - timedelta(days=1)}",
+                f"stats:{chat_id}:{target_date + timedelta(days=1)}",
             ):
                 self._cache.pop(key, None)
                 self._cache_ttl.pop(key, None)
 
+            # 清理班次状态缓存
+            shift_cache_keys = [
+                key
+                for key in list(self._cache.keys())
+                if key.startswith(f"shift_state:{chat_id}:{user_id}")
+            ]
+            for key in shift_cache_keys:
+                self._cache.pop(key, None)
+                self._cache_ttl.pop(key, None)
+
+            # ===== 8. 解析删除计数 =====
             def parse_count(result):
                 if not result:
                     return 0
@@ -2511,33 +2559,43 @@ class PostgreSQLDatabase:
             work_del_count = parse_count(work_deleted)
             users_upd_count = parse_count(users_updated)
 
-            log = (
-                f"✅ [硬重置完成] 用户:{user_id} 群:{chat_id}\n"
-                f"📅 日期:{new_date}\n"
-                f"🗑 删除记录: daily_statistics({daily_del_count}), "
-                f"user_activities({activities_del_count}), "
-                f"work_records({work_del_count})\n"
-                f"🔄 更新用户: {users_upd_count} 次\n"
-                f"💾 月度统计: 已安全持久化\n"
-            )
-            if cross_day["activity"]:
-                log += f"🌙 跨天结算: {cross_day['activity']} {self.format_seconds_to_hms(cross_day['duration'])}"
-                if cross_day["fine"] > 0:
-                    log += f" 💰罚款:{cross_day['fine']}元\n"
-            log += (
-                f"📊 重置前状态: 次数{user_before.get('total_activity_count', 0) if user_before else 0} "
-                f"时长{user_before.get('total_accumulated_time', 0) if user_before else 0}s "
-                f"罚款{user_before.get('total_fines', 0) if user_before else 0} "
-                f"超时{user_before.get('overtime_count', 0) if user_before else 0} "
-                f"当前:{user_before.get('current_activity', '无') if user_before else '无'} "
-                f"活动种类:{len(activities_before)}"
-            )
+            # ===== 9. 生成详细日志 =====
+            log_lines = [
+                f"✅ [硬重置完成] 用户:{user_id} 群:{chat_id}",
+                f"📅 目标日期:{target_date} 新业务日期:{new_date}",
+                f"🗑 删除记录:",
+                f"   • daily_statistics: {daily_del_count} 条（包含所有上下班统计）",
+                f"   • user_activities: {activities_del_count} 条",
+                f"   • work_records: {work_del_count} 条",
+                f"🔄 更新用户: {users_upd_count} 次",
+                f"💾 月度统计: 已安全持久化",
+            ]
 
-            logger.info(log)
+            if cross_day["activity"]:
+                log_lines.append(
+                    f"🌙 跨天结算: {cross_day['activity']} "
+                    f"{self.format_seconds_to_hms(cross_day['duration'])}"
+                )
+                if cross_day["fine"] > 0:
+                    log_lines.append(f"   💰罚款:{cross_day['fine']}元")
+
+            if user_before:
+                log_lines.append(
+                    f"📊 重置前状态: "
+                    f"次数:{user_before.get('total_activity_count', 0)}, "
+                    f"时长:{self.format_seconds_to_hms(user_before.get('total_accumulated_time', 0))}, "
+                    f"罚款:{user_before.get('total_fines', 0)}, "
+                    f"超时:{user_before.get('overtime_count', 0)}, "
+                    f"当前活动:{user_before.get('current_activity', '无')}, "
+                    f"活动种类:{len(activities_before)}"
+                )
+
+            logger.info("\n".join(log_lines))
             return True
 
         except Exception as e:
             logger.error(f"❌ 硬重置失败 {chat_id}-{user_id}: {e}")
+            logger.exception(e)
             return False
 
     async def get_user_all_activities(
@@ -2582,7 +2640,7 @@ class PostgreSQLDatabase:
         shift: str = "day",
         shift_detail: str = None,
     ):
-        """添加上下班记录 - 完整同步版"""
+        """添加上下班记录 - 完整同步版（基于最终结果统计）"""
 
         business_date = await self.get_business_date(chat_id)
         statistic_date = business_date.replace(day=1)
@@ -2607,6 +2665,7 @@ class PostgreSQLDatabase:
         async with self.pool.acquire() as conn:
             async with conn.transaction():
 
+                # ==================== 1. 插入工作记录表 ====================
                 await conn.execute(
                     """
                     INSERT INTO work_records
@@ -2635,7 +2694,7 @@ class PostgreSQLDatabase:
                     shift_detail,
                 )
 
-                activity_name = "work_fines"
+                # ==================== 2. 罚款处理 ====================
                 if fine_amount > 0:
                     activity_name = (
                         "work_start_fines"
@@ -2647,6 +2706,7 @@ class PostgreSQLDatabase:
                         )
                     )
 
+                    # 罚款直接记录金额（不累加，因为已经是最新值）
                     await conn.execute(
                         """
                         INSERT INTO daily_statistics
@@ -2656,7 +2716,7 @@ class PostgreSQLDatabase:
                         ON CONFLICT (chat_id, user_id, record_date,
                                      activity_name, shift)
                         DO UPDATE SET
-                            accumulated_time = daily_statistics.accumulated_time + EXCLUDED.accumulated_time,
+                            accumulated_time = EXCLUDED.accumulated_time,
                             updated_at = CURRENT_TIMESTAMP
                         """,
                         chat_id,
@@ -2667,8 +2727,206 @@ class PostgreSQLDatabase:
                         shift,
                     )
 
-                work_duration_seconds = 0
-                if checkin_type == "work_end":
+                    # 月度罚款
+                    await conn.execute(
+                        """
+                        INSERT INTO monthly_statistics
+                        (chat_id, user_id, statistic_date,
+                         activity_name, accumulated_time, shift)
+                        VALUES ($1,$2,$3,$4,$5,$6)
+                        ON CONFLICT (chat_id, user_id, statistic_date, activity_name, shift)
+                        DO UPDATE SET
+                            accumulated_time = EXCLUDED.accumulated_time,
+                            updated_at = CURRENT_TIMESTAMP
+                        """,
+                        chat_id,
+                        user_id,
+                        statistic_date,
+                        activity_name,
+                        fine_amount,
+                        shift,
+                    )
+
+                    # 更新用户总罚款（累加罚款差异，而不是直接设置为新值）
+                    # 先获取旧的罚款金额
+                    old_fine = (
+                        await conn.fetchval(
+                            """
+                        SELECT accumulated_time FROM daily_statistics
+                        WHERE chat_id = $1 AND user_id = $2 
+                        AND record_date = $3 AND activity_name = $4 AND shift = $5
+                        """,
+                            chat_id,
+                            user_id,
+                            business_date,
+                            activity_name,
+                            shift,
+                        )
+                        or 0
+                    )
+
+                    fine_diff = fine_amount - old_fine
+                    if fine_diff != 0:
+                        await conn.execute(
+                            """
+                            UPDATE users
+                            SET total_fines = total_fines + $1
+                            WHERE chat_id = $2 AND user_id = $3
+                            """,
+                            fine_diff,
+                            chat_id,
+                            user_id,
+                        )
+
+                # ==================== 3. 统计计算 ====================
+                # 获取该用户当天的所有工作记录（最新状态）
+                work_records = await conn.fetch(
+                    """
+                    SELECT checkin_type, checkin_time, time_diff_minutes, fine_amount
+                    FROM work_records
+                    WHERE chat_id = $1 AND user_id = $2 
+                    AND record_date = $3 AND shift = $4
+                    ORDER BY created_at DESC
+                    """,
+                    chat_id,
+                    user_id,
+                    business_date,
+                    shift,
+                )
+
+                # 提取最新的上班和下班记录
+                latest_start = None
+                latest_end = None
+                for record in work_records:
+                    if record["checkin_type"] == "work_start" and latest_start is None:
+                        latest_start = record
+                    elif record["checkin_type"] == "work_end" and latest_end is None:
+                        latest_end = record
+                    if latest_start and latest_end:
+                        break
+
+                # ==================== 4. 更新上班统计 ====================
+                if latest_start:
+                    # 上班次数（总是1，如果有记录）
+                    await conn.execute(
+                        """
+                        INSERT INTO daily_statistics
+                        (chat_id, user_id, record_date, activity_name,
+                         activity_count, shift)
+                        VALUES ($1,$2,$3,'work_start_count',1,$4)
+                        ON CONFLICT (chat_id, user_id, record_date,
+                                     activity_name, shift)
+                        DO UPDATE SET
+                            activity_count = 1,
+                            updated_at = CURRENT_TIMESTAMP
+                        """,
+                        chat_id,
+                        user_id,
+                        business_date,
+                        shift,
+                    )
+
+                    # 迟到次数（根据最新记录的时间差）
+                    is_late = latest_start["time_diff_minutes"] > 0
+                    await conn.execute(
+                        """
+                        INSERT INTO daily_statistics
+                        (chat_id, user_id, record_date, activity_name,
+                         activity_count, shift)
+                        VALUES ($1,$2,$3,'late_count',$4,$5)
+                        ON CONFLICT (chat_id, user_id, record_date,
+                                     activity_name, shift)
+                        DO UPDATE SET
+                            activity_count = EXCLUDED.activity_count,
+                            updated_at = CURRENT_TIMESTAMP
+                        """,
+                        chat_id,
+                        user_id,
+                        business_date,
+                        1 if is_late else 0,
+                        shift,
+                    )
+                else:
+                    # 没有上班记录，清零
+                    await conn.execute(
+                        """
+                        INSERT INTO daily_statistics
+                        (chat_id, user_id, record_date, activity_name,
+                         activity_count, shift)
+                        VALUES ($1,$2,$3,'work_start_count',0,$4)
+                        ON CONFLICT (chat_id, user_id, record_date,
+                                     activity_name, shift)
+                        DO UPDATE SET
+                            activity_count = 0,
+                            updated_at = CURRENT_TIMESTAMP
+                        """,
+                        chat_id,
+                        user_id,
+                        business_date,
+                        shift,
+                    )
+
+                    await conn.execute(
+                        """
+                        INSERT INTO daily_statistics
+                        (chat_id, user_id, record_date, activity_name,
+                         activity_count, shift)
+                        VALUES ($1,$2,$3,'late_count',0,$4)
+                        ON CONFLICT (chat_id, user_id, record_date,
+                                     activity_name, shift)
+                        DO UPDATE SET
+                            activity_count = 0,
+                            updated_at = CURRENT_TIMESTAMP
+                        """,
+                        chat_id,
+                        user_id,
+                        business_date,
+                        shift,
+                    )
+
+                # ==================== 5. 更新下班统计 ====================
+                if latest_end:
+                    # 下班次数（总是1，如果有记录）
+                    await conn.execute(
+                        """
+                        INSERT INTO daily_statistics
+                        (chat_id, user_id, record_date, activity_name,
+                         activity_count, shift)
+                        VALUES ($1,$2,$3,'work_end_count',1,$4)
+                        ON CONFLICT (chat_id, user_id, record_date,
+                                     activity_name, shift)
+                        DO UPDATE SET
+                            activity_count = 1,
+                            updated_at = CURRENT_TIMESTAMP
+                        """,
+                        chat_id,
+                        user_id,
+                        business_date,
+                        shift,
+                    )
+
+                    # 早退次数（根据最新记录的时间差）
+                    is_early = latest_end["time_diff_minutes"] < 0
+                    await conn.execute(
+                        """
+                        INSERT INTO daily_statistics
+                        (chat_id, user_id, record_date, activity_name,
+                         activity_count, shift)
+                        VALUES ($1,$2,$3,'early_count',$4,$5)
+                        ON CONFLICT (chat_id, user_id, record_date,
+                                     activity_name, shift)
+                        DO UPDATE SET
+                            activity_count = EXCLUDED.activity_count,
+                            updated_at = CURRENT_TIMESTAMP
+                        """,
+                        chat_id,
+                        user_id,
+                        business_date,
+                        1 if is_early else 0,
+                        shift,
+                    )
+
+                    # 工作天数（如果有下班记录，就是1）
                     await conn.execute(
                         """
                         INSERT INTO daily_statistics
@@ -2678,7 +2936,7 @@ class PostgreSQLDatabase:
                         ON CONFLICT (chat_id, user_id, record_date,
                                      activity_name, shift)
                         DO UPDATE SET
-                            activity_count = daily_statistics.activity_count + 1,
+                            activity_count = 1,
                             updated_at = CURRENT_TIMESTAMP
                         """,
                         chat_id,
@@ -2687,26 +2945,16 @@ class PostgreSQLDatabase:
                         shift,
                     )
 
-                    start_row = await conn.fetchrow(
-                        """
-                        SELECT checkin_time FROM work_records
-                        WHERE chat_id=$1 AND user_id=$2
-                          AND record_date=$3
-                          AND checkin_type='work_start'
-                          AND shift=$4
-                        """,
-                        chat_id,
-                        user_id,
-                        business_date,
-                        shift,
-                    )
-
-                    if start_row:
+                    # 工作时长（如果有下班记录且也有上班记录）
+                    work_duration_seconds = 0
+                    if latest_start and latest_end:
                         try:
                             start_dt = datetime.strptime(
-                                start_row["checkin_time"], "%H:%M"
+                                latest_start["checkin_time"], "%H:%M"
                             )
-                            end_dt = datetime.strptime(checkin_time, "%H:%M")
+                            end_dt = datetime.strptime(
+                                latest_end["checkin_time"], "%H:%M"
+                            )
                             diff_minutes = (end_dt - start_dt).total_seconds() / 60
                             if diff_minutes < 0:
                                 diff_minutes += 1440
@@ -2722,7 +2970,7 @@ class PostgreSQLDatabase:
                                 ON CONFLICT (chat_id, user_id, record_date,
                                              activity_name, shift)
                                 DO UPDATE SET
-                                    accumulated_time = daily_statistics.accumulated_time + EXCLUDED.accumulated_time,
+                                    accumulated_time = EXCLUDED.accumulated_time,
                                     updated_at = CURRENT_TIMESTAMP
                                 """,
                                 chat_id,
@@ -2733,81 +2981,161 @@ class PostgreSQLDatabase:
                             )
                         except Exception as e:
                             logger.error(f"工时计算失败: {e}")
-
-                if checkin_type == "work_end":
+                    else:
+                        # 没有完整上下班，工作时长为0
+                        await conn.execute(
+                            """
+                            INSERT INTO daily_statistics
+                            (chat_id, user_id, record_date,
+                             activity_name, accumulated_time,
+                             shift)
+                            VALUES ($1,$2,$3,'work_hours',0,$4)
+                            ON CONFLICT (chat_id, user_id, record_date,
+                                         activity_name, shift)
+                            DO UPDATE SET
+                                accumulated_time = 0,
+                                updated_at = CURRENT_TIMESTAMP
+                            """,
+                            chat_id,
+                            user_id,
+                            business_date,
+                            shift,
+                        )
+                else:
+                    # 没有下班记录，清零相关统计
                     await conn.execute(
                         """
-                        INSERT INTO monthly_statistics
-                        (chat_id, user_id, statistic_date,
-                         activity_name, activity_count, shift)
-                        VALUES ($1,$2,$3,'work_days',1,$4)
-                        ON CONFLICT (chat_id, user_id, statistic_date, activity_name, shift)
+                        INSERT INTO daily_statistics
+                        (chat_id, user_id, record_date, activity_name,
+                         activity_count, shift)
+                        VALUES ($1,$2,$3,'work_end_count',0,$4)
+                        ON CONFLICT (chat_id, user_id, record_date,
+                                     activity_name, shift)
                         DO UPDATE SET
-                            activity_count = monthly_statistics.activity_count + 1,
+                            activity_count = 0,
                             updated_at = CURRENT_TIMESTAMP
                         """,
                         chat_id,
                         user_id,
-                        statistic_date,
+                        business_date,
                         shift,
                     )
 
-                    if work_duration_seconds > 0:
+                    await conn.execute(
+                        """
+                        INSERT INTO daily_statistics
+                        (chat_id, user_id, record_date, activity_name,
+                         activity_count, shift)
+                        VALUES ($1,$2,$3,'early_count',0,$4)
+                        ON CONFLICT (chat_id, user_id, record_date,
+                                     activity_name, shift)
+                        DO UPDATE SET
+                            activity_count = 0,
+                            updated_at = CURRENT_TIMESTAMP
+                        """,
+                        chat_id,
+                        user_id,
+                        business_date,
+                        shift,
+                    )
+
+                    await conn.execute(
+                        """
+                        INSERT INTO daily_statistics
+                        (chat_id, user_id, record_date, activity_name,
+                         activity_count, shift)
+                        VALUES ($1,$2,$3,'work_days',0,$4)
+                        ON CONFLICT (chat_id, user_id, record_date,
+                                     activity_name, shift)
+                        DO UPDATE SET
+                            activity_count = 0,
+                            updated_at = CURRENT_TIMESTAMP
+                        """,
+                        chat_id,
+                        user_id,
+                        business_date,
+                        shift,
+                    )
+
+                # ==================== 6. 同步到月度统计 ====================
+                # 获取当天所有统计数据，汇总到月度表
+                daily_stats = await conn.fetch(
+                    """
+                    SELECT activity_name, activity_count, accumulated_time
+                    FROM daily_statistics
+                    WHERE chat_id = $1 AND user_id = $2 
+                    AND record_date = $3 AND shift = $4
+                    """,
+                    chat_id,
+                    user_id,
+                    business_date,
+                    shift,
+                )
+
+                for stat in daily_stats:
+                    activity = stat["activity_name"]
+                    count = stat["activity_count"]
+                    time_val = stat["accumulated_time"]
+
+                    if activity in [
+                        "work_start_count",
+                        "work_end_count",
+                        "late_count",
+                        "early_count",
+                        "work_days",
+                    ]:
+                        # 计数类统计
                         await conn.execute(
                             """
                             INSERT INTO monthly_statistics
                             (chat_id, user_id, statistic_date,
-                             activity_name, accumulated_time, shift)
-                            VALUES ($1,$2,$3,'work_hours',$4,$5)
+                             activity_name, activity_count, shift)
+                            VALUES ($1,$2,$3,$4,$5,$6)
                             ON CONFLICT (chat_id, user_id, statistic_date, activity_name, shift)
                             DO UPDATE SET
-                                accumulated_time = monthly_statistics.accumulated_time + EXCLUDED.accumulated_time,
+                                activity_count = EXCLUDED.activity_count,
                                 updated_at = CURRENT_TIMESTAMP
                             """,
                             chat_id,
                             user_id,
                             statistic_date,
-                            work_duration_seconds,
+                            activity,
+                            count,
+                            shift,
+                        )
+                    elif activity in [
+                        "work_hours",
+                        "work_start_fines",
+                        "work_end_fines",
+                    ]:
+                        # 时长/金额类统计
+                        await conn.execute(
+                            """
+                            INSERT INTO monthly_statistics
+                            (chat_id, user_id, statistic_date,
+                             activity_name, accumulated_time, shift)
+                            VALUES ($1,$2,$3,$4,$5,$6)
+                            ON CONFLICT (chat_id, user_id, statistic_date, activity_name, shift)
+                            DO UPDATE SET
+                                accumulated_time = EXCLUDED.accumulated_time,
+                                updated_at = CURRENT_TIMESTAMP
+                            """,
+                            chat_id,
+                            user_id,
+                            statistic_date,
+                            activity,
+                            time_val,
                             shift,
                         )
 
-                if fine_amount > 0:
-                    await conn.execute(
-                        """
-                        INSERT INTO monthly_statistics
-                        (chat_id, user_id, statistic_date,
-                         activity_name, accumulated_time, shift)
-                        VALUES ($1,$2,$3,$4,$5,$6)
-                        ON CONFLICT (chat_id, user_id, statistic_date, activity_name, shift)
-                        DO UPDATE SET
-                            accumulated_time = monthly_statistics.accumulated_time + EXCLUDED.accumulated_time,
-                            updated_at = CURRENT_TIMESTAMP
-                        """,
-                        chat_id,
-                        user_id,
-                        statistic_date,
-                        activity_name,
-                        fine_amount,
-                        shift,
-                    )
-
-                if fine_amount > 0:
-                    await conn.execute(
-                        """
-                        UPDATE users
-                        SET total_fines = total_fines + $1
-                        WHERE chat_id = $2 AND user_id = $3
-                        """,
-                        fine_amount,
-                        chat_id,
-                        user_id,
-                    )
-
+        # ==================== 7. 清理缓存 ====================
         self._cache.pop(f"user:{chat_id}:{user_id}", None)
 
+        # ==================== 8. 日志记录 ====================
         logger.debug(
-            f"✅ [四表同步完成] 用户:{user_id} | 业务日期:{business_date} | "
-            f"班次:{shift} | 罚款:{fine_amount} | 工时:{work_duration_seconds}s"
+            f"✅ [工作记录同步完成] 用户:{user_id} | 日期:{business_date} | "
+            f"班次:{shift} | 类型:{checkin_type} | 时间:{checkin_time} | "
+            f"罚款:{fine_amount}"
         )
 
     async def get_work_records_by_shift(
@@ -3216,7 +3544,7 @@ class PostgreSQLDatabase:
                 # ===== 4. 获取班次配置 =====
                 shift_config = await self.get_shift_config(chat_id)
 
-                # ===== 5. 终极修复版查询：包含所有活动类型，正确统计所有数据 =====
+                # ===== 5. 修复版查询：包含所有字段 =====
                 async with self.pool.acquire() as conn:
                     # 获取所有用户
                     all_users = await conn.fetch(
@@ -3231,7 +3559,7 @@ class PostgreSQLDatabase:
                     if not all_users:
                         return []
 
-                    # 获取该日期的所有统计记录
+                    # 🔥🔥🔥 修复：移除不存在的字段，只查询实际存在的字段 🔥🔥🔥
                     rows = await conn.fetch(
                         """
                         SELECT 
@@ -3240,6 +3568,14 @@ class PostgreSQLDatabase:
                             ds.activity_name,
                             ds.activity_count,
                             ds.accumulated_time,
+                            ds.work_days,
+                            ds.work_hours,
+                            ds.work_start_count,
+                            ds.work_end_count,
+                            ds.work_start_fines,
+                            ds.work_end_fines,
+                            ds.late_count,
+                            ds.early_count,
                             u.nickname
                         FROM daily_statistics ds
                         LEFT JOIN users u ON ds.user_id = u.user_id AND ds.chat_id = u.chat_id
@@ -3259,6 +3595,12 @@ class PostgreSQLDatabase:
                         key = f"{user_id}:{shift}"
 
                         if key not in user_shift_data:
+                            # 🔥🔥🔥 修复：初始化时从 row 读取所有统计字段 🔥🔥🔥
+                            # total_fines 需要从各罚款字段计算得出
+                            work_start_fines = row["work_start_fines"] or 0
+                            work_end_fines = row["work_end_fines"] or 0
+                            total_fines = work_start_fines + work_end_fines
+
                             user_shift_data[key] = {
                                 "user_id": user_id,
                                 "shift": shift,
@@ -3266,17 +3608,17 @@ class PostgreSQLDatabase:
                                 "activities": {},
                                 "total_activity_count": 0,
                                 "total_accumulated_time": 0,
-                                "total_fines": 0,
-                                "overtime_count": 0,
-                                "total_overtime_time": 0,
-                                "work_days": 0,
-                                "work_hours": 0,
-                                "work_start_count": 0,
-                                "work_end_count": 0,
-                                "work_start_fines": 0,
-                                "work_end_fines": 0,
-                                "late_count": 0,
-                                "early_count": 0,
+                                "total_fines": total_fines,  # 从罚款字段计算
+                                "overtime_count": 0,  # 从 activity 记录中计算
+                                "total_overtime_time": 0,  # 从 activity 记录中计算
+                                "work_days": row["work_days"] or 0,
+                                "work_hours": row["work_hours"] or 0,
+                                "work_start_count": row["work_start_count"] or 0,
+                                "work_end_count": row["work_end_count"] or 0,
+                                "work_start_fines": work_start_fines,
+                                "work_end_fines": work_end_fines,
+                                "late_count": row["late_count"] or 0,
+                                "early_count": row["early_count"] or 0,
                             }
 
                         activity_name = row["activity_name"]
@@ -3289,46 +3631,40 @@ class PostgreSQLDatabase:
                             "time": time_sec,
                         }
 
-                        # 根据活动类型累加到不同的统计字段
-                        if activity_name in [
+                        # 🔥🔥🔥 修复：排除统计类活动，避免重复计数 🔥🔥🔥
+                        if activity_name not in [
                             "total_fines",
                             "work_fines",
                             "work_start_fines",
                             "work_end_fines",
+                            "overtime_count",
+                            "overtime_time",
+                            "work_days",
+                            "work_hours",
+                            "work_start_count",
+                            "work_end_count",
+                            "late_count",
+                            "early_count",
                         ]:
-                            user_shift_data[key]["total_fines"] += time_sec
-
-                            if activity_name == "work_start_fines":
-                                user_shift_data[key]["work_start_fines"] += time_sec
-                            elif activity_name == "work_end_fines":
-                                user_shift_data[key]["work_end_fines"] += time_sec
-
-                        elif activity_name == "overtime_count":
-                            user_shift_data[key]["overtime_count"] += count
-                        elif activity_name == "overtime_time":
-                            user_shift_data[key]["total_overtime_time"] += time_sec
-                        elif activity_name == "work_days":
-                            user_shift_data[key]["work_days"] += count
-                        elif activity_name == "work_hours":
-                            user_shift_data[key]["work_hours"] += time_sec
-                        elif activity_name in ["work_start", "work_start_count"]:
-                            user_shift_data[key]["work_start_count"] += count
-                        elif activity_name in ["work_end", "work_end_count"]:
-                            user_shift_data[key]["work_end_count"] += count
-                        elif activity_name == "late_count":
-                            user_shift_data[key]["late_count"] += count
-                        elif activity_name == "early_count":
-                            user_shift_data[key]["early_count"] += count
-                        else:
                             # 普通活动
                             user_shift_data[key]["total_activity_count"] += count
                             user_shift_data[key]["total_accumulated_time"] += time_sec
+
+                        # 检查是否是超时活动并单独累加
+                        if activity_name == "overtime_count":
+                            user_shift_data[key]["overtime_count"] += count
+                        elif activity_name == "overtime_time":
+                            user_shift_data[key]["total_overtime_time"] += time_sec
 
                     # ===== 6. 构建最终结果 =====
                     result = []
 
                     # 处理有数据的用户
                     for key, data in user_shift_data.items():
+                        # 确保 total_fines 是 work_start_fines + work_end_fines
+                        data["total_fines"] = (
+                            data["work_start_fines"] + data["work_end_fines"]
+                        )
                         result.append(data)
 
                     # 添加没有数据的用户（补全默认值）
@@ -3496,7 +3832,7 @@ class PostgreSQLDatabase:
     async def get_monthly_statistics(
         self, chat_id: int, year: int = None, month: int = None
     ) -> List[Dict]:
-        """增强版月度统计"""
+        """增强版月度统计 - 包含所有统计字段"""
         if year is None or month is None:
             today = self.get_beijing_time()
             year = today.year
@@ -3515,6 +3851,7 @@ class PostgreSQLDatabase:
         self._ensure_pool_initialized()
 
         async with self.pool.acquire() as conn:
+            # 获取该月有活动的所有用户
             users = await conn.fetch(
                 """
                 SELECT DISTINCT user_id 
@@ -3539,6 +3876,7 @@ class PostgreSQLDatabase:
             for user_row in users:
                 user_id = user_row["user_id"]
 
+                # 获取用户昵称
                 user_info = await conn.fetchrow(
                     "SELECT nickname FROM users WHERE chat_id = $1 AND user_id = $2",
                     chat_id,
@@ -3546,6 +3884,7 @@ class PostgreSQLDatabase:
                 )
                 nickname = user_info["nickname"] if user_info else f"用户{user_id}"
 
+                # ===== 1. 获取活动记录（从 user_activities）=====
                 activities_rows = await conn.fetch(
                     """
                     SELECT 
@@ -3577,37 +3916,45 @@ class PostgreSQLDatabase:
                     total_activity_count += row["total_count"]
                     total_accumulated_time += row["total_time"]
 
-                fines = (
-                    await conn.fetchval(
-                        """
-                        SELECT SUM(accumulated_time)
-                        FROM daily_statistics
-                        WHERE chat_id = $1
-                          AND user_id = $2
-                          AND record_date >= $3
-                          AND record_date < $4
-                          AND activity_name IN ('total_fines', 'work_fines', 
-                                               'work_start_fines', 'work_end_fines')
-                        """,
-                        chat_id,
-                        user_id,
-                        month_start,
-                        month_end,
-                    )
-                    or 0
-                )
-
-                overtime = await conn.fetchrow(
+                # ===== 2. 一次性获取所有 daily_statistics 统计 =====
+                stats = await conn.fetchrow(
                     """
                     SELECT 
+                        -- 罚款统计
+                        SUM(CASE WHEN activity_name IN ('total_fines', 'work_fines', 
+                                                       'work_start_fines', 'work_end_fines') 
+                            THEN accumulated_time ELSE 0 END) as total_fines,
+                        
+                        -- 超时统计
                         SUM(CASE WHEN activity_name = 'overtime_count' 
                             THEN activity_count ELSE 0 END) as overtime_count,
                         SUM(CASE WHEN activity_name = 'overtime_time' 
-                            THEN accumulated_time ELSE 0 END) as overtime_time
+                            THEN accumulated_time ELSE 0 END) as total_overtime_time,
+                        
+                        -- 白班统计
+                        SUM(CASE WHEN activity_name = 'work_days' AND shift = 'day' 
+                            THEN activity_count ELSE 0 END) as day_work_days,
+                        SUM(CASE WHEN activity_name = 'work_hours' AND shift = 'day' 
+                            THEN accumulated_time ELSE 0 END) as day_work_hours,
+                        
+                        -- 所有班次的统计（不分班次）
+                        SUM(CASE WHEN activity_name = 'work_start_count' 
+                            THEN activity_count ELSE 0 END) as work_start_count,
+                        SUM(CASE WHEN activity_name = 'work_end_count' 
+                            THEN activity_count ELSE 0 END) as work_end_count,
+                        SUM(CASE WHEN activity_name = 'work_start_fines' 
+                            THEN accumulated_time ELSE 0 END) as work_start_fines,
+                        SUM(CASE WHEN activity_name = 'work_end_fines' 
+                            THEN accumulated_time ELSE 0 END) as work_end_fines,
+                        SUM(CASE WHEN activity_name = 'late_count' 
+                            THEN activity_count ELSE 0 END) as late_count,
+                        SUM(CASE WHEN activity_name = 'early_count' 
+                            THEN activity_count ELSE 0 END) as early_count
+                        
                     FROM daily_statistics
-                    WHERE chat_id = $1
-                      AND user_id = $2
-                      AND record_date >= $3
+                    WHERE chat_id = $1 
+                      AND user_id = $2 
+                      AND record_date >= $3 
                       AND record_date < $4
                     """,
                     chat_id,
@@ -3616,32 +3963,7 @@ class PostgreSQLDatabase:
                     month_end,
                 )
 
-                overtime_count = overtime["overtime_count"] if overtime else 0
-                total_overtime_time = overtime["overtime_time"] if overtime else 0
-
-                day_work = await conn.fetchrow(
-                    """
-                    SELECT 
-                        SUM(CASE WHEN activity_name = 'work_days' 
-                            THEN activity_count ELSE 0 END) as work_days,
-                        SUM(CASE WHEN activity_name = 'work_hours' 
-                            THEN accumulated_time ELSE 0 END) as work_hours
-                    FROM daily_statistics
-                    WHERE chat_id = $1
-                      AND user_id = $2
-                      AND record_date >= $3
-                      AND record_date < $4
-                      AND shift = 'day'
-                    """,
-                    chat_id,
-                    user_id,
-                    month_start,
-                    month_end,
-                )
-
-                work_days = day_work["work_days"] if day_work else 0
-                work_hours = day_work["work_hours"] if day_work else 0
-
+                # ===== 3. 计算夜班工时 =====
                 night_shifts = await conn.fetch(
                     """
                     SELECT 
@@ -3674,96 +3996,72 @@ class PostgreSQLDatabase:
                 month_start_dt = beijing_tz.localize(
                     datetime.combine(month_start, datetime.min.time())
                 )
-
                 month_end_dt = beijing_tz.localize(
                     datetime.combine(month_end, datetime.min.time())
                 )
 
                 for shift in night_shifts:
                     if shift["end_date"] and shift["end_time"]:
-                        start_dt = datetime.combine(
-                            shift["start_date"],
-                            datetime.strptime(shift["start_time"], "%H:%M").time(),
-                        ).replace(tzinfo=beijing_tz)
-                        end_dt = datetime.combine(
-                            shift["end_date"],
-                            datetime.strptime(shift["end_time"], "%H:%M").time(),
-                        ).replace(tzinfo=beijing_tz)
+                        try:
+                            start_dt = datetime.combine(
+                                shift["start_date"],
+                                datetime.strptime(shift["start_time"], "%H:%M").time(),
+                            ).replace(tzinfo=beijing_tz)
+                            end_dt = datetime.combine(
+                                shift["end_date"],
+                                datetime.strptime(shift["end_time"], "%H:%M").time(),
+                            ).replace(tzinfo=beijing_tz)
 
-                        if end_dt < start_dt:
-                            end_dt += timedelta(days=1)
+                            if end_dt < start_dt:
+                                end_dt += timedelta(days=1)
 
-                        work_start = max(start_dt, month_start_dt)
-                        work_end = min(end_dt, month_end_dt)
+                            work_start = max(start_dt, month_start_dt)
+                            work_end = min(end_dt, month_end_dt)
 
-                        if work_end > work_start:
-                            night_work_hours += int(
-                                (work_end - work_start).total_seconds()
-                            )
-                            night_work_days += 1
+                            if work_end > work_start:
+                                night_work_hours += int(
+                                    (work_end - work_start).total_seconds()
+                                )
+                                night_work_days += 1
+                        except Exception as e:
+                            logger.error(f"夜班工时计算失败: {e}")
 
-                work_counts = await conn.fetchrow(
-                    """
-                    SELECT 
-                        COUNT(CASE WHEN checkin_type = 'work_start' THEN 1 END) as work_start_count,
-                        COUNT(CASE WHEN checkin_type = 'work_end' THEN 1 END) as work_end_count,
-                        SUM(CASE WHEN checkin_type = 'work_start' THEN fine_amount ELSE 0 END) as work_start_fines,
-                        SUM(CASE WHEN checkin_type = 'work_end' THEN fine_amount ELSE 0 END) as work_end_fines
-                    FROM work_records
-                    WHERE chat_id = $1
-                      AND user_id = $2
-                      AND record_date >= $3
-                      AND record_date < $4
-                    """,
-                    chat_id,
-                    user_id,
-                    month_start,
-                    month_end,
-                )
-
-                late_early = await self.get_user_late_early_counts(
-                    chat_id, user_id, year, month
-                )
-
-                # ========== 安全处理所有可能为 None 的值 ==========
-                def safe_int(value):
+                # ===== 4. 安全处理所有可能为 None 的值 =====
+                def safe_int(value, default=0):
                     """安全转换为整数，处理 None 值"""
-                    return 0 if value is None else int(value)
+                    if value is None:
+                        return default
+                    try:
+                        return int(value)
+                    except (ValueError, TypeError):
+                        return default
 
-                total_activity_count = safe_int(total_activity_count)
-                total_accumulated_time = safe_int(total_accumulated_time)
-                fines = safe_int(fines)
-                overtime_count = safe_int(overtime_count)
-                total_overtime_time = safe_int(total_overtime_time)
+                # 从 stats 获取值
+                total_fines = safe_int(stats["total_fines"])
+                overtime_count = safe_int(stats["overtime_count"])
+                total_overtime_time = safe_int(stats["total_overtime_time"])
 
-                work_days = safe_int(work_days)
-                work_hours = safe_int(work_hours)
-                night_work_days = safe_int(night_work_days)
-                night_work_hours = safe_int(night_work_hours)
+                day_work_days = safe_int(stats["day_work_days"])
+                day_work_hours = safe_int(stats["day_work_hours"])
 
-                total_work_days = work_days + night_work_days
-                total_work_hours = work_hours + night_work_hours
+                work_start_count = safe_int(stats["work_start_count"])
+                work_end_count = safe_int(stats["work_end_count"])
+                work_start_fines = safe_int(stats["work_start_fines"])
+                work_end_fines = safe_int(stats["work_end_fines"])
+                late_count = safe_int(stats["late_count"])
+                early_count = safe_int(stats["early_count"])
 
-                if work_counts:
-                    work_start_count = safe_int(work_counts["work_start_count"])
-                    work_end_count = safe_int(work_counts["work_end_count"])
-                    work_start_fines = safe_int(work_counts["work_start_fines"])
-                    work_end_fines = safe_int(work_counts["work_end_fines"])
-                else:
-                    work_start_count = 0
-                    work_end_count = 0
-                    work_start_fines = 0
-                    work_end_fines = 0
+                # 合并白班和夜班的工作统计
+                total_work_days = day_work_days + night_work_days
+                total_work_hours = day_work_hours + night_work_hours
 
-                late_count = safe_int(late_early.get("late_count", 0))
-                early_count = safe_int(late_early.get("early_count", 0))
-
+                # ===== 5. 构建用户数据 =====
                 user_data = {
                     "user_id": user_id,
                     "nickname": nickname,
                     "total_activity_count": total_activity_count,
                     "total_accumulated_time": total_accumulated_time,
-                    "total_fines": fines,
+                    "total_fines": total_fines,
                     "overtime_count": overtime_count,
                     "total_overtime_time": total_overtime_time,
                     "work_days": total_work_days,
