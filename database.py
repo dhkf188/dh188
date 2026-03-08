@@ -785,31 +785,30 @@ class PostgreSQLDatabase:
                 """,
                 # 9. monthly_statistics表
                 """
-                CREATE TABLE IF NOT EXISTS daily_statistics(
+                CREATE TABLE IF NOT EXISTS monthly_statistics (
                     id SERIAL PRIMARY KEY,
                     chat_id BIGINT,
                     user_id BIGINT,
-                    record_date DATE,
+                    statistic_date DATE,
                     activity_name TEXT,
                     activity_count INTEGER DEFAULT 0,
                     accumulated_time INTEGER DEFAULT 0,
-                    fine_amount INTEGER DEFAULT 0,
-                    overtime_count INTEGER DEFAULT 0,
-                    overtime_time INTEGER DEFAULT 0,
+                    shift TEXT DEFAULT 'day',
                     work_days INTEGER DEFAULT 0,
                     work_hours INTEGER DEFAULT 0,
+                    total_fines INTEGER DEFAULT 0,
+                    overtime_count INTEGER DEFAULT 0,
+                    total_overtime_time INTEGER DEFAULT 0,
                     work_start_count INTEGER DEFAULT 0,
                     work_end_count INTEGER DEFAULT 0,
                     work_start_fines INTEGER DEFAULT 0,
                     work_end_fines INTEGER DEFAULT 0,
                     late_count INTEGER DEFAULT 0,
                     early_count INTEGER DEFAULT 0,
-                    shift TEXT DEFAULT 'day',
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                    UNIQUE(chat_id, user_id, record_date, activity_name, shift)
+                    UNIQUE(chat_id, user_id, statistic_date, activity_name, shift)
                 )
-
                 """,
                 # 10. activity_user_limits表
                 """
@@ -835,6 +834,12 @@ class PostgreSQLDatabase:
                     overtime_time INTEGER DEFAULT 0,
                     work_days INTEGER DEFAULT 0,
                     work_hours INTEGER DEFAULT 0,
+                    work_start_count INTEGER DEFAULT 0,
+                    work_end_count INTEGER DEFAULT 0,
+                    work_start_fines INTEGER DEFAULT 0,
+                    work_end_fines INTEGER DEFAULT 0,
+                    late_count INTEGER DEFAULT 0,
+                    early_count INTEGER DEFAULT 0,
                     shift TEXT DEFAULT 'day',
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
