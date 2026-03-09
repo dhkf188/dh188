@@ -700,7 +700,7 @@ class HandoverManager:
 
         try:
             # 使用带重试机制的执行器
-            await self.execute_with_retry(
+            await db.execute_with_retry(
                 "创建用户周期",
                 """
                 INSERT INTO user_handover_cycles 
@@ -1088,3 +1088,4 @@ class HandoverManager:
 
 # 全局实例
 handover_manager = HandoverManager()
+
